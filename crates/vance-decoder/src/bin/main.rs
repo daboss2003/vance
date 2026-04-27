@@ -240,7 +240,11 @@ fn frame_to_payload(
     for plane in 0..plane_count {
         let stride = frame.stride(plane) as u32;
         strides.push(stride);
-        let plane_height = if plane == 0 { height } else { height.div_ceil(2) };
+        let plane_height = if plane == 0 {
+            height
+        } else {
+            height.div_ceil(2)
+        };
         let plane_width = if plane == 0 || expected_pf == PixelFormat::Nv12 && plane == 1 {
             // Y plane: width pixels, 1 byte each. UV plane in NV12: width pixels (interleaved).
             width

@@ -1,6 +1,22 @@
-//! `vance-render` — stub.
+//! `vance-render` — wgpu render pipeline for decoded video frames.
 //!
-//! See PLAN.md §6 for this crate's role.
+//! Milestone 1.3 scope: a `Renderer` that uploads a YUV frame from
+//! `vance-decoder` and renders it as a fullscreen RGB quad onto an arbitrary
+//! target texture (or surface, in later milestones).
+//!
+//! Color: Rec.709 *limited range* throughout this milestone. This is the
+//! deliberate Phase-1 shortcut documented in PLAN.md §7 Phase 1; full color
+//! management lands in Phase 6.
+//!
+//! Both [`PixelFormat::Yuv420P`] (planar) and [`PixelFormat::Nv12`]
+//! (semi-planar) inputs are accepted. For NV12 inputs the UV plane is
+//! split CPU-side at upload so the GPU sees the same three R8 textures
+//! either way. Zero-copy NV12 (R8 + Rg8) is a Milestone 1.6 optimization
+//! once VideoToolbox hardware decode lands.
 
-#[doc(hidden)]
-pub fn _stub() {}
+#![warn(missing_docs)]
+
+mod renderer;
+
+pub use renderer::{RenderError, Renderer, RendererConfig};
+pub use vance_decoder::{FrameData, PixelFormat};

@@ -7,3 +7,16 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
+
+[dependencies]
+vance-core = { workspace = true }
+vance-decoder = { workspace = true }
+wgpu = "29"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# For the headless golden-frame test we just need the renderer to map
+# its output texture; no extra crate needed.
