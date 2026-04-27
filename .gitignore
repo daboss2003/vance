@@ -1,0 +1,33 @@
+# Rust
+/target/
+**/target/
+Cargo.lock.bak
+*.rs.bk
+
+# Node / pnpm
+node_modules/
+.pnpm-store/
+dist-build/
+.svelte-kit/
+build/
+.vite/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config
+.env
+.env.local
+*.log
+
+# Tauri build artifacts
+src-tauri/target/
+src-tauri/gen/

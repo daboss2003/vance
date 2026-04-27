@@ -1,0 +1,34 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Vance",
+  "version": "0.0.0",
+  "identifier": "dev.vance.app",
+  "build": {
+    "frontendDist": "../../ui/build",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "pnpm --dir ../../ui dev",
+    "beforeBuildCommand": "pnpm --dir ../../ui build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Vance",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 500,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "withGlobalTauri": false,
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all",
+    "icon": ["icons/icon.png"]
+  }
+}

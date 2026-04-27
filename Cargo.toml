@@ -1,0 +1,88 @@
+[workspace]
+resolver = "2"
+members = [
+    "xtask",
+    "crates/vance-core",
+    "crates/vance-time",
+    "crates/vance-color",
+    "crates/vance-media",
+    "crates/vance-ffmpeg-sys",
+    "crates/vance-decoder",
+    "crates/vance-encoder",
+    "crates/vance-audio",
+    "crates/vance-audio-plugins",
+    "crates/vance-render",
+    "crates/vance-effects",
+    "crates/vance-timeline",
+    "crates/vance-engine",
+    "crates/vance-project",
+    "crates/vance-otio",
+    "crates/vance-cache",
+    "crates/vance-plugin-host",
+    "crates/vance-plugin-sdk",
+    "crates/vance-ai",
+    "crates/vance-ai-runtime",
+    "crates/vance-ipc",
+    "crates/vance-viewport",
+    "crates/vance-app",
+    "crates/vance-cli",
+    "crates/vance-bench",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.95"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/your-org/vance"
+authors = ["Vance contributors"]
+
+[workspace.dependencies]
+# Internal crates (other workspace members reference these by name)
+vance-core = { path = "crates/vance-core" }
+vance-time = { path = "crates/vance-time" }
+vance-color = { path = "crates/vance-color" }
+vance-media = { path = "crates/vance-media" }
+vance-ffmpeg-sys = { path = "crates/vance-ffmpeg-sys" }
+vance-decoder = { path = "crates/vance-decoder" }
+vance-encoder = { path = "crates/vance-encoder" }
+vance-audio = { path = "crates/vance-audio" }
+vance-audio-plugins = { path = "crates/vance-audio-plugins" }
+vance-render = { path = "crates/vance-render" }
+vance-effects = { path = "crates/vance-effects" }
+vance-timeline = { path = "crates/vance-timeline" }
+vance-engine = { path = "crates/vance-engine" }
+vance-project = { path = "crates/vance-project" }
+vance-otio = { path = "crates/vance-otio" }
+vance-cache = { path = "crates/vance-cache" }
+vance-plugin-host = { path = "crates/vance-plugin-host" }
+vance-plugin-sdk = { path = "crates/vance-plugin-sdk" }
+vance-ai = { path = "crates/vance-ai" }
+vance-ai-runtime = { path = "crates/vance-ai-runtime" }
+vance-ipc = { path = "crates/vance-ipc" }
+vance-viewport = { path = "crates/vance-viewport" }
+
+# External
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tokio = { version = "1", features = ["full"] }
+parking_lot = "0.12"
+
+[profile.dev]
+incremental = true
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+strip = true
+
+# Apply release-level optimization to dependencies even in dev builds.
+# Speeds up wgpu/ffmpeg/etc. without making our own iteration loop slow.
+[profile.dev.package."*"]
+opt-level = 2

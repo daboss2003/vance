@@ -1,0 +1,24 @@
+@import 'tailwindcss';
+
+@theme {
+  --color-vance-bg: #16161a;
+  --color-vance-panel: #1e1e22;
+  --color-vance-border: #2a2a30;
+  --color-vance-fg: #e8e8ea;
+  --color-vance-muted: #8a8a92;
+  --color-vance-accent: #6cf;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  font:
+    13px/1.45 -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    Roboto,
+    sans-serif;
+}
