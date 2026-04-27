@@ -7,3 +7,21 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "vance-decoder"
+path = "src/bin/main.rs"
+
+[dependencies]
+vance-core = { workspace = true }
+vance-ipc = { workspace = true }
+vance-ffmpeg-sys = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+bincode = { version = "2", features = ["serde"] }

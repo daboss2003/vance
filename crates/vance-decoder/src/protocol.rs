@@ -1,0 +1,218 @@
+//! Decoder wire protocol.
+//!
+//! `DecoderRequest` flows parent → sidecar; `DecoderResponse` flows back.
+//! Versioned by the `PROTOCOL_VERSION` constant. Bump on any breaking
+//! change; older sidecars must reject newer requests cleanly.
+
+use serde::{Deserialize, Serialize};
+
+/// Wire protocol version. Bump on breaking changes.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// One request from parent to sidecar.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DecoderRequest {
+    /// Handshake. Sidecar replies with [`DecoderResponse::Hello`].
+    Hello {
+        /// Parent's protocol version. Sidecar refuses on mismatch.
+        protocol_version: u32,
+    },
+
+    /// Open a media file. Sidecar replies with [`DecoderResponse::Opened`]
+    /// (containing stream info) or [`DecoderResponse::OpenFailed`].
+    Open {
+        /// Absolute or working-directory-relative path to the media file.
+        path: String,
+    },
+
+    /// Seek the currently-open stream so the next decode starts at or
+    /// before this PTS in the stream's time base. Returns [`DecoderResponse::Seeked`].
+    Seek {
+        /// Target PTS in the stream's time base units.
+        target_pts: i64,
+    },
+
+    /// Decode the frame whose PTS is closest to (and at most) `target_pts`,
+    /// in the stream's time base. The sidecar may seek + decode forward as
+    /// needed; the response returns the actual PTS of the frame delivered.
+    DecodeAt {
+        /// Target PTS in the stream's time base.
+        target_pts: i64,
+    },
+
+    /// Close the currently-open file (if any). Sidecar stays alive,
+    /// ready for another `Open`.
+    Close,
+
+    /// Graceful shutdown request. Equivalent to closing the parent's stdin
+    /// from the sidecar's point of view, but lets the parent get a clean
+    /// `Goodbye` response before EOF.
+    Shutdown,
+}
+
+/// One response from sidecar to parent. Always sent in reply to a request,
+/// in the same order — this is strict request/response, not push.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DecoderResponse {
+    /// Reply to [`DecoderRequest::Hello`].
+    Hello {
+        /// Sidecar's protocol version (must equal the parent's).
+        protocol_version: u32,
+        /// FFmpeg `av_version_info()` string, e.g. "7.1.3".
+        ffmpeg_version: String,
+    },
+
+    /// File opened successfully. Carries the chosen video stream's info.
+    Opened(StreamInfo),
+
+    /// File open failed.
+    OpenFailed(OpenError),
+
+    /// Seek completed. The sidecar's internal state now points at or before `pts`.
+    Seeked {
+        /// PTS of the seek target as recorded by the sidecar.
+        pts: i64,
+    },
+
+    /// A decoded frame.
+    Frame(FrameData),
+
+    /// `DecodeAt` failed (no frame at or near the requested PTS, decoder
+    /// error, etc.).
+    DecodeFailed {
+        /// Human-readable reason; the sidecar logs more detail to stderr.
+        reason: String,
+    },
+
+    /// `Close` acknowledged. The sidecar has no open file.
+    Closed,
+
+    /// Graceful shutdown acknowledged; sidecar will exit immediately.
+    Goodbye,
+}
+
+/// Information about the chosen video stream after open. Returned in
+/// [`DecoderResponse::Opened`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamInfo {
+    /// Width of the video frame in pixels.
+    pub width: u32,
+    /// Height of the video frame in pixels.
+    pub height: u32,
+    /// Pixel format the decoder will deliver frames in.
+    pub pixel_format: PixelFormat,
+    /// Frame rate as `(num, den)`. May be the container's average rate.
+    pub frame_rate: (i64, i64),
+    /// Stream time base as `(num, den)`. PTS values are in this unit.
+    pub time_base: (i64, i64),
+    /// Duration in stream time-base units, if known.
+    pub duration_pts: Option<i64>,
+    /// Codec name, e.g. "h264", "hevc", "prores".
+    pub codec_name: String,
+    /// 0-based index of this stream within the container.
+    pub stream_index: u32,
+}
+
+/// Pixel formats the decoder emits over the wire.
+///
+/// Phase 1 ships planar 8-bit YUV (`Yuv420P`, the most common decoder
+/// output) and semi-planar `Nv12` (what VideoToolbox returns from hardware
+/// decode). Other formats get added as they're encountered; downstream
+/// code (renderer, etc.) must handle every variant or fail loudly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PixelFormat {
+    /// I420: Y plane, then half-resolution U and V planes (4:2:0).
+    Yuv420P,
+    /// NV12: Y plane, then interleaved UV plane at half resolution.
+    Nv12,
+}
+
+impl PixelFormat {
+    /// Number of bytes for a frame of this format at `width` × `height`.
+    /// All Phase 1 formats are 12 bits per pixel (4:2:0).
+    pub fn frame_size(self, width: u32, height: u32) -> usize {
+        match self {
+            PixelFormat::Yuv420P | PixelFormat::Nv12 => width as usize * height as usize * 3 / 2,
+        }
+    }
+}
+
+/// One decoded frame returned in [`DecoderResponse::Frame`].
+///
+/// Pixel data is inline for Milestone 1.2 (works up to ~1080p within the
+/// IPC frame cap). Will be replaced by a shared-memory handle when 4K
+/// performance demands it (Milestone 1.5+).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameData {
+    /// PTS in the stream's time base.
+    pub pts: i64,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Pixel format (matches the open's `StreamInfo.pixel_format`).
+    pub pixel_format: PixelFormat,
+    /// Per-plane line strides in bytes (NV12: [Y, UV]; YUV420P: [Y, U, V]).
+    pub strides: Vec<u32>,
+    /// Raw pixel bytes, planes packed back to back (Y first).
+    pub bytes: Vec<u8>,
+}
+
+/// Reasons an `Open` can fail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OpenError {
+    /// Path does not exist or is not readable.
+    NotFound(String),
+    /// Path opened but no video stream was found.
+    NoVideoStream,
+    /// Video codec is recognized but not supported by this build.
+    UnsupportedCodec(String),
+    /// Pixel format is recognized but not supported by this build.
+    UnsupportedPixelFormat(String),
+    /// FFmpeg returned an error during open / probe.
+    FfmpegError(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pixel_format_size_1080p() {
+        // 1920x1080 @ 4:2:0 = 1920*1080*1.5 = 3_110_400 bytes.
+        assert_eq!(PixelFormat::Yuv420P.frame_size(1920, 1080), 3_110_400);
+        assert_eq!(PixelFormat::Nv12.frame_size(1920, 1080), 3_110_400);
+    }
+
+    #[test]
+    fn pixel_format_size_4k() {
+        // 3840x2160 @ 4:2:0 = 12_441_600 bytes ~ 11.9 MiB.
+        // Inline-payload-OK for now (vance-ipc cap is 16 MiB) but tight.
+        assert_eq!(PixelFormat::Yuv420P.frame_size(3840, 2160), 12_441_600);
+    }
+
+    #[test]
+    fn protocol_round_trips() {
+        // Round-trip every variant through bincode to catch serde slip-ups
+        // before they bite us across a process boundary.
+        let cases = vec![
+            DecoderRequest::Hello {
+                protocol_version: 1,
+            },
+            DecoderRequest::Open {
+                path: "/tmp/x.mov".into(),
+            },
+            DecoderRequest::Seek { target_pts: 12345 },
+            DecoderRequest::DecodeAt { target_pts: 12345 },
+            DecoderRequest::Close,
+            DecoderRequest::Shutdown,
+        ];
+        for c in cases {
+            let cfg = bincode::config::standard();
+            let bytes = bincode::serde::encode_to_vec(&c, cfg).unwrap();
+            let (back, _): (DecoderRequest, _) =
+                bincode::serde::decode_from_slice(&bytes, cfg).unwrap();
+            assert_eq!(format!("{c:?}"), format!("{back:?}"));
+        }
+    }
+}

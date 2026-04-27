@@ -7,3 +7,16 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
+
+# Thin re-export of `ffmpeg-the-third` (an actively-maintained fork of
+# `ffmpeg-next`). Keeping this isolated in its own crate lets us swap the
+# binding crate later without touching consumer code, and lets us add
+# vendored-build options behind features without polluting downstream.
+[dependencies]
+ffmpeg-the-third = { version = "3", default-features = false, features = [
+    "codec",
+    "format",
+    "filter",
+    "software-resampling",
+    "software-scaling",
+] }

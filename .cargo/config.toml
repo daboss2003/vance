@@ -1,2 +1,23 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# FFmpeg discovery on macOS (Homebrew, Apple Silicon).
+#
+# `ffmpeg-the-third` 3.x supports FFmpeg up to 7.1, but `brew install ffmpeg`
+# now ships 8.x (which removed `avfft.h` and breaks the bindings). We install
+# the side-by-side `ffmpeg@7` formula and point pkg-config at it here.
+#
+# Linux + Windows use system / vcpkg paths; covered in CI matrix later.
+[env]
+# FFmpeg discovery on macOS (Homebrew).
+#
+# `ffmpeg-the-third` 3.x supports FFmpeg up to 7.1; brew's default `ffmpeg`
+# now ships 8.x (which removed `avfft.h` and breaks the bindings). We use
+# the side-by-side `brew install ffmpeg@7` formula. `FFMPEG_DIR` overrides
+# pkg-config detection in the sys crate's build script.
+#
+# Apple Silicon path is /opt/homebrew/opt; Intel Mac is /usr/local/opt.
+# Cargo's [env] is global, not per-target, so we set both via the env
+# resolution order — whichever directory exists wins.
+FFMPEG_DIR = { value = "/opt/homebrew/opt/ffmpeg@7", force = true }
+PKG_CONFIG_PATH = { value = "/opt/homebrew/opt/ffmpeg@7/lib/pkgconfig:/usr/local/opt/ffmpeg@7/lib/pkgconfig", force = true }
