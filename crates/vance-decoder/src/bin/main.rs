@@ -22,6 +22,7 @@ use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use vance_decoder::hwaccel::{self, HwDeviceCtx};
 use vance_decoder::protocol::{
     DecoderRequest, DecoderResponse, FrameData, OpenError, PixelFormat, StreamInfo,
     PROTOCOL_VERSION,
@@ -49,6 +50,12 @@ struct OpenContext {
     decoder: ffmpeg::decoder::Video,
     stream_index: usize,
     info: StreamInfo,
+    /// Holds the VideoToolbox device context (if any) for the lifetime
+    /// of this open file. `None` means software decode.
+    _hw_device: Option<HwDeviceCtx>,
+    /// Reusable destination frame for `av_hwframe_transfer_data`.
+    /// `None` when not using HW decode.
+    sw_dest_frame: Option<ffmpeg::frame::Video>,
 }
 
 /// Decode-thread bookkeeping held by the main thread for the lifetime of a
@@ -148,15 +155,54 @@ impl State {
         let codec_id = stream.parameters().id();
         let codec_name = format!("{codec_id:?}").to_lowercase();
 
-        let codec_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
+        let mut codec_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
             .map_err(|e| OpenError::FfmpegError(e.to_string()))?;
+
+        // Try VideoToolbox before opening the decoder. On success, attach
+        // hw_device_ctx so FFmpeg's get_format chooses AV_PIX_FMT_VIDEOTOOLBOX
+        // and decoded frames come back as opaque GPU surfaces (which we
+        // then transfer to NV12 system memory).
+        let hw_device = HwDeviceCtx::try_videotoolbox();
+        let using_hw = if let Some(ref hw) = hw_device {
+            unsafe {
+                hw.attach_to(codec_ctx.as_mut_ptr() as *mut std::ffi::c_void);
+            }
+            true
+        } else {
+            false
+        };
+
         let decoder = codec_ctx
             .decoder()
             .video()
             .map_err(|e| OpenError::UnsupportedCodec(format!("{codec_name}: {e}")))?;
 
-        let pixel_format =
-            map_pixel_format(decoder.format()).map_err(OpenError::UnsupportedPixelFormat)?;
+        // If HW decode is in play, decoded frames are AV_PIX_FMT_VIDEOTOOLBOX
+        // and we transfer them to NV12. Report NV12 in StreamInfo so the
+        // renderer picks the right path. Otherwise, report whatever the
+        // SW decoder outputs.
+        let pixel_format = if using_hw {
+            PixelFormat::Nv12
+        } else {
+            map_pixel_format(decoder.format()).map_err(OpenError::UnsupportedPixelFormat)?
+        };
+        let sw_dest_frame = if using_hw {
+            Some(ffmpeg::frame::Video::empty())
+        } else {
+            None
+        };
+
+        eprintln!(
+            "[decoder] open ok: {}x{} {} ({})",
+            decoder.width(),
+            decoder.height(),
+            codec_name,
+            if using_hw {
+                "VideoToolbox HW"
+            } else {
+                "software"
+            }
+        );
 
         let info = StreamInfo {
             width: decoder.width(),
@@ -174,6 +220,8 @@ impl State {
             decoder,
             stream_index,
             info: info.clone(),
+            _hw_device: hw_device,
+            sw_dest_frame,
         });
         Ok(info)
     }
@@ -301,7 +349,11 @@ fn decode_one_at_or_after(ctx: &mut OpenContext, target_pts: i64) -> Result<Fram
             while ctx.decoder.receive_frame(&mut decoded).is_ok() {
                 let pts = decoded.pts().unwrap_or(0);
                 if pts >= target_pts {
-                    return frame_to_payload(&decoded, ctx.info.pixel_format);
+                    return materialize_frame(
+                        &decoded,
+                        ctx.sw_dest_frame.as_mut(),
+                        ctx.info.pixel_format,
+                    );
                 }
             }
             break;
@@ -313,11 +365,43 @@ fn decode_one_at_or_after(ctx: &mut OpenContext, target_pts: i64) -> Result<Fram
             while ctx.decoder.receive_frame(&mut decoded).is_ok() {
                 let pts = decoded.pts().unwrap_or(0);
                 if pts >= target_pts {
-                    return frame_to_payload(&decoded, ctx.info.pixel_format);
+                    return materialize_frame(
+                        &decoded,
+                        ctx.sw_dest_frame.as_mut(),
+                        ctx.info.pixel_format,
+                    );
                 }
             }
             return Err(format!("no frame at or after pts {target_pts}"));
         }
+    }
+}
+
+/// Convert a decoded `Video` frame into wire `FrameData`, transferring
+/// hardware surfaces to NV12 system memory if needed.
+///
+/// Takes split borrows (sw_dest_frame, pixel_format) instead of `&mut ctx`
+/// so callers can hold a mutable borrow on `ctx.input` (the packets
+/// iterator) at the same time.
+fn materialize_frame(
+    decoded: &ffmpeg::frame::Video,
+    sw_dest_frame: Option<&mut ffmpeg::frame::Video>,
+    pixel_format: PixelFormat,
+) -> Result<FrameData, String> {
+    let format_i32 = unsafe { (*decoded.as_ptr()).format };
+    if hwaccel::is_hardware_pixel_format(format_i32) {
+        let dest = sw_dest_frame.ok_or("got HW frame but no sw_dest_frame allocated")?;
+        unsafe {
+            hwaccel::transfer_to_sw(
+                decoded.as_ptr() as *const std::ffi::c_void,
+                dest.as_mut_ptr() as *mut std::ffi::c_void,
+            )?;
+            let pts = (*decoded.as_ptr()).pts;
+            (*dest.as_mut_ptr()).pts = pts;
+        }
+        frame_to_payload(dest, pixel_format)
+    } else {
+        frame_to_payload(decoded, pixel_format)
     }
 }
 
@@ -368,7 +452,11 @@ fn decode_stream_loop(
                 if pts < from_pts {
                     continue;
                 }
-                let payload = match frame_to_payload(&decoded, ctx.info.pixel_format) {
+                let payload = match materialize_frame(
+                    &decoded,
+                    ctx.sw_dest_frame.as_mut(),
+                    ctx.info.pixel_format,
+                ) {
                     Ok(p) => p,
                     Err(e) => {
                         let _ = tx.send(Some(DecodedItem::Failure(e)));
@@ -400,7 +488,8 @@ fn decode_stream_loop(
                 if pts < from_pts {
                     continue;
                 }
-                match frame_to_payload(&decoded, ctx.info.pixel_format) {
+                match materialize_frame(&decoded, ctx.sw_dest_frame.as_mut(), ctx.info.pixel_format)
+                {
                     Ok(p) => {
                         if tx.send(Some(DecodedItem::Frame(p))).is_err() {
                             break 'outer;

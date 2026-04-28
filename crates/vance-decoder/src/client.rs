@@ -55,8 +55,20 @@ pub struct DecoderClient {
 impl DecoderClient {
     /// Spawn the sidecar binary and complete the protocol handshake.
     pub fn spawn(binary: impl AsRef<Path>) -> Result<Self, ClientError> {
+        Self::spawn_with_env(binary, std::iter::empty::<(&str, &str)>())
+    }
+
+    /// Spawn the sidecar with extra environment variables (e.g. `VANCE_FORCE_SW=1`
+    /// to disable hardware decode for testing). Otherwise identical to `spawn`.
+    pub fn spawn_with_env<P, I, K, V>(binary: P, env: I) -> Result<Self, ClientError>
+    where
+        P: AsRef<Path>,
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    {
         let mut sidecar: Sidecar<DecoderRequest, DecoderResponse> =
-            Sidecar::spawn(binary, std::iter::empty::<&str>())?;
+            Sidecar::spawn_with_env(binary, std::iter::empty::<&str>(), env)?;
         let resp = sidecar.request(&DecoderRequest::Hello {
             protocol_version: PROTOCOL_VERSION,
         })?;

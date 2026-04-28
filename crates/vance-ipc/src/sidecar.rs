@@ -52,9 +52,25 @@ impl<Req: Serialize, Resp: DeserializeOwned> Sidecar<Req, Resp> {
         A: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        Self::spawn_with_env(program, args, std::iter::empty::<(&str, &str)>())
+    }
+
+    /// Like [`Sidecar::spawn`] but also sets extra environment variables on
+    /// the child process. Used by tests that want to flip feature flags
+    /// (e.g. `VANCE_FORCE_SW=1`) without polluting the parent's env.
+    pub fn spawn_with_env<P, A, S, E, K, V>(program: P, args: A, env: E) -> Result<Self>
+    where
+        P: AsRef<Path>,
+        A: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+        E: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
         let program_str = program.as_ref().display().to_string();
         let mut cmd = Command::new(program.as_ref());
         cmd.args(args)
+            .envs(env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());

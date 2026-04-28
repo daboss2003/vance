@@ -15,6 +15,7 @@
 #![warn(missing_docs)]
 
 pub mod client;
+pub mod hwaccel;
 pub mod protocol;
 
 pub use client::DecoderClient;
