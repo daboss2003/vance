@@ -25,3 +25,4 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 bincode = { version = "2", features = ["serde"] }
+sysinfo = "0.32"

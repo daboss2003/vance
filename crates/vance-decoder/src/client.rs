@@ -147,4 +147,11 @@ impl DecoderClient {
         let _ = self.sidecar.shutdown();
         Ok(())
     }
+
+    /// Force-kill the sidecar process. Test/diagnostic only — production
+    /// code should use [`DecoderClient::shutdown`] for graceful exit.
+    /// Use to validate the crash-isolation contract (PLAN.md §3 principle 4).
+    pub fn kill(&mut self) -> Result<(), ClientError> {
+        Ok(self.sidecar.kill()?)
+    }
 }

@@ -502,11 +502,16 @@ async fn create_device(
         })
         .await
         .map_err(|_| RenderError::NoAdapter)?;
+    // Downlevel defaults cap max_texture_dimension_2d at 2048, which is
+    // smaller than 4K (3840). Use the adapter's native limits so we can
+    // allocate Y/U/V planes at any reasonable resolution. We still keep
+    // the rest of the request defensive (no special features).
+    let limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("vance-render.device"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults(),
+            required_limits: limits,
             experimental_features: wgpu::ExperimentalFeatures::default(),
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
