@@ -166,6 +166,12 @@ impl AudioPlayer {
         self.current_pts.load(Ordering::Acquire)
     }
 
+    /// Shared atomic handle to the audio clock, for callers that want to
+    /// read it from another thread without going through `&self`.
+    pub fn current_pts_handle(&self) -> Arc<AtomicI64> {
+        self.current_pts.clone()
+    }
+
     /// Sample rate of the cpal output device.
     pub fn device_sample_rate(&self) -> u32 {
         self.device_sample_rate

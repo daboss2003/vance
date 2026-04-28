@@ -35,3 +35,4 @@ vance-time = { workspace = true }
 vance-decoder = { workspace = true }
 vance-render = { workspace = true }
 vance-viewport = { workspace = true }
+vance-audio = { workspace = true }

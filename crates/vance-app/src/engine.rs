@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+use vance_audio::AudioPlayer;
 use vance_decoder::{DecoderClient, StreamInfo};
 use vance_render::{Renderer, RendererConfig};
 use vance_viewport::{HostWindowHandle, Viewport, ViewportBounds};
@@ -89,10 +90,24 @@ pub struct Engine {
     /// Stream info from the most recent successful `open_file`. Stays
     /// available even during playback so the UI can read it.
     stream_info: Option<StreamInfo>,
+    /// Most recently opened media path. Needed by `start_playback` to
+    /// also open the audio side of the file.
+    current_media_path: Option<String>,
     /// Last-applied viewport bounds (in physical pixels).
     last_bounds: ViewportBounds,
     /// Active playback, if any.
     playback: Option<PlaybackSession>,
+    /// Audio playback owner thread (holds the AudioPlayer; AudioPlayer's
+    /// cpal::Stream is !Send so it has to stay on its own thread).
+    audio_owner: Option<AudioOwner>,
+}
+
+/// Owns the AudioPlayer on a dedicated thread. The thread parks until
+/// `stop` is set, then drops the AudioPlayer (which stops the cpal
+/// stream and joins its puller).
+pub struct AudioOwner {
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
 }
 
 /// Owned by the engine while video playback is running.
@@ -183,6 +198,7 @@ impl Engine {
         let dec = self.decoder.as_mut().unwrap();
         let info = dec.open(path.to_string())?;
         self.stream_info = Some(info.clone());
+        self.current_media_path = Some(path.to_string());
         Ok(info)
     }
 
@@ -244,6 +260,10 @@ impl Engine {
             .as_ref()
             .ok_or(EngineError::NoFileOpen)?
             .clone();
+        let media_path = self
+            .current_media_path
+            .clone()
+            .ok_or(EngineError::NoFileOpen)?;
         let mut decoder = self.decoder.take().ok_or(EngineError::NoFileOpen)?;
 
         // Kick off streaming on the sidecar before handing off the client.
@@ -252,6 +272,17 @@ impl Engine {
             self.decoder = Some(decoder);
             return Err(EngineError::DecoderClient(e));
         }
+
+        // Best-effort audio start. If the file has no audio or audio init
+        // fails, keep going with wall-clock-only video — better degraded
+        // playback than no playback.
+        let (audio_owner, audio_sync) = match start_audio(&media_path, from_pts) {
+            Ok((owner, sync)) => (Some(owner), Some(sync)),
+            Err(e) => {
+                tracing::warn!(?e, "audio: not started; video will use wall-clock master");
+                (None, None)
+            }
+        };
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
@@ -267,10 +298,12 @@ impl Engine {
                     viewport,
                     render_state,
                     stop_clone,
+                    audio_sync,
                 )
             })
             .map_err(|e| EngineError::PlaybackThread(format!("spawn: {e}")))?;
         self.playback = Some(PlaybackSession { stop, handle });
+        self.audio_owner = audio_owner;
         Ok(())
     }
 
@@ -280,6 +313,12 @@ impl Engine {
             return Err(EngineError::NoPlayback);
         };
         session.stop.store(true, Ordering::Release);
+        // Stop the audio owner thread (it'll drop the AudioPlayer, which
+        // stops cpal + joins the puller thread).
+        if let Some(owner) = self.audio_owner.take() {
+            owner.stop.store(true, Ordering::Release);
+            let _ = owner.handle.join();
+        }
         match session.handle.join() {
             Ok(decoder) => {
                 self.decoder = Some(decoder);
@@ -295,10 +334,87 @@ impl Engine {
     }
 }
 
+/// What the playback loop needs to read the audio clock as master.
+/// Cloned from the AudioPlayer at session start.
+pub struct AudioSync {
+    /// Most recently consumed audio chunk's leading PTS, in audio time base.
+    pub current_pts: Arc<std::sync::atomic::AtomicI64>,
+    /// Audio stream's time base as `(num, den)`. Seconds = pts*num/den.
+    pub time_base: (i64, i64),
+}
+
+/// Try to start the audio side of playback. Spawns an owner thread that
+/// holds the AudioPlayer (cpal::Stream is !Send, so it must stay on
+/// one thread) and parks until told to stop. Returns a stop handle and
+/// a clock-sharing handle for the video loop.
+fn start_audio(media_path: &str, _from_pts: i64) -> Result<(AudioOwner, AudioSync), String> {
+    let bin = locate_audio_binary().map_err(|e| format!("{e:?}"))?;
+    let media_path = media_path.to_string();
+
+    // Use a one-shot channel to ship the AudioSync (and any startup error)
+    // back from the owner thread to here.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<AudioSync, String>>(1);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+
+    let handle = std::thread::Builder::new()
+        .name("vance-engine.audio-owner".into())
+        .spawn(move || {
+            let player = match AudioPlayer::start(&bin, media_path, 0) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = tx.send(Err(format!("{e}")));
+                    return;
+                }
+            };
+            // Audio time base = (1, device_sample_rate). The decoded
+            // chunks' PTS values are in *audio stream* time base (per
+            // Symphonia: typically 1/sample_rate); device rate is the
+            // same in the common case (48 kHz file → 48 kHz device).
+            let sync = AudioSync {
+                current_pts: player.current_pts_handle(),
+                time_base: (1, player.device_sample_rate() as i64),
+            };
+            if tx.send(Ok(sync)).is_err() {
+                return; // engine gave up before we could ship the sync
+            }
+
+            // Park until stop is signalled. The player keeps streaming.
+            while !stop_clone.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            drop(player); // stops cpal + joins puller thread
+        })
+        .map_err(|e| format!("spawn audio owner: {e}"))?;
+
+    let sync = rx
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|_| "audio owner thread did not report ready in 10s".to_string())??;
+    Ok((AudioOwner { stop, handle }, sync))
+}
+
+fn locate_audio_binary() -> Result<PathBuf, EngineError> {
+    let exe_name = if cfg!(windows) {
+        "vance-audio-decoder.exe"
+    } else {
+        "vance-audio-decoder"
+    };
+    let mut tried = Vec::new();
+    if let Ok(self_exe) = std::env::current_exe() {
+        if let Some(dir) = self_exe.parent() {
+            let cand = dir.join(exe_name);
+            if cand.exists() {
+                return Ok(cand);
+            }
+            tried.push(cand);
+        }
+    }
+    Err(EngineError::DecoderBinaryMissing(tried))
+}
+
 /// Background scheduler. Pulls frames from the decoder in PTS order;
-/// for each, sleeps until its target wall-clock present time then
-/// uploads + renders + presents. Wall-clock-only for 2.4; A/V sync to
-/// the audio clock lands in 2.5.
+/// for each, presents at the right time relative to the **audio clock**
+/// (when present) or wall clock (audio missing/failed).
 ///
 /// Returns the `DecoderClient` so the engine can resume single-shot use.
 #[allow(clippy::too_many_arguments)]
@@ -310,6 +426,7 @@ fn playback_loop(
     viewport: Arc<Viewport>,
     render_state: Arc<Mutex<RenderState>>,
     stop: Arc<AtomicBool>,
+    audio: Option<AudioSync>,
 ) -> DecoderClient {
     // Stream-time-base → seconds: pts * tb_num / tb_den.
     let (tb_num, tb_den) = info.time_base;
@@ -323,8 +440,17 @@ fn playback_loop(
 
     // Anchor wall clock to the moment we receive the FIRST frame, mapped
     // to its PTS. Subsequent frames' target time = anchor + (pts - first).
-    tracing::info!(from_pts, "playback thread started");
-    let mut anchor: Option<(Instant, f64)> = None;
+    tracing::info!(
+        from_pts,
+        master = if audio.is_some() {
+            "audio"
+        } else {
+            "wall-clock"
+        },
+        "playback thread started"
+    );
+    // Wall-clock fallback anchor (only used when no audio).
+    let mut wall_anchor: Option<(Instant, f64)> = None;
     let mut bounds = initial_bounds;
     let mut last_logged_drops = 0u64;
     let mut total_drops = 0u64;
@@ -347,29 +473,46 @@ fn playback_loop(
         };
         let frame_sec = pts_to_sec(frame.pts);
 
-        // First-frame anchor.
-        if anchor.is_none() {
-            anchor = Some((Instant::now(), frame_sec));
-        }
-        let (origin, origin_sec) = anchor.unwrap();
-        let target = origin + Duration::from_secs_f64((frame_sec - origin_sec).max(0.0));
-        let now = Instant::now();
-        if target > now {
-            let wait = target - now;
-            // Bounded sleep so a stop signal isn't ignored for too long.
-            std::thread::sleep(wait.min(Duration::from_millis(50)));
-            // Re-check stop after the sleep.
-            if stop.load(Ordering::Acquire) {
-                break;
+        // Decide how late/early this frame is relative to the master clock.
+        // Positive => frame is in the future, sleep that long.
+        // Negative below threshold => frame is too late, drop.
+        let wait_secs = if let Some(audio) = audio.as_ref() {
+            let audio_pts = audio.current_pts.load(std::sync::atomic::Ordering::Acquire);
+            let (atb_n, atb_d) = audio.time_base;
+            let audio_sec = if atb_d != 0 {
+                (audio_pts as f64) * (atb_n as f64) / (atb_d as f64)
+            } else {
+                0.0
+            };
+            // Anchor to the FIRST frame's PTS so video/audio share an origin
+            // even though their PTS systems differ. (audio_sec is real wall
+            // time progress; we offset video PTS by its from_pts.)
+            let video_progress = frame_sec - pts_to_sec(from_pts);
+            video_progress - audio_sec
+        } else {
+            // Wall-clock fallback.
+            if wall_anchor.is_none() {
+                wall_anchor = Some((Instant::now(), frame_sec));
             }
-            // If the remaining wait is still meaningful, sleep again.
-            let now2 = Instant::now();
-            if target > now2 {
-                std::thread::sleep(target - now2);
+            let (origin, origin_sec) = wall_anchor.unwrap();
+            let now_sec = origin.elapsed().as_secs_f64();
+            (frame_sec - origin_sec) - now_sec
+        };
+
+        if wait_secs > 0.0 {
+            // Future frame; sleep but in chunks so stop is responsive.
+            let total = Duration::from_secs_f64(wait_secs);
+            let mut remaining = total;
+            while remaining > Duration::from_millis(0) {
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                let chunk = remaining.min(Duration::from_millis(50));
+                std::thread::sleep(chunk);
+                remaining = remaining.saturating_sub(chunk);
             }
-        } else if (now - target) > Duration::from_millis(80) {
-            // > ~2 frames late at 24fps: drop this one. Keeps the playhead
-            // honest under load instead of letting drift accumulate.
+        } else if wait_secs < -0.080 {
+            // > ~2 frames late at 24fps; drop to keep the playhead honest.
             total_drops += 1;
             if total_drops - last_logged_drops >= 30 {
                 tracing::warn!(total_drops, "playback: dropped frames so far");

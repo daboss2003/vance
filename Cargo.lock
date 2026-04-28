@@ -5231,6 +5231,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
+ "vance-audio",
  "vance-core",
  "vance-decoder",
  "vance-render",
