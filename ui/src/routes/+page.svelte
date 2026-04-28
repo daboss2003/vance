@@ -6,6 +6,8 @@
     decodeAndRenderAt,
     openFile,
     setViewportBounds,
+    startPlayback,
+    stopPlayback,
     type StreamInfo
   } from '$lib/ipc';
 
@@ -15,6 +17,8 @@
   let renderError = $state<string | null>(null);
   let lastPts = $state<number | null>(null);
   let timecodeInput = $state<string>('00:00:00:00');
+  let playing = $state<boolean>(false);
+  let playError = $state<string | null>(null);
 
   let viewportEl: HTMLDivElement | null = $state(null);
 
@@ -107,6 +111,25 @@
     }
     render(pts);
   }
+
+  async function togglePlayback() {
+    playError = null;
+    if (playing) {
+      try {
+        await stopPlayback();
+        playing = false;
+      } catch (e) {
+        playError = String(e);
+      }
+    } else {
+      try {
+        await startPlayback(lastPts ?? 0);
+        playing = true;
+      } catch (e) {
+        playError = String(e);
+      }
+    }
+  }
 </script>
 
 <div class="flex h-screen flex-col">
@@ -148,6 +171,13 @@
       <div
         class="border-vance-border bg-vance-panel flex h-12 flex-shrink-0 items-center gap-3 border-t px-4 text-xs"
       >
+        <button
+          class="rounded bg-[var(--color-vance-accent)] px-3 py-1 font-semibold text-[#003040] disabled:opacity-50"
+          onclick={togglePlayback}
+          disabled={!info}
+        >
+          {playing ? 'Stop' : 'Play'}
+        </button>
         <form onsubmit={handleTimecodeSeek} class="flex items-center gap-2">
           <label class="text-vance-muted">
             Seek to TC
@@ -160,13 +190,16 @@
           <button
             type="submit"
             class="rounded bg-[var(--color-vance-accent)] px-2 py-1 text-[#003040]"
-            disabled={!info}
+            disabled={!info || playing}
           >
             Go
           </button>
         </form>
         <span class="text-vance-muted ml-auto">
           last PTS: <span class="text-vance-fg font-mono">{lastPts ?? '—'}</span>
+          {#if playError}
+            <span class="ml-3 text-red-400">{playError}</span>
+          {/if}
         </span>
       </div>
     </main>

@@ -29,3 +29,10 @@ export const openFile = (path: string): Promise<StreamInfo> =>
 
 export const decodeAndRenderAt = (targetPts: number): Promise<number> =>
   invoke('decode_and_render_at', { targetPts });
+
+export const startPlayback = (fromPts: number): Promise<void> =>
+  invoke('start_playback', { fromPts });
+
+export const stopPlayback = (): Promise<void> => invoke('stop_playback');
+
+export const isPlaying = (): Promise<boolean> => invoke('is_playing');

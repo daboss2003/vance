@@ -86,6 +86,24 @@ fn decode_and_render_at(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn start_playback(state: tauri::State<'_, EngineHandle>, from_pts: i64) -> Result<(), String> {
+    state
+        .lock()
+        .start_playback(from_pts)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn stop_playback(state: tauri::State<'_, EngineHandle>) -> Result<(), String> {
+    state.lock().stop_playback().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn is_playing(state: tauri::State<'_, EngineHandle>) -> bool {
+    state.lock().is_playing()
+}
+
 fn main() {
     // Quiet by default; bump with RUST_LOG=info for diagnostics.
     let _ = tracing_subscriber::fmt()
@@ -130,6 +148,9 @@ fn main() {
             set_viewport_bounds,
             open_file,
             decode_and_render_at,
+            start_playback,
+            stop_playback,
+            is_playing,
         ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");
