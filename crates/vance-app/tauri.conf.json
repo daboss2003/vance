@@ -5,8 +5,6 @@
   "identifier": "dev.vance.app",
   "build": {
     "frontendDist": "../../ui/build",
-    "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "pnpm --dir ../../ui dev",
     "beforeBuildCommand": "pnpm --dir ../../ui build"
   },
   "app": {

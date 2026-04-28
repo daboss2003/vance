@@ -21,7 +21,17 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wgpu = "29"
+pollster = "0.4"
 vance-core = { workspace = true }
 vance-time = { workspace = true }
+vance-decoder = { workspace = true }
+vance-render = { workspace = true }
+vance-viewport = { workspace = true }

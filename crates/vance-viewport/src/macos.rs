@@ -1,28 +1,42 @@
-//! macOS viewport: an overlay `NSView` parented to the host window's
-//! content view, backed by a `CAMetalLayer` we hand to wgpu.
+//! macOS viewport: a borderless **child NSWindow** parented to the host
+//! window via `addChildWindow:ordered:NSWindowAbove`, hosting a layer-backed
+//! NSView + CAMetalLayer.
 //!
-//! Productionized from the Phase −1 spike (`vance-spike-parenting/src-tauri/src/viewport.rs`).
-//! Differences from the spike:
-//! - The overlay NSView and CAMetalLayer are owned by the [`Viewport`]
-//!   struct (no `mem::forget`); `Drop` removes the overlay and releases
-//!   the layer.
-//! - Bounds updates always dispatch onto the main queue.
-//! - We expose the wgpu `Surface` so [`vance_render::Renderer`] can render
-//!   into it directly.
+//! ## Why a child window
+//!
+//! The previous attempt added a CAMetalLayer as a sublayer of the host
+//! window's content view (or the WKWebView's layer). Modern macOS WKWebView
+//! uses out-of-process compositing; sublayers added locally do not
+//! reliably surface above the WKWebView's content. A borderless child
+//! NSWindow sidesteps the entire composition problem — it's a separate OS
+//! window that the window server composites on top of the parent. This is
+//! the same pattern Final Cut Pro, DaVinci Resolve, etc. use for their
+//! native preview surfaces.
+//!
+//! ## Trade-offs (acceptable for v1)
+//!
+//! - The child window stays anchored to the parent (`addChildWindow`
+//!   handles move / minimize / close together).
+//! - `setIgnoresMouseEvents:YES` so all clicks pass through to the
+//!   webview chrome below.
+//! - When the parent loses focus, the child window stays visible (this
+//!   matches every other NLE's behavior).
+//! - Drag-resize of the parent triggers per-frame `set_bounds` updates
+//!   from the chrome's ResizeObserver; the child window snaps to match.
 
 use crate::{HostWindowHandle, Result, ViewportBounds, ViewportError};
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{msg_send, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSAutoresizingMaskOptions, NSView, NSWindow};
+use objc2_app_kit::{NSBackingStoreType, NSView, NSWindow, NSWindowStyleMask};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use objc2_quartz_core::CAMetalLayer;
 use parking_lot::Mutex;
 use std::ffi::c_void;
 use std::sync::Arc;
 
-/// macOS viewport: owns an overlay NSView + CAMetalLayer attached to the
-/// Tauri webview's content view, plus a wgpu Surface bound to that layer.
+/// macOS viewport: owns a child NSWindow + layer-hosting NSView +
+/// CAMetalLayer + the wgpu Surface bound to it.
 pub struct Viewport {
     inner: Arc<Inner>,
     bounds: Mutex<ViewportBounds>,
@@ -31,34 +45,36 @@ pub struct Viewport {
 }
 
 struct Inner {
-    overlay: Retained<NSView>,
-    metal_layer: Retained<CAMetalLayer>,
+    /// The parent host window — used to compute child window screen coords.
+    parent_window: Retained<NSWindow>,
+    /// Borderless child window we create.
+    child_window: Retained<NSWindow>,
+    /// Content view of the child window; layer-hosting our CAMetalLayer.
     content_view: Retained<NSView>,
+    /// The metal layer wgpu renders into.
+    metal_layer: Retained<CAMetalLayer>,
 }
 
 impl Viewport {
-    /// Install the overlay and create a wgpu surface bound to its CAMetalLayer.
-    ///
-    /// Must be called on the main thread (AppKit requirement). The wgpu
-    /// instance you pass in must have the `METAL` backend enabled.
+    /// Install the child window + create a wgpu surface bound to its
+    /// CAMetalLayer. Must be called on the main thread.
     pub fn install(host: HostWindowHandle, wgpu_instance: &wgpu::Instance) -> Result<Self> {
-        let _mtm = MainThreadMarker::new().ok_or(ViewportError::NotMainThread)?;
+        let mtm = MainThreadMarker::new().ok_or(ViewportError::NotMainThread)?;
         let ns_window_ptr = host.as_ns_window().ok_or(ViewportError::WrongHandleKind {
             expected: "AppKit NSWindow",
         })?;
 
-        // SAFETY: caller-supplied NSWindow*; Tauri returns a valid one from
-        // `WebviewWindow::ns_window()`. The pointer outlives this call.
-        let ns_window: &NSWindow = unsafe { &*(ns_window_ptr as *const NSWindow) };
-        let content_view: Retained<NSView> = ns_window
-            .contentView()
-            .ok_or(ViewportError::NoContentView)?;
-        let backing_scale = ns_window.backingScaleFactor();
+        // SAFETY: caller-supplied NSWindow*.
+        let parent_ref: &NSWindow = unsafe { &*(ns_window_ptr as *const NSWindow) };
+        let parent_window: Retained<NSWindow> =
+            unsafe { Retained::retain(parent_ref as *const NSWindow as *mut NSWindow) }
+                .ok_or(ViewportError::NoContentView)?;
+        let backing_scale = parent_window.backingScaleFactor();
 
-        // Allocate the overlay NSView. Initial frame is zero-sized; a
-        // `set_bounds` call from the chrome will resize it on the first
-        // layout-change event.
-        let mtm_for_alloc = MainThreadMarker::new().ok_or(ViewportError::NotMainThread)?;
+        // ---- Build a layer-hosting NSView that will become the child
+        //      window's content view. setLayer: must be called BEFORE
+        //      setWantsLayer:true to get layer-hosting (vs layer-backed)
+        //      mode where our CAMetalLayer is the actual backing layer.
         let init_frame = NSRect {
             origin: NSPoint { x: 0.0, y: 0.0 },
             size: NSSize {
@@ -66,43 +82,74 @@ impl Viewport {
                 height: 1.0,
             },
         };
-        let overlay: Retained<NSView> =
-            NSView::initWithFrame(NSView::alloc(mtm_for_alloc), init_frame);
-        overlay.setWantsLayer(true);
-        // We manage our own frame; no AppKit autoresize.
-        overlay.setAutoresizingMask(NSAutoresizingMaskOptions::ViewNotSizable);
+        let content_view: Retained<NSView> = NSView::initWithFrame(NSView::alloc(mtm), init_frame);
 
-        // Build the CAMetalLayer and attach it as the overlay's backing layer.
         let metal_layer = CAMetalLayer::new();
         unsafe {
             let layer_ptr: *const CAMetalLayer = Retained::as_ptr(&metal_layer);
             let layer_obj: &AnyObject = &*(layer_ptr as *const AnyObject);
-            let _: () = msg_send![&*overlay, setLayer: layer_obj];
+            let _: () = msg_send![&*content_view, setLayer: layer_obj];
             let _: () = msg_send![&*metal_layer, setContentsScale: backing_scale];
             metal_layer.setAnchorPoint(NSPoint { x: 0.0, y: 0.0 });
+            // Solid black background until the first wgpu render arrives,
+            // so the layer doesn't flash whatever default the OS gives it.
+            let black: *mut c_void = create_cg_color_rgba(0.0, 0.0, 0.0, 1.0);
+            let _: () = msg_send![layer_obj, setBackgroundColor: black];
+            cf_release(black);
+        }
+        content_view.setWantsLayer(true);
+
+        // ---- Build the borderless child NSWindow.
+        let style = NSWindowStyleMask::Borderless;
+        let initial_screen_frame = NSRect {
+            origin: NSPoint { x: 0.0, y: 0.0 },
+            size: NSSize {
+                width: 1.0,
+                height: 1.0,
+            },
+        };
+        let child_window: Retained<NSWindow> = unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                NSWindow::alloc(mtm),
+                initial_screen_frame,
+                style,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        };
+        child_window.setContentView(Some(&content_view));
+
+        // Transparent so any wgpu alpha respects the chrome behind it
+        // (we render fully opaque, but be defensive).
+        unsafe {
+            let win_ptr: *const NSWindow = Retained::as_ptr(&child_window);
+            let win_obj: &AnyObject = &*(win_ptr as *const AnyObject);
+            let _: () = msg_send![win_obj, setOpaque: false];
+            let clear: *mut c_void = create_cg_color_rgba(0.0, 0.0, 0.0, 0.0);
+            // setBackgroundColor on NSWindow takes an NSColor not CGColor;
+            // we use NSColor's clearColor singleton instead.
+            cf_release(clear);
+            let nscolor_class = objc2::runtime::AnyClass::get(c"NSColor").expect("NSColor missing");
+            let clear_color: *mut AnyObject = msg_send![nscolor_class, clearColor];
+            let _: () = msg_send![win_obj, setBackgroundColor: clear_color];
+            let _: () = msg_send![win_obj, setHasShadow: false];
+            let _: () = msg_send![win_obj, setIgnoresMouseEvents: true];
         }
 
-        // Add overlay as the topmost subview of the content view (above the
-        // WKWebView). Per ADR 0005, this is what gives us "native overlay
-        // sits above HTML chrome."
+        // ---- Attach to parent. NSWindowAbove (= 1) makes the child
+        // composite above the parent. The parent will move/close the
+        // child along with itself.
         const NS_WINDOW_ABOVE: i64 = 1;
         unsafe {
-            let cv_ptr: *const NSView = Retained::as_ptr(&content_view);
-            let ov_ptr: *const NSView = Retained::as_ptr(&overlay);
-            let cv_obj: &AnyObject = &*(cv_ptr as *const AnyObject);
-            let ov_obj: &AnyObject = &*(ov_ptr as *const AnyObject);
-            let nil_view: *mut NSView = std::ptr::null_mut();
-            let _: () = msg_send![cv_obj,
-                addSubview: ov_obj,
-                positioned: NS_WINDOW_ABOVE,
-                relativeTo: nil_view
+            let parent_obj: &AnyObject = &*(Retained::as_ptr(&parent_window) as *const AnyObject);
+            let child_obj: &AnyObject = &*(Retained::as_ptr(&child_window) as *const AnyObject);
+            let _: () = msg_send![parent_obj,
+                addChildWindow: child_obj,
+                ordered: NS_WINDOW_ABOVE
             ];
         }
 
-        // Create a wgpu surface bound to the CAMetalLayer.
-        // SAFETY: the layer is owned by `Inner` (held in an Arc) and outlives
-        // every clone of this Viewport, so the raw pointer remains valid for
-        // the surface's lifetime.
+        // ---- Create wgpu surface bound to the CAMetalLayer.
         let layer_raw = Retained::as_ptr(&metal_layer) as *mut c_void;
         let surface = unsafe {
             wgpu_instance
@@ -111,10 +158,13 @@ impl Viewport {
         };
 
         let inner = Arc::new(Inner {
-            overlay,
-            metal_layer,
+            parent_window,
+            child_window,
             content_view,
+            metal_layer,
         });
+
+        tracing::info!("viewport: child window installed");
 
         Ok(Self {
             inner,
@@ -124,45 +174,61 @@ impl Viewport {
         })
     }
 
-    /// The wgpu surface backing the overlay layer. Hand this to
-    /// [`vance_render::Renderer`] (or any wgpu code that needs a surface).
+    /// The wgpu surface backing the child window's CAMetalLayer.
     pub fn surface(&self) -> &wgpu::Surface<'static> {
         &self.surface
     }
 
-    /// HiDPI scale factor of the host window when this viewport was installed.
-    /// Used by the renderer to size its target.
+    /// HiDPI scale factor of the parent window when this viewport was installed.
     pub fn backing_scale(&self) -> f64 {
         self.backing_scale
     }
 
-    /// Update the overlay's position/size. Schedules an update on the main
-    /// queue (CALayer mutations must happen on the main thread). Returns
-    /// immediately; the chrome doesn't need to wait for the geometry to apply.
+    /// Update the child window's screen frame to cover the chrome's
+    /// reported viewport rectangle.
     pub fn set_bounds(&self, bounds: ViewportBounds) {
+        tracing::debug!(
+            x = bounds.x,
+            y = bounds.y,
+            w = bounds.w,
+            h = bounds.h,
+            "viewport set_bounds"
+        );
         *self.bounds.lock() = bounds;
-        let inner = self.inner.clone();
-        let scale = self.backing_scale;
-        unsafe {
-            dispatch_async_on_main(move || {
-                let frame = bounds_to_view_frame(&inner.content_view, &bounds, scale);
-                let ov_ptr: *const NSView = Retained::as_ptr(&inner.overlay);
-                let ov_obj: &AnyObject = &*(ov_ptr as *const AnyObject);
-                let _: () = msg_send![ov_obj, setFrame: frame];
-                // Match the layer's drawableSize to the overlay's pixel size
-                // so wgpu's swapchain reconfigure delivers the right resolution.
-                let pixel_size = NSSize {
-                    width: bounds.w as f64,
-                    height: bounds.h as f64,
-                };
-                let layer_ptr: *const CAMetalLayer = Retained::as_ptr(&inner.metal_layer);
+
+        if !bounds.is_empty() {
+            // CAMetalLayer.drawableSize is documented thread-safe.
+            let pixel_size = NSSize {
+                width: bounds.w as f64,
+                height: bounds.h as f64,
+            };
+            unsafe {
+                let layer_ptr: *const CAMetalLayer = Retained::as_ptr(&self.inner.metal_layer);
                 let layer_obj: &AnyObject = &*(layer_ptr as *const AnyObject);
                 let _: () = msg_send![layer_obj, setDrawableSize: pixel_size];
-            });
+            }
+        }
+
+        // Move/resize the child window. Uses the parent's screen frame
+        // to translate from chrome client-area pixels to screen points.
+        let inner = self.inner.clone();
+        let scale = self.backing_scale;
+        let work = move || {
+            let screen_frame = compute_child_screen_frame(&inner.parent_window, &bounds, scale);
+            unsafe {
+                let win_ptr: *const NSWindow = Retained::as_ptr(&inner.child_window);
+                let win_obj: &AnyObject = &*(win_ptr as *const AnyObject);
+                let _: () = msg_send![win_obj, setFrame: screen_frame, display: true];
+            }
+        };
+        if MainThreadMarker::new().is_some() {
+            work();
+        } else {
+            unsafe { dispatch_async_on_main(work) };
         }
     }
 
-    /// Latest bounds the chrome has reported.
+    /// Most recent bounds the chrome has reported.
     pub fn current_bounds(&self) -> ViewportBounds {
         *self.bounds.lock()
     }
@@ -170,36 +236,69 @@ impl Viewport {
 
 impl Drop for Viewport {
     fn drop(&mut self) {
-        // Remove the overlay from the host window. Schedule on the main
-        // thread; the Arc keeps `inner` alive across the dispatch.
         let inner = self.inner.clone();
         unsafe {
             dispatch_async_on_main(move || {
-                let ov_ptr: *const NSView = Retained::as_ptr(&inner.overlay);
-                let ov_obj: &AnyObject = &*(ov_ptr as *const AnyObject);
-                let _: () = msg_send![ov_obj, removeFromSuperview];
+                let parent_obj: &AnyObject =
+                    &*(Retained::as_ptr(&inner.parent_window) as *const AnyObject);
+                let child_obj: &AnyObject =
+                    &*(Retained::as_ptr(&inner.child_window) as *const AnyObject);
+                let _: () = msg_send![parent_obj, removeChildWindow: child_obj];
+                let _: () = msg_send![child_obj, orderOut: std::ptr::null_mut::<AnyObject>()];
+                let _ = &inner.content_view;
+                let _ = &inner.metal_layer;
             });
         }
     }
 }
 
-fn bounds_to_view_frame(content_view: &NSView, b: &ViewportBounds, scale: f64) -> NSRect {
-    // HTML reports physical pixels with origin top-left of the host window's
-    // client area. AppKit defaults to bottom-left origin; flip Y in points.
-    let view_size_pts = content_view.bounds().size;
-    let view_h_pts = view_size_pts.height;
-    let x_pt = b.x as f64 / scale;
-    let w_pt = b.w as f64 / scale;
-    let h_pt = b.h as f64 / scale;
-    let y_pt_top = b.y as f64 / scale;
-    let y_pt = view_h_pts - y_pt_top - h_pt;
+/// Compute the child window's screen frame from the chrome's reported
+/// viewport rectangle.
+///
+/// Chrome reports `bounds` in **physical pixels with origin at the
+/// top-left of the parent window's client area**. macOS screen coordinates
+/// are **points with origin at the bottom-left of the primary display**.
+fn compute_child_screen_frame(parent: &NSWindow, bounds: &ViewportBounds, scale: f64) -> NSRect {
+    // Parent's frame on screen (in points, bottom-left origin).
+    let parent_frame: NSRect = parent.frame();
+    // Convert chrome-reported pixels → points.
+    let x_pt = bounds.x as f64 / scale;
+    let y_pt_top = bounds.y as f64 / scale; // distance from top of window
+    let w_pt = bounds.w as f64 / scale;
+    let h_pt = bounds.h as f64 / scale;
+
+    // Position in screen points: x is parent_left + viewport_x; y is
+    // parent_bottom + (parent_height - viewport_y_top - viewport_h).
+    // Note: parent_frame.height already accounts for the title bar etc.
+    // because we measured the bounds from the *content* area of the
+    // window (the chrome's <body>), and Tauri windows have no title bar
+    // in our config. If a title bar is added later, subtract its height
+    // from y_pt_top.
+    let x = parent_frame.origin.x + x_pt;
+    let y = parent_frame.origin.y + parent_frame.size.height - y_pt_top - h_pt;
+
     NSRect {
-        origin: NSPoint { x: x_pt, y: y_pt },
+        origin: NSPoint { x, y },
         size: NSSize {
             width: w_pt,
             height: h_pt,
         },
     }
+}
+
+// ---- CoreGraphics CGColor helpers (for diagnostic backgroundColor) ---------
+
+extern "C" {
+    fn CGColorCreateGenericRGB(r: f64, g: f64, b: f64, a: f64) -> *mut c_void;
+    fn CFRelease(cf: *mut c_void);
+}
+
+fn create_cg_color_rgba(r: f64, g: f64, b: f64, a: f64) -> *mut c_void {
+    unsafe { CGColorCreateGenericRGB(r, g, b, a) }
+}
+
+fn cf_release(cf: *mut c_void) {
+    unsafe { CFRelease(cf) }
 }
 
 // ---- libdispatch main-queue dispatch ---------------------------------------
@@ -223,9 +322,8 @@ unsafe fn dispatch_async_on_main<F: FnOnce() + Send + 'static>(f: F) {
     dispatch_async_f(main_q, ctx, trampoline);
 }
 
-// `Inner` holds Retained<NSView>/Retained<CAMetalLayer> which are not Send by
-// default. We promise Send/Sync because (a) all mutations of the wrapped
-// AppKit objects happen on the main queue via libdispatch, and (b) the
-// inner Arc is only ever read for cloning + main-thread closures.
+// `Inner` holds Retained<NSWindow>/Retained<NSView>/Retained<CAMetalLayer>
+// which are not Send by default. We promise Send/Sync because all
+// mutations of those AppKit objects happen on the main queue.
 unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}

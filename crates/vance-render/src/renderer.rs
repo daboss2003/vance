@@ -54,6 +54,7 @@ impl Default for RendererConfig {
 /// Owned and reused across frames; resizes its plane textures lazily when
 /// the input dimensions change.
 pub struct Renderer {
+    adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
@@ -71,12 +72,38 @@ pub struct Renderer {
 impl Renderer {
     /// Create a renderer. Picks a wgpu adapter without an associated surface
     /// (the renderer is surface-agnostic; the *consumer* hands it a target).
+    ///
+    /// Use [`Renderer::new_with`] when you already have an `Instance` and a
+    /// surface to be compatible with — that's the path the production app
+    /// takes so the viewport's Surface and the renderer's Device share an
+    /// adapter.
     pub fn new(cfg: RendererConfig) -> Result<Self, RenderError> {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = cfg.backends;
         let instance = wgpu::Instance::new(desc);
-        let (device, queue) = pollster::block_on(create_device(&instance))?;
+        let (adapter, device, queue) = pollster::block_on(create_device(&instance, None))?;
+        Self::from_device_queue(adapter, device, queue, cfg)
+    }
 
+    /// Create a renderer using an existing `Instance` and a `Surface` it
+    /// must be compatible with. The chosen adapter will satisfy `surface`'s
+    /// requirements; the device + queue are picked from that adapter.
+    pub fn new_with(
+        instance: &wgpu::Instance,
+        compatible_surface: &wgpu::Surface<'static>,
+        cfg: RendererConfig,
+    ) -> Result<Self, RenderError> {
+        let (adapter, device, queue) =
+            pollster::block_on(create_device(instance, Some(compatible_surface)))?;
+        Self::from_device_queue(adapter, device, queue, cfg)
+    }
+
+    fn from_device_queue(
+        adapter: wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        cfg: RendererConfig,
+    ) -> Result<Self, RenderError> {
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("vance-render.yuv-bgl"),
             entries: &[
@@ -144,6 +171,7 @@ impl Renderer {
         });
 
         Ok(Self {
+            adapter,
             device,
             queue,
             pipeline,
@@ -217,6 +245,53 @@ impl Renderer {
             }
         }
         Ok(())
+    }
+
+    /// Pick a sensible swapchain configuration for `surface` at the given
+    /// pixel size. Chooses the first sRGB-capable format the surface
+    /// supports — caller must pass that same format as `target_format`
+    /// when constructing the renderer.
+    pub fn recommended_surface_config(
+        &self,
+        surface: &wgpu::Surface<'static>,
+        width: u32,
+        height: u32,
+    ) -> Option<wgpu::SurfaceConfiguration> {
+        let caps = surface.get_capabilities(&self.adapter);
+        if caps.formats.is_empty() {
+            return None;
+        }
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| f.is_srgb())
+            .unwrap_or(caps.formats[0]);
+        Some(wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: width.max(1),
+            height: height.max(1),
+            present_mode: caps
+                .present_modes
+                .iter()
+                .copied()
+                .find(|m| *m == wgpu::PresentMode::Fifo)
+                .unwrap_or(caps.present_modes[0]),
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        })
+    }
+
+    /// Apply a surface configuration. Thin wrapper so callers don't need to
+    /// hold a reference to the device.
+    pub fn configure_surface(
+        &self,
+        surface: &wgpu::Surface<'static>,
+        config: &wgpu::SurfaceConfiguration,
+    ) {
+        surface.configure(&self.device, config);
     }
 
     /// Render the most-recently-uploaded frame to `target_view`. The view
@@ -417,11 +492,12 @@ impl Renderer {
 
 async fn create_device(
     instance: &wgpu::Instance,
-) -> Result<(wgpu::Device, wgpu::Queue), RenderError> {
+    compatible_surface: Option<&wgpu::Surface<'static>>,
+) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), RenderError> {
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
+            compatible_surface,
             force_fallback_adapter: false,
         })
         .await
@@ -437,7 +513,7 @@ async fn create_device(
         })
         .await
         .map_err(|e| RenderError::DeviceRequest(format!("{e}")))?;
-    Ok((device, queue))
+    Ok((adapter, device, queue))
 }
 
 fn yuv_plane_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
