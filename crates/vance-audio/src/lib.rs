@@ -1,6 +1,28 @@
-//! `vance-audio` — stub.
+//! `vance-audio` — sidecar process + parent-side player for decoded audio.
 //!
-//! See PLAN.md §6 for this crate's role.
+//! Mirrors the `vance-decoder` split:
+//! - `vance-audio-decoder` sidecar (in `src/bin/main.rs`): opens a media
+//!   file via Symphonia, decodes packets to f32 stereo PCM at the file's
+//!   native sample rate, ships chunks over IPC.
+//! - Parent-side `AudioPlayer` (in this lib): owns the cpal output stream,
+//!   pulls PCM chunks via the IPC client, and feeds the cpal callback
+//!   from a lock-free ring buffer.
+//!
+//! Phase 2.3 ships:
+//! - The wire protocol.
+//! - The decoder sidecar (Symphonia).
+//! - `AudioClient` parent-side IPC wrapper.
+//! - `AudioPlayer` skeleton (cpal output, ring buffer, simple stereo
+//!   passthrough; no resample yet — file rate must match device rate).
+//!
+//! Phase 2.5 will add the audio clock + drift correction for A/V sync.
 
-#[doc(hidden)]
-pub fn _stub() {}
+#![warn(missing_docs)]
+
+pub mod client;
+pub mod player;
+pub mod protocol;
+
+pub use client::{AudioClient, AudioClientError};
+pub use player::{AudioPlayer, AudioPlayerError};
+pub use protocol::{AudioRequest, AudioResponse, AudioStreamInfo, PcmChunk};

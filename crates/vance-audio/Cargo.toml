@@ -7,3 +7,30 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "vance-audio-decoder"
+path = "src/bin/main.rs"
+
+[dependencies]
+vance-core = { workspace = true }
+vance-ipc = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+
+# cpal for output, ringbuf for the lock-free producer/consumer ring that
+# moves PCM samples from the IPC-puller thread into the cpal callback.
+cpal = "0.16"
+ringbuf = "0.4"
+
+# Symphonia is the pure-Rust audio decode crate. Default features cover
+# AAC, FLAC, MP3, OGG, PCM, WAV — everything common in our target media.
+symphonia = { version = "0.5", features = ["aac", "flac", "mp3", "wav", "isomp4", "pcm"] }
+
+[dev-dependencies]
+bincode = { version = "2", features = ["serde"] }
