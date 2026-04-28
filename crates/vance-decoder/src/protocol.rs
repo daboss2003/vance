@@ -7,7 +7,12 @@
 use serde::{Deserialize, Serialize};
 
 /// Wire protocol version. Bump on breaking changes.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// History:
+/// - v1: Phase 1 — Hello/Open/Seek/DecodeAt/Close/Shutdown.
+/// - v2: Phase 2.1 — adds streaming (StartStream/NextFrame/StopStream)
+///   and the `EndOfStream` response.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// One request from parent to sidecar.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +44,32 @@ pub enum DecoderRequest {
         /// Target PTS in the stream's time base.
         target_pts: i64,
     },
+
+    /// Begin streaming decoded frames in PTS order starting at or after
+    /// `from_pts`. The sidecar spawns a background decode thread that
+    /// pre-fills a ring of up to `buffer_frames` frames; the parent then
+    /// pulls them one at a time with [`DecoderRequest::NextFrame`].
+    ///
+    /// Replaces any in-progress stream. Reply: [`DecoderResponse::Streaming`].
+    StartStream {
+        /// Stream-time-base PTS to start streaming from.
+        from_pts: i64,
+        /// How many frames the sidecar may pre-decode ahead of the
+        /// parent's last-pulled position. Higher = smoother playback,
+        /// more sidecar memory. Phase 2.1 default: 8.
+        buffer_frames: u32,
+    },
+
+    /// Pull the next decoded frame in PTS order. Blocks (on the sidecar
+    /// side) until a frame is ready or end-of-stream is reached.
+    ///
+    /// Reply: [`DecoderResponse::Frame`], [`DecoderResponse::EndOfStream`],
+    /// or [`DecoderResponse::DecodeFailed`].
+    NextFrame,
+
+    /// Stop the in-progress stream and tear down its background decode
+    /// thread. Reply: [`DecoderResponse::Stopped`].
+    StopStream,
 
     /// Close the currently-open file (if any). Sidecar stays alive,
     /// ready for another `Open`.
@@ -83,6 +114,22 @@ pub enum DecoderResponse {
         /// Human-readable reason; the sidecar logs more detail to stderr.
         reason: String,
     },
+
+    /// `StartStream` acknowledged.
+    Streaming {
+        /// First PTS the sidecar will deliver via `NextFrame`. May be
+        /// at or after the requested `from_pts` (the nearest keyframe
+        /// available at that point).
+        first_pts: i64,
+    },
+
+    /// The stream has been fully delivered; no more frames will arrive.
+    /// The sidecar is still alive and ready for `StopStream` / `Seek` /
+    /// new `StartStream` / `Close`.
+    EndOfStream,
+
+    /// `StopStream` acknowledged.
+    Stopped,
 
     /// `Close` acknowledged. The sidecar has no open file.
     Closed,
@@ -197,13 +244,19 @@ mod tests {
         // before they bite us across a process boundary.
         let cases = vec![
             DecoderRequest::Hello {
-                protocol_version: 1,
+                protocol_version: PROTOCOL_VERSION,
             },
             DecoderRequest::Open {
                 path: "/tmp/x.mov".into(),
             },
             DecoderRequest::Seek { target_pts: 12345 },
             DecoderRequest::DecodeAt { target_pts: 12345 },
+            DecoderRequest::StartStream {
+                from_pts: 0,
+                buffer_frames: 8,
+            },
+            DecoderRequest::NextFrame,
+            DecoderRequest::StopStream,
             DecoderRequest::Close,
             DecoderRequest::Shutdown,
         ];

@@ -129,6 +129,48 @@ impl DecoderClient {
         }
     }
 
+    /// Begin streaming decoded frames in PTS order from `from_pts`.
+    /// `buffer_frames` is the sidecar's pre-decode-ahead window
+    /// (capped at 64). Returns the first PTS the sidecar will deliver.
+    pub fn start_stream(&mut self, from_pts: i64, buffer_frames: u32) -> Result<i64, ClientError> {
+        match self.sidecar.request(&DecoderRequest::StartStream {
+            from_pts,
+            buffer_frames,
+        })? {
+            DecoderResponse::Streaming { first_pts } => Ok(first_pts),
+            DecoderResponse::DecodeFailed { reason } => Err(ClientError::Decode(reason)),
+            other => Err(ClientError::UnexpectedResponse {
+                expected: "Streaming",
+                got: other,
+            }),
+        }
+    }
+
+    /// Pull the next streamed frame. Returns `Ok(None)` on clean
+    /// end-of-stream, `Err` on decode failure / sidecar death.
+    pub fn next_frame(&mut self) -> Result<Option<FrameData>, ClientError> {
+        match self.sidecar.request(&DecoderRequest::NextFrame)? {
+            DecoderResponse::Frame(f) => Ok(Some(f)),
+            DecoderResponse::EndOfStream => Ok(None),
+            DecoderResponse::DecodeFailed { reason } => Err(ClientError::Decode(reason)),
+            other => Err(ClientError::UnexpectedResponse {
+                expected: "Frame|EndOfStream",
+                got: other,
+            }),
+        }
+    }
+
+    /// Tear down the in-progress stream. Sidecar stays alive.
+    pub fn stop_stream(&mut self) -> Result<(), ClientError> {
+        match self.sidecar.request(&DecoderRequest::StopStream)? {
+            DecoderResponse::Stopped => Ok(()),
+            other => Err(ClientError::UnexpectedResponse {
+                expected: "Stopped",
+                got: other,
+            }),
+        }
+    }
+
     /// Close the currently-open file. The sidecar stays alive.
     pub fn close(&mut self) -> Result<(), ClientError> {
         match self.sidecar.request(&DecoderRequest::Close)? {

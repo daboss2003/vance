@@ -1,13 +1,27 @@
 //! `vance-decoder` sidecar binary.
 //!
 //! Wraps FFmpeg behind the protocol in `vance_decoder::protocol`. Software
-//! decode only in Milestone 1.2; hardware decode (VideoToolbox / NVDEC /
-//! VAAPI / D3D11VA) lands in Milestone 1.6.
+//! decode only in Phase 2.1; hardware decode (VideoToolbox / NVDEC /
+//! VAAPI / D3D11VA) lands in Phase 2.2.
 //!
-//! Lives in this crate so the parent and child share the wire types
-//! verbatim (no manual schema sync).
+//! ## Threading
+//!
+//! - The main thread runs `vance_ipc::serve()` and processes one request
+//!   at a time.
+//! - During streaming, a background **decode thread** owns the FFmpeg
+//!   `Input` / `Video` decoder and pushes decoded frames into a bounded
+//!   channel. The main thread `recv()`s from that channel when a
+//!   `NextFrame` request arrives.
+//! - `StopStream` (or `Close` / `Shutdown` during a stream) signals the
+//!   decode thread, joins it, and reclaims the `OpenContext` for further
+//!   single-shot `Seek` / `DecodeAt` operations.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 use vance_decoder::protocol::{
     DecoderRequest, DecoderResponse, FrameData, OpenError, PixelFormat, StreamInfo,
     PROTOCOL_VERSION,
@@ -22,7 +36,12 @@ fn main() -> vance_ipc::Result<()> {
 
 #[derive(Default)]
 struct State {
+    /// Owned exclusively by the main thread while no stream is active.
+    /// Moved INTO the decode thread for the duration of a stream, then
+    /// reclaimed via the join handle when the stream stops.
     open: Option<OpenContext>,
+    /// Set whenever a stream is in progress.
+    streaming: Option<StreamingState>,
 }
 
 struct OpenContext {
@@ -30,6 +49,24 @@ struct OpenContext {
     decoder: ffmpeg::decoder::Video,
     stream_index: usize,
     info: StreamInfo,
+}
+
+/// Decode-thread bookkeeping held by the main thread for the lifetime of a
+/// stream. The `JoinHandle` returns the `OpenContext` so we can resume
+/// single-shot decoding after the stream stops.
+struct StreamingState {
+    /// Receives frames in PTS order. `None` = end-of-stream sentinel.
+    rx: Receiver<Option<DecodedItem>>,
+    /// Tells the decode thread to exit at its next chance.
+    stop: Arc<AtomicBool>,
+    /// Joins to recover the OpenContext (or an error string).
+    handle: JoinHandle<Result<OpenContext, String>>,
+}
+
+enum DecodedItem {
+    Frame(FrameData),
+    /// Decoder error mid-stream; thread will exit after sending this.
+    Failure(String),
 }
 
 impl State {
@@ -41,30 +78,56 @@ impl State {
                 protocol_version: PROTOCOL_VERSION,
                 ffmpeg_version: ffmpeg_version_string(),
             },
-            DecoderRequest::Open { path } => match self.open(&path) {
-                Ok(info) => DecoderResponse::Opened(info),
-                Err(e) => DecoderResponse::OpenFailed(e),
-            },
-            DecoderRequest::Seek { target_pts } => match self.seek(target_pts) {
-                Ok(pts) => DecoderResponse::Seeked { pts },
-                Err(e) => DecoderResponse::DecodeFailed { reason: e },
-            },
-            DecoderRequest::DecodeAt { target_pts } => match self.decode_at(target_pts) {
-                Ok(f) => DecoderResponse::Frame(f),
-                Err(e) => DecoderResponse::DecodeFailed { reason: e },
-            },
+            DecoderRequest::Open { path } => {
+                self.stop_stream_if_any();
+                match self.open(&path) {
+                    Ok(info) => DecoderResponse::Opened(info),
+                    Err(e) => DecoderResponse::OpenFailed(e),
+                }
+            }
+            DecoderRequest::Seek { target_pts } => {
+                self.stop_stream_if_any();
+                match self.seek(target_pts) {
+                    Ok(pts) => DecoderResponse::Seeked { pts },
+                    Err(e) => DecoderResponse::DecodeFailed { reason: e },
+                }
+            }
+            DecoderRequest::DecodeAt { target_pts } => {
+                self.stop_stream_if_any();
+                match self.decode_at(target_pts) {
+                    Ok(f) => DecoderResponse::Frame(f),
+                    Err(e) => DecoderResponse::DecodeFailed { reason: e },
+                }
+            }
+            DecoderRequest::StartStream {
+                from_pts,
+                buffer_frames,
+            } => {
+                self.stop_stream_if_any();
+                match self.start_stream(from_pts, buffer_frames) {
+                    Ok(first_pts) => DecoderResponse::Streaming { first_pts },
+                    Err(e) => DecoderResponse::DecodeFailed { reason: e },
+                }
+            }
+            DecoderRequest::NextFrame => self.next_frame(),
+            DecoderRequest::StopStream => {
+                self.stop_stream_if_any();
+                DecoderResponse::Stopped
+            }
             DecoderRequest::Close => {
+                self.stop_stream_if_any();
                 self.open = None;
                 DecoderResponse::Closed
             }
             DecoderRequest::Shutdown => {
+                self.stop_stream_if_any();
                 self.open = None;
-                // Returning `Goodbye` lets the parent see a clean reply
-                // before stdin EOF closes our serve loop.
                 DecoderResponse::Goodbye
             }
         }
     }
+
+    // ---- one-shot path (Phase 1 retained) ---------------------------------
 
     fn open(&mut self, path: &str) -> Result<StreamInfo, OpenError> {
         let p = Path::new(path);
@@ -117,80 +180,247 @@ impl State {
 
     fn seek(&mut self, target_pts: i64) -> Result<i64, String> {
         let ctx = self.open.as_mut().ok_or("no file open")?;
-        // ffmpeg-the-third's `seek` calls `avformat_seek_file` with stream
-        // index = -1, which means the timestamp is in AV_TIME_BASE units
-        // (microseconds), not the stream's time base. Convert here.
-        let (tb_num, tb_den) = ctx.info.time_base;
-        let target_us = if tb_den != 0 {
-            // pts * tb_num / tb_den == seconds; * 1_000_000 == microseconds.
-            // Order multiplications carefully to avoid i64 overflow on long files.
-            target_pts.saturating_mul(tb_num).saturating_mul(1_000_000) / tb_den
-        } else {
-            target_pts
-        };
-        // Range needs to *include* the target to be a valid seek window.
-        // Seek backward to the nearest keyframe at or before `target_us`.
-        ctx.input
-            .seek(target_us, i64::MIN..=target_us)
-            .map_err(|e| format!("seek: {e}"))?;
-        ctx.decoder.flush();
+        seek_ctx(ctx, target_pts)?;
         Ok(target_pts)
     }
 
     fn decode_at(&mut self, target_pts: i64) -> Result<FrameData, String> {
-        // Always seek to the requested PTS before decoding so successive
-        // calls don't accumulate state. Optimization (skip seek if already
-        // close) lands in Milestone 1.5 with the cache.
-        self.seek(target_pts)?;
-
         let ctx = self.open.as_mut().ok_or("no file open")?;
-        let mut decoded = ffmpeg::frame::Video::empty();
+        seek_ctx(ctx, target_pts)?;
+        decode_one_at_or_after(ctx, target_pts)
+    }
 
-        // Drain packets from the chosen stream into the decoder until it
-        // emits a frame at or after `target_pts`.
-        let stream_index = ctx.stream_index;
-        // ffmpeg's `Input::packets()` borrows the input mutably, so we have
-        // to be careful — collect packets ourselves.
-        loop {
-            let mut got_packet = false;
-            // Read one packet at a time so we can break/continue cleanly.
-            for item in ctx.input.packets() {
-                let (stream, packet) = item.map_err(|e| format!("read packet: {e}"))?;
-                if stream.index() != stream_index {
-                    continue;
-                }
-                got_packet = true;
-                ctx.decoder
-                    .send_packet(&packet)
-                    .map_err(|e| format!("send_packet: {e}"))?;
-                // Pull as many frames as the decoder will emit for this packet.
-                while ctx.decoder.receive_frame(&mut decoded).is_ok() {
-                    let pts = decoded.pts().unwrap_or(0);
-                    if pts >= target_pts {
-                        return frame_to_payload(&decoded, ctx.info.pixel_format);
-                    }
-                }
-                break; // process more packets in next loop iteration
+    // ---- streaming path (Phase 2.1) ---------------------------------------
+
+    fn start_stream(&mut self, from_pts: i64, buffer_frames: u32) -> Result<i64, String> {
+        // Take ownership of the open context and move it into the decode thread.
+        let mut ctx = self.open.take().ok_or("no file open")?;
+        seek_ctx(&mut ctx, from_pts)?;
+
+        let cap = (buffer_frames.max(1) as usize).min(64);
+        let (tx, rx) = sync_channel::<Option<DecodedItem>>(cap);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+
+        let handle = thread::Builder::new()
+            .name("vance-decoder.stream".into())
+            .spawn(move || decode_stream_loop(ctx, tx, stop_clone, from_pts))
+            .map_err(|e| format!("spawn decode thread: {e}"))?;
+
+        self.streaming = Some(StreamingState { rx, stop, handle });
+        // We return the requested `from_pts` as the first PTS upper-bound;
+        // the actual first frame's PTS will arrive on the channel and the
+        // caller will see it via `NextFrame`.
+        Ok(from_pts)
+    }
+
+    fn next_frame(&mut self) -> DecoderResponse {
+        let Some(s) = self.streaming.as_ref() else {
+            return DecoderResponse::DecodeFailed {
+                reason: "no stream in progress".into(),
+            };
+        };
+        // Long-ish timeout so wedged decoders surface as errors rather than
+        // hanging the parent forever. Real playback should always have a
+        // frame within ~1s; if not, something is wrong.
+        match s.rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Some(DecodedItem::Frame(f))) => DecoderResponse::Frame(f),
+            Ok(Some(DecodedItem::Failure(reason))) => {
+                self.stop_stream_if_any();
+                DecoderResponse::DecodeFailed { reason }
             }
-            if !got_packet {
-                // EOF: drain the decoder.
-                ctx.decoder
-                    .send_eof()
-                    .map_err(|e| format!("send_eof: {e}"))?;
-                while ctx.decoder.receive_frame(&mut decoded).is_ok() {
-                    let pts = decoded.pts().unwrap_or(0);
-                    if pts >= target_pts {
-                        return frame_to_payload(&decoded, ctx.info.pixel_format);
-                    }
+            Ok(None) => {
+                self.stop_stream_if_any();
+                DecoderResponse::EndOfStream
+            }
+            Err(RecvTimeoutError::Timeout) => DecoderResponse::DecodeFailed {
+                reason: "decode thread starved (5s timeout)".into(),
+            },
+            Err(RecvTimeoutError::Disconnected) => {
+                self.stop_stream_if_any();
+                DecoderResponse::DecodeFailed {
+                    reason: "decode thread exited".into(),
                 }
-                return Err(format!("no frame at or after pts {target_pts}"));
+            }
+        }
+    }
+
+    fn stop_stream_if_any(&mut self) {
+        if let Some(s) = self.streaming.take() {
+            s.stop.store(true, Ordering::Relaxed);
+            // Drain the channel so the producer can unblock and exit.
+            while s.rx.try_recv().is_ok() {}
+            match s.handle.join() {
+                Ok(Ok(ctx)) => {
+                    self.open = Some(ctx);
+                }
+                Ok(Err(e)) => {
+                    eprintln!("[stream] decode thread returned error: {e}");
+                }
+                Err(_) => {
+                    eprintln!("[stream] decode thread panicked");
+                }
             }
         }
     }
 }
 
+// ---- shared decode helpers (used by both one-shot and streaming) -----------
+
+fn seek_ctx(ctx: &mut OpenContext, target_pts: i64) -> Result<(), String> {
+    let (tb_num, tb_den) = ctx.info.time_base;
+    let target_us = if tb_den != 0 {
+        target_pts.saturating_mul(tb_num).saturating_mul(1_000_000) / tb_den
+    } else {
+        target_pts
+    };
+    ctx.input
+        .seek(target_us, i64::MIN..=target_us)
+        .map_err(|e| format!("seek: {e}"))?;
+    ctx.decoder.flush();
+    Ok(())
+}
+
+/// Drain packets + decoder until we get a frame at or after `target_pts`.
+/// Used by one-shot `decode_at` (NOT by the streaming loop, which decodes
+/// every frame it produces).
+fn decode_one_at_or_after(ctx: &mut OpenContext, target_pts: i64) -> Result<FrameData, String> {
+    let mut decoded = ffmpeg::frame::Video::empty();
+    let stream_index = ctx.stream_index;
+    loop {
+        let mut got_packet = false;
+        for item in ctx.input.packets() {
+            let (stream, packet) = item.map_err(|e| format!("read packet: {e}"))?;
+            if stream.index() != stream_index {
+                continue;
+            }
+            got_packet = true;
+            ctx.decoder
+                .send_packet(&packet)
+                .map_err(|e| format!("send_packet: {e}"))?;
+            while ctx.decoder.receive_frame(&mut decoded).is_ok() {
+                let pts = decoded.pts().unwrap_or(0);
+                if pts >= target_pts {
+                    return frame_to_payload(&decoded, ctx.info.pixel_format);
+                }
+            }
+            break;
+        }
+        if !got_packet {
+            ctx.decoder
+                .send_eof()
+                .map_err(|e| format!("send_eof: {e}"))?;
+            while ctx.decoder.receive_frame(&mut decoded).is_ok() {
+                let pts = decoded.pts().unwrap_or(0);
+                if pts >= target_pts {
+                    return frame_to_payload(&decoded, ctx.info.pixel_format);
+                }
+            }
+            return Err(format!("no frame at or after pts {target_pts}"));
+        }
+    }
+}
+
+/// Background decode loop. Reads packets, sends decoded frames to `tx`.
+/// Sends `None` on clean EOS, `Some(Failure(...))` on decode error.
+/// Returns the `OpenContext` so the main thread can reclaim it.
+fn decode_stream_loop(
+    mut ctx: OpenContext,
+    tx: SyncSender<Option<DecodedItem>>,
+    stop: Arc<AtomicBool>,
+    from_pts: i64,
+) -> Result<OpenContext, String> {
+    let mut decoded = ffmpeg::frame::Video::empty();
+    let stream_index = ctx.stream_index;
+
+    'outer: loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let mut got_packet = false;
+        for item in ctx.input.packets() {
+            if stop.load(Ordering::Relaxed) {
+                break 'outer;
+            }
+            let (stream, packet) = match item {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx.send(Some(DecodedItem::Failure(format!("read packet: {e}"))));
+                    return Ok(ctx);
+                }
+            };
+            if stream.index() != stream_index {
+                continue;
+            }
+            got_packet = true;
+            if let Err(e) = ctx.decoder.send_packet(&packet) {
+                let _ = tx.send(Some(DecodedItem::Failure(format!("send_packet: {e}"))));
+                return Ok(ctx);
+            }
+            while ctx.decoder.receive_frame(&mut decoded).is_ok() {
+                if stop.load(Ordering::Relaxed) {
+                    break 'outer;
+                }
+                let pts = decoded.pts().unwrap_or(0);
+                // Skip frames before from_pts (typical when seek snapped to
+                // an earlier keyframe).
+                if pts < from_pts {
+                    continue;
+                }
+                let payload = match frame_to_payload(&decoded, ctx.info.pixel_format) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = tx.send(Some(DecodedItem::Failure(e)));
+                        return Ok(ctx);
+                    }
+                };
+                if tx.send(Some(DecodedItem::Frame(payload))).is_err() {
+                    // Receiver dropped → main thread told us to stop.
+                    break 'outer;
+                }
+            }
+            // Check stop & continue with next packet.
+            if stop.load(Ordering::Relaxed) {
+                break 'outer;
+            }
+        }
+
+        if !got_packet {
+            // EOF in the demuxer; flush the decoder.
+            if let Err(e) = ctx.decoder.send_eof() {
+                let _ = tx.send(Some(DecodedItem::Failure(format!("send_eof: {e}"))));
+                return Ok(ctx);
+            }
+            while ctx.decoder.receive_frame(&mut decoded).is_ok() {
+                if stop.load(Ordering::Relaxed) {
+                    break 'outer;
+                }
+                let pts = decoded.pts().unwrap_or(0);
+                if pts < from_pts {
+                    continue;
+                }
+                match frame_to_payload(&decoded, ctx.info.pixel_format) {
+                    Ok(p) => {
+                        if tx.send(Some(DecodedItem::Frame(p))).is_err() {
+                            break 'outer;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Some(DecodedItem::Failure(e)));
+                        return Ok(ctx);
+                    }
+                }
+            }
+            // Clean EOS sentinel.
+            let _ = tx.send(None);
+            break 'outer;
+        }
+    }
+    Ok(ctx)
+}
+
 fn ffmpeg_version_string() -> String {
-    // av_version_info() is available via the sys crate.
     use std::ffi::CStr;
     unsafe {
         let p = vance_ffmpeg_sys::ffmpeg::sys::av_version_info();
@@ -219,7 +449,6 @@ fn frame_to_payload(
     let width = frame.width();
     let height = frame.height();
 
-    // Re-validate format in case the decoder switched mid-stream.
     let actual = map_pixel_format(frame.format()).map_err(|s| format!("pixel format: {s}"))?;
     if actual != expected_pf {
         return Err(format!(
@@ -227,9 +456,6 @@ fn frame_to_payload(
         ));
     }
 
-    // Pack planes back-to-back, recording strides.
-    // YUV420P: planes Y (h rows, stride[0]), U (h/2 rows, stride[1]), V (h/2 rows, stride[2]).
-    // NV12:    planes Y (h rows, stride[0]), UV interleaved (h/2 rows, stride[1]).
     let plane_count = match expected_pf {
         PixelFormat::Yuv420P => 3,
         PixelFormat::Nv12 => 2,
@@ -246,10 +472,8 @@ fn frame_to_payload(
             height.div_ceil(2)
         };
         let plane_width = if plane == 0 || expected_pf == PixelFormat::Nv12 && plane == 1 {
-            // Y plane: width pixels, 1 byte each. UV plane in NV12: width pixels (interleaved).
             width
         } else {
-            // U or V plane in YUV420P: half width.
             width.div_ceil(2)
         };
         let data = frame.data(plane);
@@ -258,7 +482,6 @@ fn frame_to_payload(
             let end = start + plane_width as usize;
             bytes.extend_from_slice(&data[start..end]);
         }
-        // After packing, the strides we report are now `plane_width` (no padding).
         strides[plane] = plane_width;
     }
 
