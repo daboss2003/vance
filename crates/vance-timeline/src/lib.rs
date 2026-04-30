@@ -35,6 +35,7 @@ pub mod error;
 pub mod id;
 pub mod marker;
 pub mod media;
+pub mod ops;
 pub mod project;
 pub mod sequence;
 pub mod track;
