@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use vance_timeline::Project;
 
 use crate::error::{ProjectError, Result};
+use crate::migrations::migrate_to_current;
 
 /// Latest on-disk format version this build can write.
 ///
@@ -100,14 +101,9 @@ pub fn open(bundle_path: impl AsRef<Path>) -> Result<Project> {
     let body = fs::read_to_string(&ron_path)?;
     let envelope: ProjectFile = ron::de::from_str(&body)?;
 
-    if envelope.format_version > FORMAT_VERSION {
-        return Err(ProjectError::UnsupportedFormatVersion {
-            found: envelope.format_version,
-            supported: FORMAT_VERSION,
-        });
-    }
-    // Older versions go through migrations once 3.5 lands. For now
-    // there's only one version, so nothing to migrate.
+    // Run the migration chain (no-op on v1; rejects future / pre-min
+    // versions with UnsupportedFormatVersion).
+    let envelope = migrate_to_current(envelope)?;
     Ok(envelope.project)
 }
 

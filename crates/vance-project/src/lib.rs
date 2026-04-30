@@ -26,6 +26,8 @@
 
 mod bundle;
 mod error;
+pub mod migrations;
 
 pub use bundle::{open, save, ProjectFile, FORMAT_VERSION};
 pub use error::{ProjectError, Result};
+pub use migrations::{migrate_to_current, MIN_SUPPORTED_VERSION};
