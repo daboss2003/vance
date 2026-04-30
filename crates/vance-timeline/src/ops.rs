@@ -127,9 +127,28 @@ fn insertion_index(clips: &[Arc<Clip>], at: RationalTime) -> usize {
 
 // ---- track-level operations -------------------------------------------------
 
-/// Append a new track to the sequence.
+/// Append a new track to the sequence with a freshly allocated ID.
 pub fn add_track(seq: &Sequence, kind: TrackKind, name: impl Into<String>) -> Sequence {
-    let new_track = Track::new(kind, name);
+    add_track_with_id(seq, TrackId::new(), kind, name)
+}
+
+/// Append a new track using the supplied ID. The `EditLog` calls this
+/// when re-applying a logged `AddTrack` so undo/redo round-trips are
+/// faithful.
+pub fn add_track_with_id(
+    seq: &Sequence,
+    track_id: TrackId,
+    kind: TrackKind,
+    name: impl Into<String>,
+) -> Sequence {
+    let new_track = Track {
+        id: track_id,
+        kind,
+        name: name.into(),
+        enabled: true,
+        locked: false,
+        clips: Vec::new(),
+    };
     let mut tracks = seq.tracks.clone();
     tracks.push(Arc::new(new_track));
     Sequence {

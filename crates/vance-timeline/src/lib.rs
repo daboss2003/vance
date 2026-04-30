@@ -30,6 +30,7 @@
 #![warn(missing_docs)]
 
 pub mod clip;
+pub mod edit_log;
 pub mod effect;
 pub mod error;
 pub mod id;
@@ -41,6 +42,7 @@ pub mod sequence;
 pub mod track;
 
 pub use clip::Clip;
+pub use edit_log::{apply, EditLog, EditOp};
 pub use effect::{Effect, EffectParams, EffectValue};
 pub use error::{Result, TimelineError};
 pub use id::{ClipId, EffectId, MarkerId, MediaItemId, ProjectId, SequenceId, TrackId};
