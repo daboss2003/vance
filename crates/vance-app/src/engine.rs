@@ -163,13 +163,15 @@ pub struct Engine {
 
     /// Currently loaded project, if any. Phase 4 introduces project
     /// state into the engine so playback can target a sequence rather
-    /// than just a file. The actual sequence-driven playback loop
-    /// lands in 4.2; 4.1 just plumbs the state and the load command.
+    /// than just a file.
     current_project: Option<Project>,
     /// Which sequence in `current_project` is the active edit. Cleared
     /// when the project changes. Defaults to the first sequence on
     /// `load_project`.
     current_sequence_id: Option<SequenceId>,
+    /// Path of the `.vance/` bundle the current project was loaded
+    /// from (or last saved to). `save_project(None)` writes here.
+    current_project_path: Option<PathBuf>,
 }
 
 /// Owns the AudioPlayer on a dedicated thread. The thread parks until
@@ -445,10 +447,52 @@ impl Engine {
             return Err(EngineError::PlaybackInProgress);
         }
         let project = vance_project::open(path).map_err(|e| EngineError::Project(e.to_string()))?;
-        let info = ProjectInfo::from(&project);
+        let mut info = ProjectInfo::from(&project);
         self.current_sequence_id = project.sequences.first().map(|s| s.id);
+        info.current_sequence_id = self.current_sequence_id.map(|id| id.to_string());
+        self.current_project_path = Some(PathBuf::from(path));
         self.current_project = Some(project);
         Ok(info)
+    }
+
+    /// Replace the current project with a fresh empty one. The save
+    /// path is cleared — `save_project(None)` will fail until the
+    /// caller passes an explicit path.
+    pub fn new_project(&mut self, name: String) -> Result<ProjectInfo, EngineError> {
+        if self.playback.is_some() {
+            return Err(EngineError::PlaybackInProgress);
+        }
+        let project = Project::new(name);
+        let info = ProjectInfo::from(&project);
+        self.current_sequence_id = None;
+        self.current_project_path = None;
+        self.current_project = Some(project);
+        Ok(info)
+    }
+
+    /// Save the current project. If `path` is provided it overrides the
+    /// remembered bundle path (acts like Save As); otherwise the engine
+    /// writes back to the path the project was loaded from.
+    pub fn save_project(&mut self, path: Option<String>) -> Result<(), EngineError> {
+        let project = self
+            .current_project
+            .as_ref()
+            .ok_or(EngineError::NoProject)?;
+        let target = match path {
+            Some(p) => PathBuf::from(p),
+            None => self
+                .current_project_path
+                .clone()
+                .ok_or_else(|| EngineError::Project("project has no save path; call save_project with an explicit path first".into()))?,
+        };
+        vance_project::save(project, &target).map_err(|e| EngineError::Project(e.to_string()))?;
+        self.current_project_path = Some(target);
+        Ok(())
+    }
+
+    /// Path the current project was loaded from / last saved to.
+    pub fn current_project_path(&self) -> Option<&PathBuf> {
+        self.current_project_path.as_ref()
     }
 
     /// Switch the active sequence. The ID must reference a sequence in
@@ -466,9 +510,14 @@ impl Engine {
     }
 
     /// A snapshot of the current project for the UI: name + sequence
-    /// list. Returns `None` when no project is loaded.
+    /// list + active sequence ID. Returns `None` when no project is
+    /// loaded.
     pub fn project_info(&self) -> Option<ProjectInfo> {
-        self.current_project.as_ref().map(ProjectInfo::from)
+        self.current_project.as_ref().map(|p| {
+            let mut info = ProjectInfo::from(p);
+            info.current_sequence_id = self.current_sequence_id.map(|id| id.to_string());
+            info
+        })
     }
 
     /// Is playback currently running? Auto-reaps sessions whose scheduler

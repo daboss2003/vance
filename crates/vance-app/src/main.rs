@@ -119,6 +119,30 @@ fn load_project(
 }
 
 #[tauri::command]
+fn new_project(
+    state: tauri::State<'_, EngineHandle>,
+    name: String,
+) -> Result<ProjectInfo, String> {
+    state.lock().new_project(name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn save_project(
+    state: tauri::State<'_, EngineHandle>,
+    path: Option<String>,
+) -> Result<(), String> {
+    state.lock().save_project(path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn current_project_path(state: tauri::State<'_, EngineHandle>) -> Option<String> {
+    state
+        .lock()
+        .current_project_path()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+}
+
+#[tauri::command]
 fn project_info(state: tauri::State<'_, EngineHandle>) -> Option<ProjectInfo> {
     state.lock().project_info()
 }
@@ -188,6 +212,9 @@ fn main() {
             load_project,
             project_info,
             set_current_sequence,
+            new_project,
+            save_project,
+            current_project_path,
         ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");

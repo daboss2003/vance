@@ -12,6 +12,7 @@
     stopPlayback,
     type StreamInfo
   } from '$lib/ipc';
+  import { projectState } from '$lib/project.svelte';
 
   let backend = $state<string>('checking…');
   let info = $state<StreamInfo | null>(null);
@@ -42,6 +43,11 @@
     // Poll the engine for playback state — covers natural EOS / errors.
     // On a true→false transition we also fetch the engine's last resume
     // PTS so the next Play can detect end-of-file and rewind to 0.
+    // We also re-broadcast viewport bounds here: layout reflows that
+    // don't change the viewport el's *size* (header content updates,
+    // font loading, async chrome shifts) won't trip ResizeObserver, so
+    // a 250ms heartbeat keeps the native overlay aligned with what the
+    // user sees.
     const pollId = window.setInterval(async () => {
       try {
         const next = await isPlaying();
@@ -53,6 +59,7 @@
       } catch {
         // ignore transient errors
       }
+      reportBounds();
     }, 250);
     reportBounds();
     return () => {
@@ -180,6 +187,19 @@
     setViewportBounds(x, y, w, h).catch((e) => console.error('set_viewport_bounds', e));
   }
 
+  // Re-broadcast bounds whenever the chrome around the viewport changes
+  // shape (project loaded/cleared, sequence selection, save path appears).
+  // ResizeObserver only fires on size changes of the viewport el itself
+  // and misses the case where its *position* changes because a sibling
+  // reflowed.
+  $effect(() => {
+    // Touch the runes we care about so the effect re-runs on change.
+    void projectState.info;
+    void projectState.path;
+    // Wait for the next frame so DOM layout has settled.
+    requestAnimationFrame(reportBounds);
+  });
+
   async function handleOpen() {
     openError = null;
     const selected = await open({
@@ -201,6 +221,43 @@
     } catch (e) {
       openError = String(e);
     }
+  }
+
+  // ---- Project toolbar handlers --------------------------------------------
+
+  async function handleNewProject() {
+    // Tauri's WKWebView suppresses window.prompt(), so we just create
+    // an "Untitled" project here. Renaming via the Inspector lands in
+    // 4.10; for now the user can Save As to give it a real path/name.
+    await projectState.newProject('Untitled');
+  }
+
+  async function handleOpenProject() {
+    const selected = await open({
+      multiple: false,
+      directory: true,
+      title: 'Open .vance project bundle'
+    });
+    if (typeof selected !== 'string') return;
+    await projectState.open(selected);
+  }
+
+  async function handleSaveProject() {
+    if (!projectState.info) return;
+    if (projectState.path) {
+      await projectState.save(null);
+      return;
+    }
+    // No remembered path → Save As: pick a location, append .vance.
+    const selected = await open({
+      multiple: false,
+      directory: true,
+      title: 'Pick a folder to save the project bundle in'
+    });
+    if (typeof selected !== 'string') return;
+    const name = projectState.info.name || 'Untitled';
+    const bundle = `${selected}/${name}.vance`;
+    await projectState.save(bundle);
   }
 
   async function render(pts: number) {
@@ -305,13 +362,51 @@
     class="border-vance-border bg-vance-panel flex h-11 flex-shrink-0 items-center gap-3 border-b px-4"
   >
     <h1 class="text-sm font-semibold">Vance</h1>
-    <span class="text-vance-muted text-xs">Phase 1 · M1.5</span>
-    <button
-      class="ml-auto rounded bg-[var(--color-vance-accent)] px-3 py-1 text-xs font-semibold text-[#003040] hover:brightness-110"
-      onclick={handleOpen}
-    >
-      Open File…
-    </button>
+    <span class="text-vance-muted text-xs">Phase 4 · M4.2</span>
+
+    {#if projectState.info}
+      <span class="ml-3 text-xs text-vance-muted">
+        Project: <span class="text-vance-fg font-medium">{projectState.info.name}</span>
+        {#if projectState.path}
+          <span class="text-vance-muted">·</span>
+          <span class="text-vance-muted">{projectState.path}</span>
+        {:else}
+          <span class="text-vance-muted">·</span>
+          <span class="text-yellow-400">unsaved</span>
+        {/if}
+      </span>
+    {/if}
+
+    <div class="ml-auto flex items-center gap-2">
+      <button
+        class="rounded bg-vance-bg border-vance-border border px-2 py-1 text-xs hover:brightness-110"
+        onclick={handleNewProject}
+        title="Create a new empty project"
+      >
+        New
+      </button>
+      <button
+        class="rounded bg-vance-bg border-vance-border border px-2 py-1 text-xs hover:brightness-110"
+        onclick={handleOpenProject}
+        title="Open a .vance/ bundle"
+      >
+        Open Project
+      </button>
+      <button
+        class="rounded bg-vance-bg border-vance-border border px-2 py-1 text-xs hover:brightness-110 disabled:opacity-50"
+        onclick={handleSaveProject}
+        disabled={!projectState.info}
+        title="Save the current project"
+      >
+        Save
+      </button>
+      <button
+        class="rounded bg-[var(--color-vance-accent)] px-3 py-1 text-xs font-semibold text-[#003040] hover:brightness-110"
+        onclick={handleOpen}
+      >
+        Open File…
+      </button>
+    </div>
   </header>
 
   <!-- Main 3-pane area -->
@@ -321,9 +416,41 @@
       class="border-vance-border bg-vance-panel w-60 flex-shrink-0 overflow-y-auto border-r p-4"
     >
       <h2 class="text-vance-muted mb-3 text-xs uppercase tracking-wider">Browser</h2>
-      <p class="text-vance-muted text-xs">
-        Open a file from the toolbar. Browser bin lands in Phase 4.
-      </p>
+      {#if projectState.info}
+        <div class="mb-4">
+          <h3 class="text-vance-muted mb-1 text-[11px] uppercase">Sequences</h3>
+          {#if projectState.info.sequences.length === 0}
+            <p class="text-vance-muted text-xs italic">No sequences yet.</p>
+          {:else}
+            <ul class="flex flex-col gap-1 text-xs">
+              {#each projectState.info.sequences as seq (seq.id)}
+                {@const active = seq.id === projectState.info?.current_sequence_id}
+                <li>
+                  <button
+                    class="w-full rounded border px-2 py-1 text-left
+                      {active
+                        ? 'border-[var(--color-vance-accent)] bg-[#003040] text-[var(--color-vance-accent)]'
+                        : 'bg-vance-bg border-vance-border hover:brightness-125'}"
+                    onclick={() => projectState.selectSequence(seq.id)}
+                  >
+                    <div class="font-medium">{seq.name}</div>
+                    <div class="text-[10px] text-vance-muted">{seq.clip_count} clips</div>
+                  </button>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </div>
+      {:else}
+        <p class="text-vance-muted text-xs">
+          Create or open a project from the toolbar.
+        </p>
+      {/if}
+      {#if projectState.error}
+        <p class="mt-3 rounded border border-red-700 bg-red-950 p-2 text-xs text-red-200">
+          {projectState.error}
+        </p>
+      {/if}
     </aside>
 
     <!-- Center: viewport + transport -->

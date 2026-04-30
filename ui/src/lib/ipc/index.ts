@@ -67,3 +67,17 @@ export const projectInfo = (): Promise<ProjectInfo | null> => invoke('project_in
 /** Switch the active sequence within the loaded project. */
 export const setCurrentSequence = (sequenceId: string): Promise<void> =>
   invoke('set_current_sequence', { sequenceId });
+
+/** Replace the current project with a fresh empty one. */
+export const newProject = (name: string): Promise<ProjectInfo> =>
+  invoke('new_project', { name });
+
+/** Save the current project. Pass `path` to override the remembered
+ *  bundle location (Save As). Pass `null` to write back to the
+ *  loaded path; errors if there isn't one yet. */
+export const saveProject = (path: string | null): Promise<void> =>
+  invoke('save_project', { path });
+
+/** Path the current project was loaded from / last saved to. */
+export const currentProjectPath = (): Promise<string | null> =>
+  invoke('current_project_path');

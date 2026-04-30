@@ -256,26 +256,58 @@ impl Drop for Viewport {
 /// viewport rectangle.
 ///
 /// Chrome reports `bounds` in **physical pixels with origin at the
-/// top-left of the parent window's client area**. macOS screen coordinates
-/// are **points with origin at the bottom-left of the primary display**.
+/// top-left of the parent window's *content area*** (i.e. the
+/// `<body>`-relative coordinates that `getBoundingClientRect` returns).
+/// macOS screen coordinates are **points with origin at the bottom-left
+/// of the primary display**, and `parent.frame()` includes the title
+/// bar — so we have to subtract the title-bar height from the parent's
+/// frame height to get the content-area height that the chrome's `y`
+/// values are measured against.
 fn compute_child_screen_frame(parent: &NSWindow, bounds: &ViewportBounds, scale: f64) -> NSRect {
     // Parent's frame on screen (in points, bottom-left origin).
     let parent_frame: NSRect = parent.frame();
+    // `contentLayoutRect` is the rect *inside* the parent window where
+    // chrome content is laid out — it excludes the title bar/toolbar
+    // even with `NSWindowStyleMask::FullSizeContentView`, which is
+    // exactly the area `getBoundingClientRect` measures against. Using
+    // it instead of `contentView.frame` keeps the math correct under
+    // Tauri's various title-bar styles.
+    //
+    // `contentLayoutRect` returns a rect in *window* coordinates
+    // (bottom-left origin). Its top-left corresponds to chrome y=0.
+    let layout_rect: NSRect = unsafe { msg_send![&*parent, contentLayoutRect] };
+    let layout_top_in_window = layout_rect.origin.y + layout_rect.size.height;
+
     // Convert chrome-reported pixels → points.
     let x_pt = bounds.x as f64 / scale;
-    let y_pt_top = bounds.y as f64 / scale; // distance from top of window
+    let y_pt_top = bounds.y as f64 / scale;
     let w_pt = bounds.w as f64 / scale;
     let h_pt = bounds.h as f64 / scale;
 
-    // Position in screen points: x is parent_left + viewport_x; y is
-    // parent_bottom + (parent_height - viewport_y_top - viewport_h).
-    // Note: parent_frame.height already accounts for the title bar etc.
-    // because we measured the bounds from the *content* area of the
-    // window (the chrome's <body>), and Tauri windows have no title bar
-    // in our config. If a title bar is added later, subtract its height
-    // from y_pt_top.
-    let x = parent_frame.origin.x + x_pt;
-    let y = parent_frame.origin.y + parent_frame.size.height - y_pt_top - h_pt;
+    let x = parent_frame.origin.x + layout_rect.origin.x + x_pt;
+    let y = parent_frame.origin.y + layout_top_in_window - y_pt_top - h_pt;
+
+    tracing::trace!(
+        parent_origin_x = parent_frame.origin.x,
+        parent_origin_y = parent_frame.origin.y,
+        parent_w = parent_frame.size.width,
+        parent_h = parent_frame.size.height,
+        layout_origin_x = layout_rect.origin.x,
+        layout_origin_y = layout_rect.origin.y,
+        layout_w = layout_rect.size.width,
+        layout_h = layout_rect.size.height,
+        layout_top_in_window,
+        scale,
+        bounds_x = bounds.x,
+        bounds_y = bounds.y,
+        bounds_w = bounds.w,
+        bounds_h = bounds.h,
+        out_x = x,
+        out_y = y,
+        out_w = w_pt,
+        out_h = h_pt,
+        "compute_child_screen_frame"
+    );
 
     NSRect {
         origin: NSPoint { x, y },
