@@ -36,3 +36,6 @@ vance-decoder = { workspace = true }
 vance-render = { workspace = true }
 vance-viewport = { workspace = true }
 vance-audio = { workspace = true }
+vance-timeline = { workspace = true }
+vance-project = { workspace = true }
+uuid = { workspace = true }

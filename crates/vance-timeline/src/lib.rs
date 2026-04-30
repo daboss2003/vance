@@ -38,6 +38,7 @@ pub mod marker;
 pub mod media;
 pub mod ops;
 pub mod project;
+pub mod scene_plan;
 pub mod sequence;
 pub mod track;
 
@@ -49,5 +50,6 @@ pub use id::{ClipId, EffectId, MarkerId, MediaItemId, ProjectId, SequenceId, Tra
 pub use marker::{Marker, MarkerColor, MarkerKind};
 pub use media::{ContentHash, MediaItem, MediaKind};
 pub use project::Project;
+pub use scene_plan::{scene_at, ActiveClip, SceneAt};
 pub use sequence::Sequence;
 pub use track::{Track, TrackKind};

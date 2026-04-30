@@ -41,3 +41,29 @@ export const isPlaying = (): Promise<boolean> => invoke('is_playing');
 /** PTS of the last presented frame from the most recent finished playback
  *  session, or null if no session has finished since the last start. */
 export const lastResumePts = (): Promise<number | null> => invoke('last_resume_pts');
+
+// ---- Phase 4: project & sequence state ------------------------------------
+
+/** Lightweight view of the loaded project for the UI. */
+export type SequenceInfo = {
+  id: string;
+  name: string;
+  clip_count: number;
+};
+
+export type ProjectInfo = {
+  name: string;
+  sequences: SequenceInfo[];
+  current_sequence_id: string | null;
+};
+
+/** Load a `.vance/` bundle and make it the engine's current project. */
+export const loadProject = (path: string): Promise<ProjectInfo> =>
+  invoke('load_project', { path });
+
+/** Snapshot of the current project, or null if none is loaded. */
+export const projectInfo = (): Promise<ProjectInfo | null> => invoke('project_info');
+
+/** Switch the active sequence within the loaded project. */
+export const setCurrentSequence = (sequenceId: string): Promise<void> =>
+  invoke('set_current_sequence', { sequenceId });

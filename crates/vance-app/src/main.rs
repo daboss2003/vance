@@ -11,10 +11,11 @@
 
 mod engine;
 
-use engine::EngineHandle;
+use engine::{EngineHandle, ProjectInfo};
 use serde::Serialize;
 use tauri::Manager;
 use vance_decoder::StreamInfo;
+use vance_timeline::SequenceId;
 use vance_viewport::{HostWindowHandle, ViewportBounds};
 
 #[derive(Serialize)]
@@ -109,6 +110,33 @@ fn last_resume_pts(state: tauri::State<'_, EngineHandle>) -> Option<i64> {
     state.lock().last_resume_pts()
 }
 
+#[tauri::command]
+fn load_project(
+    state: tauri::State<'_, EngineHandle>,
+    path: String,
+) -> Result<ProjectInfo, String> {
+    state.lock().load_project(&path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn project_info(state: tauri::State<'_, EngineHandle>) -> Option<ProjectInfo> {
+    state.lock().project_info()
+}
+
+#[tauri::command]
+fn set_current_sequence(
+    state: tauri::State<'_, EngineHandle>,
+    sequence_id: String,
+) -> Result<(), String> {
+    let uuid = sequence_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid sequence id: {e}"))?;
+    state
+        .lock()
+        .set_current_sequence(SequenceId::from_uuid(uuid))
+        .map_err(|e| e.to_string())
+}
+
 fn main() {
     // Quiet by default; bump with RUST_LOG=info for diagnostics.
     let _ = tracing_subscriber::fmt()
@@ -157,6 +185,9 @@ fn main() {
             stop_playback,
             is_playing,
             last_resume_pts,
+            load_project,
+            project_info,
+            set_current_sequence,
         ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");

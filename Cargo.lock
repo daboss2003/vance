@@ -3541,6 +3541,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ron"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b91f7eff05f748767f183df4320a63d6936e9c6107d97c9e6bdd9784f4289c94"
+dependencies = [
+ "base64 0.21.7",
+ "bitflags 2.11.1",
+ "serde",
+ "serde_derive",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5231,11 +5243,14 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "vance-audio",
  "vance-core",
  "vance-decoder",
+ "vance-project",
  "vance-render",
  "vance-time",
+ "vance-timeline",
  "vance-viewport",
  "wgpu",
 ]
@@ -5351,6 +5366,15 @@ version = "0.0.0"
 [[package]]
 name = "vance-project"
 version = "0.0.0"
+dependencies = [
+ "proptest",
+ "ron",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "vance-core",
+ "vance-timeline",
+]
 
 [[package]]
 name = "vance-render"
@@ -5376,6 +5400,13 @@ dependencies = [
 [[package]]
 name = "vance-timeline"
 version = "0.0.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "thiserror 2.0.18",
+ "uuid",
+ "vance-core",
+]
 
 [[package]]
 name = "vance-viewport"

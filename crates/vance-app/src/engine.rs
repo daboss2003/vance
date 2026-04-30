@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use vance_audio::AudioPlayer;
 use vance_decoder::{DecoderClient, StreamInfo};
 use vance_render::{Renderer, RendererConfig};
+use vance_timeline::{Project, SequenceId};
 use vance_viewport::{HostWindowHandle, Viewport, ViewportBounds};
 
 /// Errors surfaced through Tauri command handlers as plain strings.
@@ -53,6 +54,60 @@ pub enum EngineError {
 
     #[error("playback thread error: {0}")]
     PlaybackThread(String),
+
+    /// `vance-project` failed to read or write a bundle.
+    #[error("project: {0}")]
+    Project(String),
+
+    /// A project-level command was issued without a project loaded.
+    #[error("no project loaded")]
+    NoProject,
+
+    /// `set_current_sequence` was given an ID that's not in the project.
+    #[error("sequence not found in current project")]
+    SequenceNotFound,
+}
+
+/// Lightweight summary of the loaded project for the UI. Kept small so
+/// it's cheap to ship over the IPC boundary; the full project lives on
+/// the engine side and is accessed via per-entity commands.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ProjectInfo {
+    /// Project's display name.
+    pub name: String,
+    /// Sequences in insertion order, with their IDs and human names.
+    pub sequences: Vec<SequenceInfo>,
+    /// Currently active sequence's ID, if any.
+    pub current_sequence_id: Option<String>,
+}
+
+/// One row in `ProjectInfo.sequences`.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct SequenceInfo {
+    /// Sequence ID as a string (UUID).
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Total clip count across all tracks (a useful summary for the UI).
+    pub clip_count: usize,
+}
+
+impl From<&Project> for ProjectInfo {
+    fn from(p: &Project) -> Self {
+        Self {
+            name: p.name.clone(),
+            sequences: p
+                .sequences
+                .iter()
+                .map(|s| SequenceInfo {
+                    id: s.id.to_string(),
+                    name: s.name.clone(),
+                    clip_count: s.clip_count(),
+                })
+                .collect(),
+            current_sequence_id: None,
+        }
+    }
 }
 
 /// Shared, internally-mutable engine handle. Cheap to clone.
@@ -105,6 +160,16 @@ pub struct Engine {
     /// cleared on the next start_playback. Lets the UI learn the EOS PTS
     /// without having to call stop_playback itself.
     last_resume_pts: Option<i64>,
+
+    /// Currently loaded project, if any. Phase 4 introduces project
+    /// state into the engine so playback can target a sequence rather
+    /// than just a file. The actual sequence-driven playback loop
+    /// lands in 4.2; 4.1 just plumbs the state and the load command.
+    current_project: Option<Project>,
+    /// Which sequence in `current_project` is the active edit. Cleared
+    /// when the project changes. Defaults to the first sequence on
+    /// `load_project`.
+    current_sequence_id: Option<SequenceId>,
 }
 
 /// Owns the AudioPlayer on a dedicated thread. The thread parks until
@@ -369,6 +434,41 @@ impl Engine {
             }
             Err(_) => Err(EngineError::PlaybackThread("scheduler panicked".into())),
         }
+    }
+
+    /// Load a `.vance/` bundle and make it the current project.
+    /// Selects the first sequence as the active sequence; `None` if
+    /// the project has no sequences. The previous project (if any) is
+    /// discarded — a future "save before close" gate is up to the UI.
+    pub fn load_project(&mut self, path: &str) -> Result<ProjectInfo, EngineError> {
+        if self.playback.is_some() {
+            return Err(EngineError::PlaybackInProgress);
+        }
+        let project = vance_project::open(path).map_err(|e| EngineError::Project(e.to_string()))?;
+        let info = ProjectInfo::from(&project);
+        self.current_sequence_id = project.sequences.first().map(|s| s.id);
+        self.current_project = Some(project);
+        Ok(info)
+    }
+
+    /// Switch the active sequence. The ID must reference a sequence in
+    /// the loaded project.
+    pub fn set_current_sequence(&mut self, id: SequenceId) -> Result<(), EngineError> {
+        let project = self
+            .current_project
+            .as_ref()
+            .ok_or(EngineError::NoProject)?;
+        if project.sequence(id).is_none() {
+            return Err(EngineError::SequenceNotFound);
+        }
+        self.current_sequence_id = Some(id);
+        Ok(())
+    }
+
+    /// A snapshot of the current project for the UI: name + sequence
+    /// list. Returns `None` when no project is loaded.
+    pub fn project_info(&self) -> Option<ProjectInfo> {
+        self.current_project.as_ref().map(ProjectInfo::from)
     }
 
     /// Is playback currently running? Auto-reaps sessions whose scheduler
