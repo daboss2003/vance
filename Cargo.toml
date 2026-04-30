@@ -74,6 +74,7 @@ parking_lot = "0.12"
 uuid = { version = "1", features = ["v4", "serde"] }
 ron = "0.8"
 tempfile = "3"
+proptest = "1"
 
 [profile.dev]
 incremental = true
