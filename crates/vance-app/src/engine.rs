@@ -100,6 +100,11 @@ pub struct Engine {
     /// Audio playback owner thread (holds the AudioPlayer; AudioPlayer's
     /// cpal::Stream is !Send so it has to stay on its own thread).
     audio_owner: Option<AudioOwner>,
+    /// Last presented video PTS from the most recent playback session.
+    /// Set when a session is reaped (explicit stop OR auto-reap on EOS),
+    /// cleared on the next start_playback. Lets the UI learn the EOS PTS
+    /// without having to call stop_playback itself.
+    last_resume_pts: Option<i64>,
 }
 
 /// Owns the AudioPlayer on a dedicated thread. The thread parks until
@@ -113,6 +118,15 @@ pub struct AudioOwner {
 /// Owned by the engine while video playback is running.
 pub struct PlaybackSession {
     stop: Arc<AtomicBool>,
+    /// Last video PTS the scheduler presented. Updated atomically each
+    /// frame; read by `stop_playback` so the UI can resume from here on
+    /// the next Play.
+    last_pts: Arc<std::sync::atomic::AtomicI64>,
+    /// Set by the playback loop when it exits via natural end-of-stream
+    /// (as opposed to an explicit stop or a decoder error). Tells
+    /// `stop_playback` to report a resume PTS of 0 so the next Play
+    /// rewinds to the start instead of getting stuck at EOS.
+    ended_at_eos: Arc<AtomicBool>,
     /// Joins to recover the DecoderClient back into Engine.decoder.
     handle: JoinHandle<DecoderClient>,
 }
@@ -276,7 +290,13 @@ impl Engine {
         // Best-effort audio start. If the file has no audio or audio init
         // fails, keep going with wall-clock-only video — better degraded
         // playback than no playback.
-        let (audio_owner, audio_sync) = match start_audio(&media_path, from_pts) {
+        let (vtb_n, vtb_d) = info.time_base;
+        let from_seconds = if vtb_d > 0 {
+            (from_pts as f64) * (vtb_n as f64) / (vtb_d as f64)
+        } else {
+            0.0
+        };
+        let (audio_owner, audio_sync) = match start_audio(&media_path, from_seconds) {
             Ok((owner, sync)) => (Some(owner), Some(sync)),
             Err(e) => {
                 tracing::warn!(?e, "audio: not started; video will use wall-clock master");
@@ -286,6 +306,10 @@ impl Engine {
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
+        let last_pts = Arc::new(std::sync::atomic::AtomicI64::new(from_pts));
+        let last_pts_clone = last_pts.clone();
+        let ended_at_eos = Arc::new(AtomicBool::new(false));
+        let ended_at_eos_clone = ended_at_eos.clone();
         let last_bounds = self.last_bounds;
         let handle = std::thread::Builder::new()
             .name("vance-engine.playback".into())
@@ -299,16 +323,26 @@ impl Engine {
                     render_state,
                     stop_clone,
                     audio_sync,
+                    last_pts_clone,
+                    ended_at_eos_clone,
                 )
             })
             .map_err(|e| EngineError::PlaybackThread(format!("spawn: {e}")))?;
-        self.playback = Some(PlaybackSession { stop, handle });
+        self.playback = Some(PlaybackSession {
+            stop,
+            last_pts,
+            ended_at_eos,
+            handle,
+        });
         self.audio_owner = audio_owner;
+        self.last_resume_pts = None;
         Ok(())
     }
 
     /// Stop the current playback session (if any) and reclaim the decoder.
-    pub fn stop_playback(&mut self) -> Result<(), EngineError> {
+    /// Stop the current playback session and return the last presented
+    /// video PTS so the UI can resume from there on the next Play.
+    pub fn stop_playback(&mut self) -> Result<i64, EngineError> {
         let Some(session) = self.playback.take() else {
             return Err(EngineError::NoPlayback);
         };
@@ -319,18 +353,43 @@ impl Engine {
             owner.stop.store(true, Ordering::Release);
             let _ = owner.handle.join();
         }
+        let resume_pts = if session.ended_at_eos.load(Ordering::Acquire) {
+            // EOS → tell the UI to start from 0 next time. Otherwise the
+            // playhead stays parked at the last frame and Play does
+            // nothing because the decoder seeks straight to EOS.
+            0
+        } else {
+            session.last_pts.load(Ordering::Acquire)
+        };
         match session.handle.join() {
             Ok(decoder) => {
                 self.decoder = Some(decoder);
-                Ok(())
+                self.last_resume_pts = Some(resume_pts);
+                Ok(resume_pts)
             }
             Err(_) => Err(EngineError::PlaybackThread("scheduler panicked".into())),
         }
     }
 
-    /// Is playback currently running?
-    pub fn is_playing(&self) -> bool {
+    /// Is playback currently running? Auto-reaps sessions whose scheduler
+    /// thread has exited (e.g. natural end-of-stream) so the engine state
+    /// matches reality and the decoder is reclaimed for single-shot use.
+    pub fn is_playing(&mut self) -> bool {
+        let finished = self
+            .playback
+            .as_ref()
+            .is_some_and(|s| s.handle.is_finished());
+        if finished {
+            let _ = self.stop_playback();
+            return false;
+        }
         self.playback.is_some()
+    }
+
+    /// Last presented PTS from the most recent finished playback session,
+    /// or `None` if no session has run since the last `start_playback`.
+    pub fn last_resume_pts(&self) -> Option<i64> {
+        self.last_resume_pts
     }
 }
 
@@ -347,7 +406,7 @@ pub struct AudioSync {
 /// holds the AudioPlayer (cpal::Stream is !Send, so it must stay on
 /// one thread) and parks until told to stop. Returns a stop handle and
 /// a clock-sharing handle for the video loop.
-fn start_audio(media_path: &str, _from_pts: i64) -> Result<(AudioOwner, AudioSync), String> {
+fn start_audio(media_path: &str, from_seconds: f64) -> Result<(AudioOwner, AudioSync), String> {
     let bin = locate_audio_binary().map_err(|e| format!("{e:?}"))?;
     let media_path = media_path.to_string();
 
@@ -360,20 +419,19 @@ fn start_audio(media_path: &str, _from_pts: i64) -> Result<(AudioOwner, AudioSyn
     let handle = std::thread::Builder::new()
         .name("vance-engine.audio-owner".into())
         .spawn(move || {
-            let player = match AudioPlayer::start(&bin, media_path, 0) {
+            let player = match AudioPlayer::start(&bin, media_path, from_seconds) {
                 Ok(p) => p,
                 Err(e) => {
                     let _ = tx.send(Err(format!("{e}")));
                     return;
                 }
             };
-            // Audio time base = (1, device_sample_rate). The decoded
-            // chunks' PTS values are in *audio stream* time base (per
-            // Symphonia: typically 1/sample_rate); device rate is the
-            // same in the common case (48 kHz file → 48 kHz device).
+            // current_pts is updated by the puller with chunk PTS values
+            // in the *audio stream's* time base — that's what we need to
+            // convert to seconds for sync.
             let sync = AudioSync {
                 current_pts: player.current_pts_handle(),
-                time_base: (1, player.device_sample_rate() as i64),
+                time_base: player.stream_time_base(),
             };
             if tx.send(Ok(sync)).is_err() {
                 return; // engine gave up before we could ship the sync
@@ -427,6 +485,8 @@ fn playback_loop(
     render_state: Arc<Mutex<RenderState>>,
     stop: Arc<AtomicBool>,
     audio: Option<AudioSync>,
+    last_pts: Arc<std::sync::atomic::AtomicI64>,
+    ended_at_eos: Arc<AtomicBool>,
 ) -> DecoderClient {
     // Stream-time-base → seconds: pts * tb_num / tb_den.
     let (tb_num, tb_den) = info.time_base;
@@ -464,6 +524,7 @@ fn playback_loop(
             Ok(Some(f)) => f,
             Ok(None) => {
                 tracing::info!("playback: end of stream");
+                ended_at_eos.store(true, Ordering::Release);
                 break;
             }
             Err(e) => {
@@ -484,11 +545,9 @@ fn playback_loop(
             } else {
                 0.0
             };
-            // Anchor to the FIRST frame's PTS so video/audio share an origin
-            // even though their PTS systems differ. (audio_sec is real wall
-            // time progress; we offset video PTS by its from_pts.)
-            let video_progress = frame_sec - pts_to_sec(from_pts);
-            video_progress - audio_sec
+            // Both clocks are in absolute file seconds now (audio is seeked
+            // to from_seconds at start_stream), so the comparison is direct.
+            frame_sec - audio_sec
         } else {
             // Wall-clock fallback.
             if wall_anchor.is_none() {
@@ -524,6 +583,7 @@ fn playback_loop(
         if let Err(e) = upload_and_render(&render_state, &viewport, &frame, bounds) {
             tracing::warn!(?e, "playback: render error (continuing)");
         }
+        last_pts.store(frame.pts, Ordering::Release);
         frames_presented += 1;
         if frames_presented == 1 || frames_presented.is_multiple_of(30) {
             tracing::info!(

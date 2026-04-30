@@ -95,13 +95,18 @@ fn start_playback(state: tauri::State<'_, EngineHandle>, from_pts: i64) -> Resul
 }
 
 #[tauri::command]
-fn stop_playback(state: tauri::State<'_, EngineHandle>) -> Result<(), String> {
+fn stop_playback(state: tauri::State<'_, EngineHandle>) -> Result<i64, String> {
     state.lock().stop_playback().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn is_playing(state: tauri::State<'_, EngineHandle>) -> bool {
     state.lock().is_playing()
+}
+
+#[tauri::command]
+fn last_resume_pts(state: tauri::State<'_, EngineHandle>) -> Option<i64> {
+    state.lock().last_resume_pts()
 }
 
 fn main() {
@@ -151,6 +156,7 @@ fn main() {
             start_playback,
             stop_playback,
             is_playing,
+            last_resume_pts,
         ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");

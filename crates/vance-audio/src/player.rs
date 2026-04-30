@@ -63,6 +63,9 @@ pub struct AudioPlayer {
     current_pts: Arc<AtomicI64>,
     /// Sample rate the cpal output stream is configured at.
     device_sample_rate: u32,
+    /// Audio stream's time base as `(num, den)`. Required to interpret
+    /// `current_pts` as seconds for A/V sync.
+    stream_time_base: (i64, i64),
 }
 
 struct Inner {
@@ -74,10 +77,14 @@ struct Inner {
 impl AudioPlayer {
     /// Spawn the audio sidecar, open `path`, and start a cpal output stream
     /// fed by a puller thread. Returns once the stream is playing.
+    ///
+    /// `from_seconds` is the playhead position in absolute file seconds
+    /// (i.e. the same units the video side uses, modulo time bases). The
+    /// player converts to the audio stream's PTS internally.
     pub fn start(
         sidecar_binary: impl AsRef<Path>,
         media_path: impl Into<String>,
-        from_pts: i64,
+        from_seconds: f64,
     ) -> Result<Self, AudioPlayerError> {
         // 1. Pick the default output device + a stereo f32 config.
         let host = cpal::default_host();
@@ -99,6 +106,15 @@ impl AudioPlayer {
             file_channels = info.channels,
             "audio: opened media file"
         );
+        // Convert the requested seek (in file seconds) to the audio stream's
+        // PTS units. PTS = sec * tb_den / tb_num.
+        let (atb_n, atb_d) = info.time_base;
+        let from_pts = if atb_n > 0 {
+            (from_seconds.max(0.0) * (atb_d as f64) / (atb_n as f64)).round() as i64
+        } else {
+            0
+        };
+        tracing::info!(from_seconds, from_pts, "audio: seeking to start");
         let _ = client.start_stream(from_pts, 1024)?;
 
         // 3. Build a lock-free ring sized to ~250 ms at the device rate.
@@ -157,7 +173,14 @@ impl AudioPlayer {
             })),
             current_pts,
             device_sample_rate: sample_rate,
+            stream_time_base: info.time_base,
         })
+    }
+
+    /// Audio stream's time base as `(num, den)`. PTS values reported by
+    /// `current_pts` are in this unit; seconds = pts * num / den.
+    pub fn stream_time_base(&self) -> (i64, i64) {
+        self.stream_time_base
     }
 
     /// Most recently consumed chunk's leading PTS. Used as the audio

@@ -24,6 +24,10 @@ SUBCOMMANDS:
     ui-build    Production build of the frontend.
     ui-fmt      Format frontend code (prettier).
     ui-lint     Lint frontend code (eslint + svelte-check).
+    app-build   Build the frontend AND rebuild vance-app so the Tauri
+                binary embeds the latest UI bundle. ALWAYS use this
+                after changing files under ui/.
+    app-run     Same as app-build, then launch ./target/debug/vance-app.
     check-deps  Verify the internal crate dependency graph stays a DAG (PLAN.md §6.1).
     help        Print this message.
 "#;
@@ -58,6 +62,10 @@ fn main() {
         "ui-build" => pnpm(&["build"], &rest),
         "ui-fmt" => pnpm(&["fmt"], &rest),
         "ui-lint" => pnpm(&["lint"], &rest),
+        "app-build" => app_build(),
+        "app-run" => app_build().and_then(|_| {
+            cargo(&["run", "--package", "vance-app"], &rest)
+        }),
         "check-deps" => check_deps(),
         "help" | "--help" | "-h" => {
             print!("{HELP}");
@@ -115,6 +123,25 @@ fn run(mut cmd: Command) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Build the frontend AND rebuild vance-app. The Tauri binary embeds the
+/// frontend at compile time via `tauri::generate_context!()`; UI rebuilds
+/// alone don't take effect until the binary recompiles. A `touch` on
+/// tauri.conf.json forces cargo to invalidate the relevant build artifacts.
+fn app_build() -> Result<(), String> {
+    pnpm(&["build"], &[])?;
+    let conf = workspace_root().join("crates/vance-app/tauri.conf.json");
+    let now = std::time::SystemTime::now();
+    if let Err(e) = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&conf)
+        .and_then(|f| f.set_modified(now))
+    {
+        // Non-fatal — the conf may already be newer than the build artifact.
+        eprintln!("xtask: warning: failed to touch {}: {e}", conf.display());
+    }
+    cargo(&["build", "--package", "vance-app"], &[])
 }
 
 /// PLAN.md §6.1: enforce the internal crate dependency rules.

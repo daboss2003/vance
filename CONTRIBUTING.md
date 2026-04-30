@@ -50,6 +50,12 @@ cargo xtask ui-dev     # run the Tauri dev shell with hot reload
 cargo xtask ui-build   # production build of the frontend
 cargo xtask ui-fmt     # format frontend code
 cargo xtask ui-lint    # lint frontend code
+cargo xtask app-build  # build the frontend AND rebuild vance-app
+cargo xtask app-run    # app-build, then launch the app
+
+# IMPORTANT: Tauri 2 embeds the frontend INTO the binary at compile time.
+# After any change under ui/, you MUST rebuild vance-app for the change
+# to appear. `cargo xtask app-build` does both in one step.
 ```
 
 CI runs `fmt`, `clippy`, `test`, `ui-lint`, `ui-build` on Windows / macOS / Linux. PRs must pass CI.

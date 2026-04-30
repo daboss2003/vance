@@ -4,6 +4,8 @@
   import {
     backendVersion,
     decodeAndRenderAt,
+    isPlaying,
+    lastResumePts,
     openFile,
     setViewportBounds,
     startPlayback,
@@ -36,13 +38,123 @@
     observer.observe(viewportEl);
     window.addEventListener('resize', reportBounds);
     window.addEventListener('scroll', reportBounds, true);
+    window.addEventListener('keydown', handleKeydown);
+    // Poll the engine for playback state — covers natural EOS / errors.
+    // On a true→false transition we also fetch the engine's last resume
+    // PTS so the next Play can detect end-of-file and rewind to 0.
+    const pollId = window.setInterval(async () => {
+      try {
+        const next = await isPlaying();
+        if (playing && !next) {
+          const resume = await lastResumePts();
+          if (resume != null) lastPts = resume;
+        }
+        playing = next;
+      } catch {
+        // ignore transient errors
+      }
+    }, 250);
     reportBounds();
     return () => {
       observer.disconnect();
       window.removeEventListener('resize', reportBounds);
       window.removeEventListener('scroll', reportBounds, true);
+      window.removeEventListener('keydown', handleKeydown);
+      window.clearInterval(pollId);
     };
   });
+
+  /** PTS units per video frame: time_base_den / (frame_rate_num/den). */
+  function ptsPerFrame(): number | null {
+    if (!info) return null;
+    if (info.frame_rate_num === 0 || info.frame_rate_den === 0) return null;
+    if (info.time_base_num === 0 || info.time_base_den === 0) return null;
+    // one frame in seconds = den / num; in stream PTS = sec * (tb_den / tb_num)
+    return Math.round(
+      (info.frame_rate_den / info.frame_rate_num) *
+        (info.time_base_den / info.time_base_num)
+    );
+  }
+
+  /** PTS for one second in the stream's time base. */
+  function ptsPerSecond(): number {
+    if (!info) return 1;
+    return info.time_base_num !== 0
+      ? Math.round(info.time_base_den / info.time_base_num)
+      : 1;
+  }
+
+  /** Clamp a PTS into the valid seekable range for the open stream. */
+  function clampPts(target: number, step: number): number {
+    let t = Math.max(0, target);
+    if (info && info.duration_pts != null) {
+      const last = Math.max(0, info.duration_pts - step);
+      if (t > last) t = last;
+    }
+    return t;
+  }
+
+  async function stepFrame(direction: 1 | -1) {
+    if (!info) return;
+    if (playing) await togglePlayback();
+    const step = ptsPerFrame();
+    if (step == null) return;
+    const target = clampPts((lastPts ?? 0) + direction * step, step);
+    await render(target);
+  }
+
+  async function jumpSeconds(seconds: number) {
+    if (!info) return;
+    if (playing) {
+      try {
+        const resumePts = await stopPlayback();
+        lastPts = resumePts;
+        playing = false;
+      } catch {
+        /* ignore */
+      }
+    }
+    const step = ptsPerFrame() ?? 1;
+    const target = clampPts((lastPts ?? 0) + seconds * ptsPerSecond(), step);
+    await render(target);
+  }
+
+  function handleKeydown(e: KeyboardEvent) {
+    // Don't steal keys when the user is typing in an input.
+    const target = e.target as HTMLElement | null;
+    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
+      return;
+    }
+    switch (e.key) {
+      case ' ':
+        e.preventDefault();
+        togglePlayback();
+        return;
+      case 'k':
+      case 'K':
+        e.preventDefault();
+        if (playing) togglePlayback();
+        return;
+      case 'l':
+      case 'L':
+        e.preventDefault();
+        if (!playing) togglePlayback();
+        return;
+      case 'j':
+      case 'J':
+        e.preventDefault();
+        jumpSeconds(-1);
+        return;
+      case 'ArrowLeft':
+        e.preventDefault();
+        stepFrame(-1);
+        return;
+      case 'ArrowRight':
+        e.preventDefault();
+        stepFrame(1);
+        return;
+    }
+  }
 
   function reportBounds() {
     if (!viewportEl) return;
@@ -83,7 +195,12 @@
     try {
       lastPts = await decodeAndRenderAt(pts);
     } catch (e) {
-      renderError = String(e);
+      const msg = String(e);
+      // "no frame at or after pts X" is the decoder telling us we asked
+      // for a frame past the last decodable one. Treat as a no-op (stay
+      // on the current frame) instead of surfacing an error banner.
+      if (msg.includes('no frame at or after')) return;
+      renderError = msg;
     }
   }
 
@@ -116,14 +233,31 @@
     playError = null;
     if (playing) {
       try {
-        await stopPlayback();
+        // Engine returns the PTS at which playback was stopped so the
+        // next Play resumes from there (not from the original anchor).
+        const resumePts = await stopPlayback();
+        lastPts = resumePts;
         playing = false;
       } catch (e) {
         playError = String(e);
       }
     } else {
       try {
-        await startPlayback(lastPts ?? 0);
+        // If the playhead is on/past the last frame of the file, rewind
+        // to 0 so Play means "play the file again" (matches every NLE).
+        // The last presented frame is one step short of duration_pts, so
+        // compare against (duration_pts - step) rather than duration_pts.
+        let from = lastPts ?? 0;
+        const step = ptsPerFrame() ?? 1;
+        if (
+          info &&
+          info.duration_pts != null &&
+          from >= info.duration_pts - step
+        ) {
+          from = 0;
+          lastPts = 0;
+        }
+        await startPlayback(from);
         playing = true;
       } catch (e) {
         playError = String(e);
@@ -171,13 +305,40 @@
       <div
         class="border-vance-border bg-vance-panel flex h-12 flex-shrink-0 items-center gap-3 border-t px-4 text-xs"
       >
-        <button
-          class="rounded bg-[var(--color-vance-accent)] px-3 py-1 font-semibold text-[#003040] disabled:opacity-50"
-          onclick={togglePlayback}
-          disabled={!info}
-        >
-          {playing ? 'Stop' : 'Play'}
-        </button>
+        <div class="flex items-center gap-1">
+          <button
+            class="rounded bg-vance-bg border-vance-border border px-2 py-1 disabled:opacity-50"
+            onclick={() => jumpSeconds(-1)}
+            disabled={!info}
+            title="J: jump back 1s"
+          >
+            J
+          </button>
+          <button
+            class="rounded bg-vance-bg border-vance-border border px-2 py-1 disabled:opacity-50"
+            onclick={() => stepFrame(-1)}
+            disabled={!info}
+            title="←: step back 1 frame"
+          >
+            ‹
+          </button>
+          <button
+            class="rounded bg-[var(--color-vance-accent)] px-3 py-1 font-semibold text-[#003040] disabled:opacity-50"
+            onclick={togglePlayback}
+            disabled={!info}
+            title="Space / L: play, K: pause"
+          >
+            {playing ? 'Stop' : 'Play'}
+          </button>
+          <button
+            class="rounded bg-vance-bg border-vance-border border px-2 py-1 disabled:opacity-50"
+            onclick={() => stepFrame(1)}
+            disabled={!info}
+            title="→: step forward 1 frame"
+          >
+            ›
+          </button>
+        </div>
         <form onsubmit={handleTimecodeSeek} class="flex items-center gap-2">
           <label class="text-vance-muted">
             Seek to TC

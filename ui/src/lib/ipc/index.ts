@@ -33,6 +33,11 @@ export const decodeAndRenderAt = (targetPts: number): Promise<number> =>
 export const startPlayback = (fromPts: number): Promise<void> =>
   invoke('start_playback', { fromPts });
 
-export const stopPlayback = (): Promise<void> => invoke('stop_playback');
+/** Returns the last-presented PTS so the UI can resume from there. */
+export const stopPlayback = (): Promise<number> => invoke('stop_playback');
 
 export const isPlaying = (): Promise<boolean> => invoke('is_playing');
+
+/** PTS of the last presented frame from the most recent finished playback
+ *  session, or null if no session has finished since the last start. */
+export const lastResumePts = (): Promise<number | null> => invoke('last_resume_pts');
