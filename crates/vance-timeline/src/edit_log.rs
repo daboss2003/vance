@@ -178,6 +178,9 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
 /// between, both kept Arc-shared for cheap undo/redo swaps.
 #[derive(Clone, Debug)]
 struct Entry {
+    /// Retained for future logging / status-bar display, even though
+    /// the swap-based undo/redo doesn't need to inspect it.
+    #[allow(dead_code)]
     op: EditOp,
     before: Sequence,
     after: Sequence,
