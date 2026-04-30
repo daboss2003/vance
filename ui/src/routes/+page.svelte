@@ -105,7 +105,10 @@
 
   async function jumpSeconds(seconds: number) {
     if (!info) return;
-    if (playing) {
+    // Preserve play state across the jump: J/L while playing should jump
+    // and KEEP PLAYING from the new position, like every NLE.
+    const wasPlaying = playing;
+    if (wasPlaying) {
       try {
         const resumePts = await stopPlayback();
         lastPts = resumePts;
@@ -117,6 +120,14 @@
     const step = ptsPerFrame() ?? 1;
     const target = clampPts((lastPts ?? 0) + seconds * ptsPerSecond(), step);
     await render(target);
+    if (wasPlaying) {
+      try {
+        await startPlayback(lastPts ?? target);
+        playing = true;
+      } catch (e) {
+        playError = String(e);
+      }
+    }
   }
 
   function handleKeydown(e: KeyboardEvent) {
@@ -147,11 +158,13 @@
         return;
       case 'ArrowLeft':
         e.preventDefault();
-        stepFrame(-1);
+        if (e.shiftKey) jumpSeconds(-1);
+        else stepFrame(-1);
         return;
       case 'ArrowRight':
         e.preventDefault();
-        stepFrame(1);
+        if (e.shiftKey) jumpSeconds(1);
+        else stepFrame(1);
         return;
     }
   }
@@ -219,14 +232,34 @@
     return Math.round(seconds * (info.time_base_den / info.time_base_num));
   }
 
-  function handleTimecodeSeek(e: SubmitEvent) {
+  async function handleTimecodeSeek(e: SubmitEvent) {
     e.preventDefault();
     const pts = timecodeToPts(timecodeInput);
     if (pts == null) {
       renderError = 'invalid timecode (expected HH:MM:SS:FF)';
       return;
     }
-    render(pts);
+    // If we're playing, the engine refuses single-shot decode_at because
+    // the decoder is held by the scheduler. Stop, seek, then resume from
+    // the requested PTS so playback continues from the new position.
+    const wasPlaying = playing;
+    if (wasPlaying) {
+      try {
+        await stopPlayback();
+        playing = false;
+      } catch {
+        /* ignore */
+      }
+    }
+    await render(pts);
+    if (wasPlaying) {
+      try {
+        await startPlayback(lastPts ?? pts);
+        playing = true;
+      } catch (e) {
+        playError = String(e);
+      }
+    }
   }
 
   async function togglePlayback() {
@@ -338,6 +371,14 @@
           >
             ›
           </button>
+          <button
+            class="rounded bg-vance-bg border-vance-border border px-2 py-1 disabled:opacity-50"
+            onclick={() => jumpSeconds(1)}
+            disabled={!info}
+            title="Shift+→: jump forward 1s"
+          >
+            L
+          </button>
         </div>
         <form onsubmit={handleTimecodeSeek} class="flex items-center gap-2">
           <label class="text-vance-muted">
@@ -351,7 +392,7 @@
           <button
             type="submit"
             class="rounded bg-[var(--color-vance-accent)] px-2 py-1 text-[#003040]"
-            disabled={!info || playing}
+            disabled={!info}
           >
             Go
           </button>
