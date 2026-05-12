@@ -11,13 +11,11 @@
 
   import { onMount } from 'svelte';
   import {
-    currentSequenceContents,
     currentTimelineSeconds,
     decodeSequenceAt,
     diagLog,
     isPlaying,
     stopPlayback,
-    type SequenceContents,
     type TrackContents,
     type ClipContents
   } from '$lib/ipc';
@@ -29,7 +27,9 @@
 
   let canvas = $state<HTMLCanvasElement | null>(null);
   let wrap = $state<HTMLDivElement | null>(null);
-  let sequence = $state<SequenceContents | null>(null);
+  // The sequence lives in projectState now (single source of truth
+  // shared with the Inspector). Aliased here for readability.
+  const sequence = $derived(projectState.sequence);
 
   // Viewport: pixelsPerSecond is the zoom; scrollSeconds is how many
   // seconds are clipped off the left edge of the visible area.
@@ -66,17 +66,13 @@
   const MARQUEE_FILL = 'rgba(94, 197, 245, 0.15)';
   const MARQUEE_STROKE = '#5ec5f5';
 
-  // Subscribe to the engine's sequence — refresh whenever the parent
-  // bumps `refreshTick`. (4.4+ will switch to a proper edit-log
-  // subscription; this is enough for read-only display.)
+  // Redraw whenever the shared sequence rune updates. projectState
+  // refreshes that rune after every successful edit op (and on
+  // project load), so the canvas stays in sync without its own fetch.
   $effect(() => {
+    void projectState.sequence;
     void refreshTick;
-    currentSequenceContents()
-      .then((s) => {
-        sequence = s;
-        scheduleDraw();
-      })
-      .catch((e) => console.error('currentSequenceContents', e));
+    scheduleDraw();
   });
 
   // Redraw whenever the selection changes so external mutations

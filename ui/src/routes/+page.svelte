@@ -348,6 +348,35 @@
     return `${m}:${String(ss).padStart(2, '0')}`;
   }
 
+  /** HH:MM:SS.mmm formatting for the Inspector. */
+  function formatPrecise(seconds: number): string {
+    const s = Math.max(0, seconds);
+    const total = Math.floor(s);
+    const ms = Math.round((s - total) * 1000);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const ss = total % 60;
+    const head =
+      h > 0
+        ? `${h}:${String(m).padStart(2, '0')}:${String(ss).padStart(2, '0')}`
+        : `${m}:${String(ss).padStart(2, '0')}`;
+    return `${head}.${String(ms).padStart(3, '0')}`;
+  }
+
+  /** Find the selected clip (when exactly one is selected) in the
+   *  current sequence so the Inspector can render its details. */
+  const selectedClipDetails = $derived.by(() => {
+    const ids = selectionState.ids;
+    if (ids.length !== 1) return null;
+    const seq = projectState.sequence;
+    if (!seq) return null;
+    for (const t of seq.tracks) {
+      const c = t.clips.find((c) => c.id === ids[0]);
+      if (c) return { clip: c, track: t };
+    }
+    return null;
+  });
+
   async function render(pts: number) {
     renderError = null;
     try {
@@ -702,7 +731,37 @@
       class="border-vance-border bg-vance-panel w-72 flex-shrink-0 overflow-y-auto border-l p-4"
     >
       <h2 class="text-vance-muted mb-3 text-xs uppercase tracking-wider">Inspector</h2>
-      {#if info}
+
+      {#if selectedClipDetails}
+        {@const c = selectedClipDetails.clip}
+        {@const t = selectedClipDetails.track}
+        <div class="mb-3">
+          <div class="text-xs uppercase tracking-wider text-vance-muted">Clip</div>
+          <div class="mt-1 break-all text-sm font-medium">{c.name}</div>
+        </div>
+        <dl class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 font-mono text-xs">
+          <dt class="text-vance-muted">track</dt>
+          <dd>{t.name} ({t.kind})</dd>
+          <dt class="text-vance-muted">tl in</dt>
+          <dd>{formatPrecise(c.timeline_in_seconds)}</dd>
+          <dt class="text-vance-muted">tl out</dt>
+          <dd>{formatPrecise(c.timeline_in_seconds + c.duration_seconds)}</dd>
+          <dt class="text-vance-muted">duration</dt>
+          <dd>{formatPrecise(c.duration_seconds)}</dd>
+          <dt class="text-vance-muted">src in</dt>
+          <dd>{formatPrecise(c.source_in_seconds)}</dd>
+          <dt class="text-vance-muted">src out</dt>
+          <dd>{formatPrecise(c.source_in_seconds + c.duration_seconds)}</dd>
+          <dt class="text-vance-muted">enabled</dt>
+          <dd>{c.enabled ? 'yes' : 'muted'}</dd>
+        </dl>
+      {:else if selectionState.count > 1}
+        <p class="text-vance-muted text-xs">
+          {selectionState.count} clips selected. Single-selection details
+          show here.
+        </p>
+      {:else if info}
+        <div class="mb-2 text-xs uppercase tracking-wider text-vance-muted">File</div>
         <dl class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 font-mono text-xs">
           <dt class="text-vance-muted">codec</dt>
           <dd>{info.codec_name}</dd>
@@ -720,8 +779,11 @@
           {/if}
         </dl>
       {:else}
-        <p class="text-vance-muted text-xs">No file open.</p>
+        <p class="text-vance-muted text-xs">
+          Select a clip on the timeline to inspect its properties.
+        </p>
       {/if}
+
       {#if openError}
         <p class="mt-3 rounded border border-red-700 bg-red-950 p-2 text-xs text-red-200">
           {openError}
