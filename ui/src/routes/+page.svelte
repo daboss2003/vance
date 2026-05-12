@@ -4,6 +4,7 @@
   import {
     backendVersion,
     decodeAndRenderAt,
+    diagLog,
     isPlaying,
     lastResumePts,
     openFile,
@@ -13,6 +14,7 @@
     type StreamInfo
   } from '$lib/ipc';
   import { projectState } from '$lib/project.svelte';
+  import { dragState } from '$lib/drag.svelte';
   import Timeline from '$lib/timeline/Timeline.svelte';
 
   let backend = $state<string>('checking…');
@@ -27,8 +29,8 @@
   let viewportEl: HTMLDivElement | null = $state(null);
 
   // Bumped whenever something in the project changes that the Timeline
-  // canvas should re-render in response to. Cheap counter; the Timeline
-  // re-fetches its sequence data on each tick.
+  // canvas should re-render in response to. We track both the project
+  // info (sequence/project changes) and the edit tick (clip inserts).
   //
   // NOTE: the `++` would read+write the same rune inside the effect,
   // which Svelte 5 trips as `effect_update_depth_exceeded`. We wrap
@@ -36,6 +38,7 @@
   let timelineRefreshTick = $state<number>(0);
   $effect(() => {
     void projectState.info;
+    void projectState.editTick;
     untrack(() => {
       timelineRefreshTick = timelineRefreshTick + 1;
     });
@@ -78,11 +81,28 @@
       reportBounds();
     }, 250);
     reportBounds();
+
+    // Manual drag tracking: move the ghost with the cursor and clear
+    // the drag if mouseup happens anywhere outside a drop zone. The
+    // clear is deferred to a microtask so each drop zone's mouseup
+    // handler runs first and can claim the drop before we wipe state.
+    const onMouseMoveDrag = (e: MouseEvent) => dragState.move(e.clientX, e.clientY);
+    const onMouseUpDrag = () => {
+      if (!dragState.mediaId) return;
+      queueMicrotask(() => {
+        if (dragState.mediaId) dragState.end();
+      });
+    };
+    window.addEventListener('mousemove', onMouseMoveDrag);
+    window.addEventListener('mouseup', onMouseUpDrag);
+
     return () => {
       observer.disconnect();
       window.removeEventListener('resize', reportBounds);
       window.removeEventListener('scroll', reportBounds, true);
       window.removeEventListener('keydown', handleKeydown);
+      window.removeEventListener('mousemove', onMouseMoveDrag);
+      window.removeEventListener('mouseup', onMouseUpDrag);
       window.clearInterval(pollId);
     };
   });
@@ -276,6 +296,32 @@
     await projectState.save(bundle);
   }
 
+  async function handleImportMedia() {
+    if (!projectState.info) return;
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      filters: [
+        {
+          name: 'Video',
+          extensions: ['mp4', 'mov', 'mkv', 'm4v', 'webm', 'avi']
+        },
+        { name: 'All files', extensions: ['*'] }
+      ]
+    });
+    if (typeof selected !== 'string') return;
+    await projectState.importMedia(selected);
+  }
+
+  function formatDuration(seconds: number): string {
+    const s = Math.max(0, Math.floor(seconds));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const ss = s % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
+    return `${m}:${String(ss).padStart(2, '0')}`;
+  }
+
   async function render(pts: number) {
     renderError = null;
     try {
@@ -457,6 +503,45 @@
             </ul>
           {/if}
         </div>
+
+        <div class="mb-3 flex items-center justify-between">
+          <h3 class="text-vance-muted text-[11px] uppercase">Media</h3>
+          <button
+            class="rounded bg-vance-bg border-vance-border border px-2 py-0.5 text-[10px] hover:brightness-125"
+            onclick={handleImportMedia}
+          >
+            + Import
+          </button>
+        </div>
+        {#if projectState.media.length === 0}
+          <p class="text-vance-muted text-xs italic">
+            Click + Import to add a video. Drag it onto the timeline below.
+          </p>
+        {:else}
+          <ul class="flex flex-col gap-1 text-xs">
+            {#each projectState.media as m (m.id)}
+              <li>
+                <div
+                  class="cursor-grab rounded border border-vance-border bg-vance-bg px-2 py-1 active:cursor-grabbing hover:brightness-125"
+                  role="button"
+                  tabindex="0"
+                  onmousedown={(e) => {
+                    if (e.button !== 0) return;
+                    e.preventDefault();
+                    dragState.begin(m.id, m.name, e.clientX, e.clientY);
+                    diagLog(`browser: mousedown media=${m.id}`);
+                  }}
+                  title="Drag onto the timeline"
+                >
+                  <div class="font-medium truncate">{m.name}</div>
+                  <div class="text-[10px] text-vance-muted">
+                    {m.kind} · {formatDuration(m.duration_seconds)}
+                  </div>
+                </div>
+              </li>
+            {/each}
+          </ul>
+        {/if}
       {:else}
         <p class="text-vance-muted text-xs">
           Create or open a project from the toolbar.
@@ -603,3 +688,13 @@
     <span>backend: <span class="font-mono">{backend}</span></span>
   </footer>
 </div>
+
+{#if dragState.mediaId}
+  <div
+    class="pointer-events-none fixed z-50 rounded border border-[var(--color-vance-accent)] bg-[#003040] px-2 py-1 text-xs font-medium text-[var(--color-vance-accent)] shadow-lg"
+    style:left="{dragState.cursorX + 8}px"
+    style:top="{dragState.cursorY + 8}px"
+  >
+    {dragState.mediaName}
+  </div>
+{/if}

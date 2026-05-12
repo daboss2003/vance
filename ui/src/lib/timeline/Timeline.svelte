@@ -12,10 +12,13 @@
   import { onMount } from 'svelte';
   import {
     currentSequenceContents,
+    diagLog,
     type SequenceContents,
     type TrackContents,
     type ClipContents
   } from '$lib/ipc';
+  import { projectState } from '$lib/project.svelte';
+  import { dragState } from '$lib/drag.svelte';
 
   let { refreshTick = 0 }: { refreshTick?: number } = $props();
 
@@ -357,6 +360,53 @@
     dragStart = null;
   }
 
+  // ---- Media drag-drop from Browser --------------------------------------
+
+  /** Map a (canvas-local) cursor position to (timeline_seconds, trackIdx). */
+  function dropTargetAt(localX: number, localY: number): { t: number; trackIdx: number } | null {
+    if (!sequence) return null;
+    if (localX < TRACK_HEADER_W) return null;
+    const t = scrollSeconds + (localX - TRACK_HEADER_W) / pixelsPerSecond;
+    if (localY < RULER_HEIGHT) return null;
+    const trackIdx = Math.floor((localY - RULER_HEIGHT) / TRACK_HEIGHT);
+    if (trackIdx < 0 || trackIdx >= sequence.tracks.length) return null;
+    return { t: Math.max(0, t), trackIdx };
+  }
+
+  /** Global mouseup handler: if we're currently drag-carrying a
+   *  media id and the release lands inside this canvas, insert the
+   *  clip and clear the drag state. */
+  async function onWindowMouseUp(e: MouseEvent) {
+    const mediaId = dragState.mediaId;
+    if (!mediaId) return;
+    if (!canvas || !sequence) return;
+    const rect = canvas.getBoundingClientRect();
+    if (
+      e.clientX < rect.left ||
+      e.clientX > rect.right ||
+      e.clientY < rect.top ||
+      e.clientY > rect.bottom
+    ) {
+      return;
+    }
+    // We claim this drop — clear dragState before any await so the
+    // global mouseup handler in the parent doesn't double-clear.
+    dragState.end();
+    const localX = e.clientX - rect.left;
+    const localY = e.clientY - rect.top;
+    const target = dropTargetAt(localX, localY);
+    await diagLog(
+      `timeline: drop at localX=${localX.toFixed(0)} localY=${localY.toFixed(0)} target=${
+        target ? `t=${target.t.toFixed(2)} trackIdx=${target.trackIdx}` : 'null'
+      }`
+    );
+    if (!target) return;
+    const track = sequence.tracks[target.trackIdx];
+    await diagLog(`timeline: inserting on track ${track.id} (${track.name})`);
+    await projectState.insertClip(track.id, mediaId, target.t);
+    await diagLog('timeline: insertClip returned');
+  }
+
   // ---- Mount --------------------------------------------------------------
 
   onMount(() => {
@@ -366,10 +416,15 @@
     resizeCanvas();
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('mouseup', onMouseUp);
+    // Drag-from-Browser-to-canvas uses our own mouse-based drag (Tauri
+    // disables HTML5 native drag-and-drop). On mouseup we check
+    // dragState and consume it if the cursor is inside our canvas.
+    window.addEventListener('mouseup', onWindowMouseUp);
     return () => {
       ro.disconnect();
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseup', onMouseUp);
+      window.removeEventListener('mouseup', onWindowMouseUp);
     };
   });
 </script>

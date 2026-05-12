@@ -11,7 +11,7 @@
 
 mod engine;
 
-use engine::{EngineHandle, ProjectInfo, SequenceContents};
+use engine::{EngineHandle, MediaItemInfo, ProjectInfo, SequenceContents};
 use serde::Serialize;
 use tauri::Manager;
 use vance_decoder::StreamInfo;
@@ -155,6 +155,45 @@ fn diag_log(message: String) {
 }
 
 #[tauri::command]
+fn import_media_file(
+    state: tauri::State<'_, EngineHandle>,
+    path: String,
+) -> Result<MediaItemInfo, String> {
+    state
+        .lock()
+        .import_media_file(&path)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn media_list(state: tauri::State<'_, EngineHandle>) -> Vec<MediaItemInfo> {
+    state.lock().media_list()
+}
+
+#[tauri::command]
+fn insert_clip_at(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    media_id: String,
+    timeline_seconds: f64,
+) -> Result<String, String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let media_uuid = media_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid media id: {e}"))?;
+    state
+        .lock()
+        .insert_clip_at(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            vance_timeline::MediaItemId::from_uuid(media_uuid),
+            timeline_seconds,
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn project_info(state: tauri::State<'_, EngineHandle>) -> Option<ProjectInfo> {
     state.lock().project_info()
 }
@@ -229,6 +268,9 @@ fn main() {
             current_project_path,
             current_sequence_contents,
             diag_log,
+            import_media_file,
+            media_list,
+            insert_clip_at,
         ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");

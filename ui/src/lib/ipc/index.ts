@@ -120,3 +120,32 @@ export const currentSequenceContents = (): Promise<SequenceContents | null> =>
 /** Send a debug line into the engine's tracing log. */
 export const diagLog = (message: string): Promise<void> =>
   invoke('diag_log', { message });
+
+// ---- Media library + edit ops --------------------------------------------
+
+export type MediaItemInfo = {
+  id: string;
+  name: string;
+  path: string;
+  kind: 'video' | 'audio' | 'image';
+  duration_seconds: number;
+  frame_rate_num: number | null;
+  frame_rate_den: number | null;
+};
+
+/** Pull metadata from a media file via the decoder and register it
+ *  in the current project's media library. */
+export const importMediaFile = (path: string): Promise<MediaItemInfo> =>
+  invoke('import_media_file', { path });
+
+/** All media items in the current project's library. */
+export const mediaList = (): Promise<MediaItemInfo[]> => invoke('media_list');
+
+/** Drop a clip referencing `mediaId` (full visible range) onto
+ *  `trackId` at `timelineSeconds`. Returns the new clip's UUID. */
+export const insertClipAt = (
+  trackId: string,
+  mediaId: string,
+  timelineSeconds: number
+): Promise<string> =>
+  invoke('insert_clip_at', { trackId, mediaId, timelineSeconds });

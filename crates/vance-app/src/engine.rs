@@ -16,7 +16,10 @@ use std::time::{Duration, Instant};
 use vance_audio::AudioPlayer;
 use vance_decoder::{DecoderClient, StreamInfo};
 use vance_render::{Renderer, RendererConfig};
-use vance_timeline::{Project, SequenceId};
+use vance_timeline::{
+    Clip, MediaItem, MediaItemId, MediaKind, Project, Sequence, SequenceId, Track, TrackId,
+    TrackKind,
+};
 use vance_viewport::{HostWindowHandle, Viewport, ViewportBounds};
 
 /// Errors surfaced through Tauri command handlers as plain strings.
@@ -66,6 +69,20 @@ pub enum EngineError {
     /// `set_current_sequence` was given an ID that's not in the project.
     #[error("sequence not found in current project")]
     SequenceNotFound,
+
+    /// A clip-edit command was issued before any sequence was active.
+    #[error("no current sequence selected")]
+    NoCurrentSequence,
+
+    /// `insert_clip_at` referenced a `MediaItemId` not in the library.
+    #[error("media item not found in project library")]
+    MediaNotFound,
+}
+
+impl EngineError {
+    fn from_core(e: vance_core::Error) -> Self {
+        EngineError::Project(e.to_string())
+    }
 }
 
 /// Lightweight summary of the loaded project for the UI. Kept small so
@@ -156,6 +173,68 @@ fn rt_to_seconds(t: vance_core::RationalTime) -> f64 {
         0.0
     } else {
         n / d
+    }
+}
+
+/// Inverse of `rt_to_seconds`. Round to milliseconds — gives plenty
+/// of precision for clip placement and keeps the on-disk RON
+/// human-readable.
+fn seconds_to_rt(s: f64) -> vance_core::RationalTime {
+    let ms = (s * 1000.0).round() as i64;
+    vance_core::RationalTime::new(ms.max(0), 1000)
+        .unwrap_or(vance_core::RationalTime::ZERO)
+}
+
+/// Convert a decoder `StreamInfo` duration into a `RationalTime`.
+/// Returns `None` when the container didn't declare a duration.
+fn duration_from_stream(s: &StreamInfo) -> Option<vance_core::RationalTime> {
+    let dur_pts = s.duration_pts?;
+    let (tb_n, tb_d) = s.time_base;
+    if tb_d == 0 {
+        return None;
+    }
+    // duration_seconds = dur_pts * tb_n / tb_d. We carry that through
+    // RationalTime by multiplying the numerator.
+    vance_core::RationalTime::new(dur_pts.saturating_mul(tb_n), tb_d).ok()
+}
+
+/// Lightweight DTO of a `MediaItem` for the Browser panel.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct MediaItemInfo {
+    /// Stable UUID as a string.
+    pub id: String,
+    /// Display name (defaults to the file stem on import).
+    pub name: String,
+    /// Absolute path on disk.
+    pub path: String,
+    /// "video", "audio", or "image".
+    pub kind: String,
+    /// Total duration in seconds.
+    pub duration_seconds: f64,
+    /// Source frame rate as `(num, den)`, or null when unknown.
+    pub frame_rate_num: Option<i64>,
+    pub frame_rate_den: Option<i64>,
+}
+
+impl From<&MediaItem> for MediaItemInfo {
+    fn from(m: &MediaItem) -> Self {
+        let (fr_n, fr_d) = match m.frame_rate {
+            Some(fr) => (Some(fr.0.numer()), Some(fr.0.denom())),
+            None => (None, None),
+        };
+        Self {
+            id: m.id.to_string(),
+            name: m.display_name.clone(),
+            path: m.path.to_string_lossy().into_owned(),
+            kind: match m.kind {
+                MediaKind::Video => "video".into(),
+                MediaKind::Audio => "audio".into(),
+                MediaKind::Image => "image".into(),
+            },
+            duration_seconds: rt_to_seconds(m.duration),
+            frame_rate_num: fr_n,
+            frame_rate_den: fr_d,
+        }
     }
 }
 
@@ -525,16 +604,167 @@ impl Engine {
     /// Replace the current project with a fresh empty one. The save
     /// path is cleared — `save_project(None)` will fail until the
     /// caller passes an explicit path.
+    ///
+    /// To give the user something to drag onto right away, we seed the
+    /// project with one "Sequence 01" (24fps) containing a V1 video
+    /// and A1 audio track. The user can rename / re-rate later.
     pub fn new_project(&mut self, name: String) -> Result<ProjectInfo, EngineError> {
         if self.playback.is_some() {
             return Err(EngineError::PlaybackInProgress);
         }
-        let project = Project::new(name);
-        let info = ProjectInfo::from(&project);
-        self.current_sequence_id = None;
+        let mut project = Project::new(name);
+        let mut seq = Sequence::new("Sequence 01", vance_core::FrameRate::FPS_24);
+        seq.tracks.push(Arc::new(Track::new(TrackKind::Video, "V1")));
+        seq.tracks.push(Arc::new(Track::new(TrackKind::Audio, "A1")));
+        let seq_id = seq.id;
+        project.sequences.push(Arc::new(seq));
+        let mut info = ProjectInfo::from(&project);
+        info.current_sequence_id = Some(seq_id.to_string());
+        self.current_sequence_id = Some(seq_id);
         self.current_project_path = None;
         self.current_project = Some(project);
         Ok(info)
+    }
+
+    /// Import a media file by path. Briefly opens it via the decoder
+    /// sidecar to capture its metadata (codec, duration, frame rate,
+    /// pixel format), then registers it as a `MediaItem` in the
+    /// current project's media library.
+    pub fn import_media_file(&mut self, path: &str) -> Result<MediaItemInfo, EngineError> {
+        if self.playback.is_some() {
+            return Err(EngineError::PlaybackInProgress);
+        }
+        if self.current_project.is_none() {
+            return Err(EngineError::NoProject);
+        }
+
+        // Spawn the decoder sidecar if needed; we share the same one
+        // single-file playback uses. Calling `open` returns the
+        // stream's StreamInfo (codec, dims, time_base, duration_pts).
+        if self.decoder.is_none() {
+            let bin = locate_decoder_binary()?;
+            let client = DecoderClient::spawn(&bin)
+                .map_err(|e| EngineError::DecoderSpawn(format!("{e}")))?;
+            self.decoder = Some(client);
+        }
+        let dec = self.decoder.as_mut().unwrap();
+        let stream = dec.open(path.to_string())?;
+
+        // Convert the decoder's duration_pts (in its time base) to
+        // seconds. duration_pts can be None if the container didn't
+        // declare one; in that case we pessimistically pick 60 s so
+        // there's something draggable. Real fix in a later milestone.
+        let duration = duration_from_stream(&stream).unwrap_or_else(|| {
+            vance_core::RationalTime::new(60, 1).expect("60s rational")
+        });
+
+        // Frame rate as a RationalTime is the inverse; we keep the raw
+        // FrameRate on MediaItem since rate is meaningful per kind.
+        let frame_rate = if stream.frame_rate.1 != 0 {
+            Some(vance_core::FrameRate(
+                vance_core::Rational::new(stream.frame_rate.0, stream.frame_rate.1)
+                    .map_err(EngineError::from_core)?,
+            ))
+        } else {
+            None
+        };
+
+        // Display name from the path's file stem.
+        let display_name = std::path::Path::new(path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(path)
+            .to_string();
+
+        let mut item = MediaItem::new(
+            std::path::PathBuf::from(path),
+            display_name,
+            MediaKind::Video, // audio-only / image imports handled later
+            duration,
+        );
+        if let Some(fr) = frame_rate {
+            item = item.with_frame_rate(fr);
+        }
+        let id = item.id;
+        let info = MediaItemInfo::from(&item);
+
+        // Add to project. Project::media is BTreeMap<MediaItemId, Arc<MediaItem>>.
+        let project = self.current_project.as_mut().unwrap();
+        project.media.insert(id, Arc::new(item));
+
+        tracing::info!(
+            id = %id,
+            path = %path,
+            duration = ?duration,
+            "imported media"
+        );
+        Ok(info)
+    }
+
+    /// All media items registered in the current project, for the
+    /// Browser panel. Empty when no project is loaded.
+    pub fn media_list(&self) -> Vec<MediaItemInfo> {
+        self.current_project
+            .as_ref()
+            .map(|p| {
+                p.media
+                    .values()
+                    .map(|arc| MediaItemInfo::from(arc.as_ref()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Insert a clip referencing `media_id`'s full visible range at
+    /// `timeline_seconds` on `track_id`. Returns the new clip's ID
+    /// for the UI's selection model in 4.4.
+    pub fn insert_clip_at(
+        &mut self,
+        track_id: TrackId,
+        media_id: MediaItemId,
+        timeline_seconds: f64,
+    ) -> Result<String, EngineError> {
+        if self.playback.is_some() {
+            return Err(EngineError::PlaybackInProgress);
+        }
+        let project = self
+            .current_project
+            .as_mut()
+            .ok_or(EngineError::NoProject)?;
+        let seq_id = self
+            .current_sequence_id
+            .ok_or(EngineError::NoCurrentSequence)?;
+
+        let media = project
+            .media
+            .get(&media_id)
+            .ok_or(EngineError::MediaNotFound)?
+            .clone();
+
+        let timeline_in = seconds_to_rt(timeline_seconds);
+        let clip = Clip::new(
+            media.id,
+            media.display_name.clone(),
+            timeline_in,
+            vance_core::RationalTime::ZERO,
+            media.duration,
+        )
+        .map_err(|e| EngineError::Project(e.to_string()))?;
+        let new_clip_id = clip.id;
+
+        // Apply the insert via ops::insert_clip on the current sequence.
+        let seq = project
+            .sequence(seq_id)
+            .ok_or(EngineError::SequenceNotFound)?
+            .clone();
+        let new_seq = vance_timeline::ops::insert_clip(seq.as_ref(), track_id, clip)
+            .map_err(|e| EngineError::Project(e.to_string()))?;
+
+        // Replace the sequence in the project's Vec<Arc<Sequence>>.
+        if let Some(slot) = project.sequences.iter_mut().find(|s| s.id == seq_id) {
+            *slot = Arc::new(new_seq);
+        }
+        Ok(new_clip_id.to_string())
     }
 
     /// Save the current project. If `path` is provided it overrides the

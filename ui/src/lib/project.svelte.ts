@@ -6,11 +6,15 @@
 
 import {
   currentProjectPath,
+  importMediaFile,
+  insertClipAt,
   loadProject,
+  mediaList,
   newProject as ipcNew,
   projectInfo,
   saveProject as ipcSave,
   setCurrentSequence as ipcSetSeq,
+  type MediaItemInfo,
   type ProjectInfo
 } from './ipc';
 
@@ -21,6 +25,11 @@ class ProjectState {
   path = $state<string | null>(null);
   /** Last error string from a project IPC call; `null` when clean. */
   error = $state<string | null>(null);
+  /** Media items in the project's library, for the Browser panel. */
+  media = $state<MediaItemInfo[]>([]);
+  /** Counter bumped after every edit (clip insert, etc.) so the
+   *  Timeline canvas can refresh its sequence contents. */
+  editTick = $state<number>(0);
 
   /** Replace the current project with a freshly created empty one. */
   async newProject(name: string) {
@@ -28,6 +37,8 @@ class ProjectState {
     try {
       this.info = await ipcNew(name);
       this.path = null;
+      this.media = [];
+      this.editTick++;
     } catch (e) {
       this.error = String(e);
     }
@@ -39,6 +50,8 @@ class ProjectState {
     try {
       this.info = await loadProject(path);
       this.path = path;
+      this.media = await mediaList();
+      this.editTick++;
     } catch (e) {
       this.error = String(e);
     }
@@ -75,6 +88,30 @@ class ProjectState {
   async refresh() {
     this.info = await projectInfo();
     this.path = await currentProjectPath();
+    this.media = await mediaList();
+  }
+
+  /** Import a media file by path and append it to the library. */
+  async importMedia(path: string) {
+    this.error = null;
+    try {
+      const item = await importMediaFile(path);
+      this.media = [...this.media, item];
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Drop a clip on the timeline. After a successful insert, bump
+   *  `editTick` so the Timeline canvas re-fetches its contents. */
+  async insertClip(trackId: string, mediaId: string, timelineSeconds: number) {
+    this.error = null;
+    try {
+      await insertClipAt(trackId, mediaId, timelineSeconds);
+      this.editTick++;
+    } catch (e) {
+      this.error = String(e);
+    }
   }
 }
 
