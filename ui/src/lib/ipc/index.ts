@@ -193,3 +193,10 @@ export const decodeSequenceAt = (timelineSeconds: number): Promise<number> =>
  *  sequence playback has started since the last project load. */
 export const currentTimelineSeconds = (): Promise<number | null> =>
   invoke('current_timeline_seconds');
+
+// ---- Undo / redo ----------------------------------------------------------
+
+export const undo = (): Promise<boolean> => invoke('undo');
+export const redo = (): Promise<boolean> => invoke('redo');
+export const canUndo = (): Promise<boolean> => invoke('can_undo');
+export const canRedo = (): Promise<boolean> => invoke('can_redo');

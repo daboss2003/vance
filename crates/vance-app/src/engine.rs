@@ -16,9 +16,10 @@ use std::time::{Duration, Instant};
 use vance_audio::AudioPlayer;
 use vance_decoder::{DecoderClient, StreamInfo};
 use vance_render::{Renderer, RendererConfig};
+use std::collections::HashMap;
 use vance_timeline::{
-    Clip, MediaItem, MediaItemId, MediaKind, Project, Sequence, SequenceId, Track, TrackId,
-    TrackKind,
+    Clip, EditLog, EditOp, MediaItem, MediaItemId, MediaKind, Project, Sequence, SequenceId,
+    Track, TrackId, TrackKind,
 };
 use vance_viewport::{HostWindowHandle, Viewport, ViewportBounds};
 
@@ -388,6 +389,12 @@ pub struct Engine {
     /// canvas playhead. Cleared when no sequence playback is in
     /// flight (single-file `start_playback` doesn't set it).
     playing_clip_anchor: Option<ClipAnchor>,
+
+    /// Per-sequence undo/redo history. Populated when a sequence
+    /// becomes the current one (via new_project, load_project, or
+    /// set_current_sequence). Each successful edit (insert/move/trim)
+    /// applies through this log so it can be undone.
+    edit_logs: HashMap<SequenceId, EditLog>,
 }
 
 /// Anchors a stream-time-base playback position back to a sequence
@@ -677,6 +684,13 @@ impl Engine {
         let mut info = ProjectInfo::from(&project);
         self.current_sequence_id = project.sequences.first().map(|s| s.id);
         info.current_sequence_id = self.current_sequence_id.map(|id| id.to_string());
+        // Fresh edit-log per loaded sequence, seeded with that
+        // sequence's current state as the undo baseline.
+        self.edit_logs.clear();
+        for s in &project.sequences {
+            self.edit_logs
+                .insert(s.id, EditLog::new(s.as_ref().clone()));
+        }
         self.current_project_path = Some(PathBuf::from(path));
         self.current_project = Some(project);
         Ok(info)
@@ -698,11 +712,14 @@ impl Engine {
         seq.tracks.push(Arc::new(Track::new(TrackKind::Video, "V1")));
         seq.tracks.push(Arc::new(Track::new(TrackKind::Audio, "A1")));
         let seq_id = seq.id;
+        let seq_for_log = seq.clone();
         project.sequences.push(Arc::new(seq));
         let mut info = ProjectInfo::from(&project);
         info.current_sequence_id = Some(seq_id.to_string());
         self.current_sequence_id = Some(seq_id);
         self.current_project_path = None;
+        self.edit_logs.clear();
+        self.edit_logs.insert(seq_id, EditLog::new(seq_for_log));
         self.current_project = Some(project);
         Ok(info)
     }
@@ -971,7 +988,7 @@ impl Engine {
     /// Trim a clip's in-point. `new_source_in_seconds` is the new
     /// visible start inside the source media; the clip's `timeline_in`
     /// shifts by the same delta so the right-hand content keeps its
-    /// timeline position.
+    /// timeline position. Recorded in the edit log.
     pub fn trim_clip_in(
         &mut self,
         track_id: TrackId,
@@ -981,24 +998,11 @@ impl Engine {
         if self.playback.is_some() {
             return Err(EngineError::PlaybackInProgress);
         }
-        let project = self
-            .current_project
-            .as_mut()
-            .ok_or(EngineError::NoProject)?;
-        let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
-        let seq = project
-            .sequence(seq_id)
-            .ok_or(EngineError::SequenceNotFound)?
-            .clone();
-
-        let new_source_in = seconds_to_rt(new_source_in_seconds.max(0.0));
-        let new_seq = vance_timeline::ops::trim_in(&seq, track_id, clip_id, new_source_in)
-            .map_err(|e| EngineError::Project(e.to_string()))?;
-
-        if let Some(slot) = project.sequences.iter_mut().find(|s| s.id == seq_id) {
-            *slot = Arc::new(new_seq);
-        }
-        Ok(())
+        self.apply_edit_op(EditOp::TrimIn {
+            track_id,
+            clip_id,
+            new_source_in: seconds_to_rt(new_source_in_seconds.max(0.0)),
+        })
     }
 
     /// Trim a clip's out-point. `new_source_out_seconds` is the new
@@ -1013,29 +1017,17 @@ impl Engine {
         if self.playback.is_some() {
             return Err(EngineError::PlaybackInProgress);
         }
-        let project = self
-            .current_project
-            .as_mut()
-            .ok_or(EngineError::NoProject)?;
-        let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
-        let seq = project
-            .sequence(seq_id)
-            .ok_or(EngineError::SequenceNotFound)?
-            .clone();
-
-        let new_source_out = seconds_to_rt(new_source_out_seconds.max(0.0));
-        let new_seq = vance_timeline::ops::trim_out(&seq, track_id, clip_id, new_source_out)
-            .map_err(|e| EngineError::Project(e.to_string()))?;
-
-        if let Some(slot) = project.sequences.iter_mut().find(|s| s.id == seq_id) {
-            *slot = Arc::new(new_seq);
-        }
-        Ok(())
+        self.apply_edit_op(EditOp::TrimOut {
+            track_id,
+            clip_id,
+            new_source_out: seconds_to_rt(new_source_out_seconds.max(0.0)),
+        })
     }
 
     /// Move a clip to `new_timeline_seconds` on the same track via
     /// `ops::slide`. Rejects if the new position would overlap a
-    /// neighboring clip on the track.
+    /// neighboring clip on the track. Recorded in the edit log so
+    /// undo restores the prior position.
     pub fn move_clip_to(
         &mut self,
         track_id: TrackId,
@@ -1045,37 +1037,22 @@ impl Engine {
         if self.playback.is_some() {
             return Err(EngineError::PlaybackInProgress);
         }
-        let project = self
-            .current_project
-            .as_mut()
-            .ok_or(EngineError::NoProject)?;
-        let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
-        let seq = project
-            .sequence(seq_id)
-            .ok_or(EngineError::SequenceNotFound)?
-            .clone();
-
-        // Locate current timeline_in to compute the delta.
-        let current_in = seq
+        // Compute delta from the clip's current timeline_in.
+        let current_in = self
+            .current_sequence_ref()?
             .tracks
             .iter()
             .find(|t| t.id == track_id)
             .and_then(|t| t.clips.iter().find(|c| c.id == clip_id))
             .map(|c| c.timeline_in)
             .ok_or_else(|| EngineError::Project("clip not found on track".into()))?;
-
         let new_in = seconds_to_rt(new_timeline_seconds.max(0.0));
         let delta = vance_core::RationalTime(new_in.0 - current_in.0);
-
-        // Slide on the same track — rejects negative final position and
-        // overlap with neighbors.
-        let new_seq = vance_timeline::ops::slide(&seq, track_id, clip_id, delta)
-            .map_err(|e| EngineError::Project(e.to_string()))?;
-
-        if let Some(slot) = project.sequences.iter_mut().find(|s| s.id == seq_id) {
-            *slot = Arc::new(new_seq);
-        }
-        Ok(())
+        self.apply_edit_op(EditOp::Slide {
+            track_id,
+            clip_id,
+            delta,
+        })
     }
 
     /// Insert a clip referencing `media_id`'s full visible range at
@@ -1115,19 +1092,117 @@ impl Engine {
         .map_err(|e| EngineError::Project(e.to_string()))?;
         let new_clip_id = clip.id;
 
-        // Apply the insert via ops::insert_clip on the current sequence.
-        let seq = project
-            .sequence(seq_id)
-            .ok_or(EngineError::SequenceNotFound)?
-            .clone();
-        let new_seq = vance_timeline::ops::insert_clip(seq.as_ref(), track_id, clip)
-            .map_err(|e| EngineError::Project(e.to_string()))?;
+        // Sanity: track must exist on the current sequence.
+        let _ = seq_id;
+        let _ = project;
 
-        // Replace the sequence in the project's Vec<Arc<Sequence>>.
+        // Apply through the edit log so it's undoable.
+        self.apply_edit_op(EditOp::InsertClip {
+            track_id,
+            clip,
+        })?;
+        Ok(new_clip_id.to_string())
+    }
+
+    // ---- Edit-log plumbing --------------------------------------------------
+
+    /// Borrow the current sequence from the project. Errors when no
+    /// project is loaded or the current_sequence_id is stale.
+    fn current_sequence_ref(&self) -> Result<&Sequence, EngineError> {
+        let project = self
+            .current_project
+            .as_ref()
+            .ok_or(EngineError::NoProject)?;
+        let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+        project
+            .sequence(seq_id)
+            .map(|arc| arc.as_ref())
+            .ok_or(EngineError::SequenceNotFound)
+    }
+
+    /// Apply `op` to the current sequence's edit log, then mirror the
+    /// log's new `current()` Sequence back into `project.sequences`
+    /// so reads (rendering, save, scene_plan) see the latest state.
+    fn apply_edit_op(&mut self, op: EditOp) -> Result<(), EngineError> {
+        let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+        let log = self
+            .edit_logs
+            .get_mut(&seq_id)
+            .ok_or(EngineError::NoCurrentSequence)?;
+        log.apply(op).map_err(|e| EngineError::Project(e.to_string()))?;
+        let new_seq = log.current().clone();
+        let project = self
+            .current_project
+            .as_mut()
+            .ok_or(EngineError::NoProject)?;
         if let Some(slot) = project.sequences.iter_mut().find(|s| s.id == seq_id) {
             *slot = Arc::new(new_seq);
         }
-        Ok(new_clip_id.to_string())
+        Ok(())
+    }
+
+    /// Undo the most recent edit on the current sequence. Returns
+    /// `false` if there's nothing to undo.
+    pub fn undo(&mut self) -> Result<bool, EngineError> {
+        if self.playback.is_some() {
+            return Err(EngineError::PlaybackInProgress);
+        }
+        let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+        let log = self
+            .edit_logs
+            .get_mut(&seq_id)
+            .ok_or(EngineError::NoCurrentSequence)?;
+        if log.undo().is_none() {
+            return Ok(false);
+        }
+        let new_seq = log.current().clone();
+        let project = self
+            .current_project
+            .as_mut()
+            .ok_or(EngineError::NoProject)?;
+        if let Some(slot) = project.sequences.iter_mut().find(|s| s.id == seq_id) {
+            *slot = Arc::new(new_seq);
+        }
+        Ok(true)
+    }
+
+    /// Redo the next edit on the current sequence. Returns `false`
+    /// if there's nothing to redo.
+    pub fn redo(&mut self) -> Result<bool, EngineError> {
+        if self.playback.is_some() {
+            return Err(EngineError::PlaybackInProgress);
+        }
+        let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+        let log = self
+            .edit_logs
+            .get_mut(&seq_id)
+            .ok_or(EngineError::NoCurrentSequence)?;
+        if log.redo().is_none() {
+            return Ok(false);
+        }
+        let new_seq = log.current().clone();
+        let project = self
+            .current_project
+            .as_mut()
+            .ok_or(EngineError::NoProject)?;
+        if let Some(slot) = project.sequences.iter_mut().find(|s| s.id == seq_id) {
+            *slot = Arc::new(new_seq);
+        }
+        Ok(true)
+    }
+
+    /// True when there's anything to undo on the current sequence.
+    pub fn can_undo(&self) -> bool {
+        self.current_sequence_id
+            .and_then(|id| self.edit_logs.get(&id))
+            .is_some_and(|log| log.can_undo())
+    }
+
+    /// True when there's anything to redo on the current sequence.
+    pub fn can_redo(&self) -> bool {
+        self.current_sequence_id
+            .and_then(|id| self.edit_logs.get(&id))
+            .is_some_and(|log| log.can_redo())
     }
 
     /// Save the current project. If `path` is provided it overrides the

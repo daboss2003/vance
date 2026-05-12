@@ -5,6 +5,8 @@
 // via the IPC commands in `$lib/ipc`.
 
 import {
+  canRedo as ipcCanRedo,
+  canUndo as ipcCanUndo,
   currentProjectPath,
   importMediaFile,
   insertClipAt,
@@ -13,10 +15,12 @@ import {
   moveClipTo,
   newProject as ipcNew,
   projectInfo,
+  redo as ipcRedo,
   saveProject as ipcSave,
   setCurrentSequence as ipcSetSeq,
   trimClipIn,
   trimClipOut,
+  undo as ipcUndo,
   type MediaItemInfo,
   type ProjectInfo
 } from './ipc';
@@ -33,6 +37,21 @@ class ProjectState {
   /** Counter bumped after every edit (clip insert, etc.) so the
    *  Timeline canvas can refresh its sequence contents. */
   editTick = $state<number>(0);
+  /** Live state of the current sequence's edit log, refreshed
+   *  after every edit op and after undo / redo. Drives toolbar
+   *  button enable-disable. */
+  canUndo = $state<boolean>(false);
+  canRedo = $state<boolean>(false);
+
+  private async refreshUndoState() {
+    try {
+      this.canUndo = await ipcCanUndo();
+      this.canRedo = await ipcCanRedo();
+    } catch {
+      this.canUndo = false;
+      this.canRedo = false;
+    }
+  }
 
   /** Replace the current project with a freshly created empty one. */
   async newProject(name: string) {
@@ -42,6 +61,7 @@ class ProjectState {
       this.path = null;
       this.media = [];
       this.editTick++;
+      await this.refreshUndoState();
     } catch (e) {
       this.error = String(e);
     }
@@ -55,6 +75,7 @@ class ProjectState {
       this.path = path;
       this.media = await mediaList();
       this.editTick++;
+      await this.refreshUndoState();
     } catch (e) {
       this.error = String(e);
     }
@@ -114,6 +135,7 @@ class ProjectState {
       await insertClipAt(trackId, mediaId, timelineSeconds);
       this.info = await projectInfo();
       this.editTick++;
+      await this.refreshUndoState();
     } catch (e) {
       this.error = String(e);
     }
@@ -125,6 +147,7 @@ class ProjectState {
     try {
       await moveClipTo(trackId, clipId, timelineSeconds);
       this.editTick++;
+      await this.refreshUndoState();
     } catch (e) {
       this.error = String(e);
     }
@@ -136,6 +159,7 @@ class ProjectState {
     try {
       await trimClipIn(trackId, clipId, newSourceInSeconds);
       this.editTick++;
+      await this.refreshUndoState();
     } catch (e) {
       this.error = String(e);
     }
@@ -147,6 +171,37 @@ class ProjectState {
     try {
       await trimClipOut(trackId, clipId, newSourceOutSeconds);
       this.editTick++;
+      await this.refreshUndoState();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Undo the last edit on the active sequence. */
+  async undo() {
+    this.error = null;
+    try {
+      const ok = await ipcUndo();
+      if (ok) {
+        this.info = await projectInfo();
+        this.editTick++;
+      }
+      await this.refreshUndoState();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Redo the next edit on the active sequence. */
+  async redo() {
+    this.error = null;
+    try {
+      const ok = await ipcRedo();
+      if (ok) {
+        this.info = await projectInfo();
+        this.editTick++;
+      }
+      await this.refreshUndoState();
     } catch (e) {
       this.error = String(e);
     }

@@ -198,6 +198,26 @@ fn current_timeline_seconds(state: tauri::State<'_, EngineHandle>) -> Option<f64
 }
 
 #[tauri::command]
+fn undo(state: tauri::State<'_, EngineHandle>) -> Result<bool, String> {
+    state.lock().undo().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn redo(state: tauri::State<'_, EngineHandle>) -> Result<bool, String> {
+    state.lock().redo().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn can_undo(state: tauri::State<'_, EngineHandle>) -> bool {
+    state.lock().can_undo()
+}
+
+#[tauri::command]
+fn can_redo(state: tauri::State<'_, EngineHandle>) -> bool {
+    state.lock().can_redo()
+}
+
+#[tauri::command]
 fn trim_clip_in(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -373,6 +393,10 @@ fn main() {
             play_sequence,
             decode_sequence_at,
             current_timeline_seconds,
+            undo,
+            redo,
+            can_undo,
+            can_redo,
         ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");

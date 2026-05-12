@@ -219,6 +219,22 @@
           selectionState.clear();
         }
         return;
+      case 'z':
+      case 'Z':
+        if (e.metaKey || e.ctrlKey) {
+          e.preventDefault();
+          if (e.shiftKey) projectState.redo();
+          else projectState.undo();
+        }
+        return;
+      case 'y':
+      case 'Y':
+        // Windows-style redo, also accepted on Mac as an alt.
+        if (e.metaKey || e.ctrlKey) {
+          e.preventDefault();
+          projectState.redo();
+        }
+        return;
     }
   }
 
@@ -492,6 +508,22 @@
         title="Save the current project"
       >
         Save
+      </button>
+      <button
+        class="rounded bg-vance-bg border-vance-border border px-2 py-1 text-xs hover:brightness-110 disabled:opacity-50"
+        onclick={() => projectState.undo()}
+        disabled={!projectState.canUndo}
+        title="Undo (⌘Z)"
+      >
+        Undo
+      </button>
+      <button
+        class="rounded bg-vance-bg border-vance-border border px-2 py-1 text-xs hover:brightness-110 disabled:opacity-50"
+        onclick={() => projectState.redo()}
+        disabled={!projectState.canRedo}
+        title="Redo (⌘⇧Z)"
+      >
+        Redo
       </button>
       <button
         class="rounded bg-[var(--color-vance-accent)] px-3 py-1 text-xs font-semibold text-[#003040] hover:brightness-110"
