@@ -141,6 +141,37 @@
     drawPlayhead(ctx, cssH);
     drawTrackHeaders(ctx, cssH);
     drawMarquee(ctx);
+    drawMoveDragOverlay(ctx, cssH);
+  }
+
+  /** Ghost outline at the clip's *original* position, plus a vertical
+   *  snap line when a snap target is active. Only renders while a
+   *  move-drag is in flight. */
+  function drawMoveDragOverlay(ctx: CanvasRenderingContext2D, cssH: number) {
+    if (!moveDrag) return;
+    const y = trackY(moveDrag.trackIdx);
+    const x = timeToX(moveDrag.originalTimelineIn);
+    const w = moveDrag.durationSeconds * pixelsPerSecond;
+    // Dashed grey outline at the source position.
+    ctx.save();
+    ctx.strokeStyle = '#5a6172';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 3]);
+    ctx.strokeRect(x + 0.5, y + 4.5, Math.max(1, w - 1), TRACK_HEIGHT - 9);
+    ctx.restore();
+
+    if (moveDrag.snapAt != null) {
+      const sx = timeToX(moveDrag.snapAt);
+      ctx.save();
+      ctx.strokeStyle = SELECTED_STROKE;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(Math.round(sx) + 0.5, 0);
+      ctx.lineTo(Math.round(sx) + 0.5, cssH);
+      ctx.stroke();
+      ctx.restore();
+    }
   }
 
   function drawMarquee(ctx: CanvasRenderingContext2D) {
@@ -265,7 +296,9 @@
     const baseStroke = track.kind === 'video' ? VIDEO_STROKE : AUDIO_STROKE;
 
     for (const c of track.clips) {
-      const t_in = c.timeline_in_seconds;
+      // While moving this clip, draw it at the candidate position.
+      const moving = moveDrag && moveDrag.clipId === c.id;
+      const t_in = moving ? moveDrag!.candidateTimelineIn : c.timeline_in_seconds;
       const t_out = t_in + c.duration_seconds;
       // Cull clips entirely off-screen.
       if (t_out < visibleLeft || t_in > visibleRight) continue;
@@ -422,7 +455,27 @@
     scheduleDraw();
   }
 
-  type DragKind = 'pan' | 'marquee';
+  type DragKind = 'pan' | 'marquee' | 'move';
+
+  /** While a move-drag is live, this carries the in-flight clip plus
+   *  its anchor and current (snapped) candidate position. Cleared on
+   *  mouseup. The canvas redraws the clip at `candidateTimelineIn`
+   *  while this is set, ignoring the persisted `timeline_in`. */
+  type MoveDrag = {
+    trackId: string;
+    trackIdx: number;
+    clipId: string;
+    originalTimelineIn: number;
+    durationSeconds: number;
+    /** Horizontal offset between the cursor and the clip's left edge
+     *  at the moment the drag started, so the clip doesn't "jump" to
+     *  align its left edge with the cursor. */
+    grabOffsetSeconds: number;
+    candidateTimelineIn: number;
+    /** Snap line drawn on the canvas, if any. */
+    snapAt: number | null;
+  };
+  let moveDrag = $state<MoveDrag | null>(null);
 
   let dragStart:
     | {
@@ -445,10 +498,10 @@
     const localY = e.clientY - rect.top;
     const hit = clipAt(localX, localY);
     dragStart = {
-      // If the press starts ON a clip, we *could* be about to drag-move
-      // it (4.5); for 4.4 we treat that as pan. If it starts in empty
-      // area or on the ruler, drag becomes a marquee selection.
-      kind: hit ? 'pan' : 'marquee',
+      // Press ON a clip → potential move-drag (committed only after
+      // ≥ 3px movement so plain clicks still select & seek). Press on
+      // empty area / ruler → marquee.
+      kind: hit ? 'move' : 'marquee',
       clientX: e.clientX,
       clientY: e.clientY,
       localX,
@@ -488,7 +541,87 @@
         y1: e.clientY - rect.top
       };
       scheduleDraw();
+    } else if (dragStart.kind === 'move' && dragStart.downOnClipId && sequence) {
+      ensureMoveDrag(dragStart);
+      if (moveDrag && canvas) {
+        const rect = canvas.getBoundingClientRect();
+        const cursorT = scrollSeconds + (e.clientX - rect.left - TRACK_HEADER_W) / pixelsPerSecond;
+        let candidate = Math.max(0, cursorT - moveDrag.grabOffsetSeconds);
+        const snap = e.shiftKey ? null : snapTimeline(candidate, moveDrag);
+        if (snap != null) {
+          candidate = snap;
+          moveDrag.snapAt = snap;
+        } else {
+          moveDrag.snapAt = null;
+        }
+        moveDrag.candidateTimelineIn = candidate;
+        scheduleDraw();
+      }
     }
+  }
+
+  /** Initialize moveDrag the first time the move-drag exceeds the
+   *  jitter threshold. Looks up the clip in the current sequence so
+   *  we have its original anchor + duration to snap against. */
+  function ensureMoveDrag(ds: NonNullable<typeof dragStart>) {
+    if (moveDrag || !sequence || !ds.downOnClipId || !canvas) return;
+    for (let i = 0; i < sequence.tracks.length; i++) {
+      const track = sequence.tracks[i];
+      const clip = track.clips.find((c) => c.id === ds.downOnClipId);
+      if (!clip) continue;
+      const rect = canvas.getBoundingClientRect();
+      const cursorT =
+        scrollSeconds + (ds.clientX - rect.left - TRACK_HEADER_W) / pixelsPerSecond;
+      moveDrag = {
+        trackId: track.id,
+        trackIdx: i,
+        clipId: clip.id,
+        originalTimelineIn: clip.timeline_in_seconds,
+        durationSeconds: clip.duration_seconds,
+        grabOffsetSeconds: cursorT - clip.timeline_in_seconds,
+        candidateTimelineIn: clip.timeline_in_seconds,
+        snapAt: null
+      };
+      return;
+    }
+  }
+
+  /** Find a snap target within 8 px of `candidateTimelineIn`. Tries:
+   *  playhead, t=0, edges of *other* clips on the same track. Returns
+   *  the snapped timeline_in seconds, or null for no snap. */
+  function snapTimeline(candidate: number, m: MoveDrag): number | null {
+    if (!sequence) return null;
+    const tolPx = 8;
+    const tolSec = tolPx / pixelsPerSecond;
+    const candidates: number[] = [0, playheadSeconds];
+
+    const myTrack = sequence.tracks[m.trackIdx];
+    if (myTrack) {
+      for (const c of myTrack.clips) {
+        if (c.id === m.clipId) continue;
+        candidates.push(c.timeline_in_seconds);
+        candidates.push(c.timeline_in_seconds + c.duration_seconds);
+      }
+    }
+
+    // Snap can be the clip's *left* edge OR its *right* edge to a
+    // candidate, whichever is closer.
+    let bestDiff = tolSec + 1;
+    let bestTarget: number | null = null;
+    for (const t of candidates) {
+      const leftDiff = Math.abs(candidate - t);
+      const rightDiff = Math.abs(candidate + m.durationSeconds - t);
+      if (leftDiff < bestDiff) {
+        bestDiff = leftDiff;
+        bestTarget = t;
+      }
+      if (rightDiff < bestDiff) {
+        bestDiff = rightDiff;
+        bestTarget = t - m.durationSeconds;
+      }
+    }
+    if (bestTarget == null) return null;
+    return Math.max(0, bestTarget);
   }
 
   async function onMouseUp(e: MouseEvent) {
@@ -501,6 +634,21 @@
     const wasMarquee = ds.kind === 'marquee' && marquee != null;
     const m = marquee;
     marquee = null;
+
+    // ---- Move-drag release: commit via engine -----------------------------
+    if (ds.kind === 'move' && moveDrag) {
+      const md = moveDrag;
+      moveDrag = null;
+      const delta = md.candidateTimelineIn - md.originalTimelineIn;
+      if (Math.abs(delta) < 1e-3) {
+        // Effectively no move — fall through to the click path below.
+      } else {
+        await projectState.moveClip(md.trackId, md.clipId, md.candidateTimelineIn);
+        // The Timeline's $effect on refreshTick will re-fetch the
+        // sequence and redraw the clip at its new position.
+        return;
+      }
+    }
 
     // ---- Marquee release: select intersecting clips, no seek ------------
     if (wasMarquee && moved > 3 && m && sequence) {

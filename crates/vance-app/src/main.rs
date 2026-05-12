@@ -198,6 +198,29 @@ fn current_timeline_seconds(state: tauri::State<'_, EngineHandle>) -> Option<f64
 }
 
 #[tauri::command]
+fn move_clip_to(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    clip_id: String,
+    timeline_seconds: f64,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let clip_uuid = clip_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid clip id: {e}"))?;
+    state
+        .lock()
+        .move_clip_to(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            vance_timeline::ClipId::from_uuid(clip_uuid),
+            timeline_seconds,
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn insert_clip_at(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -298,6 +321,7 @@ fn main() {
             import_media_file,
             media_list,
             insert_clip_at,
+            move_clip_to,
             play_sequence,
             decode_sequence_at,
             current_timeline_seconds,

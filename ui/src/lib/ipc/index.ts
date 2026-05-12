@@ -150,6 +150,15 @@ export const insertClipAt = (
 ): Promise<string> =>
   invoke('insert_clip_at', { trackId, mediaId, timelineSeconds });
 
+/** Move an existing clip to a new timeline position on the same
+ *  track. Rejects if the new position would overlap a neighbor. */
+export const moveClipTo = (
+  trackId: string,
+  clipId: string,
+  timelineSeconds: number
+): Promise<void> =>
+  invoke('move_clip_to', { trackId, clipId, timelineSeconds });
+
 /** Start playback of the active sequence from `timelineSeconds`,
  *  using scene_plan to pick the active clip and swapping the
  *  decoder onto its media. */

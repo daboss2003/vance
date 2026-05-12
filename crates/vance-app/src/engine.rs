@@ -968,6 +968,51 @@ impl Engine {
         Ok(pts)
     }
 
+    /// Move a clip to `new_timeline_seconds` on the same track via
+    /// `ops::slide`. Rejects if the new position would overlap a
+    /// neighboring clip on the track.
+    pub fn move_clip_to(
+        &mut self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+        new_timeline_seconds: f64,
+    ) -> Result<(), EngineError> {
+        if self.playback.is_some() {
+            return Err(EngineError::PlaybackInProgress);
+        }
+        let project = self
+            .current_project
+            .as_mut()
+            .ok_or(EngineError::NoProject)?;
+        let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+        let seq = project
+            .sequence(seq_id)
+            .ok_or(EngineError::SequenceNotFound)?
+            .clone();
+
+        // Locate current timeline_in to compute the delta.
+        let current_in = seq
+            .tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .and_then(|t| t.clips.iter().find(|c| c.id == clip_id))
+            .map(|c| c.timeline_in)
+            .ok_or_else(|| EngineError::Project("clip not found on track".into()))?;
+
+        let new_in = seconds_to_rt(new_timeline_seconds.max(0.0));
+        let delta = vance_core::RationalTime(new_in.0 - current_in.0);
+
+        // Slide on the same track — rejects negative final position and
+        // overlap with neighbors.
+        let new_seq = vance_timeline::ops::slide(&seq, track_id, clip_id, delta)
+            .map_err(|e| EngineError::Project(e.to_string()))?;
+
+        if let Some(slot) = project.sequences.iter_mut().find(|s| s.id == seq_id) {
+            *slot = Arc::new(new_seq);
+        }
+        Ok(())
+    }
+
     /// Insert a clip referencing `media_id`'s full visible range at
     /// `timeline_seconds` on `track_id`. Returns the new clip's ID
     /// for the UI's selection model in 4.4.

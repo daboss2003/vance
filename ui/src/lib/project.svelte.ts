@@ -10,6 +10,7 @@ import {
   insertClipAt,
   loadProject,
   mediaList,
+  moveClipTo,
   newProject as ipcNew,
   projectInfo,
   saveProject as ipcSave,
@@ -110,6 +111,17 @@ class ProjectState {
     try {
       await insertClipAt(trackId, mediaId, timelineSeconds);
       this.info = await projectInfo();
+      this.editTick++;
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Move an existing clip. Bumps `editTick` on success. */
+  async moveClip(trackId: string, clipId: string, timelineSeconds: number) {
+    this.error = null;
+    try {
+      await moveClipTo(trackId, clipId, timelineSeconds);
       this.editTick++;
     } catch (e) {
       this.error = String(e);
