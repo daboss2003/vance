@@ -142,6 +142,21 @@
     drawTrackHeaders(ctx, cssH);
     drawMarquee(ctx);
     drawMoveDragOverlay(ctx, cssH);
+    drawTrimSnapLine(ctx, cssH);
+  }
+
+  function drawTrimSnapLine(ctx: CanvasRenderingContext2D, cssH: number) {
+    if (!trimDrag || trimDrag.snapAt == null) return;
+    const sx = timeToX(trimDrag.snapAt);
+    ctx.save();
+    ctx.strokeStyle = SELECTED_STROKE;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(Math.round(sx) + 0.5, 0);
+    ctx.lineTo(Math.round(sx) + 0.5, cssH);
+    ctx.stroke();
+    ctx.restore();
   }
 
   /** Ghost outline at the clip's *original* position, plus a vertical
@@ -296,15 +311,27 @@
     const baseStroke = track.kind === 'video' ? VIDEO_STROKE : AUDIO_STROKE;
 
     for (const c of track.clips) {
-      // While moving this clip, draw it at the candidate position.
+      // While moving / trimming this clip, draw it at candidate bounds.
       const moving = moveDrag && moveDrag.clipId === c.id;
-      const t_in = moving ? moveDrag!.candidateTimelineIn : c.timeline_in_seconds;
-      const t_out = t_in + c.duration_seconds;
+      const trimming = trimDrag && trimDrag.clipId === c.id;
+      let t_in: number;
+      let dur: number;
+      if (trimming) {
+        t_in = trimDrag!.candidateTimelineIn;
+        dur = trimDrag!.candidateSourceOut - trimDrag!.candidateSourceIn;
+      } else if (moving) {
+        t_in = moveDrag!.candidateTimelineIn;
+        dur = c.duration_seconds;
+      } else {
+        t_in = c.timeline_in_seconds;
+        dur = c.duration_seconds;
+      }
+      const t_out = t_in + dur;
       // Cull clips entirely off-screen.
       if (t_out < visibleLeft || t_in > visibleRight) continue;
 
       const x = timeToX(t_in);
-      const w = c.duration_seconds * pixelsPerSecond;
+      const w = dur * pixelsPerSecond;
       const cy = y + 4;
       const ch = TRACK_HEIGHT - 8;
 
@@ -347,25 +374,59 @@
         ctx.fillText(text, x + 4, cy + ch / 2);
         ctx.restore();
       }
+
+      // Edge-handle hint: a brighter vertical bar on the side the
+      // cursor is hovering, so the user can see the trim is grabable.
+      if (hoverClipId === c.id && hoverEdge) {
+        ctx.fillStyle = SELECTED_STROKE;
+        if (hoverEdge === 'left') {
+          ctx.fillRect(Math.round(x) - 1, cy, 3, ch);
+        } else {
+          ctx.fillRect(Math.round(x + w) - 2, cy, 3, ch);
+        }
+      }
     }
   }
 
-  /** Hit-test: which clip is under (canvasLocalX, canvasLocalY), or
-   *  `null` for empty area / ruler / header. */
-  function clipAt(localX: number, localY: number): { clip: ClipContents; track: TrackContents } | null {
+  type HitKind = 'body' | 'left' | 'right';
+  type Hit = {
+    kind: HitKind;
+    clip: ClipContents;
+    track: TrackContents;
+    trackIdx: number;
+  };
+
+  /** Hit-test: where on a clip (if any) is (localX, localY)? Returns
+   *  `null` for empty area / ruler / header. Edge handles take a
+   *  `HANDLE_PX`-wide region around each clip's left and right edges. */
+  function hitAt(localX: number, localY: number): Hit | null {
     if (!sequence) return null;
     if (localX < TRACK_HEADER_W) return null;
     if (localY < RULER_HEIGHT) return null;
     const trackIdx = Math.floor((localY - RULER_HEIGHT) / TRACK_HEIGHT);
     if (trackIdx < 0 || trackIdx >= sequence.tracks.length) return null;
     const track = sequence.tracks[trackIdx];
-    const t = scrollSeconds + (localX - TRACK_HEADER_W) / pixelsPerSecond;
     for (const c of track.clips) {
-      if (c.timeline_in_seconds <= t && t < c.timeline_in_seconds + c.duration_seconds) {
-        return { clip: c, track };
+      const xLeft = timeToX(c.timeline_in_seconds);
+      const xRight = xLeft + c.duration_seconds * pixelsPerSecond;
+      // Test edges first so handles win even if the clip is short.
+      if (Math.abs(localX - xLeft) <= HANDLE_PX) {
+        return { kind: 'left', clip: c, track, trackIdx };
+      }
+      if (Math.abs(localX - xRight) <= HANDLE_PX) {
+        return { kind: 'right', clip: c, track, trackIdx };
+      }
+      if (localX >= xLeft && localX <= xRight) {
+        return { kind: 'body', clip: c, track, trackIdx };
       }
     }
     return null;
+  }
+
+  /** Kept as a thin shim for code that just needs the clip itself. */
+  function clipAt(localX: number, localY: number): { clip: ClipContents; track: TrackContents } | null {
+    const h = hitAt(localX, localY);
+    return h ? { clip: h.clip, track: h.track } : null;
   }
 
   function formatClipLabel(c: ClipContents, _maxPxWidth: number): string {
@@ -455,7 +516,10 @@
     scheduleDraw();
   }
 
-  type DragKind = 'pan' | 'marquee' | 'move';
+  type DragKind = 'pan' | 'marquee' | 'move' | 'trim-left' | 'trim-right';
+  /** Width of the edge-grab region in CSS pixels. Cursor within this
+   *  many pixels of a clip's left/right edge triggers a trim handle. */
+  const HANDLE_PX = 6;
 
   /** While a move-drag is live, this carries the in-flight clip plus
    *  its anchor and current (snapped) candidate position. Cleared on
@@ -477,6 +541,28 @@
   };
   let moveDrag = $state<MoveDrag | null>(null);
 
+  /** While a trim-drag is live, we know which edge and the live
+   *  candidate values to render the clip at. Committed on mouseup. */
+  type TrimDrag = {
+    trackId: string;
+    trackIdx: number;
+    clipId: string;
+    edge: 'left' | 'right';
+    /** Original anchors so we can compute the delta and constrain. */
+    originalTimelineIn: number;
+    originalSourceIn: number;
+    originalSourceOut: number;
+    /** Live candidates. */
+    candidateTimelineIn: number;
+    candidateSourceIn: number;
+    candidateSourceOut: number;
+    snapAt: number | null;
+  };
+  let trimDrag = $state<TrimDrag | null>(null);
+
+  /** Set on every mousemove; drives the cursor style + handle hint. */
+  let hoverEdge = $state<'left' | 'right' | null>(null);
+
   let dragStart:
     | {
         kind: DragKind;
@@ -496,12 +582,17 @@
     const rect = canvas.getBoundingClientRect();
     const localX = e.clientX - rect.left;
     const localY = e.clientY - rect.top;
-    const hit = clipAt(localX, localY);
+    const hit = hitAt(localX, localY);
+    const kind: DragKind =
+      hit?.kind === 'left'
+        ? 'trim-left'
+        : hit?.kind === 'right'
+          ? 'trim-right'
+          : hit?.kind === 'body'
+            ? 'move'
+            : 'marquee';
     dragStart = {
-      // Press ON a clip → potential move-drag (committed only after
-      // ≥ 3px movement so plain clicks still select & seek). Press on
-      // empty area / ruler → marquee.
-      kind: hit ? 'move' : 'marquee',
+      kind,
       clientX: e.clientX,
       clientY: e.clientY,
       localX,
@@ -513,14 +604,20 @@
   }
 
   function onMouseMove(e: MouseEvent) {
-    // Track hover so clips light up under the cursor regardless of drag.
+    // Track hover so clips light up under the cursor regardless of drag,
+    // and the cursor flips to col-resize over an edge handle.
     if (canvas && !dragStart) {
       const rect = canvas.getBoundingClientRect();
-      const hit = clipAt(e.clientX - rect.left, e.clientY - rect.top);
+      const hit = hitAt(e.clientX - rect.left, e.clientY - rect.top);
       const id = hit ? hit.clip.id : null;
+      const edge = hit?.kind === 'left' || hit?.kind === 'right' ? hit.kind : null;
       if (id !== hoverClipId) {
         hoverClipId = id;
         scheduleDraw();
+      }
+      if (edge !== hoverEdge) {
+        hoverEdge = edge;
+        canvas.style.cursor = edge ? 'ew-resize' : '';
       }
     }
 
@@ -557,7 +654,114 @@
         moveDrag.candidateTimelineIn = candidate;
         scheduleDraw();
       }
+    } else if (
+      (dragStart.kind === 'trim-left' || dragStart.kind === 'trim-right') &&
+      dragStart.downOnClipId &&
+      sequence
+    ) {
+      ensureTrimDrag(dragStart);
+      if (trimDrag && canvas) {
+        const rect = canvas.getBoundingClientRect();
+        const cursorT =
+          scrollSeconds + (e.clientX - rect.left - TRACK_HEADER_W) / pixelsPerSecond;
+        applyTrimCandidate(trimDrag, cursorT, e.shiftKey);
+        scheduleDraw();
+      }
     }
+  }
+
+  function ensureTrimDrag(ds: NonNullable<typeof dragStart>) {
+    if (trimDrag || !sequence || !ds.downOnClipId) return;
+    for (let i = 0; i < sequence.tracks.length; i++) {
+      const track = sequence.tracks[i];
+      const clip = track.clips.find((c) => c.id === ds.downOnClipId);
+      if (!clip) continue;
+      trimDrag = {
+        trackId: track.id,
+        trackIdx: i,
+        clipId: clip.id,
+        edge: ds.kind === 'trim-left' ? 'left' : 'right',
+        originalTimelineIn: clip.timeline_in_seconds,
+        originalSourceIn: clip.source_in_seconds,
+        originalSourceOut: clip.source_in_seconds + clip.duration_seconds,
+        candidateTimelineIn: clip.timeline_in_seconds,
+        candidateSourceIn: clip.source_in_seconds,
+        candidateSourceOut: clip.source_in_seconds + clip.duration_seconds,
+        snapAt: null
+      };
+      return;
+    }
+  }
+
+  /** Map the cursor's timeline position to new source_in / source_out
+   *  (and timeline_in for left-edge trim), clamping to legal ranges
+   *  and snapping to nearby clip edges / playhead unless `noSnap`. */
+  function applyTrimCandidate(td: TrimDrag, cursorT: number, noSnap: boolean) {
+    if (td.edge === 'left') {
+      // Drag left edge to cursor. timeline_out stays fixed at
+      // (originalTimelineIn + duration). new_timeline_in = cursorT,
+      // new_source_in = originalSourceIn + (cursorT - originalTimelineIn).
+      const timelineOut = td.originalTimelineIn + (td.originalSourceOut - td.originalSourceIn);
+      // Don't let the user drag past timeline_out (zero-length).
+      const maxTimelineIn = timelineOut - 1 / Math.max(1, pixelsPerSecond);
+      let candTimelineIn = Math.min(Math.max(0, cursorT), maxTimelineIn);
+      const snap = noSnap ? null : snapEdge(candTimelineIn, td.trackIdx, td.clipId);
+      if (snap != null) {
+        candTimelineIn = snap;
+        td.snapAt = snap;
+      } else {
+        td.snapAt = null;
+      }
+      const delta = candTimelineIn - td.originalTimelineIn;
+      const candSourceIn = Math.max(0, td.originalSourceIn + delta);
+      td.candidateTimelineIn = candTimelineIn;
+      td.candidateSourceIn = candSourceIn;
+      td.candidateSourceOut = td.originalSourceOut;
+    } else {
+      // Drag right edge to cursor. timeline_in stays fixed; new
+      // timeline_out = cursorT; new_source_out = originalSourceIn +
+      // (cursorT - originalTimelineIn).
+      const minTimelineOut = td.originalTimelineIn + 1 / Math.max(1, pixelsPerSecond);
+      let candTimelineOut = Math.max(minTimelineOut, cursorT);
+      const snap = noSnap ? null : snapEdge(candTimelineOut, td.trackIdx, td.clipId);
+      if (snap != null) {
+        candTimelineOut = snap;
+        td.snapAt = snap;
+      } else {
+        td.snapAt = null;
+      }
+      const dur = candTimelineOut - td.originalTimelineIn;
+      td.candidateTimelineIn = td.originalTimelineIn;
+      td.candidateSourceIn = td.originalSourceIn;
+      td.candidateSourceOut = td.originalSourceIn + dur;
+    }
+  }
+
+  /** Snap a single timeline value to the closest of {playhead, t=0,
+   *  every neighbor clip's edges on the same track} within
+   *  `HANDLE_PX` pixels' worth of seconds. */
+  function snapEdge(candidate: number, trackIdx: number, skipClipId: string): number | null {
+    if (!sequence) return null;
+    const tolSec = HANDLE_PX / pixelsPerSecond;
+    const candidates: number[] = [0, playheadSeconds];
+    const track = sequence.tracks[trackIdx];
+    if (track) {
+      for (const c of track.clips) {
+        if (c.id === skipClipId) continue;
+        candidates.push(c.timeline_in_seconds);
+        candidates.push(c.timeline_in_seconds + c.duration_seconds);
+      }
+    }
+    let bestDiff = tolSec + 1;
+    let best: number | null = null;
+    for (const t of candidates) {
+      const d = Math.abs(candidate - t);
+      if (d < bestDiff) {
+        bestDiff = d;
+        best = t;
+      }
+    }
+    return best;
   }
 
   /** Initialize moveDrag the first time the move-drag exceeds the
@@ -648,6 +852,26 @@
         // sequence and redraw the clip at its new position.
         return;
       }
+    }
+
+    // ---- Trim-drag release: commit via engine ----------------------------
+    if ((ds.kind === 'trim-left' || ds.kind === 'trim-right') && trimDrag) {
+      const td = trimDrag;
+      trimDrag = null;
+      if (td.edge === 'left') {
+        const delta = td.candidateSourceIn - td.originalSourceIn;
+        if (Math.abs(delta) > 1e-3) {
+          await projectState.trimIn(td.trackId, td.clipId, td.candidateSourceIn);
+          return;
+        }
+      } else {
+        const delta = td.candidateSourceOut - td.originalSourceOut;
+        if (Math.abs(delta) > 1e-3) {
+          await projectState.trimOut(td.trackId, td.clipId, td.candidateSourceOut);
+          return;
+        }
+      }
+      // Effectively no trim — fall through to click handling (selects).
     }
 
     // ---- Marquee release: select intersecting clips, no seek ------------

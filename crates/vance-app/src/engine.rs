@@ -968,6 +968,71 @@ impl Engine {
         Ok(pts)
     }
 
+    /// Trim a clip's in-point. `new_source_in_seconds` is the new
+    /// visible start inside the source media; the clip's `timeline_in`
+    /// shifts by the same delta so the right-hand content keeps its
+    /// timeline position.
+    pub fn trim_clip_in(
+        &mut self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+        new_source_in_seconds: f64,
+    ) -> Result<(), EngineError> {
+        if self.playback.is_some() {
+            return Err(EngineError::PlaybackInProgress);
+        }
+        let project = self
+            .current_project
+            .as_mut()
+            .ok_or(EngineError::NoProject)?;
+        let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+        let seq = project
+            .sequence(seq_id)
+            .ok_or(EngineError::SequenceNotFound)?
+            .clone();
+
+        let new_source_in = seconds_to_rt(new_source_in_seconds.max(0.0));
+        let new_seq = vance_timeline::ops::trim_in(&seq, track_id, clip_id, new_source_in)
+            .map_err(|e| EngineError::Project(e.to_string()))?;
+
+        if let Some(slot) = project.sequences.iter_mut().find(|s| s.id == seq_id) {
+            *slot = Arc::new(new_seq);
+        }
+        Ok(())
+    }
+
+    /// Trim a clip's out-point. `new_source_out_seconds` is the new
+    /// visible end inside the source media; `timeline_in` is unchanged
+    /// and the clip's `timeline_out` slides to match the new length.
+    pub fn trim_clip_out(
+        &mut self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+        new_source_out_seconds: f64,
+    ) -> Result<(), EngineError> {
+        if self.playback.is_some() {
+            return Err(EngineError::PlaybackInProgress);
+        }
+        let project = self
+            .current_project
+            .as_mut()
+            .ok_or(EngineError::NoProject)?;
+        let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+        let seq = project
+            .sequence(seq_id)
+            .ok_or(EngineError::SequenceNotFound)?
+            .clone();
+
+        let new_source_out = seconds_to_rt(new_source_out_seconds.max(0.0));
+        let new_seq = vance_timeline::ops::trim_out(&seq, track_id, clip_id, new_source_out)
+            .map_err(|e| EngineError::Project(e.to_string()))?;
+
+        if let Some(slot) = project.sequences.iter_mut().find(|s| s.id == seq_id) {
+            *slot = Arc::new(new_seq);
+        }
+        Ok(())
+    }
+
     /// Move a clip to `new_timeline_seconds` on the same track via
     /// `ops::slide`. Rejects if the new position would overlap a
     /// neighboring clip on the track.

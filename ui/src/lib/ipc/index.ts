@@ -159,6 +159,25 @@ export const moveClipTo = (
 ): Promise<void> =>
   invoke('move_clip_to', { trackId, clipId, timelineSeconds });
 
+/** Trim a clip's in-point. `newSourceInSeconds` is the new visible
+ *  start inside the source media; the clip's timeline_in shifts by
+ *  the same delta so the right edge stays put on the timeline. */
+export const trimClipIn = (
+  trackId: string,
+  clipId: string,
+  newSourceInSeconds: number
+): Promise<void> =>
+  invoke('trim_clip_in', { trackId, clipId, newSourceInSeconds });
+
+/** Trim a clip's out-point. `timeline_in` is unchanged; the clip's
+ *  timeline_out slides to match the new length. */
+export const trimClipOut = (
+  trackId: string,
+  clipId: string,
+  newSourceOutSeconds: number
+): Promise<void> =>
+  invoke('trim_clip_out', { trackId, clipId, newSourceOutSeconds });
+
 /** Start playback of the active sequence from `timelineSeconds`,
  *  using scene_plan to pick the active clip and swapping the
  *  decoder onto its media. */

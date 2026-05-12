@@ -198,6 +198,52 @@ fn current_timeline_seconds(state: tauri::State<'_, EngineHandle>) -> Option<f64
 }
 
 #[tauri::command]
+fn trim_clip_in(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    clip_id: String,
+    new_source_in_seconds: f64,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let clip_uuid = clip_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid clip id: {e}"))?;
+    state
+        .lock()
+        .trim_clip_in(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            vance_timeline::ClipId::from_uuid(clip_uuid),
+            new_source_in_seconds,
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn trim_clip_out(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    clip_id: String,
+    new_source_out_seconds: f64,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let clip_uuid = clip_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid clip id: {e}"))?;
+    state
+        .lock()
+        .trim_clip_out(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            vance_timeline::ClipId::from_uuid(clip_uuid),
+            new_source_out_seconds,
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn move_clip_to(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -322,6 +368,8 @@ fn main() {
             media_list,
             insert_clip_at,
             move_clip_to,
+            trim_clip_in,
+            trim_clip_out,
             play_sequence,
             decode_sequence_at,
             current_timeline_seconds,

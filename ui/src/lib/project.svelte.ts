@@ -15,6 +15,8 @@ import {
   projectInfo,
   saveProject as ipcSave,
   setCurrentSequence as ipcSetSeq,
+  trimClipIn,
+  trimClipOut,
   type MediaItemInfo,
   type ProjectInfo
 } from './ipc';
@@ -122,6 +124,28 @@ class ProjectState {
     this.error = null;
     try {
       await moveClipTo(trackId, clipId, timelineSeconds);
+      this.editTick++;
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Trim a clip's in-point. */
+  async trimIn(trackId: string, clipId: string, newSourceInSeconds: number) {
+    this.error = null;
+    try {
+      await trimClipIn(trackId, clipId, newSourceInSeconds);
+      this.editTick++;
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Trim a clip's out-point. */
+  async trimOut(trackId: string, clipId: string, newSourceOutSeconds: number) {
+    this.error = null;
+    try {
+      await trimClipOut(trackId, clipId, newSourceOutSeconds);
       this.editTick++;
     } catch (e) {
       this.error = String(e);
