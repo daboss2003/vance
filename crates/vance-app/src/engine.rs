@@ -654,10 +654,13 @@ impl Engine {
             owner.stop.store(true, Ordering::Release);
             let _ = owner.handle.join();
         }
-        let resume_pts = if session.ended_at_eos.load(Ordering::Acquire) {
-            // EOS → tell the UI to start from 0 next time. Otherwise the
-            // playhead stays parked at the last frame and Play does
-            // nothing because the decoder seeks straight to EOS.
+        let resume_pts = if session.ended_at_eos.load(Ordering::Acquire)
+            && self.playing_clip_anchor.is_none()
+        {
+            // Single-file EOS → restart from 0 next time so Play means
+            // "play again". In sequence mode this would force the
+            // playhead back to t=0 on every clip end, which is jarring;
+            // the UI is responsible for rewinding (see togglePlayback).
             0
         } else {
             session.last_pts.load(Ordering::Acquire)
@@ -1497,8 +1500,13 @@ fn playback_loop(
                 std::thread::sleep(chunk);
                 remaining = remaining.saturating_sub(chunk);
             }
-        } else if wait_secs < -0.080 {
-            // > ~2 frames late at 24fps; drop to keep the playhead honest.
+        } else if wait_secs < -0.080 && audio.is_some() {
+            // > ~2 frames late at 24fps; drop to keep the playhead
+            // honest with the audio clock. In *wall-clock-master*
+            // mode (no audio) there's no external clock to sync to —
+            // dropping just because decode + IPC are slower than
+            // real-time silently empties the user's view of the clip.
+            // We accept slower-than-realtime playback there instead.
             total_drops += 1;
             if total_drops - last_logged_drops >= 30 {
                 tracing::warn!(total_drops, "playback: dropped frames so far");

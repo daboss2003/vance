@@ -460,10 +460,15 @@
     } else if (isSequencePlayable()) {
       // Phase 4.7.5: play the active sequence from the current
       // playhead (so Stop → Play resumes where it left off rather
-      // than restarting from the first clip). Continuous through-
-      // clip-boundary playback comes later.
+      // than restarting from the first clip). Phase 4.7.6: when the
+      // playhead sits at/past the end of the sequence, rewind to 0
+      // so Play means "play again" instead of "play nothing".
       try {
-        const from = (await currentTimelineSeconds()) ?? 0;
+        let from = (await currentTimelineSeconds()) ?? 0;
+        const seq = projectState.sequence;
+        if (seq && from >= seq.duration_seconds - 0.05) {
+          from = 0;
+        }
         await playSequence(from);
         playing = true;
       } catch (e) {
