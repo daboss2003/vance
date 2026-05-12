@@ -23,6 +23,7 @@
   } from '$lib/ipc';
   import { projectState } from '$lib/project.svelte';
   import { dragState } from '$lib/drag.svelte';
+  import { selectionState } from '$lib/selection.svelte';
 
   let { refreshTick = 0 }: { refreshTick?: number } = $props();
 
@@ -38,6 +39,10 @@
   // Engine's current playhead, fetched from `current_timeline_seconds`.
   // Updated by the playback poll set up in onMount.
   let playheadSeconds = $state<number>(0);
+
+  // Hover + marquee state for selection feedback.
+  let hoverClipId = $state<string | null>(null);
+  let marquee = $state<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
 
   // Layout constants.
   const RULER_HEIGHT = 22; // px
@@ -56,6 +61,10 @@
   const PLAYHEAD = '#ffd166';
   const TRACK_HEADER_BG = '#16181c';
   const TRACK_HEADER_TEXT = '#9099a8';
+  const SELECTED_STROKE = '#5ec5f5';
+  const HOVER_STROKE = '#a8d8f0';
+  const MARQUEE_FILL = 'rgba(94, 197, 245, 0.15)';
+  const MARQUEE_STROKE = '#5ec5f5';
 
   // Subscribe to the engine's sequence — refresh whenever the parent
   // bumps `refreshTick`. (4.4+ will switch to a proper edit-log
@@ -68,6 +77,13 @@
         scheduleDraw();
       })
       .catch((e) => console.error('currentSequenceContents', e));
+  });
+
+  // Redraw whenever the selection changes so external mutations
+  // (e.g. Inspector later, keyboard shortcuts) update the canvas.
+  $effect(() => {
+    void selectionState.ids;
+    scheduleDraw();
   });
 
   // Re-draw the canvas. Idempotent; draws into the canvas at its
@@ -124,6 +140,20 @@
     drawTracks(ctx, cssW, cssH);
     drawPlayhead(ctx, cssH);
     drawTrackHeaders(ctx, cssH);
+    drawMarquee(ctx);
+  }
+
+  function drawMarquee(ctx: CanvasRenderingContext2D) {
+    if (!marquee) return;
+    const x = Math.min(marquee.x0, marquee.x1);
+    const y = Math.min(marquee.y0, marquee.y1);
+    const w = Math.abs(marquee.x1 - marquee.x0);
+    const h = Math.abs(marquee.y1 - marquee.y0);
+    ctx.fillStyle = MARQUEE_FILL;
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = MARQUEE_STROKE;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x + 0.5, y + 0.5, w, h);
   }
 
   // ---- Ruler --------------------------------------------------------------
@@ -231,8 +261,8 @@
     visibleLeft: number,
     visibleRight: number
   ) {
-    const fill = track.kind === 'video' ? VIDEO_FILL : AUDIO_FILL;
-    const stroke = track.kind === 'video' ? VIDEO_STROKE : AUDIO_STROKE;
+    const baseFill = track.kind === 'video' ? VIDEO_FILL : AUDIO_FILL;
+    const baseStroke = track.kind === 'video' ? VIDEO_STROKE : AUDIO_STROKE;
 
     for (const c of track.clips) {
       const t_in = c.timeline_in_seconds;
@@ -245,15 +275,30 @@
       const cy = y + 4;
       const ch = TRACK_HEIGHT - 8;
 
+      const isSelected = selectionState.has(c.id);
+      const isHovered = hoverClipId === c.id;
+
       // Clip body.
-      ctx.fillStyle = c.enabled && track.enabled ? fill : DISABLED_FILL;
+      ctx.fillStyle = c.enabled && track.enabled ? baseFill : DISABLED_FILL;
       roundRect(ctx, x, cy, Math.max(2, w), ch, 3);
       ctx.fill();
 
-      // Border.
-      ctx.strokeStyle = stroke;
-      ctx.lineWidth = 1;
-      roundRect(ctx, x + 0.5, cy + 0.5, Math.max(1, w - 1), ch - 1, 3);
+      // Border — thicker accent when selected, lighter when hovered.
+      ctx.lineWidth = isSelected ? 2 : 1;
+      ctx.strokeStyle = isSelected
+        ? SELECTED_STROKE
+        : isHovered
+          ? HOVER_STROKE
+          : baseStroke;
+      const inset = isSelected ? 1 : 0.5;
+      roundRect(
+        ctx,
+        x + inset,
+        cy + inset,
+        Math.max(1, w - 2 * inset),
+        ch - 2 * inset,
+        3
+      );
       ctx.stroke();
 
       // Label, if there's room.
@@ -270,6 +315,24 @@
         ctx.restore();
       }
     }
+  }
+
+  /** Hit-test: which clip is under (canvasLocalX, canvasLocalY), or
+   *  `null` for empty area / ruler / header. */
+  function clipAt(localX: number, localY: number): { clip: ClipContents; track: TrackContents } | null {
+    if (!sequence) return null;
+    if (localX < TRACK_HEADER_W) return null;
+    if (localY < RULER_HEIGHT) return null;
+    const trackIdx = Math.floor((localY - RULER_HEIGHT) / TRACK_HEIGHT);
+    if (trackIdx < 0 || trackIdx >= sequence.tracks.length) return null;
+    const track = sequence.tracks[trackIdx];
+    const t = scrollSeconds + (localX - TRACK_HEADER_W) / pixelsPerSecond;
+    for (const c of track.clips) {
+      if (c.timeline_in_seconds <= t && t < c.timeline_in_seconds + c.duration_seconds) {
+        return { clip: c, track };
+      }
+    }
+    return null;
   }
 
   function formatClipLabel(c: ClipContents, _maxPxWidth: number): string {
@@ -359,38 +422,161 @@
     scheduleDraw();
   }
 
-  let dragStart: { x: number; clientX: number; clientY: number; scroll: number } | null = null;
+  type DragKind = 'pan' | 'marquee';
+
+  let dragStart:
+    | {
+        kind: DragKind;
+        clientX: number;
+        clientY: number;
+        localX: number;
+        localY: number;
+        scroll: number;
+        modKeys: { shift: boolean; cmd: boolean };
+        downOnClipId: string | null;
+      }
+    | null = null;
+
   function onMouseDown(e: MouseEvent) {
     if (e.button !== 0) return;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const localX = e.clientX - rect.left;
+    const localY = e.clientY - rect.top;
+    const hit = clipAt(localX, localY);
     dragStart = {
-      x: e.clientX,
+      // If the press starts ON a clip, we *could* be about to drag-move
+      // it (4.5); for 4.4 we treat that as pan. If it starts in empty
+      // area or on the ruler, drag becomes a marquee selection.
+      kind: hit ? 'pan' : 'marquee',
       clientX: e.clientX,
       clientY: e.clientY,
-      scroll: scrollSeconds
+      localX,
+      localY,
+      scroll: scrollSeconds,
+      modKeys: { shift: e.shiftKey, cmd: e.metaKey || e.ctrlKey },
+      downOnClipId: hit ? hit.clip.id : null
     };
   }
+
   function onMouseMove(e: MouseEvent) {
+    // Track hover so clips light up under the cursor regardless of drag.
+    if (canvas && !dragStart) {
+      const rect = canvas.getBoundingClientRect();
+      const hit = clipAt(e.clientX - rect.left, e.clientY - rect.top);
+      const id = hit ? hit.clip.id : null;
+      if (id !== hoverClipId) {
+        hoverClipId = id;
+        scheduleDraw();
+      }
+    }
+
     if (!dragStart) return;
-    const dx = e.clientX - dragStart.x;
-    if (Math.abs(dx) < 3) return; // ignore micro-jitter so clicks survive
-    scrollSeconds = Math.max(0, dragStart.scroll - dx / pixelsPerSecond);
-    scheduleDraw();
+    const dx = e.clientX - dragStart.clientX;
+    const dy = e.clientY - dragStart.clientY;
+    if (Math.abs(dx) + Math.abs(dy) < 3) return; // ignore micro-jitter
+
+    if (dragStart.kind === 'pan') {
+      scrollSeconds = Math.max(0, dragStart.scroll - dx / pixelsPerSecond);
+      scheduleDraw();
+    } else if (dragStart.kind === 'marquee' && canvas) {
+      const rect = canvas.getBoundingClientRect();
+      marquee = {
+        x0: dragStart.localX,
+        y0: dragStart.localY,
+        x1: e.clientX - rect.left,
+        y1: e.clientY - rect.top
+      };
+      scheduleDraw();
+    }
   }
+
   async function onMouseUp(e: MouseEvent) {
     if (!dragStart) return;
     const moved =
       Math.abs(e.clientX - dragStart.clientX) +
       Math.abs(e.clientY - dragStart.clientY);
+    const ds = dragStart;
     dragStart = null;
-    // Click (≤ 3 px) seeks the sequence to that timeline position.
+    const wasMarquee = ds.kind === 'marquee' && marquee != null;
+    const m = marquee;
+    marquee = null;
+
+    // ---- Marquee release: select intersecting clips, no seek ------------
+    if (wasMarquee && moved > 3 && m && sequence) {
+      const ids = clipsIntersecting(m);
+      if (ds.modKeys.shift || ds.modKeys.cmd) {
+        // additive — keep existing selection, add intersected
+        ids.forEach((id) => selectionState.add(id));
+      } else {
+        selectionState.replace(ids);
+      }
+      scheduleDraw();
+      return;
+    }
+
+    // ---- Click (≤ 3 px) ---------------------------------------------------
     if (moved > 3 || !canvas || !sequence) return;
+
+    if (ds.downOnClipId) {
+      // Clip-click selection behavior (Premiere defaults).
+      if (ds.modKeys.cmd) {
+        selectionState.toggle(ds.downOnClipId);
+      } else if (ds.modKeys.shift) {
+        // Range-extend: select all clips on the same track between the
+        // earliest selected and this one (inclusive). With no prior
+        // selection this just selects the clicked clip.
+        const t = sequence.tracks.find((tr) =>
+          tr.clips.some((c) => c.id === ds.downOnClipId)
+        );
+        if (t) {
+          const selectedOnTrack = t.clips.filter((c) => selectionState.has(c.id));
+          if (selectedOnTrack.length === 0) {
+            selectionState.selectOnly(ds.downOnClipId);
+          } else {
+            const target = t.clips.find((c) => c.id === ds.downOnClipId)!;
+            const lo = Math.min(
+              target.timeline_in_seconds,
+              ...selectedOnTrack.map((c) => c.timeline_in_seconds)
+            );
+            const hi = Math.max(
+              target.timeline_in_seconds,
+              ...selectedOnTrack.map((c) => c.timeline_in_seconds)
+            );
+            const inRange = t.clips
+              .filter((c) => c.timeline_in_seconds >= lo && c.timeline_in_seconds <= hi)
+              .map((c) => c.id);
+            selectionState.replace(inRange);
+          }
+        }
+      } else {
+        selectionState.selectOnly(ds.downOnClipId);
+      }
+      scheduleDraw();
+      // Also seek the playhead to the click position — feels natural in
+      // every NLE. The seek runs in the background; we don't await it.
+      const localX = e.clientX - canvas.getBoundingClientRect().left;
+      const t = Math.max(0, scrollSeconds + (localX - TRACK_HEADER_W) / pixelsPerSecond);
+      void seekToTimeline(t);
+      return;
+    }
+
+    // ---- Click in empty area or ruler ----------------------------------
+    if (!ds.modKeys.shift && !ds.modKeys.cmd && selectionState.count > 0) {
+      selectionState.clear();
+      scheduleDraw();
+    }
     const rect = canvas.getBoundingClientRect();
     const localX = e.clientX - rect.left;
     if (localX < TRACK_HEADER_W) return;
     const t = Math.max(0, scrollSeconds + (localX - TRACK_HEADER_W) / pixelsPerSecond);
+    await seekToTimeline(t);
+  }
+
+  /** Seek the engine to `t` and park the playhead. Used by both
+   *  click-on-clip (background, no await) and click-empty. */
+  async function seekToTimeline(t: number) {
     try {
-      // `decode_sequence_at` refuses while playback is in flight;
-      // stop first so the click always lands.
       if (await isPlaying()) {
         try {
           await stopPlayback();
@@ -402,8 +588,30 @@
       playheadSeconds = t;
       scheduleDraw();
     } catch (err) {
-      await diagLog(`timeline: click-seek failed at t=${t.toFixed(3)}: ${String(err)}`);
+      await diagLog(`timeline: seek failed at t=${t.toFixed(3)}: ${String(err)}`);
     }
+  }
+
+  /** Which clip IDs intersect a marquee rect (in canvas-local px)? */
+  function clipsIntersecting(rect: { x0: number; y0: number; x1: number; y1: number }): string[] {
+    if (!sequence) return [];
+    const xLo = Math.min(rect.x0, rect.x1);
+    const xHi = Math.max(rect.x0, rect.x1);
+    const yLo = Math.min(rect.y0, rect.y1);
+    const yHi = Math.max(rect.y0, rect.y1);
+    const ids: string[] = [];
+    sequence.tracks.forEach((track, rowIdx) => {
+      const y = trackY(rowIdx) + 4;
+      const yh = TRACK_HEIGHT - 8;
+      if (y + yh < yLo || y > yHi) return;
+      for (const c of track.clips) {
+        const cx = timeToX(c.timeline_in_seconds);
+        const cw = c.duration_seconds * pixelsPerSecond;
+        if (cx + cw < xLo || cx > xHi) continue;
+        ids.push(c.id);
+      }
+    });
+    return ids;
   }
 
   // ---- Media drag-drop from Browser --------------------------------------
@@ -497,5 +705,11 @@
     class="block h-full w-full cursor-grab active:cursor-grabbing"
     onwheel={onWheel}
     onmousedown={onMouseDown}
+    onmouseleave={() => {
+      if (hoverClipId !== null) {
+        hoverClipId = null;
+        scheduleDraw();
+      }
+    }}
   ></canvas>
 </div>

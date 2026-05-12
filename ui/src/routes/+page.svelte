@@ -18,6 +18,7 @@
   } from '$lib/ipc';
   import { projectState } from '$lib/project.svelte';
   import { dragState } from '$lib/drag.svelte';
+  import { selectionState } from '$lib/selection.svelte';
   import Timeline from '$lib/timeline/Timeline.svelte';
 
   let backend = $state<string>('checking…');
@@ -211,6 +212,12 @@
         e.preventDefault();
         if (e.shiftKey) jumpSeconds(1);
         else stepFrame(1);
+        return;
+      case 'Escape':
+        if (selectionState.count > 0) {
+          e.preventDefault();
+          selectionState.clear();
+        }
         return;
     }
   }
