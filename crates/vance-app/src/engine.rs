@@ -92,6 +92,73 @@ pub struct SequenceInfo {
     pub clip_count: usize,
 }
 
+/// Full contents of a sequence, in floats-of-seconds, suitable for the
+/// JS timeline canvas. Times use `f64` (rather than `RationalTime`)
+/// because the canvas just needs a position; rendering accuracy is fine
+/// at 64-bit float precision and saves a JSON conversion layer per
+/// clip.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct SequenceContents {
+    /// Sequence ID as a string.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Master frame rate as `(num, den)`.
+    pub frame_rate_num: i64,
+    /// Master frame rate denominator.
+    pub frame_rate_den: i64,
+    /// Total duration of the sequence, in seconds.
+    pub duration_seconds: f64,
+    /// Tracks in render order (video first, then audio by convention).
+    pub tracks: Vec<TrackContents>,
+}
+
+/// One track's worth of clips in `SequenceContents`.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct TrackContents {
+    /// Track ID.
+    pub id: String,
+    /// "video" or "audio".
+    pub kind: String,
+    /// Display name (V1, A1, etc.).
+    pub name: String,
+    /// Whether the track contributes to playback.
+    pub enabled: bool,
+    /// Whether edit ops refuse to modify this track.
+    pub locked: bool,
+    /// Clips on this track, in timeline order.
+    pub clips: Vec<ClipContents>,
+}
+
+/// One clip's worth of timing info for the UI.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ClipContents {
+    /// Clip ID.
+    pub id: String,
+    /// MediaItem ID this clip references.
+    pub media_id: String,
+    /// Display name.
+    pub name: String,
+    /// Start time on the sequence timeline, in seconds.
+    pub timeline_in_seconds: f64,
+    /// Length on the timeline, in seconds.
+    pub duration_seconds: f64,
+    /// First visible time within the source media, in seconds.
+    pub source_in_seconds: f64,
+    /// Whether the clip is muted.
+    pub enabled: bool,
+}
+
+fn rt_to_seconds(t: vance_core::RationalTime) -> f64 {
+    let n = t.0.numer() as f64;
+    let d = t.0.denom() as f64;
+    if d == 0.0 {
+        0.0
+    } else {
+        n / d
+    }
+}
+
 impl From<&Project> for ProjectInfo {
     fn from(p: &Project) -> Self {
         Self {
@@ -493,6 +560,49 @@ impl Engine {
     /// Path the current project was loaded from / last saved to.
     pub fn current_project_path(&self) -> Option<&PathBuf> {
         self.current_project_path.as_ref()
+    }
+
+    /// Full contents of the currently active sequence, ready for the
+    /// timeline canvas. Returns `None` when no project is loaded or no
+    /// sequence is selected.
+    pub fn current_sequence_contents(&self) -> Option<SequenceContents> {
+        let project = self.current_project.as_ref()?;
+        let id = self.current_sequence_id?;
+        let seq = project.sequence(id)?;
+        Some(SequenceContents {
+            id: seq.id.to_string(),
+            name: seq.name.clone(),
+            frame_rate_num: seq.frame_rate.0.numer(),
+            frame_rate_den: seq.frame_rate.0.denom(),
+            duration_seconds: rt_to_seconds(seq.duration()),
+            tracks: seq
+                .tracks
+                .iter()
+                .map(|t| TrackContents {
+                    id: t.id.to_string(),
+                    kind: match t.kind {
+                        vance_timeline::TrackKind::Video => "video".into(),
+                        vance_timeline::TrackKind::Audio => "audio".into(),
+                    },
+                    name: t.name.clone(),
+                    enabled: t.enabled,
+                    locked: t.locked,
+                    clips: t
+                        .clips
+                        .iter()
+                        .map(|c| ClipContents {
+                            id: c.id.to_string(),
+                            media_id: c.media.to_string(),
+                            name: c.name.clone(),
+                            timeline_in_seconds: rt_to_seconds(c.timeline_in),
+                            duration_seconds: rt_to_seconds(c.duration()),
+                            source_in_seconds: rt_to_seconds(c.source_in),
+                            enabled: c.enabled,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        })
     }
 
     /// Switch the active sequence. The ID must reference a sequence in

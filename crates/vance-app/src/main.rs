@@ -11,7 +11,7 @@
 
 mod engine;
 
-use engine::{EngineHandle, ProjectInfo};
+use engine::{EngineHandle, ProjectInfo, SequenceContents};
 use serde::Serialize;
 use tauri::Manager;
 use vance_decoder::StreamInfo;
@@ -143,6 +143,18 @@ fn current_project_path(state: tauri::State<'_, EngineHandle>) -> Option<String>
 }
 
 #[tauri::command]
+fn current_sequence_contents(state: tauri::State<'_, EngineHandle>) -> Option<SequenceContents> {
+    state.lock().current_sequence_contents()
+}
+
+/// Lets the chrome write a free-form line into the engine's tracing
+/// output. Only used for debugging the JS ↔ engine boundary.
+#[tauri::command]
+fn diag_log(message: String) {
+    tracing::info!(target: "ui_diag", "{message}");
+}
+
+#[tauri::command]
 fn project_info(state: tauri::State<'_, EngineHandle>) -> Option<ProjectInfo> {
     state.lock().project_info()
 }
@@ -215,6 +227,8 @@ fn main() {
             new_project,
             save_project,
             current_project_path,
+            current_sequence_contents,
+            diag_log,
         ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");

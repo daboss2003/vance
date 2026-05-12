@@ -202,17 +202,26 @@ impl Viewport {
                 width: bounds.w as f64,
                 height: bounds.h as f64,
             };
+            // Re-sync contentsScale with the current screen — same
+            // multi-monitor reason as backingScaleFactor below.
+            let current_scale = self.inner.parent_window.backingScaleFactor();
             unsafe {
                 let layer_ptr: *const CAMetalLayer = Retained::as_ptr(&self.inner.metal_layer);
                 let layer_obj: &AnyObject = &*(layer_ptr as *const AnyObject);
                 let _: () = msg_send![layer_obj, setDrawableSize: pixel_size];
+                let _: () = msg_send![layer_obj, setContentsScale: current_scale];
             }
         }
 
-        // Move/resize the child window. Uses the parent's screen frame
-        // to translate from chrome client-area pixels to screen points.
+        // Re-read the parent window's current backing scale every call.
+        // The chrome reports bounds in *physical* pixels using the
+        // current `window.devicePixelRatio`; if the user drags the
+        // window across screens with different DPRs, that ratio
+        // changes — and so must our divisor. The cached value captured
+        // at install time is only correct if the window never leaves
+        // its starting screen.
         let inner = self.inner.clone();
-        let scale = self.backing_scale;
+        let scale = inner.parent_window.backingScaleFactor();
         let work = move || {
             let screen_frame = compute_child_screen_frame(&inner.parent_window, &bounds, scale);
             unsafe {

@@ -81,3 +81,42 @@ export const saveProject = (path: string | null): Promise<void> =>
 /** Path the current project was loaded from / last saved to. */
 export const currentProjectPath = (): Promise<string | null> =>
   invoke('current_project_path');
+
+// ---- Sequence contents (for the timeline canvas) ---------------------------
+
+export type ClipContents = {
+  id: string;
+  media_id: string;
+  name: string;
+  timeline_in_seconds: number;
+  duration_seconds: number;
+  source_in_seconds: number;
+  enabled: boolean;
+};
+
+export type TrackContents = {
+  id: string;
+  kind: 'video' | 'audio';
+  name: string;
+  enabled: boolean;
+  locked: boolean;
+  clips: ClipContents[];
+};
+
+export type SequenceContents = {
+  id: string;
+  name: string;
+  frame_rate_num: number;
+  frame_rate_den: number;
+  duration_seconds: number;
+  tracks: TrackContents[];
+};
+
+/** Full contents of the engine's current sequence, ready to render on
+ *  the timeline canvas. `null` when no project / no active sequence. */
+export const currentSequenceContents = (): Promise<SequenceContents | null> =>
+  invoke('current_sequence_contents');
+
+/** Send a debug line into the engine's tracing log. */
+export const diagLog = (message: string): Promise<void> =>
+  invoke('diag_log', { message });

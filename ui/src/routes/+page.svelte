@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { open } from '@tauri-apps/plugin-dialog';
   import {
     backendVersion,
@@ -13,6 +13,7 @@
     type StreamInfo
   } from '$lib/ipc';
   import { projectState } from '$lib/project.svelte';
+  import Timeline from '$lib/timeline/Timeline.svelte';
 
   let backend = $state<string>('checking…');
   let info = $state<StreamInfo | null>(null);
@@ -24,6 +25,21 @@
   let playError = $state<string | null>(null);
 
   let viewportEl: HTMLDivElement | null = $state(null);
+
+  // Bumped whenever something in the project changes that the Timeline
+  // canvas should re-render in response to. Cheap counter; the Timeline
+  // re-fetches its sequence data on each tick.
+  //
+  // NOTE: the `++` would read+write the same rune inside the effect,
+  // which Svelte 5 trips as `effect_update_depth_exceeded`. We wrap
+  // the mutation in `untrack` so the read isn't tracked as a dep.
+  let timelineRefreshTick = $state<number>(0);
+  $effect(() => {
+    void projectState.info;
+    untrack(() => {
+      timelineRefreshTick = timelineRefreshTick + 1;
+    });
+  });
 
   onMount(() => {
     backendVersion()
@@ -569,6 +585,15 @@
         </p>
       {/if}
     </aside>
+  </div>
+
+  <!-- Timeline panel -->
+  <div
+    class="border-vance-border bg-vance-panel h-56 flex-shrink-0 border-t"
+    role="region"
+    aria-label="Timeline"
+  >
+    <Timeline refreshTick={timelineRefreshTick} />
   </div>
 
   <!-- Footer -->
