@@ -3,11 +3,14 @@
   import { open } from '@tauri-apps/plugin-dialog';
   import {
     backendVersion,
+    currentTimelineSeconds,
     decodeAndRenderAt,
+    decodeSequenceAt,
     diagLog,
     isPlaying,
     lastResumePts,
     openFile,
+    playSequence,
     setViewportBounds,
     startPlayback,
     stopPlayback,
@@ -381,6 +384,15 @@
     }
   }
 
+  /** True when we should treat Play as "play the active sequence"
+   *  (project + sequence + at least one clip somewhere). When false
+   *  Play falls back to the Phase-2 single-file path. */
+  function isSequencePlayable(): boolean {
+    const p = projectState.info;
+    if (!p) return false;
+    return p.sequences.some((s) => s.clip_count > 0);
+  }
+
   async function togglePlayback() {
     playError = null;
     if (playing) {
@@ -390,6 +402,18 @@
         const resumePts = await stopPlayback();
         lastPts = resumePts;
         playing = false;
+      } catch (e) {
+        playError = String(e);
+      }
+    } else if (isSequencePlayable()) {
+      // Phase 4.7.5: play the active sequence from the current
+      // playhead (so Stop → Play resumes where it left off rather
+      // than restarting from the first clip). Continuous through-
+      // clip-boundary playback comes later.
+      try {
+        const from = (await currentTimelineSeconds()) ?? 0;
+        await playSequence(from);
+        playing = true;
       } catch (e) {
         playError = String(e);
       }
@@ -570,7 +594,7 @@
           <button
             class="rounded bg-vance-bg border-vance-border border px-2 py-1 disabled:opacity-50"
             onclick={() => jumpSeconds(-1)}
-            disabled={!info}
+            disabled={!info && !isSequencePlayable()}
             title="J: jump back 1s"
           >
             J
@@ -578,7 +602,7 @@
           <button
             class="rounded bg-vance-bg border-vance-border border px-2 py-1 disabled:opacity-50"
             onclick={() => stepFrame(-1)}
-            disabled={!info}
+            disabled={!info && !isSequencePlayable()}
             title="←: step back 1 frame"
           >
             ‹
@@ -586,7 +610,7 @@
           <button
             class="rounded bg-[var(--color-vance-accent)] px-3 py-1 font-semibold text-[#003040] disabled:opacity-50"
             onclick={togglePlayback}
-            disabled={!info}
+            disabled={!info && !isSequencePlayable()}
             title="Space / L: play, K: pause"
           >
             {playing ? 'Stop' : 'Play'}
@@ -594,7 +618,7 @@
           <button
             class="rounded bg-vance-bg border-vance-border border px-2 py-1 disabled:opacity-50"
             onclick={() => stepFrame(1)}
-            disabled={!info}
+            disabled={!info && !isSequencePlayable()}
             title="→: step forward 1 frame"
           >
             ›
@@ -602,7 +626,7 @@
           <button
             class="rounded bg-vance-bg border-vance-border border px-2 py-1 disabled:opacity-50"
             onclick={() => jumpSeconds(1)}
-            disabled={!info}
+            disabled={!info && !isSequencePlayable()}
             title="Shift+→: jump forward 1s"
           >
             L
@@ -620,7 +644,7 @@
           <button
             type="submit"
             class="rounded bg-[var(--color-vance-accent)] px-2 py-1 text-[#003040]"
-            disabled={!info}
+            disabled={!info && !isSequencePlayable()}
           >
             Go
           </button>

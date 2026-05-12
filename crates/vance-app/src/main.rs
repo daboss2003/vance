@@ -171,6 +171,33 @@ fn media_list(state: tauri::State<'_, EngineHandle>) -> Vec<MediaItemInfo> {
 }
 
 #[tauri::command]
+fn play_sequence(
+    state: tauri::State<'_, EngineHandle>,
+    timeline_seconds: f64,
+) -> Result<(), String> {
+    state
+        .lock()
+        .play_sequence(timeline_seconds)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn decode_sequence_at(
+    state: tauri::State<'_, EngineHandle>,
+    timeline_seconds: f64,
+) -> Result<i64, String> {
+    state
+        .lock()
+        .decode_sequence_at(timeline_seconds)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn current_timeline_seconds(state: tauri::State<'_, EngineHandle>) -> Option<f64> {
+    state.lock().current_timeline_seconds()
+}
+
+#[tauri::command]
 fn insert_clip_at(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -271,6 +298,9 @@ fn main() {
             import_media_file,
             media_list,
             insert_clip_at,
+            play_sequence,
+            decode_sequence_at,
+            current_timeline_seconds,
         ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");

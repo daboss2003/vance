@@ -12,7 +12,11 @@
   import { onMount } from 'svelte';
   import {
     currentSequenceContents,
+    currentTimelineSeconds,
+    decodeSequenceAt,
     diagLog,
+    isPlaying,
+    stopPlayback,
     type SequenceContents,
     type TrackContents,
     type ClipContents
@@ -30,6 +34,10 @@
   // seconds are clipped off the left edge of the visible area.
   let pixelsPerSecond = $state<number>(60);
   let scrollSeconds = $state<number>(0);
+
+  // Engine's current playhead, fetched from `current_timeline_seconds`.
+  // Updated by the playback poll set up in onMount.
+  let playheadSeconds = $state<number>(0);
 
   // Layout constants.
   const RULER_HEIGHT = 22; // px
@@ -309,10 +317,8 @@
 
   // ---- Playhead -----------------------------------------------------------
 
-  // Static at 0 for now — the engine's timeline cursor wires up in 4.x
-  // when sequence-driven playback lands.
   function drawPlayhead(ctx: CanvasRenderingContext2D, cssH: number) {
-    const x = timeToX(0);
+    const x = timeToX(playheadSeconds);
     if (x < TRACK_HEADER_W) return;
     ctx.strokeStyle = PLAYHEAD;
     ctx.lineWidth = 1;
@@ -320,6 +326,14 @@
     ctx.moveTo(Math.round(x) + 0.5, 0);
     ctx.lineTo(Math.round(x) + 0.5, cssH);
     ctx.stroke();
+    // Small filled triangle on the ruler so the playhead is easy to grab.
+    ctx.fillStyle = PLAYHEAD;
+    ctx.beginPath();
+    ctx.moveTo(x - 5, 0);
+    ctx.lineTo(x + 5, 0);
+    ctx.lineTo(x, 8);
+    ctx.closePath();
+    ctx.fill();
   }
 
   // ---- Wheel / drag interaction ------------------------------------------
@@ -345,19 +359,51 @@
     scheduleDraw();
   }
 
-  let dragStart: { x: number; scroll: number } | null = null;
+  let dragStart: { x: number; clientX: number; clientY: number; scroll: number } | null = null;
   function onMouseDown(e: MouseEvent) {
     if (e.button !== 0) return;
-    dragStart = { x: e.clientX, scroll: scrollSeconds };
+    dragStart = {
+      x: e.clientX,
+      clientX: e.clientX,
+      clientY: e.clientY,
+      scroll: scrollSeconds
+    };
   }
   function onMouseMove(e: MouseEvent) {
     if (!dragStart) return;
     const dx = e.clientX - dragStart.x;
+    if (Math.abs(dx) < 3) return; // ignore micro-jitter so clicks survive
     scrollSeconds = Math.max(0, dragStart.scroll - dx / pixelsPerSecond);
     scheduleDraw();
   }
-  function onMouseUp() {
+  async function onMouseUp(e: MouseEvent) {
+    if (!dragStart) return;
+    const moved =
+      Math.abs(e.clientX - dragStart.clientX) +
+      Math.abs(e.clientY - dragStart.clientY);
     dragStart = null;
+    // Click (≤ 3 px) seeks the sequence to that timeline position.
+    if (moved > 3 || !canvas || !sequence) return;
+    const rect = canvas.getBoundingClientRect();
+    const localX = e.clientX - rect.left;
+    if (localX < TRACK_HEADER_W) return;
+    const t = Math.max(0, scrollSeconds + (localX - TRACK_HEADER_W) / pixelsPerSecond);
+    try {
+      // `decode_sequence_at` refuses while playback is in flight;
+      // stop first so the click always lands.
+      if (await isPlaying()) {
+        try {
+          await stopPlayback();
+        } catch {
+          /* ignore */
+        }
+      }
+      await decodeSequenceAt(t);
+      playheadSeconds = t;
+      scheduleDraw();
+    } catch (err) {
+      await diagLog(`timeline: click-seek failed at t=${t.toFixed(3)}: ${String(err)}`);
+    }
   }
 
   // ---- Media drag-drop from Browser --------------------------------------
@@ -420,11 +466,27 @@
     // disables HTML5 native drag-and-drop). On mouseup we check
     // dragState and consume it if the cursor is inside our canvas.
     window.addEventListener('mouseup', onWindowMouseUp);
+
+    // Playhead poll: fetch the engine's running playhead ~10×/sec so
+    // the canvas reflects live playback position.
+    const playheadPoll = window.setInterval(async () => {
+      try {
+        const t = await currentTimelineSeconds();
+        if (t != null && Math.abs(t - playheadSeconds) > 1e-3) {
+          playheadSeconds = t;
+          scheduleDraw();
+        }
+      } catch {
+        // ignore transient errors
+      }
+    }, 100);
+
     return () => {
       ro.disconnect();
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseup', onMouseUp);
       window.removeEventListener('mouseup', onWindowMouseUp);
+      window.clearInterval(playheadPoll);
     };
   });
 </script>

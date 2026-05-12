@@ -102,12 +102,14 @@ class ProjectState {
     }
   }
 
-  /** Drop a clip on the timeline. After a successful insert, bump
+  /** Drop a clip on the timeline. After a successful insert, refresh
+   *  `info` (so clip_count + isSequencePlayable update) and bump
    *  `editTick` so the Timeline canvas re-fetches its contents. */
   async insertClip(trackId: string, mediaId: string, timelineSeconds: number) {
     this.error = null;
     try {
       await insertClipAt(trackId, mediaId, timelineSeconds);
+      this.info = await projectInfo();
       this.editTick++;
     } catch (e) {
       this.error = String(e);

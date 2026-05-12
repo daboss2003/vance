@@ -149,3 +149,19 @@ export const insertClipAt = (
   timelineSeconds: number
 ): Promise<string> =>
   invoke('insert_clip_at', { trackId, mediaId, timelineSeconds });
+
+/** Start playback of the active sequence from `timelineSeconds`,
+ *  using scene_plan to pick the active clip and swapping the
+ *  decoder onto its media. */
+export const playSequence = (timelineSeconds: number): Promise<void> =>
+  invoke('play_sequence', { timelineSeconds });
+
+/** Single-shot decode + render of the active sequence at
+ *  `timelineSeconds`. Returns the actual presented PTS. */
+export const decodeSequenceAt = (timelineSeconds: number): Promise<number> =>
+  invoke('decode_sequence_at', { timelineSeconds });
+
+/** Engine's current sequence playhead in seconds. `null` when no
+ *  sequence playback has started since the last project load. */
+export const currentTimelineSeconds = (): Promise<number | null> =>
+  invoke('current_timeline_seconds');

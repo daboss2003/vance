@@ -185,6 +185,69 @@ fn seconds_to_rt(s: f64) -> vance_core::RationalTime {
         .unwrap_or(vance_core::RationalTime::ZERO)
 }
 
+/// First video clip in the sequence whose `timeline_in >= after_t`,
+/// across all enabled video tracks. Used by `play_sequence` /
+/// `decode_sequence_at` to do the right thing when the requested
+/// timeline position sits in a gap or before the first clip.
+struct FirstClipHit {
+    start: vance_core::RationalTime,
+    active: vance_timeline::ActiveClip,
+}
+
+/// Look up `(timeline_in_seconds, source_in_seconds)` for a clip by
+/// ID anywhere in the sequence. Used to anchor playback for the
+/// playhead-translation math.
+fn clip_anchor_seconds(
+    seq: &Sequence,
+    clip_id: vance_timeline::ClipId,
+) -> Option<(f64, f64)> {
+    for track in seq.tracks.iter() {
+        for clip in track.clips.iter() {
+            if clip.id == clip_id {
+                return Some((
+                    rt_to_seconds(clip.timeline_in),
+                    rt_to_seconds(clip.source_in),
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn first_clip_after(
+    seq: &Sequence,
+    after_t: vance_core::RationalTime,
+) -> Option<FirstClipHit> {
+    let mut best: Option<FirstClipHit> = None;
+    for track in seq.tracks.iter() {
+        if track.kind != TrackKind::Video || !track.enabled {
+            continue;
+        }
+        for clip in track.clips.iter() {
+            if !clip.enabled {
+                continue;
+            }
+            if clip.timeline_in < after_t {
+                continue;
+            }
+            let hit = FirstClipHit {
+                start: clip.timeline_in,
+                active: vance_timeline::ActiveClip {
+                    clip_id: clip.id,
+                    media: clip.media,
+                    source_pts: clip.source_in,
+                },
+            };
+            best = match best {
+                None => Some(hit),
+                Some(b) if hit.start < b.start => Some(hit),
+                Some(b) => Some(b),
+            };
+        }
+    }
+    best
+}
+
 /// Convert a decoder `StreamInfo` duration into a `RationalTime`.
 /// Returns `None` when the container didn't declare a duration.
 fn duration_from_stream(s: &StreamInfo) -> Option<vance_core::RationalTime> {
@@ -318,6 +381,24 @@ pub struct Engine {
     /// Path of the `.vance/` bundle the current project was loaded
     /// from (or last saved to). `save_project(None)` writes here.
     current_project_path: Option<PathBuf>,
+
+    /// Timeline/source anchors of the clip currently being played
+    /// from the active sequence. Lets us translate the playback
+    /// loop's source-PTS readout into a timeline position for the
+    /// canvas playhead. Cleared when no sequence playback is in
+    /// flight (single-file `start_playback` doesn't set it).
+    playing_clip_anchor: Option<ClipAnchor>,
+}
+
+/// Anchors a stream-time-base playback position back to a sequence
+/// timeline. `timeline_seconds = timeline_in + (source_seconds -
+/// source_in)`, where `source_seconds = stream_pts * tb_num / tb_den`.
+#[derive(Clone, Copy, Debug)]
+pub struct ClipAnchor {
+    pub timeline_in_seconds: f64,
+    pub source_in_seconds: f64,
+    pub time_base_num: i64,
+    pub time_base_den: i64,
 }
 
 /// Owns the AudioPlayer on a dedicated thread. The thread parks until
@@ -713,6 +794,178 @@ impl Engine {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Start playback of the active sequence from `timeline_seconds`.
+    ///
+    /// Uses `scene_plan::scene_at` to find the topmost video clip at
+    /// that position, swaps the decoder onto that clip's media (which
+    /// may differ from whatever was last opened via `open_file`), and
+    /// kicks off the existing `start_playback` loop at the right
+    /// source PTS. Continuous playback across clip boundaries lands
+    /// in a follow-on milestone; for now the playback loop runs
+    /// against the active clip's underlying file as a unit.
+    pub fn play_sequence(&mut self, timeline_seconds: f64) -> Result<(), EngineError> {
+        if self.playback.is_some() {
+            return Err(EngineError::PlaybackInProgress);
+        }
+        // Scope the immutable project borrow tightly so we can call
+        // `self.open_file` (mutable borrow) afterwards. Also capture
+        // the clip's timeline/source anchors so the UI can translate
+        // the running source-PTS back to a timeline position.
+        let (media_path, source_pts_seconds, anchor_timeline_in, anchor_source_in) = {
+            let project = self
+                .current_project
+                .as_ref()
+                .ok_or(EngineError::NoProject)?;
+            let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+            let seq = project
+                .sequence(seq_id)
+                .ok_or(EngineError::SequenceNotFound)?;
+
+            // If the requested t lands on a clip, use it directly;
+            // otherwise jump to the earliest clip in the sequence so
+            // "Play" with an empty playhead does the obvious thing.
+            let timeline_t = seconds_to_rt(timeline_seconds);
+            let active = match vance_timeline::scene_at(seq, timeline_t) {
+                vance_timeline::SceneAt::Clip(c) => c,
+                vance_timeline::SceneAt::Empty => {
+                    let next = first_clip_after(seq, timeline_t).ok_or_else(|| {
+                        EngineError::Project("sequence has no clips to play".into())
+                    })?;
+                    tracing::info!(
+                        requested = timeline_seconds,
+                        first_clip_start = rt_to_seconds(next.start),
+                        "play_sequence: empty at requested t, jumping to first clip"
+                    );
+                    next.active
+                }
+            };
+            let media = project
+                .media
+                .get(&active.media)
+                .ok_or(EngineError::MediaNotFound)?;
+            let path = media.path.to_string_lossy().into_owned();
+            // Find the source clip's timeline_in for the anchor.
+            let (tl_in_sec, src_in_sec) = clip_anchor_seconds(seq, active.clip_id)
+                .unwrap_or((0.0, rt_to_seconds(active.source_pts)));
+            (path, rt_to_seconds(active.source_pts), tl_in_sec, src_in_sec)
+        };
+
+        // Reopen decoder onto the active clip's media. Idempotent if
+        // we're already on this file: the decoder reopens cleanly.
+        self.open_file(&media_path)?;
+
+        // Convert source-seconds → stream-time-base PTS.
+        let info = self
+            .stream_info
+            .as_ref()
+            .ok_or_else(|| EngineError::Project("stream info missing post-open".into()))?;
+        let (tb_n, tb_d) = info.time_base;
+        let from_pts = if tb_n != 0 {
+            (source_pts_seconds * (tb_d as f64) / (tb_n as f64)).round() as i64
+        } else {
+            0
+        };
+        tracing::info!(
+            from_seconds = source_pts_seconds,
+            from_pts,
+            "play_sequence: starting"
+        );
+        self.playing_clip_anchor = Some(ClipAnchor {
+            timeline_in_seconds: anchor_timeline_in,
+            source_in_seconds: anchor_source_in,
+            time_base_num: tb_n,
+            time_base_den: tb_d,
+        });
+        self.start_playback(from_pts)
+    }
+
+    /// Current playhead position on the active sequence's timeline,
+    /// in seconds. Reads the playback loop's `last_pts` atomic and
+    /// translates through the active clip's anchor. Returns 0 when
+    /// no anchor is set (no sequence playback ever started).
+    pub fn current_timeline_seconds(&self) -> Option<f64> {
+        let anchor = self.playing_clip_anchor.as_ref()?;
+        if anchor.time_base_den == 0 {
+            return Some(anchor.timeline_in_seconds);
+        }
+        // Pick the freshest stream-PTS we have: the active session's
+        // atomic if playing, else the last-resumed value.
+        let stream_pts = if let Some(session) = &self.playback {
+            session.last_pts.load(Ordering::Acquire)
+        } else if let Some(p) = self.last_resume_pts {
+            p
+        } else {
+            return Some(anchor.timeline_in_seconds);
+        };
+        let source_sec = (stream_pts as f64) * (anchor.time_base_num as f64)
+            / (anchor.time_base_den as f64);
+        Some(anchor.timeline_in_seconds + (source_sec - anchor.source_in_seconds))
+    }
+
+    /// Decode a single frame from the active sequence at
+    /// `timeline_seconds` (used by seek-while-paused). Bypasses the
+    /// playback scheduler.
+    pub fn decode_sequence_at(&mut self, timeline_seconds: f64) -> Result<i64, EngineError> {
+        if self.playback.is_some() {
+            return Err(EngineError::PlaybackInProgress);
+        }
+        let (media_path, source_pts_seconds, anchor_timeline_in, anchor_source_in) = {
+            let project = self
+                .current_project
+                .as_ref()
+                .ok_or(EngineError::NoProject)?;
+            let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+            let seq = project
+                .sequence(seq_id)
+                .ok_or(EngineError::SequenceNotFound)?;
+            let timeline_t = seconds_to_rt(timeline_seconds);
+            let active = match vance_timeline::scene_at(seq, timeline_t) {
+                vance_timeline::SceneAt::Clip(c) => c,
+                vance_timeline::SceneAt::Empty => {
+                    let next = first_clip_after(seq, timeline_t).ok_or_else(|| {
+                        EngineError::Project("sequence has no clips to decode".into())
+                    })?;
+                    next.active
+                }
+            };
+            let media = project
+                .media
+                .get(&active.media)
+                .ok_or(EngineError::MediaNotFound)?;
+            let (tl_in, src_in) = clip_anchor_seconds(seq, active.clip_id)
+                .unwrap_or((0.0, rt_to_seconds(active.source_pts)));
+            (
+                media.path.to_string_lossy().into_owned(),
+                rt_to_seconds(active.source_pts),
+                tl_in,
+                src_in,
+            )
+        };
+        self.open_file(&media_path)?;
+        let info = self
+            .stream_info
+            .as_ref()
+            .ok_or_else(|| EngineError::Project("stream info missing post-open".into()))?;
+        let (tb_n, tb_d) = info.time_base;
+        let target_pts = if tb_n != 0 {
+            (source_pts_seconds * (tb_d as f64) / (tb_n as f64)).round() as i64
+        } else {
+            0
+        };
+        self.playing_clip_anchor = Some(ClipAnchor {
+            timeline_in_seconds: anchor_timeline_in,
+            source_in_seconds: anchor_source_in,
+            time_base_num: tb_n,
+            time_base_den: tb_d,
+        });
+        let pts = self.decode_and_render_at(target_pts)?;
+        // Park the engine's "where am I" pointer at the just-rendered
+        // frame so a subsequent Play resumes from this click, not from
+        // whatever was the last *playback* stop position.
+        self.last_resume_pts = Some(pts);
+        Ok(pts)
     }
 
     /// Insert a clip referencing `media_id`'s full visible range at
