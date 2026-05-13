@@ -704,8 +704,19 @@ pub struct PlaybackSession {
     /// `stop_playback` to report a resume PTS of 0 so the next Play
     /// rewinds to the start instead of getting stuck at EOS.
     ended_at_eos: Arc<AtomicBool>,
-    /// Joins to recover the DecoderClient back into Engine.decoder.
-    handle: JoinHandle<DecoderClient>,
+    /// Set by the playback loop when it exits because the playhead
+    /// just crossed *out* of a transition window (so the primary
+    /// decoder, which holds A's media, should be replaced by one on
+    /// B's media — see `is_playing` for the chain). The atomic
+    /// stores microseconds; `i64::MIN` means "not requested".
+    chain_resume_micros: Arc<std::sync::atomic::AtomicI64>,
+    /// Joins to recover both decoders (primary + optional secondary
+    /// used during cross-dissolves) and the path currently open in
+    /// the secondary, so the engine can reuse it across sessions.
+    /// The secondary is `None` when playback never crossed a
+    /// transition; the path is `None` when nothing has been opened on
+    /// the secondary yet.
+    handle: JoinHandle<(DecoderClient, Option<DecoderClient>, Option<String>)>,
 }
 
 impl Engine {
@@ -1131,12 +1142,42 @@ impl Engine {
         let last_pts_clone = last_pts.clone();
         let ended_at_eos = Arc::new(AtomicBool::new(false));
         let ended_at_eos_clone = ended_at_eos.clone();
+        let chain_resume_micros =
+            Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN));
+        let chain_resume_micros_clone = chain_resume_micros.clone();
         let last_bounds = self.last_bounds;
         // Consume the effects snapshot stashed by play_sequence
         // (empty for single-file Open File… playback).
         let clip_effects = std::mem::take(&mut self.next_play_effects);
         let clip_source_in_sec = self.next_play_source_in_sec;
         self.next_play_source_in_sec = 0.0;
+
+        // Build the optional sequence context. Only set when the
+        // anchor was placed by `play_sequence` (i.e., sequence
+        // playback, not Open File…) — single-file playback has no
+        // transitions to query. The secondary decoder is moved out of
+        // engine state so the loop owns it during the run.
+        let seq_ctx = if let (Some(project), Some(seq_id), Some(anchor)) = (
+            self.current_project.as_ref(),
+            self.current_sequence_id,
+            self.playing_clip_anchor.as_ref(),
+        ) {
+            project.sequence(seq_id).map(|seq| SequencePlaybackContext {
+                sequence: (**seq).clone(),
+                media_paths: project
+                    .media
+                    .iter()
+                    .map(|(id, m)| (*id, m.path.clone()))
+                    .collect(),
+                decoder_bin: locate_decoder_binary().unwrap_or_default(),
+                anchor_timeline_in: anchor.timeline_in_seconds,
+                anchor_source_in: anchor.source_in_seconds,
+            })
+        } else {
+            None
+        };
+        let transition_decoder = self.transition_decoder.take();
+        let transition_media_path = self.transition_media_path.take();
         let handle = std::thread::Builder::new()
             .name("vance-engine.playback".into())
             .spawn(move || {
@@ -1151,8 +1192,12 @@ impl Engine {
                     audio_sync,
                     last_pts_clone,
                     ended_at_eos_clone,
+                    chain_resume_micros_clone,
                     clip_effects,
                     clip_source_in_sec,
+                    seq_ctx,
+                    transition_decoder,
+                    transition_media_path,
                 )
             })
             .map_err(|e| EngineError::PlaybackThread(format!("spawn: {e}")))?;
@@ -1160,6 +1205,7 @@ impl Engine {
             stop,
             last_pts,
             ended_at_eos,
+            chain_resume_micros,
             handle,
         });
         self.audio_owner = audio_owner;
@@ -1196,8 +1242,14 @@ impl Engine {
             session.last_pts.load(Ordering::Acquire)
         };
         match session.handle.join() {
-            Ok(decoder) => {
+            Ok((decoder, secondary, secondary_path)) => {
                 self.decoder = Some(decoder);
+                // Reclaim the warm secondary + its open path so a
+                // subsequent scrub / playback through the same B
+                // media skips re-opening the sidecar.
+                self.transition_decoder = secondary;
+                self.transition_media_path = secondary_path;
+                self.transition_stream_info = None;
                 self.last_resume_pts = Some(resume_pts);
                 Ok(resume_pts)
             }
@@ -2226,16 +2278,34 @@ impl Engine {
             return self.playback.is_some();
         }
 
-        // Snapshot the chaining flag before stop_playback clears it.
+        // Snapshot the chaining flag and any explicit resume target
+        // before stop_playback clears them.
         let chain = self.playing_sequence_active;
+        let chain_resume = self
+            .playback
+            .as_ref()
+            .map(|s| s.chain_resume_micros.load(Ordering::Acquire))
+            .unwrap_or(i64::MIN);
         let _ = self.stop_playback();
         if !chain {
             return false;
         }
 
-        // After natural EOS in sequence mode, look for the next clip
-        // and continue. If no next clip, playback truly ends.
-        if let Some(next_t) = self.next_clip_start_seconds() {
+        // If the loop exited because it crossed *out* of a transition
+        // window, it stashed the timeline microseconds it wants us to
+        // resume at — there, `play_sequence` resolves to the B clip
+        // and swaps the primary onto its media. Otherwise fall back
+        // to the EOS-driven "next clip start" path.
+        if chain_resume != i64::MIN {
+            let resume_t = (chain_resume as f64) / 1_000_000.0;
+            tracing::info!(
+                resume_t,
+                "playback: chaining to post-transition position",
+            );
+            if self.play_sequence(resume_t).is_ok() {
+                return true;
+            }
+        } else if let Some(next_t) = self.next_clip_start_seconds() {
             tracing::info!(next_t, "playback: chaining to next clip");
             if self.play_sequence(next_t).is_ok() {
                 return true;
@@ -2280,6 +2350,29 @@ impl Engine {
     pub fn last_resume_pts(&self) -> Option<i64> {
         self.last_resume_pts
     }
+}
+
+/// Context passed to the playback loop so it can resolve transitions
+/// against the live sequence without touching engine state from
+/// another thread. None for single-file (Open File…) playback, where
+/// the loop has nothing to look up.
+pub struct SequencePlaybackContext {
+    /// Snapshot of the current sequence. The loop only reads it (to
+    /// query `transition_at`) so a clone is fine and avoids any
+    /// cross-thread locking on the engine.
+    pub sequence: Sequence,
+    /// Resolves `MediaItemId` (from `ActiveTransition.to.media`) to a
+    /// filesystem path the secondary decoder can open.
+    pub media_paths: std::collections::HashMap<MediaItemId, PathBuf>,
+    /// Path to the decoder binary used to spawn the secondary sidecar
+    /// lazily on first transition entry.
+    pub decoder_bin: PathBuf,
+    /// `(timeline_in_seconds, source_in_seconds)` of the clip whose
+    /// stream is feeding the *primary* decoder. Used to convert each
+    /// primary frame's stream-seconds into a timeline-seconds for
+    /// `transition_at` queries.
+    pub anchor_timeline_in: f64,
+    pub anchor_source_in: f64,
 }
 
 /// What the playback loop needs to read the audio clock as master.
@@ -2363,7 +2456,9 @@ fn locate_audio_binary() -> Result<PathBuf, EngineError> {
 /// for each, presents at the right time relative to the **audio clock**
 /// (when present) or wall clock (audio missing/failed).
 ///
-/// Returns the `DecoderClient` so the engine can resume single-shot use.
+/// Returns the `DecoderClient` so the engine can resume single-shot use,
+/// plus the (optional) secondary decoder used during cross-dissolves so
+/// the engine can hold onto a warm sidecar for the next playback.
 #[allow(clippy::too_many_arguments)]
 fn playback_loop(
     mut decoder: DecoderClient,
@@ -2376,6 +2471,12 @@ fn playback_loop(
     audio: Option<AudioSync>,
     last_pts: Arc<std::sync::atomic::AtomicI64>,
     ended_at_eos: Arc<AtomicBool>,
+    // The loop writes a timeline-position-in-microseconds here when
+    // it wants the engine to restart playback at a specific time
+    // (used at transition exit to swap the primary onto B's media).
+    // `i64::MIN` (the initial value) means "no override; chain to
+    // the next clip start instead".
+    chain_resume_micros: Arc<std::sync::atomic::AtomicI64>,
     // Effects from the active clip — evaluated per frame so keyframed
     // opacity / transform animate during continuous playback. Empty
     // when the clip has no effects (no-ops then).
@@ -2384,7 +2485,18 @@ fn playback_loop(
     // (i.e. the clip's `source_in`). Used to convert each frame's
     // stream PTS into a clip-relative time for keyframe eval.
     clip_source_in_sec: f64,
-) -> DecoderClient {
+    // Sequence-mode-only context for transition handling. `None` for
+    // single-file Open File… playback (no transitions to query).
+    seq_ctx: Option<SequencePlaybackContext>,
+    // Secondary decoder reclaimed from the engine for cross-dissolves.
+    // Returned by this function so the engine can hold onto it
+    // between sessions and avoid re-spawning the sidecar.
+    mut transition_decoder: Option<DecoderClient>,
+    // Path currently open in `transition_decoder` (matches engine state
+    // before playback). Used to skip a re-open when scrubbing /
+    // playing through the same B media repeatedly.
+    mut transition_media_path: Option<String>,
+) -> (DecoderClient, Option<DecoderClient>, Option<String>) {
     // Stream-time-base → seconds: pts * tb_num / tb_den.
     let (tb_num, tb_den) = info.time_base;
     let pts_to_sec = |pts: i64| -> f64 {
@@ -2404,6 +2516,7 @@ fn playback_loop(
         } else {
             "wall-clock"
         },
+        seq_aware = seq_ctx.is_some(),
         "playback thread started"
     );
     // Wall-clock fallback anchor (only used when no audio).
@@ -2412,6 +2525,16 @@ fn playback_loop(
     let mut last_logged_drops = 0u64;
     let mut total_drops = 0u64;
     let mut frames_presented = 0u64;
+    // Stream-info for whatever is currently open in `transition_decoder`.
+    // None until the first transition entry opens (or reuses) the
+    // secondary on a media file; cached so subsequent frames in the
+    // same window can convert source-seconds → PTS without an extra
+    // IPC call.
+    let mut transition_stream_info: Option<StreamInfo> = None;
+    // True while the playhead is inside an active transition window
+    // and the secondary is streaming B-side frames. Flips back to
+    // false (resetting the renderer's mix factor) when we leave.
+    let mut in_transition = false;
 
     loop {
         if stop.load(Ordering::Acquire) {
@@ -2497,6 +2620,133 @@ fn playback_loop(
             rs.renderer.set_brightness_contrast(br, ct);
             rs.renderer.set_crop(crop[0], crop[1], crop[2], crop[3]);
         }
+
+        // Transition handling — only relevant when this is sequence
+        // playback (seq_ctx set). The primary decoder is on the A
+        // side and streams as usual; the secondary is opened lazily
+        // on the first frame inside a transition window and the B
+        // frames it produces are blended on top via mix_factor.
+        let mut active_b_frame: Option<vance_decoder::FrameData> = None;
+        let mut active_mix: f32 = 0.0;
+        if let Some(ctx) = seq_ctx.as_ref() {
+            let timeline_sec = ctx.anchor_timeline_in + (frame_sec - ctx.anchor_source_in);
+            let timeline_rt = seconds_to_rt(timeline_sec);
+            if let Some(at) = vance_timeline::transition_at(&ctx.sequence, timeline_rt) {
+                // Resolve B's filesystem path.
+                if let Some(b_path) = ctx.media_paths.get(&at.to.media) {
+                    let b_path_str = b_path.to_string_lossy().into_owned();
+                    // Spawn the secondary sidecar on first use.
+                    if transition_decoder.is_none() {
+                        match DecoderClient::spawn(&ctx.decoder_bin) {
+                            Ok(c) => transition_decoder = Some(c),
+                            Err(e) => {
+                                tracing::warn!(
+                                    ?e,
+                                    "transition: failed to spawn secondary decoder",
+                                );
+                            }
+                        }
+                    }
+                    // (Re)open the secondary if its current file
+                    // doesn't match the B-side media. After re-open
+                    // the cached stream info is stale; clear it.
+                    if transition_media_path.as_deref() != Some(&b_path_str) {
+                        if let Some(dec) = transition_decoder.as_mut() {
+                            match dec.open(&b_path_str) {
+                                Ok(info_b) => {
+                                    transition_stream_info = Some(info_b);
+                                    transition_media_path = Some(b_path_str.clone());
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        ?e,
+                                        "transition: failed to open B media on secondary",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    // With both open + matched, decode the B frame at
+                    // the source PTS the scene resolver picked. This
+                    // is a seek per frame; for 1–2s dissolve windows
+                    // at 24–30fps it stays well under the per-frame
+                    // budget on modern hardware.
+                    if let (Some(dec), Some(info_b)) = (
+                        transition_decoder.as_mut(),
+                        transition_stream_info.as_ref(),
+                    ) {
+                        let (b_tb_n, b_tb_d) = info_b.time_base;
+                        let b_src_sec = rt_to_seconds(at.to.source_pts);
+                        let b_pts = if b_tb_n != 0 {
+                            (b_src_sec * (b_tb_d as f64) / (b_tb_n as f64)).round() as i64
+                        } else {
+                            0
+                        };
+                        match dec.decode_at(b_pts) {
+                            Ok(f) => {
+                                active_b_frame = Some(f);
+                                active_mix = at.mix;
+                                in_transition = true;
+                                // Park the resume target at the
+                                // current timeline position so that
+                                // *any* exit from this frame onward
+                                // (transition-leave OR mid-window
+                                // EOS on A) chains onto B's media
+                                // rather than skipping to the next
+                                // clip after B.
+                                let resume_micros =
+                                    (timeline_sec * 1_000_000.0).round() as i64;
+                                chain_resume_micros
+                                    .store(resume_micros, Ordering::Release);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    ?e,
+                                    b_pts,
+                                    "transition: B decode_at failed",
+                                );
+                            }
+                        }
+                    }
+                }
+            } else if in_transition {
+                // Left the window — the primary is still on A, but
+                // the timeline says B should now be the source. Tell
+                // the engine to resume at this timeline position so
+                // the chain logic swaps the primary onto B. Drop the
+                // mix factor and break so `stop_playback` joins us.
+                {
+                    let mut rs = render_state.lock();
+                    rs.renderer.set_mix_factor(0.0);
+                }
+                let resume_micros = (timeline_sec * 1_000_000.0).round() as i64;
+                chain_resume_micros.store(resume_micros, Ordering::Release);
+                tracing::info!(
+                    timeline_sec,
+                    "playback: leaving transition window — handing off to chain",
+                );
+                last_pts.store(frame.pts, Ordering::Release);
+                break;
+            }
+        }
+
+        // Push the B frame + mix factor to the renderer, then do the
+        // normal A-side upload + render. Holding the lock once for
+        // both avoids racing with a concurrent scrub. When seq_ctx
+        // is set we always touch the mix factor each frame — that
+        // way a B decode failure mid-window can't leave a stale
+        // mix > 0 baked in from the previous frame.
+        if seq_ctx.is_some() {
+            let mut rs = render_state.lock();
+            if let Some(b_frame) = active_b_frame.as_ref() {
+                if let Err(e) = rs.renderer.upload_frame_b(b_frame) {
+                    tracing::warn!(?e, "transition: upload B failed");
+                }
+                rs.renderer.set_mix_factor(active_mix);
+            } else {
+                rs.renderer.set_mix_factor(0.0);
+            }
+        }
         if let Err(e) = upload_and_render(&render_state, &viewport, &frame, bounds) {
             tracing::warn!(?e, "playback: render error (continuing)");
         }
@@ -2516,7 +2766,10 @@ fn playback_loop(
     tracing::info!(frames_presented, total_drops, "playback: thread exiting");
 
     let _ = decoder.stop_stream();
-    decoder
+    // Return the warm secondary + its currently-open path so the
+    // engine can re-use it on the next session without re-opening
+    // the same B-side media.
+    (decoder, transition_decoder, transition_media_path)
 }
 
 /// Source-monitor variant of `upload_and_render` — uses the Source
