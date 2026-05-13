@@ -519,6 +519,31 @@
     await projectState.updateEffectParam(track.id, clip.id, effect.id, key, kfs);
   }
 
+  /** Open a file dialog filtered to .cube / .3dl and write the
+   *  chosen path back to a LUT effect's `path` param. */
+  async function pickLutFile(
+    track: TrackContents,
+    clip: ClipContents,
+    effect: EffectInfo
+  ) {
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      filters: [
+        { name: 'LUT', extensions: ['cube', '3dl'] },
+        { name: 'All files', extensions: ['*'] }
+      ]
+    });
+    if (typeof selected !== 'string') return;
+    await projectState.updateEffectParam(
+      track.id,
+      clip.id,
+      effect.id,
+      'path',
+      selected
+    );
+  }
+
   /** One-character label for a keyframe's interp mode. */
   function interpLabel(i: Keyframe['interp']): string {
     const c = i ?? 'Linear';
@@ -1348,6 +1373,14 @@
               >
                 + Luma
               </button>
+              <button
+                class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+                onclick={() =>
+                  projectState.addEffect(t.id, c.id, 'lut', { path: '' })}
+                title="Attach a 3D LUT effect (.cube / .3dl)"
+              >
+                + LUT
+              </button>
             </div>
           </div>
           {#if c.effects.length === 0}
@@ -1576,6 +1609,21 @@
                     {@render numericParam('threshold', 'thr', 0, 1, 0.01, 0.5, 2)}
                     {@render numericParam('direction', 'dir', -1, 1, 1, 1, 0)}
                     {@render numericParam('softness', 'soft', 0, 0.5, 0.01, 0.05, 2)}
+                  {:else if e.kind === 'lut'}
+                    {@const rawPath = e.params.path}
+                    {@const lutPath: string = typeof rawPath === 'string' ? rawPath : ''}
+                    <div class="mt-1 flex items-center gap-2 text-[10px]">
+                      <button
+                        class="rounded bg-vance-bg border-vance-border border px-2 py-0.5 hover:brightness-125"
+                        onclick={() => pickLutFile(t, c, e)}
+                        title="Pick a .cube or .3dl LUT file"
+                      >
+                        Pick file…
+                      </button>
+                      <span class="text-vance-muted truncate font-mono" title={lutPath}>
+                        {lutPath || '(none selected)'}
+                      </span>
+                    </div>
                   {/if}
                 </li>
               {/each}

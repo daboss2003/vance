@@ -22,6 +22,10 @@ use vance_timeline::{
     Project, Sequence, SequenceId, TitleParams, Track, TrackId, TrackKind,
 };
 
+/// Cache of parsed LUT files keyed by absolute path. Loading a 32³
+/// cube parses ~100KB of text; doing it per frame would burn CPU.
+type LutCache = HashMap<PathBuf, Arc<vance_color::Lut3d>>;
+
 /// Resolution of a clip's media for an engine playback / scrub call.
 /// File-backed media goes through the decoder; title media is rendered
 /// procedurally each frame via `vance_render::render_title_yuv420`.
@@ -713,6 +717,9 @@ pub struct Engine {
     source_viewport: Option<Arc<Viewport>>,
     /// Last-applied bounds for the Source viewport.
     source_last_bounds: ViewportBounds,
+    /// Parsed LUTs cached by source path so repeated scrubs through
+    /// the same LUT effect don't re-read the file each frame.
+    lut_cache: LutCache,
     /// Independent decoder sidecar for the Source monitor. Spawned
     /// lazily on the first `load_source`. Kept separate from the
     /// Record decoder so previewing media doesn't have to swap the
@@ -1142,6 +1149,7 @@ impl Engine {
             rs.renderer.set_mix_factor(0.0);
             rs.renderer.set_chroma_key([0.0, 1.0, 0.0], 0.15, 0.05, 0.0);
             rs.renderer.set_luma_key(0.5, 1.0, 0.05, 0.0);
+            rs.renderer.set_lut_enable(0.0);
             if let Some(params) = source_pipeline {
                 rs.renderer.set_pipeline(params);
             }
@@ -1874,6 +1882,7 @@ impl Engine {
                 rs.renderer.set_pipeline(p);
             }
         }
+        self.apply_lut_for_clip(anchor_clip_id);
 
         // Convert source-seconds → stream-time-base PTS.
         let info = self
@@ -2060,6 +2069,7 @@ impl Engine {
             }
             rs.renderer.upload_frame_b(&frame_b)?;
         }
+        self.apply_lut_for_clip(from_clip_id);
 
         let viewport = self.viewport.as_ref().ok_or(EngineError::NoViewport)?.clone();
         let render_state = self
@@ -2154,6 +2164,7 @@ impl Engine {
                 rs.renderer.set_pipeline(p);
             }
         }
+        self.apply_lut_for_clip(anchor_clip_id);
         self.playing_clip_anchor = Some(ClipAnchor {
             timeline_in_seconds: effective_tl_in,
             // The Title primary always ticks from synthetic_pts = 0,
@@ -2236,6 +2247,7 @@ impl Engine {
                 rs.renderer.set_pipeline(p);
             }
         }
+        self.apply_lut_for_clip(clip_id);
         // Synthetic anchor — titles have no stream time base, so we
         // pin time_base=(1, 1000) and use timeline seconds as the
         // "stream pts" surrogate (millisecond resolution). Playback
@@ -2261,6 +2273,73 @@ impl Engine {
         let synthetic_pts = (source_pts_seconds * 1000.0).round() as i64;
         self.last_resume_pts = Some(synthetic_pts);
         Ok(synthetic_pts)
+    }
+
+    /// Find the first enabled "lut" effect on `clip_id` and push it
+    /// to the renderer. When no LUT effect is attached (or its
+    /// `enabled` is false), disables the renderer's LUT slot. The
+    /// cache absorbs repeat hits — only the first scrub through a
+    /// path actually reads + parses the file.
+    fn apply_lut_for_clip(&mut self, clip_id: vance_timeline::ClipId) {
+        let Some(rs) = self.render_state.as_ref() else {
+            return;
+        };
+        let path_opt: Option<PathBuf> = {
+            let project = self.current_project.as_ref();
+            let seq_id = self.current_sequence_id;
+            let mut path: Option<PathBuf> = None;
+            if let (Some(p), Some(id)) = (project, seq_id) {
+                if let Some(seq) = p.sequence(id) {
+                    'outer: for track in seq.tracks.iter() {
+                        for c in track.clips.iter() {
+                            if c.id != clip_id {
+                                continue;
+                            }
+                            for e in c.effects.iter() {
+                                if !e.enabled || e.kind != "lut" {
+                                    continue;
+                                }
+                                if let Some(EffectValue::String(s)) = e.params.get("path") {
+                                    if !s.is_empty() {
+                                        path = Some(PathBuf::from(s));
+                                    }
+                                }
+                                break 'outer;
+                            }
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            path
+        };
+        let Some(path) = path_opt else {
+            let mut rs = rs.lock();
+            rs.renderer.set_lut_enable(0.0);
+            return;
+        };
+        // Cache hit?
+        if let Some(lut) = self.lut_cache.get(&path).cloned() {
+            let mut rs = rs.lock();
+            rs.renderer.upload_lut(&lut);
+            rs.renderer.set_lut_enable(1.0);
+            return;
+        }
+        // Miss — parse from disk + cache.
+        match vance_color::load_lut(&path) {
+            Ok(lut) => {
+                let arc = Arc::new(lut);
+                self.lut_cache.insert(path.clone(), arc.clone());
+                let mut rs = rs.lock();
+                rs.renderer.upload_lut(&arc);
+                rs.renderer.set_lut_enable(1.0);
+            }
+            Err(e) => {
+                tracing::warn!(?e, ?path, "lut: load failed");
+                let mut rs = rs.lock();
+                rs.renderer.set_lut_enable(0.0);
+            }
+        }
     }
 
     /// Working color space currently active on the project. Falls
@@ -2477,6 +2556,7 @@ impl Engine {
                 rs.renderer.set_pipeline(p);
             }
         }
+        self.apply_lut_for_clip(anchor_clip_id);
         let info = self
             .stream_info
             .as_ref()

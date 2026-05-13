@@ -33,6 +33,7 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 @group(0) @binding(5) var tex_y_b: texture_2d<f32>;
 @group(0) @binding(6) var tex_u_b: texture_2d<f32>;
 @group(0) @binding(7) var tex_v_b: texture_2d<f32>;
+@group(0) @binding(8) var tex_lut: texture_3d<f32>;
 
 // Per-frame effect parameters. Layout must match `RenderParams` in
 // renderer.rs.
@@ -61,6 +62,8 @@ struct Params {
     // padding). Maps input primaries → working, then working → out.
     pipeline_in_to_working: array<vec4<f32>, 3>,
     pipeline_working_to_out: array<vec4<f32>, 3>,
+    // (enable, _, _, _) — toggle the bound LUT.
+    lut_params: vec4<f32>,
 };
 @group(0) @binding(4) var<uniform> params: Params;
 
@@ -182,7 +185,24 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     //    behaves the same way the renderer did pre-6.3. We could
     //    blend in linear, but for SDR sources the perceptual change
     //    is minor and the gamma-space mix is what colorists expect.
-    let rgb_enc = mix(rgb_a_enc, rgb_b_enc, params.mix_factor);
+    var rgb_enc = mix(rgb_a_enc, rgb_b_enc, params.mix_factor);
+    // 1b. Apply the loaded 3D LUT, if enabled. LUTs are sampled in
+    //     source-space gamma RGB — matches the convention colorists
+    //     use when authoring Rec.709 / sRGB film-emulation LUTs.
+    //     `lut_params.x` gates contribution; trilinear filtering on
+    //     the texture lookup gives smooth in-between values.
+    if (params.lut_params.x > 0.5) {
+        // Inset the lookup by 0.5/N on each axis so the sample
+        // coordinates land at texel centers (texture3D coords are
+        // 0..1, and texels live at (i+0.5)/N).
+        let size_minus_1 = max(1.0, f32(textureDimensions(tex_lut).x) - 1.0);
+        let half_texel = 0.5 / f32(textureDimensions(tex_lut).x);
+        let uvw = clamp(rgb_enc, vec3<f32>(0.0), vec3<f32>(1.0))
+            * (size_minus_1 / f32(textureDimensions(tex_lut).x))
+            + vec3<f32>(half_texel);
+        let lut_rgb = textureSample(tex_lut, samp, uvw).rgb;
+        rgb_enc = lut_rgb;
+    }
     // 2. Linearize via input transfer, then change primaries to the
     //    working space. Effects from here on operate on linear-RGB.
     let input_transfer = params.pipeline_flags.x;
