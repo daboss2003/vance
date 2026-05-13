@@ -24,6 +24,37 @@ export const setViewportBounds = (
   h: number
 ): Promise<void> => invoke('set_viewport_bounds', { x, y, w, h });
 
+/** Bounds for the Source monitor's native overlay window. */
+export const setSourceViewportBounds = (
+  x: number,
+  y: number,
+  w: number,
+  h: number
+): Promise<void> => invoke('set_source_viewport_bounds', { x, y, w, h });
+
+/** Open a media item in the Source monitor's decoder and render
+ *  its first frame to the Source viewport. */
+export const loadSource = (mediaId: string): Promise<StreamInfo> =>
+  invoke('load_source', { mediaId });
+
+/** Decode + render the Source media at the given source PTS. */
+export const decodeSourceAt = (targetPts: number): Promise<number> =>
+  invoke('decode_source_at', { targetPts });
+
+export type SourceState = {
+  width: number;
+  height: number;
+  codec_name: string;
+  time_base_num: number;
+  time_base_den: number;
+  duration_pts: number | null;
+  last_pts: number | null;
+};
+
+/** Snapshot of the Source monitor's stream + playhead, or null if
+ *  nothing has been loaded into Source. */
+export const sourceState = (): Promise<SourceState | null> => invoke('source_state');
+
 export const openFile = (path: string): Promise<StreamInfo> =>
   invoke('open_file', { path });
 

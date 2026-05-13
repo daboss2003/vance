@@ -11,7 +11,7 @@
 
 mod engine;
 
-use engine::{EngineHandle, MediaItemInfo, ProjectInfo, SequenceContents};
+use engine::{EngineHandle, MediaItemInfo, ProjectInfo, SequenceContents, SourceState};
 use serde::Serialize;
 use tauri::Manager;
 use vance_decoder::StreamInfo;
@@ -68,6 +68,51 @@ fn set_viewport_bounds(
         .lock()
         .set_viewport_bounds(ViewportBounds::new(x, y, w, h))
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_source_viewport_bounds(
+    state: tauri::State<'_, EngineHandle>,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<(), String> {
+    state
+        .lock()
+        .set_source_viewport_bounds(ViewportBounds::new(x, y, w, h))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn load_source(
+    state: tauri::State<'_, EngineHandle>,
+    media_id: String,
+) -> Result<OpenResponse, String> {
+    let media_uuid = media_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid media id: {e}"))?;
+    let info = state
+        .lock()
+        .load_source(vance_timeline::MediaItemId::from_uuid(media_uuid))
+        .map_err(|e| e.to_string())?;
+    Ok(info.into())
+}
+
+#[tauri::command]
+fn decode_source_at(
+    state: tauri::State<'_, EngineHandle>,
+    target_pts: i64,
+) -> Result<i64, String> {
+    state
+        .lock()
+        .decode_source_at(target_pts)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn source_state(state: tauri::State<'_, EngineHandle>) -> Option<SourceState> {
+    state.lock().source_state()
 }
 
 #[tauri::command]
@@ -391,6 +436,10 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             backend_version,
             set_viewport_bounds,
+            set_source_viewport_bounds,
+            load_source,
+            decode_source_at,
+            source_state,
             open_file,
             decode_and_render_at,
             start_playback,

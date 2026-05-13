@@ -11,6 +11,7 @@
     lastResumePts,
     openFile,
     playSequence,
+    setSourceViewportBounds,
     setViewportBounds,
     startPlayback,
     stopPlayback,
@@ -31,6 +32,7 @@
   let playError = $state<string | null>(null);
 
   let viewportEl: HTMLDivElement | null = $state(null);
+  let sourceViewportEl: HTMLDivElement | null = $state(null);
 
   // Bumped whenever something in the project changes that the Timeline
   // canvas should re-render in response to. We track both the project
@@ -60,6 +62,7 @@
     if (!viewportEl) return;
     const observer = new ResizeObserver(reportBounds);
     observer.observe(viewportEl);
+    if (sourceViewportEl) observer.observe(sourceViewportEl);
     window.addEventListener('resize', reportBounds);
     window.addEventListener('scroll', reportBounds, true);
     window.addEventListener('keydown', handleKeydown);
@@ -245,15 +248,20 @@
     }
   }
 
-  function reportBounds() {
-    if (!viewportEl) return;
-    const r = viewportEl.getBoundingClientRect();
+  function reportBoundsFor(el: HTMLDivElement, setter: (x: number, y: number, w: number, h: number) => Promise<void>, label: string) {
+    const r = el.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
     const x = Math.max(0, Math.round(r.left * dpr));
     const y = Math.max(0, Math.round(r.top * dpr));
     const w = Math.max(0, Math.round(r.width * dpr));
     const h = Math.max(0, Math.round(r.height * dpr));
-    setViewportBounds(x, y, w, h).catch((e) => console.error('set_viewport_bounds', e));
+    setter(x, y, w, h).catch((e) => console.error(label, e));
+  }
+
+  function reportBounds() {
+    if (viewportEl) reportBoundsFor(viewportEl, setViewportBounds, 'set_viewport_bounds');
+    if (sourceViewportEl)
+      reportBoundsFor(sourceViewportEl, setSourceViewportBounds, 'set_source_viewport_bounds');
   }
 
   // Re-broadcast bounds whenever the chrome around the viewport changes
@@ -659,7 +667,8 @@
                     dragState.begin(m.id, m.name, e.clientX, e.clientY);
                     diagLog(`browser: mousedown media=${m.id}`);
                   }}
-                  title="Drag onto the timeline"
+                  ondblclick={() => projectState.loadSource(m.id)}
+                  title="Drag onto the timeline · Double-click to preview in Source"
                 >
                   <div class="font-medium truncate">{m.name}</div>
                   <div class="text-[10px] text-vance-muted">
@@ -682,14 +691,67 @@
       {/if}
     </aside>
 
-    <!-- Center: viewport + transport -->
+    <!-- Center: Source + Record viewports + transport -->
     <main class="flex flex-1 flex-col min-w-0">
-      <div
-        class="m-4 flex-1 rounded border border-dashed border-[#333] bg-black"
-        bind:this={viewportEl}
-      >
-        <!-- The native wgpu surface paints over this div. Anything inside
-             will be visually covered (per ADR 0005). -->
+      <div class="flex flex-1 min-w-0 min-h-0">
+        <!-- Source monitor (left) — previews a single MediaItem. -->
+        <div class="flex flex-1 flex-col min-w-0 m-4 mr-2">
+          <div class="mb-1 flex items-center gap-2 text-[10px] uppercase tracking-wider text-vance-muted">
+            <span>Source</span>
+            {#if projectState.sourceName}
+              <span class="truncate normal-case text-vance-fg">{projectState.sourceName}</span>
+            {/if}
+          </div>
+          <div
+            class="flex-1 rounded border border-dashed border-[#333] bg-black"
+            bind:this={sourceViewportEl}
+          ></div>
+          <!-- Source scrub bar + time display. Click to seek; 4.9 adds
+               in/out marks via the I/O keys. -->
+          {#if projectState.source}
+            {@const s = projectState.source}
+            {@const tb = s.time_base_num / s.time_base_den}
+            {@const cur = (s.last_pts ?? 0) * tb}
+            {@const total = (s.duration_pts ?? 0) * tb}
+            {@const frac = total > 0 ? Math.min(1, Math.max(0, cur / total)) : 0}
+            <div class="mt-1 flex items-center gap-2 text-[10px] text-vance-muted">
+              <span class="font-mono">{formatPrecise(cur)}</span>
+              <div
+                class="relative h-2 flex-1 cursor-pointer rounded bg-[#1a1d22]"
+                role="slider"
+                tabindex="0"
+                aria-valuemin="0"
+                aria-valuemax={total}
+                aria-valuenow={cur}
+                onclick={(e) => {
+                  if (total <= 0) return;
+                  const target = e.currentTarget as HTMLDivElement;
+                  const r = target.getBoundingClientRect();
+                  const x = (e.clientX - r.left) / r.width;
+                  projectState.seekSource(Math.max(0, Math.min(1, x)) * total);
+                }}
+              >
+                <div
+                  class="absolute top-0 h-full bg-[var(--color-vance-accent)]/70"
+                  style:width="{frac * 100}%"
+                ></div>
+              </div>
+              <span class="font-mono">{formatPrecise(total)}</span>
+            </div>
+          {/if}
+        </div>
+        <!-- Record monitor (right) — previews the active sequence. -->
+        <div class="flex flex-1 flex-col min-w-0 m-4 ml-2">
+          <div class="mb-1 text-[10px] uppercase tracking-wider text-vance-muted">
+            Record
+          </div>
+          <div
+            class="flex-1 rounded border border-dashed border-[#333] bg-black"
+            bind:this={viewportEl}
+          >
+            <!-- The native wgpu surface paints over this div. -->
+          </div>
+        </div>
       </div>
       <div
         class="border-vance-border bg-vance-panel flex h-12 flex-shrink-0 items-center gap-3 border-t px-4 text-xs"

@@ -262,6 +262,22 @@ fn duration_from_stream(s: &StreamInfo) -> Option<vance_core::RationalTime> {
     vance_core::RationalTime::new(dur_pts.saturating_mul(tb_n), tb_d).ok()
 }
 
+/// State of the Source monitor for the UI — what's loaded + where
+/// the playhead is. Mirrors the chunk of StreamInfo the chrome
+/// actually needs without exposing the full type via JSON.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct SourceState {
+    pub width: u32,
+    pub height: u32,
+    pub codec_name: String,
+    pub time_base_num: i64,
+    pub time_base_den: i64,
+    pub duration_pts: Option<i64>,
+    /// Last presented PTS in the source stream's time base, or
+    /// `None` if nothing has been decoded since the last load.
+    pub last_pts: Option<i64>,
+}
+
 /// Lightweight DTO of a `MediaItem` for the Browser panel.
 #[derive(serde::Serialize, Clone, Debug)]
 pub struct MediaItemInfo {
@@ -339,13 +355,36 @@ impl EngineHandle {
 /// not playing.
 pub struct RenderState {
     pub renderer: Renderer,
+    /// Configuration of the Record monitor's surface.
     pub surface_config: Option<wgpu::SurfaceConfiguration>,
+    /// Configuration of the Source monitor's surface — independent
+    /// because the two monitors can have different sizes / DPRs at
+    /// runtime (split chrome pane, different display configurations).
+    pub source_surface_config: Option<wgpu::SurfaceConfiguration>,
 }
 
 #[derive(Default)]
 pub struct Engine {
-    /// Set once after the Tauri window exists.
+    /// Set once after the Tauri window exists. This is the *Record*
+    /// monitor — the timeline preview. Phase 4.8 adds a parallel
+    /// `source_viewport` for the Source monitor.
     viewport: Option<Arc<Viewport>>,
+    /// Source monitor's viewport — installed alongside the Record
+    /// viewport in `install_viewport`. Plays a single media item
+    /// independently of the timeline.
+    source_viewport: Option<Arc<Viewport>>,
+    /// Last-applied bounds for the Source viewport.
+    source_last_bounds: ViewportBounds,
+    /// Independent decoder sidecar for the Source monitor. Spawned
+    /// lazily on the first `load_source`. Kept separate from the
+    /// Record decoder so previewing media doesn't have to swap the
+    /// timeline decoder's open file (and vice versa).
+    source_decoder: Option<DecoderClient>,
+    /// Source's currently-opened media's stream info.
+    source_stream_info: Option<StreamInfo>,
+    /// Last-presented PTS on the Source viewport (after a
+    /// `decode_source_at`). Cleared on `load_source`.
+    source_last_pts: Option<i64>,
     /// Renderer + surface config, behind a Mutex so the playback scheduler
     /// can share access without taking the parent EngineHandle's lock.
     render_state: Option<Arc<Mutex<RenderState>>>,
@@ -439,14 +478,16 @@ pub struct PlaybackSession {
 }
 
 impl Engine {
-    /// Install the viewport + create a renderer that shares its instance.
-    /// Called once from the Tauri `setup` callback on the main thread.
+    /// Install both viewports (Record + Source) + create a renderer
+    /// that shares the wgpu instance. Called once from the Tauri
+    /// `setup` callback on the main thread.
     pub fn install_viewport(&mut self, host: HostWindowHandle) -> Result<(), EngineError> {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = wgpu::Backends::PRIMARY;
         let instance = wgpu::Instance::new(desc);
 
         let viewport = Viewport::install(host, &instance)?;
+        let source_viewport = Viewport::install(host, &instance)?;
 
         // Build the renderer first with a temporary format; the renderer
         // owns the adapter we'll use for all subsequent surface queries
@@ -478,11 +519,121 @@ impl Engine {
         }
 
         self.viewport = Some(Arc::new(viewport));
+        self.source_viewport = Some(Arc::new(source_viewport));
         self.render_state = Some(Arc::new(Mutex::new(RenderState {
             renderer,
             surface_config: None,
+            source_surface_config: None,
         })));
         Ok(())
+    }
+
+    /// Update the Source viewport's bounds. Same shape as
+    /// `set_viewport_bounds` but targets the Source monitor.
+    pub fn set_source_viewport_bounds(
+        &mut self,
+        bounds: ViewportBounds,
+    ) -> Result<(), EngineError> {
+        let viewport = self
+            .source_viewport
+            .as_ref()
+            .ok_or(EngineError::NoViewport)?;
+        viewport.set_bounds(bounds);
+        self.source_last_bounds = bounds;
+        if !bounds.is_empty() {
+            if let Some(rs) = self.render_state.as_ref() {
+                let mut rs = rs.lock();
+                if let Some(cfg) =
+                    rs.renderer
+                        .recommended_surface_config(viewport.surface(), bounds.w, bounds.h)
+                {
+                    rs.renderer.configure_surface(viewport.surface(), &cfg);
+                    rs.source_surface_config = Some(cfg);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Open a media item by ID in the Source decoder and render its
+    /// first frame to the Source viewport. The MediaItem must already
+    /// be registered in the active project's library.
+    pub fn load_source(&mut self, media_id: MediaItemId) -> Result<StreamInfo, EngineError> {
+        let project = self
+            .current_project
+            .as_ref()
+            .ok_or(EngineError::NoProject)?;
+        let media = project
+            .media
+            .get(&media_id)
+            .ok_or(EngineError::MediaNotFound)?
+            .clone();
+        let path = media.path.to_string_lossy().into_owned();
+
+        // Lazy-spawn the Source decoder.
+        if self.source_decoder.is_none() {
+            let bin = locate_decoder_binary()?;
+            tracing::info!(bin = %bin.display(), "spawning Source decoder sidecar");
+            let client = DecoderClient::spawn(&bin)
+                .map_err(|e| EngineError::DecoderSpawn(format!("{e}")))?;
+            self.source_decoder = Some(client);
+        }
+        let dec = self.source_decoder.as_mut().unwrap();
+        let info = dec.open(path)?;
+        self.source_stream_info = Some(info.clone());
+        self.source_last_pts = None;
+
+        // Decode + render the first frame so the user sees a preview
+        // immediately. Errors here are non-fatal — they'll surface on
+        // the next decode_source_at call.
+        if let Err(e) = self.decode_source_at(0) {
+            tracing::warn!(?e, "load_source: first-frame render failed");
+        }
+        Ok(info)
+    }
+
+    /// Decode the Source media at `target_pts` and render it into
+    /// the Source viewport.
+    pub fn decode_source_at(&mut self, target_pts: i64) -> Result<i64, EngineError> {
+        let dec = self.source_decoder.as_mut().ok_or(EngineError::NoFileOpen)?;
+        let frame = dec.decode_at(target_pts)?;
+        let pts = frame.pts;
+        let viewport = self
+            .source_viewport
+            .as_ref()
+            .ok_or(EngineError::NoViewport)?
+            .clone();
+        let render_state = self
+            .render_state
+            .as_ref()
+            .ok_or(EngineError::NoViewport)?
+            .clone();
+        let bounds = self.source_last_bounds;
+        upload_and_render_source(&render_state, &viewport, &frame, bounds)?;
+        self.source_last_pts = Some(pts);
+        Ok(pts)
+    }
+
+    /// Stream info from the last `load_source`. Used by the UI to
+    /// format the time display and scrub bar.
+    pub fn source_stream_info(&self) -> Option<&StreamInfo> {
+        self.source_stream_info.as_ref()
+    }
+
+    /// Snapshot of the Source monitor's state for the UI — stream
+    /// info + last-presented PTS. Returns `None` when nothing has
+    /// been loaded into Source yet.
+    pub fn source_state(&self) -> Option<SourceState> {
+        let info = self.source_stream_info.as_ref()?;
+        Some(SourceState {
+            width: info.width,
+            height: info.height,
+            codec_name: info.codec_name.clone(),
+            time_base_num: info.time_base.0,
+            time_base_den: info.time_base.1,
+            duration_pts: info.duration_pts,
+            last_pts: self.source_last_pts,
+        })
     }
 
     /// Update the overlay's bounds and reconfigure the surface to match.
@@ -1608,6 +1759,55 @@ fn playback_loop(
 
     let _ = decoder.stop_stream();
     decoder
+}
+
+/// Source-monitor variant of `upload_and_render` — uses the Source
+/// surface_config slot instead of the Record one.
+fn upload_and_render_source(
+    render_state: &Arc<Mutex<RenderState>>,
+    viewport: &Arc<Viewport>,
+    frame: &vance_decoder::FrameData,
+    bounds: ViewportBounds,
+) -> Result<(), EngineError> {
+    let mut rs = render_state.lock();
+    rs.renderer.upload_frame(frame)?;
+    let surface = viewport.surface();
+    if rs.source_surface_config.is_none() && !bounds.is_empty() {
+        if let Some(cfg) = rs
+            .renderer
+            .recommended_surface_config(surface, bounds.w, bounds.h)
+        {
+            rs.renderer.configure_surface(surface, &cfg);
+            rs.source_surface_config = Some(cfg);
+        }
+    }
+    if rs.source_surface_config.is_none() {
+        return Err(EngineError::SurfaceAcquire(
+            "source viewport bounds not yet reported".into(),
+        ));
+    }
+    let surface_tex = match surface.get_current_texture() {
+        wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+        wgpu::CurrentSurfaceTexture::Outdated
+        | wgpu::CurrentSurfaceTexture::Lost
+        | wgpu::CurrentSurfaceTexture::Validation => {
+            rs.source_surface_config = None;
+            return Err(EngineError::SurfaceAcquire(
+                "source surface outdated".into(),
+            ));
+        }
+        wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+            return Err(EngineError::SurfaceAcquire(
+                "source surface timeout/occluded".into(),
+            ));
+        }
+    };
+    let view = surface_tex
+        .texture
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    rs.renderer.render_to(&view)?;
+    surface_tex.present();
+    Ok(())
 }
 
 /// Single render frame: configure surface if needed, acquire texture,

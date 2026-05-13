@@ -9,9 +9,11 @@ import {
   canUndo as ipcCanUndo,
   currentProjectPath,
   currentSequenceContents,
+  decodeSourceAt,
   importMediaFile,
   insertClipAt,
   loadProject,
+  loadSource as ipcLoadSource,
   mediaList,
   moveClipTo,
   removeClip as ipcRemoveClip,
@@ -20,12 +22,15 @@ import {
   redo as ipcRedo,
   saveProject as ipcSave,
   setCurrentSequence as ipcSetSeq,
+  sourceState as ipcSourceState,
   trimClipIn,
   trimClipOut,
   undo as ipcUndo,
   type MediaItemInfo,
   type ProjectInfo,
-  type SequenceContents
+  type SequenceContents,
+  type SourceState,
+  type StreamInfo
 } from './ipc';
 
 class ProjectState {
@@ -50,6 +55,14 @@ class ProjectState {
    *  via `editTick`. Single source of truth for the Timeline and
    *  Inspector. */
   sequence = $state<SequenceContents | null>(null);
+  /** Media item currently loaded into the Source monitor (its
+   *  StreamInfo as returned by the engine). `null` when nothing
+   *  has been loaded yet. */
+  sourceInfo = $state<StreamInfo | null>(null);
+  /** Display name of the source media, for the monitor label. */
+  sourceName = $state<string>('');
+  /** Live source state — stream info + playhead in source PTS. */
+  source = $state<SourceState | null>(null);
 
   private async refreshUndoState() {
     try {
@@ -137,6 +150,34 @@ class ProjectState {
     this.info = await projectInfo();
     this.path = await currentProjectPath();
     this.media = await mediaList();
+  }
+
+  /** Load a media item into the Source monitor. Double-click in
+   *  the Browser triggers this. */
+  async loadSource(mediaId: string) {
+    this.error = null;
+    try {
+      this.sourceInfo = await ipcLoadSource(mediaId);
+      const m = this.media.find((x) => x.id === mediaId);
+      this.sourceName = m?.name ?? '';
+      this.source = await ipcSourceState();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Seek Source to `seconds`. Single-shot decode + render. */
+  async seekSource(seconds: number) {
+    if (!this.source) return;
+    const { time_base_num, time_base_den } = this.source;
+    if (time_base_num === 0) return;
+    const pts = Math.max(0, Math.round((seconds * time_base_den) / time_base_num));
+    try {
+      await decodeSourceAt(pts);
+      this.source = await ipcSourceState();
+    } catch (e) {
+      this.error = String(e);
+    }
   }
 
   /** Import a media file by path and append it to the library. */
