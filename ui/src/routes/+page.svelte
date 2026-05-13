@@ -942,7 +942,7 @@
 
     <!-- Inspector -->
     <aside
-      class="border-vance-border bg-vance-panel w-72 flex-shrink-0 overflow-y-auto border-l p-4"
+      class="border-vance-border bg-vance-panel w-72 flex-shrink-0 overflow-y-auto overflow-x-hidden border-l p-4"
     >
       <h2 class="text-vance-muted mb-3 text-xs uppercase tracking-wider">Inspector</h2>
 
@@ -976,13 +976,29 @@
         <div class="mt-4">
           <div class="mb-1 flex items-center justify-between text-[11px] uppercase tracking-wider">
             <span class="text-vance-muted">Effects</span>
-            <button
-              class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
-              onclick={() => projectState.addEffect(t.id, c.id, 'opacity', { value: 1 })}
-              title="Attach an opacity effect"
-            >
-              + Opacity
-            </button>
+            <div class="flex gap-1">
+              <button
+                class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+                onclick={() => projectState.addEffect(t.id, c.id, 'opacity', { value: 1 })}
+                title="Attach an opacity effect"
+              >
+                + Opacity
+              </button>
+              <button
+                class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+                onclick={() =>
+                  projectState.addEffect(t.id, c.id, 'transform', {
+                    translate_x: 0,
+                    translate_y: 0,
+                    scale_x: 1,
+                    scale_y: 1,
+                    rotation: 0
+                  })}
+                title="Attach a transform effect (position/scale/rotate)"
+              >
+                + Transform
+              </button>
+            </div>
           </div>
           {#if c.effects.length === 0}
             <p class="text-vance-muted text-xs italic">No effects.</p>
@@ -1002,23 +1018,105 @@
                   </div>
                   {#if e.kind === 'opacity'}
                     {@const cur = typeof e.params.value === 'number' ? e.params.value : 1}
-                    <div class="mt-1 flex items-center gap-2">
-                      <span class="text-vance-muted w-10 text-[10px]">value</span>
+                    <div class="mt-1 grid grid-cols-[3rem_minmax(0,1fr)_2.25rem] items-center gap-x-2">
+                      <span class="text-vance-muted text-[10px]">value</span>
                       <input
                         type="range"
                         min="0"
                         max="1"
                         step="0.01"
                         value={cur}
-                        class="flex-1"
+                        class="w-full min-w-0"
                         onchange={(ev) => {
                           const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
                           projectState.updateEffectParam(t.id, c.id, e.id, 'value', v);
                         }}
                       />
-                      <span class="font-mono w-10 text-right text-[10px]">
+                      <span class="font-mono text-right text-[10px]">
                         {cur.toFixed(2)}
                       </span>
+                    </div>
+                  {:else if e.kind === 'transform'}
+                    {@const tx = typeof e.params.translate_x === 'number' ? e.params.translate_x : 0}
+                    {@const ty = typeof e.params.translate_y === 'number' ? e.params.translate_y : 0}
+                    {@const sx = typeof e.params.scale_x === 'number' ? e.params.scale_x : 1}
+                    {@const sy = typeof e.params.scale_y === 'number' ? e.params.scale_y : 1}
+                    {@const rot = typeof e.params.rotation === 'number' ? e.params.rotation : 0}
+                    <div class="mt-1 grid grid-cols-[3rem_minmax(0,1fr)_2.25rem] items-center gap-x-2 gap-y-1">
+                      <span class="text-vance-muted text-[10px]">x</span>
+                      <input
+                        type="range"
+                        min="-1"
+                        max="1"
+                        step="0.01"
+                        value={tx}
+                        class="w-full min-w-0"
+                        onchange={(ev) => {
+                          const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
+                          projectState.updateEffectParam(t.id, c.id, e.id, 'translate_x', v);
+                        }}
+                      />
+                      <span class="font-mono text-right text-[10px]">{tx.toFixed(2)}</span>
+
+                      <span class="text-vance-muted text-[10px]">y</span>
+                      <input
+                        type="range"
+                        min="-1"
+                        max="1"
+                        step="0.01"
+                        value={ty}
+                        class="flex-1"
+                        onchange={(ev) => {
+                          const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
+                          projectState.updateEffectParam(t.id, c.id, e.id, 'translate_y', v);
+                        }}
+                      />
+                      <span class="font-mono text-right text-[10px]">{ty.toFixed(2)}</span>
+
+                      <span class="text-vance-muted text-[10px]">scale x</span>
+                      <input
+                        type="range"
+                        min="0.1"
+                        max="3"
+                        step="0.01"
+                        value={sx}
+                        class="w-full min-w-0"
+                        onchange={(ev) => {
+                          const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
+                          projectState.updateEffectParam(t.id, c.id, e.id, 'scale_x', v);
+                        }}
+                      />
+                      <span class="font-mono text-right text-[10px]">{sx.toFixed(2)}</span>
+
+                      <span class="text-vance-muted text-[10px]">scale y</span>
+                      <input
+                        type="range"
+                        min="0.1"
+                        max="3"
+                        step="0.01"
+                        value={sy}
+                        class="flex-1"
+                        onchange={(ev) => {
+                          const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
+                          projectState.updateEffectParam(t.id, c.id, e.id, 'scale_y', v);
+                        }}
+                      />
+                      <span class="font-mono text-right text-[10px]">{sy.toFixed(2)}</span>
+
+                      <span class="text-vance-muted text-[10px]">rot°</span>
+                      <input
+                        type="range"
+                        min="-180"
+                        max="180"
+                        step="1"
+                        value={rot}
+                        class="w-full min-w-0"
+                        onchange={(ev) => {
+                          const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
+                          projectState.updateEffectParam(t.id, c.id, e.id, 'rotation', v);
+                        }}
+                      />
+                      <span class="font-mono text-right text-[10px]">{rot.toFixed(0)}°</span>
                     </div>
                   {/if}
                 </li>

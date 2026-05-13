@@ -254,6 +254,49 @@ fn clip_opacity(seq: &Sequence, clip_id: vance_timeline::ClipId) -> f32 {
     1.0
 }
 
+/// 2D transform aggregated from every enabled "transform" effect on
+/// the clip. Multiple transforms compose by adding translate + rotation
+/// and multiplying scale — order-independent for the parameter shapes
+/// we expose. Defaults to the identity when no transform effects exist.
+struct ClipTransform {
+    translate: [f32; 2],
+    scale: [f32; 2],
+    rotation_radians: f32,
+}
+
+fn clip_transform(seq: &Sequence, clip_id: vance_timeline::ClipId) -> ClipTransform {
+    let mut t = ClipTransform {
+        translate: [0.0, 0.0],
+        scale: [1.0, 1.0],
+        rotation_radians: 0.0,
+    };
+    let f = |k: &str, ps: &std::collections::BTreeMap<String, EffectValue>| -> Option<f32> {
+        if let Some(EffectValue::Number(v)) = ps.get(k) {
+            Some(*v as f32)
+        } else {
+            None
+        }
+    };
+    for track in seq.tracks.iter() {
+        if let Some(clip) = track.clips.iter().find(|c| c.id == clip_id) {
+            for e in clip.effects.iter() {
+                if !e.enabled || e.kind != "transform" {
+                    continue;
+                }
+                t.translate[0] += f("translate_x", &e.params).unwrap_or(0.0);
+                t.translate[1] += f("translate_y", &e.params).unwrap_or(0.0);
+                t.scale[0] *= f("scale_x", &e.params).unwrap_or(1.0);
+                t.scale[1] *= f("scale_y", &e.params).unwrap_or(1.0);
+                // rotation parameter is degrees in the UI; convert here.
+                t.rotation_radians +=
+                    f("rotation", &e.params).unwrap_or(0.0).to_radians();
+            }
+            return t;
+        }
+    }
+    t
+}
+
 fn first_clip_after(
     seq: &Sequence,
     after_t: vance_core::RationalTime,
@@ -693,9 +736,7 @@ impl Engine {
         track_id: TrackId,
         overwrite: bool,
     ) -> Result<String, EngineError> {
-        if self.playback.is_some() {
-            return Err(EngineError::PlaybackInProgress);
-        }
+        self.pause_for_edit();
         let media_id = self.source_media_id.ok_or(EngineError::NoFileOpen)?;
         let info = self
             .source_stream_info
@@ -848,15 +889,15 @@ impl Engine {
     /// into the viewport's surface. Single-shot path; not used during
     /// playback (the scheduler handles its own render loop).
     pub fn decode_and_render_at(&mut self, target_pts: i64) -> Result<i64, EngineError> {
-        if self.playback.is_some() {
-            return Err(EngineError::PlaybackInProgress);
-        }
-        // Reset opacity to 1.0 when nothing else has anchored an
-        // effect-derived value — keeps single-file `Open File…`
-        // playback unaffected by a previous sequence preview's fade.
+        self.pause_for_edit();
+        // Reset effect uniforms to identity when nothing else has
+        // anchored them — keeps single-file `Open File…` playback
+        // unaffected by a previous sequence preview's params.
         if self.playing_clip_anchor.is_none() {
             if let Some(rs) = self.render_state.as_ref() {
-                rs.lock().renderer.set_opacity(1.0);
+                let mut rs = rs.lock();
+                rs.renderer.set_opacity(1.0);
+                rs.renderer.set_transform([0.0, 0.0], [1.0, 1.0], 0.0);
             }
         }
         let dec = self.decoder.as_mut().ok_or(EngineError::NoFileOpen)?;
@@ -892,9 +933,7 @@ impl Engine {
     /// until `stop_playback` is called.
     pub fn start_playback(&mut self, from_pts: i64) -> Result<(), EngineError> {
         tracing::info!(from_pts, "start_playback called");
-        if self.playback.is_some() {
-            return Err(EngineError::PlaybackInProgress);
-        }
+        self.pause_for_edit();
         let viewport = self
             .viewport
             .as_ref()
@@ -1018,9 +1057,7 @@ impl Engine {
     /// the project has no sequences. The previous project (if any) is
     /// discarded — a future "save before close" gate is up to the UI.
     pub fn load_project(&mut self, path: &str) -> Result<ProjectInfo, EngineError> {
-        if self.playback.is_some() {
-            return Err(EngineError::PlaybackInProgress);
-        }
+        self.pause_for_edit();
         let project = vance_project::open(path).map_err(|e| EngineError::Project(e.to_string()))?;
         let mut info = ProjectInfo::from(&project);
         self.current_sequence_id = project.sequences.first().map(|s| s.id);
@@ -1045,9 +1082,7 @@ impl Engine {
     /// project with one "Sequence 01" (24fps) containing a V1 video
     /// and A1 audio track. The user can rename / re-rate later.
     pub fn new_project(&mut self, name: String) -> Result<ProjectInfo, EngineError> {
-        if self.playback.is_some() {
-            return Err(EngineError::PlaybackInProgress);
-        }
+        self.pause_for_edit();
         let mut project = Project::new(name);
         let mut seq = Sequence::new("Sequence 01", vance_core::FrameRate::FPS_24);
         seq.tracks.push(Arc::new(Track::new(TrackKind::Video, "V1")));
@@ -1070,9 +1105,7 @@ impl Engine {
     /// pixel format), then registers it as a `MediaItem` in the
     /// current project's media library.
     pub fn import_media_file(&mut self, path: &str) -> Result<MediaItemInfo, EngineError> {
-        if self.playback.is_some() {
-            return Err(EngineError::PlaybackInProgress);
-        }
+        self.pause_for_edit();
         if self.current_project.is_none() {
             return Err(EngineError::NoProject);
         }
@@ -1164,14 +1197,19 @@ impl Engine {
     /// in a follow-on milestone; for now the playback loop runs
     /// against the active clip's underlying file as a unit.
     pub fn play_sequence(&mut self, timeline_seconds: f64) -> Result<(), EngineError> {
-        if self.playback.is_some() {
-            return Err(EngineError::PlaybackInProgress);
-        }
+        self.pause_for_edit();
         // Scope the immutable project borrow tightly so we can call
         // `self.open_file` (mutable borrow) afterwards. Also capture
         // the clip's timeline/source anchors and effect-derived
         // opacity so the renderer fades the clip if needed.
-        let (media_path, source_pts_seconds, anchor_timeline_in, anchor_source_in, anchor_opacity) = {
+        let (
+            media_path,
+            source_pts_seconds,
+            anchor_timeline_in,
+            anchor_source_in,
+            anchor_opacity,
+            anchor_clip_id,
+        ) = {
             let project = self
                 .current_project
                 .as_ref()
@@ -1214,16 +1252,33 @@ impl Engine {
                 tl_in_sec,
                 src_in_sec,
                 op,
+                active.clip_id,
             )
         };
 
         // Reopen decoder onto the active clip's media. Idempotent if
         // we're already on this file: the decoder reopens cleanly.
         self.open_file(&media_path)?;
-        // Push opacity to the renderer for this clip. Stays in effect
-        // until the next play_sequence / decode_sequence_at swaps it.
+        // Push the active clip's effect params to the renderer. Stays
+        // in effect until the next play_sequence / decode_sequence_at
+        // swaps them.
+        let xform_opt = {
+            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
+            let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+            let seq = project
+                .sequence(seq_id)
+                .ok_or(EngineError::SequenceNotFound)?;
+            Some(clip_transform(seq, anchor_clip_id))
+        };
         if let Some(rs) = self.render_state.as_ref() {
-            rs.lock().renderer.set_opacity(anchor_opacity);
+            let mut rs = rs.lock();
+            rs.renderer.set_opacity(anchor_opacity);
+            if let Some(t) = xform_opt {
+                rs.renderer
+                    .set_transform(t.translate, t.scale, t.rotation_radians);
+            } else {
+                rs.renderer.set_transform([0.0, 0.0], [1.0, 1.0], 0.0);
+            }
         }
 
         // Convert source-seconds → stream-time-base PTS.
@@ -1280,10 +1335,15 @@ impl Engine {
     /// `timeline_seconds` (used by seek-while-paused). Bypasses the
     /// playback scheduler.
     pub fn decode_sequence_at(&mut self, timeline_seconds: f64) -> Result<i64, EngineError> {
-        if self.playback.is_some() {
-            return Err(EngineError::PlaybackInProgress);
-        }
-        let (media_path, source_pts_seconds, anchor_timeline_in, anchor_source_in, anchor_opacity) = {
+        self.pause_for_edit();
+        let (
+            media_path,
+            source_pts_seconds,
+            anchor_timeline_in,
+            anchor_source_in,
+            anchor_opacity,
+            anchor_clip_id,
+        ) = {
             let project = self
                 .current_project
                 .as_ref()
@@ -1315,11 +1375,23 @@ impl Engine {
                 tl_in,
                 src_in,
                 op,
+                active.clip_id,
             )
         };
         self.open_file(&media_path)?;
+        let xform_for_decode = {
+            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
+            let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+            let seq = project
+                .sequence(seq_id)
+                .ok_or(EngineError::SequenceNotFound)?;
+            clip_transform(seq, anchor_clip_id)
+        };
         if let Some(rs) = self.render_state.as_ref() {
-            rs.lock().renderer.set_opacity(anchor_opacity);
+            let mut rs = rs.lock();
+            rs.renderer.set_opacity(anchor_opacity);
+            rs.renderer
+                .set_transform(xform_for_decode.translate, xform_for_decode.scale, xform_for_decode.rotation_radians);
         }
         let info = self
             .stream_info
@@ -1357,9 +1429,7 @@ impl Engine {
         kind: String,
         params: std::collections::BTreeMap<String, EffectValue>,
     ) -> Result<String, EngineError> {
-        if self.playback.is_some() {
-            return Err(EngineError::PlaybackInProgress);
-        }
+        self.pause_for_edit();
         let mut effect = Effect::new(kind);
         effect.params = params;
         let id = effect.id.to_string();
@@ -1378,9 +1448,7 @@ impl Engine {
         clip_id: vance_timeline::ClipId,
         effect_id: EffectId,
     ) -> Result<(), EngineError> {
-        if self.playback.is_some() {
-            return Err(EngineError::PlaybackInProgress);
-        }
+        self.pause_for_edit();
         self.apply_edit_op(EditOp::RemoveEffectFromClip {
             track_id,
             clip_id,
@@ -1399,9 +1467,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         // Allow live updates while playing? For now, refuse — same as
         // other clip ops — so we don't fight the playback thread.
-        if self.playback.is_some() {
-            return Err(EngineError::PlaybackInProgress);
-        }
+        self.pause_for_edit();
         self.apply_edit_op(EditOp::UpdateEffectParam {
             track_id,
             clip_id,
@@ -1418,9 +1484,7 @@ impl Engine {
         track_id: TrackId,
         clip_id: vance_timeline::ClipId,
     ) -> Result<(), EngineError> {
-        if self.playback.is_some() {
-            return Err(EngineError::PlaybackInProgress);
-        }
+        self.pause_for_edit();
         self.apply_edit_op(EditOp::RemoveClip { track_id, clip_id })
     }
 
@@ -1434,9 +1498,7 @@ impl Engine {
         clip_id: vance_timeline::ClipId,
         new_source_in_seconds: f64,
     ) -> Result<(), EngineError> {
-        if self.playback.is_some() {
-            return Err(EngineError::PlaybackInProgress);
-        }
+        self.pause_for_edit();
         self.apply_edit_op(EditOp::TrimIn {
             track_id,
             clip_id,
@@ -1453,9 +1515,7 @@ impl Engine {
         clip_id: vance_timeline::ClipId,
         new_source_out_seconds: f64,
     ) -> Result<(), EngineError> {
-        if self.playback.is_some() {
-            return Err(EngineError::PlaybackInProgress);
-        }
+        self.pause_for_edit();
         self.apply_edit_op(EditOp::TrimOut {
             track_id,
             clip_id,
@@ -1473,9 +1533,7 @@ impl Engine {
         clip_id: vance_timeline::ClipId,
         new_timeline_seconds: f64,
     ) -> Result<(), EngineError> {
-        if self.playback.is_some() {
-            return Err(EngineError::PlaybackInProgress);
-        }
+        self.pause_for_edit();
         // Compute delta from the clip's current timeline_in.
         let current_in = self
             .current_sequence_ref()?
@@ -1503,9 +1561,7 @@ impl Engine {
         media_id: MediaItemId,
         timeline_seconds: f64,
     ) -> Result<String, EngineError> {
-        if self.playback.is_some() {
-            return Err(EngineError::PlaybackInProgress);
-        }
+        self.pause_for_edit();
         let project = self
             .current_project
             .as_mut()
@@ -1583,9 +1639,7 @@ impl Engine {
     /// Undo the most recent edit on the current sequence. Returns
     /// `false` if there's nothing to undo.
     pub fn undo(&mut self) -> Result<bool, EngineError> {
-        if self.playback.is_some() {
-            return Err(EngineError::PlaybackInProgress);
-        }
+        self.pause_for_edit();
         let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
         let log = self
             .edit_logs
@@ -1608,9 +1662,7 @@ impl Engine {
     /// Redo the next edit on the current sequence. Returns `false`
     /// if there's nothing to redo.
     pub fn redo(&mut self) -> Result<bool, EngineError> {
-        if self.playback.is_some() {
-            return Err(EngineError::PlaybackInProgress);
-        }
+        self.pause_for_edit();
         let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
         let log = self
             .edit_logs
@@ -1745,6 +1797,18 @@ impl Engine {
             info.current_sequence_id = self.current_sequence_id.map(|id| id.to_string());
             info
         })
+    }
+
+    /// Stop in-flight playback so an edit / seek / load can proceed.
+    /// Returns the stopped PTS when it actually stopped something,
+    /// `None` when there was no playback. Used by every edit op so
+    /// the user doesn't have to remember to hit Stop first.
+    fn pause_for_edit(&mut self) -> Option<i64> {
+        if self.playback.is_some() {
+            self.stop_playback().ok()
+        } else {
+            None
+        }
     }
 
     /// Is playback currently running? Auto-reaps sessions whose scheduler

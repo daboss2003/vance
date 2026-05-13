@@ -31,35 +31,54 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 @group(0) @binding(2) var tex_u: texture_2d<f32>;
 @group(0) @binding(3) var tex_v: texture_2d<f32>;
 
-// Per-frame effect parameters. Layout must match the
-// `RenderParams` struct in renderer.rs (currently just opacity +
-// 12 bytes of padding to make it 16-byte aligned).
+// Per-frame effect parameters. Layout must match `RenderParams` in
+// renderer.rs.
 struct Params {
     opacity: f32,
+    rotation: f32,
+    translate: vec2<f32>,
+    scale: vec2<f32>,
 };
 @group(0) @binding(4) var<uniform> params: Params;
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let y_raw = textureSample(tex_y, samp, in.uv).r;
-    let u_raw = textureSample(tex_u, samp, in.uv).r;
-    let v_raw = textureSample(tex_v, samp, in.uv).r;
+    // Inverse-transform the output UV to find which source UV we
+    // should sample. Operations apply in this order (forward):
+    // scale around (0.5, 0.5) → rotate around (0.5, 0.5) → translate.
+    // Inverse: untranslate → unrotate → unscale.
+    var uv = in.uv;
+    uv -= params.translate;
+    let centered = uv - vec2<f32>(0.5, 0.5);
+    let c = cos(-params.rotation);
+    let s = sin(-params.rotation);
+    let unrotated = vec2<f32>(
+        centered.x * c - centered.y * s,
+        centered.x * s + centered.y * c,
+    );
+    let unscaled = unrotated / params.scale;
+    let source_uv = unscaled + vec2<f32>(0.5, 0.5);
+
+    // Out-of-frame regions render black so transforms don't tile.
+    if (source_uv.x < 0.0 || source_uv.x > 1.0
+        || source_uv.y < 0.0 || source_uv.y > 1.0) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+
+    let y_raw = textureSample(tex_y, samp, source_uv).r;
+    let u_raw = textureSample(tex_u, samp, source_uv).r;
+    let v_raw = textureSample(tex_v, samp, source_uv).r;
 
     // Rec.709 limited-range expansion.
-    // Y: [16/255, 235/255] → [0, 1]
-    // U,V: [16/255, 240/255] → [-0.5, 0.5]
     let y = (y_raw - 16.0 / 255.0) * (255.0 / 219.0);
     let u = (u_raw - 128.0 / 255.0) * (255.0 / 224.0);
     let v = (v_raw - 128.0 / 255.0) * (255.0 / 224.0);
 
-    // Rec.709 Y'CbCr → R'G'B' (gamma-encoded; we are NOT linearizing here).
+    // Rec.709 Y'CbCr → R'G'B' (gamma-encoded; not linearized).
     let r = y + 1.5748 * v;
     let g = y - 0.1873 * u - 0.4681 * v;
     let b = y + 1.8556 * u;
 
     let rgb = clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
-    // Opacity fades toward the layer's black background. Premultiplied
-    // so the framebuffer alpha stays at 1.0 (we render with blend: None;
-    // see RendererConfig).
     return vec4<f32>(rgb * params.opacity, 1.0);
 }

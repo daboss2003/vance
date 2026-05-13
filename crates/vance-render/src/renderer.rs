@@ -80,14 +80,23 @@ pub struct Renderer {
 struct RenderParams {
     /// Output color multiplier. 1.0 = passthrough, 0.0 = full fade.
     opacity: f32,
-    _pad: [f32; 3],
+    /// Rotation around the frame center, in radians.
+    rotation: f32,
+    /// Translation as a fraction of frame size; 0 = no shift.
+    translate: [f32; 2],
+    /// Scale around the frame center; 1.0 = original size.
+    scale: [f32; 2],
+    _pad: [f32; 2],
 }
 
 impl Default for RenderParams {
     fn default() -> Self {
         Self {
             opacity: 1.0,
-            _pad: [0.0; 3],
+            rotation: 0.0,
+            translate: [0.0; 2],
+            scale: [1.0; 2],
+            _pad: [0.0; 2],
         }
     }
 }
@@ -238,6 +247,39 @@ impl Renderer {
             return;
         }
         self.current_params.opacity = v;
+        self.queue.write_buffer(
+            &self.params_buffer,
+            0,
+            bytemuck::cast_slice(&[self.current_params]),
+        );
+    }
+
+    /// Set the per-frame 2D transform uniforms. All defaults are the
+    /// identity: `rotation = 0`, `translate = (0, 0)`,
+    /// `scale = (1, 1)`. The shader applies the inverse transform to
+    /// the output UV before sampling the source frame; out-of-frame
+    /// regions render black.
+    pub fn set_transform(
+        &mut self,
+        translate: [f32; 2],
+        scale: [f32; 2],
+        rotation_radians: f32,
+    ) {
+        let new_scale = [
+            if scale[0].abs() < 1e-4 { 1e-4 } else { scale[0] },
+            if scale[1].abs() < 1e-4 { 1e-4 } else { scale[1] },
+        ];
+        if (self.current_params.rotation - rotation_radians).abs() < 1e-5
+            && (self.current_params.translate[0] - translate[0]).abs() < 1e-5
+            && (self.current_params.translate[1] - translate[1]).abs() < 1e-5
+            && (self.current_params.scale[0] - new_scale[0]).abs() < 1e-5
+            && (self.current_params.scale[1] - new_scale[1]).abs() < 1e-5
+        {
+            return;
+        }
+        self.current_params.rotation = rotation_radians;
+        self.current_params.translate = translate;
+        self.current_params.scale = new_scale;
         self.queue.write_buffer(
             &self.params_buffer,
             0,
