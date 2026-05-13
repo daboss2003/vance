@@ -1081,6 +1081,30 @@
               >
                 + Transform
               </button>
+              <button
+                class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+                onclick={() =>
+                  projectState.addEffect(t.id, c.id, 'crop', {
+                    left: 0,
+                    right: 0,
+                    top: 0,
+                    bottom: 0
+                  })}
+                title="Attach a crop effect"
+              >
+                + Crop
+              </button>
+              <button
+                class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+                onclick={() =>
+                  projectState.addEffect(t.id, c.id, 'color', {
+                    brightness: 0,
+                    contrast: 1
+                  })}
+                title="Attach a brightness/contrast effect"
+              >
+                + Color
+              </button>
             </div>
           </div>
           {#if c.effects.length === 0}
@@ -1099,6 +1123,62 @@
                       ✕
                     </button>
                   </div>
+                  {#snippet numericParam(
+                    key: string,
+                    label: string,
+                    min: number,
+                    max: number,
+                    step: number,
+                    defaultVal: number,
+                    precision: number
+                  )}
+                    {@const raw = e.params[key]}
+                    {@const animated = raw !== undefined && isKeyframes(raw)}
+                    {@const kfs: Keyframe[] =
+                      animated && raw !== undefined && isKeyframes(raw) ? raw : []}
+                    {@const cur =
+                      raw !== undefined ? evalNumber(raw, 0, defaultVal) : defaultVal}
+                    <div class="mt-1 grid grid-cols-[3rem_minmax(0,1fr)_2.25rem_1rem] items-center gap-x-2">
+                      <span class="text-vance-muted text-[10px]">{label}</span>
+                      <input
+                        type="range"
+                        {min}
+                        {max}
+                        {step}
+                        value={cur}
+                        class="w-full min-w-0"
+                        onchange={(ev) => {
+                          const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
+                          setOrKeyframe(t, c, e, key, v);
+                        }}
+                      />
+                      <span class="font-mono text-right text-[10px]">{cur.toFixed(precision)}</span>
+                      <button
+                        class="text-[12px] leading-none {animated ? 'text-[var(--color-vance-accent)]' : 'text-vance-muted'} hover:brightness-125"
+                        onclick={() => addKeyframeAtPlayhead(t, c, e, key)}
+                        title="Add keyframe at playhead"
+                      >
+                        ◆
+                      </button>
+                    </div>
+                    {#if animated && kfs.length > 0}
+                      <ul class="mt-1 flex flex-col gap-0.5 pl-12 text-[10px] text-vance-muted">
+                        {#each kfs as k (k.time_seconds)}
+                          <li class="flex items-center justify-between gap-2">
+                            <span class="font-mono">{k.time_seconds.toFixed(2)}s</span>
+                            <span class="font-mono">{k.value.toFixed(precision)}</span>
+                            <button
+                              class="hover:text-red-400"
+                              onclick={() => removeKeyframe(t, c, e, key, k.time_seconds)}
+                              title="Remove keyframe"
+                            >
+                              ✕
+                            </button>
+                          </li>
+                        {/each}
+                      </ul>
+                    {/if}
+                  {/snippet}
                   {#if e.kind === 'opacity'}
                     {@const raw = e.params.value}
                     {@const animated = raw !== undefined && isKeyframes(raw)}
@@ -1228,6 +1308,14 @@
                       />
                       <span class="font-mono text-right text-[10px]">{rot.toFixed(0)}°</span>
                     </div>
+                  {:else if e.kind === 'crop'}
+                    {@render numericParam('left', 'left', 0, 0.95, 0.01, 0, 2)}
+                    {@render numericParam('right', 'right', 0, 0.95, 0.01, 0, 2)}
+                    {@render numericParam('top', 'top', 0, 0.95, 0.01, 0, 2)}
+                    {@render numericParam('bottom', 'bot', 0, 0.95, 0.01, 0, 2)}
+                  {:else if e.kind === 'color'}
+                    {@render numericParam('brightness', 'bright', -1, 1, 0.01, 0, 2)}
+                    {@render numericParam('contrast', 'contr', 0, 3, 0.01, 1, 2)}
                   {/if}
                 </li>
               {/each}

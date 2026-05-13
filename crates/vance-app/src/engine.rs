@@ -314,6 +314,82 @@ fn clip_transform_at(
     }
 }
 
+/// `[left, right, top, bottom]` crop fractions aggregated from every
+/// enabled "crop" effect on the clip; values stack additively (so two
+/// crop effects can compose). Defaults to all-zero (no crop) when
+/// none are attached.
+fn eval_clip_crop(effects: &[vance_timeline::Effect], t_seconds: f64) -> [f32; 4] {
+    let mut crop = [0.0_f32; 4];
+    let eval = |k: &str,
+                ps: &std::collections::BTreeMap<String, EffectValue>|
+     -> f32 {
+        ps.get(k)
+            .and_then(|p| p.eval_number(t_seconds))
+            .map(|v| v as f32)
+            .unwrap_or(0.0)
+    };
+    for e in effects {
+        if !e.enabled || e.kind != "crop" {
+            continue;
+        }
+        crop[0] += eval("left", &e.params);
+        crop[1] += eval("right", &e.params);
+        crop[2] += eval("top", &e.params);
+        crop[3] += eval("bottom", &e.params);
+    }
+    crop
+}
+
+/// Brightness/contrast values aggregated from every enabled
+/// "color" effect on the clip; brightness sums, contrast multiplies.
+/// Defaults to `(brightness=0, contrast=1)` (passthrough).
+fn eval_clip_brightness_contrast(
+    effects: &[vance_timeline::Effect],
+    t_seconds: f64,
+) -> (f32, f32) {
+    let mut brightness = 0.0_f32;
+    let mut contrast = 1.0_f32;
+    let eval = |k: &str,
+                ps: &std::collections::BTreeMap<String, EffectValue>|
+     -> Option<f32> {
+        ps.get(k).and_then(|p| p.eval_number(t_seconds)).map(|v| v as f32)
+    };
+    for e in effects {
+        if !e.enabled || e.kind != "color" {
+            continue;
+        }
+        brightness += eval("brightness", &e.params).unwrap_or(0.0);
+        contrast *= eval("contrast", &e.params).unwrap_or(1.0);
+    }
+    (brightness, contrast)
+}
+
+fn clip_crop_at(
+    seq: &Sequence,
+    clip_id: vance_timeline::ClipId,
+    t_seconds: f64,
+) -> [f32; 4] {
+    for track in seq.tracks.iter() {
+        if let Some(clip) = track.clips.iter().find(|c| c.id == clip_id) {
+            return eval_clip_crop(&clip.effects, t_seconds);
+        }
+    }
+    [0.0; 4]
+}
+
+fn clip_brightness_contrast_at(
+    seq: &Sequence,
+    clip_id: vance_timeline::ClipId,
+    t_seconds: f64,
+) -> (f32, f32) {
+    for track in seq.tracks.iter() {
+        if let Some(clip) = track.clips.iter().find(|c| c.id == clip_id) {
+            return eval_clip_brightness_contrast(&clip.effects, t_seconds);
+        }
+    }
+    (0.0, 1.0)
+}
+
 fn first_clip_after(
     seq: &Sequence,
     after_t: vance_core::RationalTime,
@@ -844,6 +920,16 @@ impl Engine {
             .ok_or(EngineError::NoViewport)?
             .clone();
         let bounds = self.source_last_bounds;
+        // Source monitor renders the raw media — reset the params the
+        // Record-side sequence playback may have left on the renderer
+        // so opacity/crop/transform/color don't bleed into Source.
+        {
+            let mut rs = render_state.lock();
+            rs.renderer.set_opacity(1.0);
+            rs.renderer.set_transform([0.0, 0.0], [1.0, 1.0], 0.0);
+            rs.renderer.set_brightness_contrast(0.0, 1.0);
+            rs.renderer.set_crop(0.0, 0.0, 0.0, 0.0);
+        }
         upload_and_render_source(&render_state, &viewport, &frame, bounds)?;
         self.source_last_pts = Some(pts);
         Ok(pts)
@@ -924,6 +1010,8 @@ impl Engine {
                 let mut rs = rs.lock();
                 rs.renderer.set_opacity(1.0);
                 rs.renderer.set_transform([0.0, 0.0], [1.0, 1.0], 0.0);
+                rs.renderer.set_brightness_contrast(0.0, 1.0);
+                rs.renderer.set_crop(0.0, 0.0, 0.0, 0.0);
             }
         }
         let dec = self.decoder.as_mut().ok_or(EngineError::NoFileOpen)?;
@@ -1300,7 +1388,7 @@ impl Engine {
         // can re-evaluate keyframes per frame. Also push the
         // entry-time values into the renderer so the first frame
         // looks right before the loop has a chance to update.
-        let (entry_xform, clip_effects_snapshot) = {
+        let (entry_xform, entry_crop, entry_color, clip_effects_snapshot) = {
             let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
             let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
             let seq = project
@@ -1308,6 +1396,8 @@ impl Engine {
                 .ok_or(EngineError::SequenceNotFound)?;
             let entry_clip_t = source_pts_seconds - anchor_source_in;
             let xform = clip_transform_at(seq, anchor_clip_id, entry_clip_t);
+            let crop = clip_crop_at(seq, anchor_clip_id, entry_clip_t);
+            let color = clip_brightness_contrast_at(seq, anchor_clip_id, entry_clip_t);
             // Snapshot the active clip's effects.
             let effects = seq
                 .tracks
@@ -1319,7 +1409,7 @@ impl Engine {
                         .map(|c| c.effects.clone())
                 })
                 .unwrap_or_default();
-            (xform, effects)
+            (xform, crop, color, effects)
         };
         if let Some(rs) = self.render_state.as_ref() {
             let mut rs = rs.lock();
@@ -1329,6 +1419,8 @@ impl Engine {
                 entry_xform.scale,
                 entry_xform.rotation_radians,
             );
+            rs.renderer.set_brightness_contrast(entry_color.0, entry_color.1);
+            rs.renderer.set_crop(entry_crop[0], entry_crop[1], entry_crop[2], entry_crop[3]);
         }
 
         // Convert source-seconds → stream-time-base PTS.
@@ -1434,14 +1526,18 @@ impl Engine {
             )
         };
         self.open_file(&media_path)?;
-        let xform_for_decode = {
+        let (xform_for_decode, crop_for_decode, color_for_decode) = {
             let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
             let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
             let seq = project
                 .sequence(seq_id)
                 .ok_or(EngineError::SequenceNotFound)?;
             let entry_clip_t = source_pts_seconds - anchor_source_in;
-            clip_transform_at(seq, anchor_clip_id, entry_clip_t)
+            (
+                clip_transform_at(seq, anchor_clip_id, entry_clip_t),
+                clip_crop_at(seq, anchor_clip_id, entry_clip_t),
+                clip_brightness_contrast_at(seq, anchor_clip_id, entry_clip_t),
+            )
         };
         if let Some(rs) = self.render_state.as_ref() {
             let mut rs = rs.lock();
@@ -1450,6 +1546,13 @@ impl Engine {
                 xform_for_decode.translate,
                 xform_for_decode.scale,
                 xform_for_decode.rotation_radians,
+            );
+            rs.renderer.set_brightness_contrast(color_for_decode.0, color_for_decode.1);
+            rs.renderer.set_crop(
+                crop_for_decode[0],
+                crop_for_decode[1],
+                crop_for_decode[2],
+                crop_for_decode[3],
             );
         }
         let info = self
@@ -2143,15 +2246,19 @@ fn playback_loop(
         }
 
         // Per-frame effect eval — picks up keyframe animation for
-        // opacity / transform. Skip the lock dance when the clip has
-        // no effects.
+        // opacity / transform / crop / color. Skip the lock dance
+        // when the clip has no effects.
         if !clip_effects.is_empty() {
             let clip_t = frame_sec - clip_source_in_sec;
             let op = eval_clip_opacity(&clip_effects, clip_t);
             let xf = eval_clip_transform(&clip_effects, clip_t);
+            let crop = eval_clip_crop(&clip_effects, clip_t);
+            let (br, ct) = eval_clip_brightness_contrast(&clip_effects, clip_t);
             let mut rs = render_state.lock();
             rs.renderer.set_opacity(op);
             rs.renderer.set_transform(xf.translate, xf.scale, xf.rotation_radians);
+            rs.renderer.set_brightness_contrast(br, ct);
+            rs.renderer.set_crop(crop[0], crop[1], crop[2], crop[3]);
         }
         if let Err(e) = upload_and_render(&render_state, &viewport, &frame, bounds) {
             tracing::warn!(?e, "playback: render error (continuing)");

@@ -86,7 +86,16 @@ struct RenderParams {
     translate: [f32; 2],
     /// Scale around the frame center; 1.0 = original size.
     scale: [f32; 2],
-    _pad: [f32; 2],
+    /// Additive RGB offset applied to the gamma-encoded color.
+    /// 0.0 = passthrough; range ~[-1, 1].
+    brightness: f32,
+    /// Multiplicative spread around 0.5. 1.0 = passthrough; 0 = flat
+    /// gray; >1 = punchier.
+    contrast: f32,
+    /// Crop fractions for left/right/top/bottom edges of the source
+    /// UV. 0 = no crop; 0.1 left = drop the leftmost 10% of source.
+    /// Sum on each axis must stay below 1.0 to leave something visible.
+    crop_lrtb: [f32; 4],
 }
 
 impl Default for RenderParams {
@@ -96,7 +105,9 @@ impl Default for RenderParams {
             rotation: 0.0,
             translate: [0.0; 2],
             scale: [1.0; 2],
-            _pad: [0.0; 2],
+            brightness: 0.0,
+            contrast: 1.0,
+            crop_lrtb: [0.0; 4],
         }
     }
 }
@@ -247,6 +258,63 @@ impl Renderer {
             return;
         }
         self.current_params.opacity = v;
+        self.queue.write_buffer(
+            &self.params_buffer,
+            0,
+            bytemuck::cast_slice(&[self.current_params]),
+        );
+    }
+
+    /// Set per-frame brightness/contrast uniforms. `brightness = 0`
+    /// and `contrast = 1` is passthrough. Contrast is applied around
+    /// 0.5 (gamma-encoded midpoint) before brightness is added; the
+    /// shader clamps the result to [0, 1].
+    pub fn set_brightness_contrast(&mut self, brightness: f32, contrast: f32) {
+        let b = brightness.clamp(-1.0, 1.0);
+        let c = contrast.clamp(0.0, 4.0);
+        if (self.current_params.brightness - b).abs() < 1e-5
+            && (self.current_params.contrast - c).abs() < 1e-5
+        {
+            return;
+        }
+        self.current_params.brightness = b;
+        self.current_params.contrast = c;
+        self.queue.write_buffer(
+            &self.params_buffer,
+            0,
+            bytemuck::cast_slice(&[self.current_params]),
+        );
+    }
+
+    /// Set per-frame crop uniforms. Each value is a fraction
+    /// `[0, 1)` of the source frame to chop off that edge; e.g.
+    /// `set_crop(0.1, 0, 0, 0)` drops the leftmost 10% of the source.
+    /// Sums above ~0.99 on an axis are clamped to leave a 1% sliver
+    /// visible — fully empty crops are an easy oops, not an art choice.
+    pub fn set_crop(&mut self, left: f32, right: f32, top: f32, bottom: f32) {
+        let mut l = left.clamp(0.0, 1.0);
+        let mut r = right.clamp(0.0, 1.0);
+        let mut t = top.clamp(0.0, 1.0);
+        let mut b = bottom.clamp(0.0, 1.0);
+        if l + r >= 0.99 {
+            let extra = (l + r) - 0.99;
+            l -= extra * 0.5;
+            r -= extra * 0.5;
+        }
+        if t + b >= 0.99 {
+            let extra = (t + b) - 0.99;
+            t -= extra * 0.5;
+            b -= extra * 0.5;
+        }
+        let new = [l, r, t, b];
+        if (self.current_params.crop_lrtb[0] - new[0]).abs() < 1e-5
+            && (self.current_params.crop_lrtb[1] - new[1]).abs() < 1e-5
+            && (self.current_params.crop_lrtb[2] - new[2]).abs() < 1e-5
+            && (self.current_params.crop_lrtb[3] - new[3]).abs() < 1e-5
+        {
+            return;
+        }
+        self.current_params.crop_lrtb = new;
         self.queue.write_buffer(
             &self.params_buffer,
             0,

@@ -38,6 +38,9 @@ struct Params {
     rotation: f32,
     translate: vec2<f32>,
     scale: vec2<f32>,
+    brightness: f32,
+    contrast: f32,
+    crop_lrtb: vec4<f32>,
 };
 @group(0) @binding(4) var<uniform> params: Params;
 
@@ -65,6 +68,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
 
+    // Crop is in *source* UV space — happens before the YUV→RGB
+    // conversion. left/right/top/bottom are fractions of the source
+    // frame to chop off each edge; outside that window we render
+    // black so cropped pixels don't repeat under transform.
+    if (source_uv.x < params.crop_lrtb.x
+        || source_uv.x > 1.0 - params.crop_lrtb.y
+        || source_uv.y < params.crop_lrtb.z
+        || source_uv.y > 1.0 - params.crop_lrtb.w) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+
     let y_raw = textureSample(tex_y, samp, source_uv).r;
     let u_raw = textureSample(tex_u, samp, source_uv).r;
     let v_raw = textureSample(tex_v, samp, source_uv).r;
@@ -79,6 +93,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let g = y - 0.1873 * u - 0.4681 * v;
     let b = y + 1.8556 * u;
 
-    let rgb = clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
+    var rgb = clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
+    // Contrast pivots around 0.5 (gamma-encoded midpoint), then
+    // brightness shifts. Both apply in gamma space; that's not
+    // strictly correct (linear would be cleaner), but it matches
+    // the perceptual feel users expect from NLE color sliders.
+    rgb = (rgb - vec3<f32>(0.5)) * params.contrast + vec3<f32>(0.5) + vec3<f32>(params.brightness);
+    rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
     return vec4<f32>(rgb * params.opacity, 1.0);
 }
