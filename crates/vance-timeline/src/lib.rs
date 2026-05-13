@@ -44,7 +44,7 @@ pub mod track;
 
 pub use clip::Clip;
 pub use edit_log::{apply, EditLog, EditOp};
-pub use effect::{Effect, EffectParams, EffectValue};
+pub use effect::{Effect, EffectParams, EffectValue, Keyframe};
 pub use error::{Result, TimelineError};
 pub use id::{ClipId, EffectId, MarkerId, MediaItemId, ProjectId, SequenceId, TrackId};
 pub use marker::{Marker, MarkerColor, MarkerKind};

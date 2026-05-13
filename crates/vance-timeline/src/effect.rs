@@ -17,8 +17,10 @@ use crate::id::EffectId;
 /// data.
 pub type EffectParams = BTreeMap<String, EffectValue>;
 
-/// A loosely-typed parameter value. Just enough to serialize a stub
-/// effect today without committing to the eventual schema.
+/// A loosely-typed parameter value. Numbers can also be animated
+/// via a `Keyframes` list — each entry pins a value at a
+/// clip-relative time, evaluated by linear interpolation between
+/// surrounding keyframes (5.9 will add bezier).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum EffectValue {
@@ -28,6 +30,57 @@ pub enum EffectValue {
     Bool(bool),
     /// A free-form string.
     String(String),
+    /// Animated numeric value — a list of keyframes in ascending
+    /// time order, interpolated between samples.
+    Keyframes(Vec<Keyframe>),
+}
+
+/// One keyframe pinning a numeric value at a specific clip-relative
+/// time (seconds from the clip's `source_in`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Keyframe {
+    pub time_seconds: f64,
+    pub value: f64,
+}
+
+impl EffectValue {
+    /// Evaluate this parameter as a number at clip-relative time
+    /// `t_seconds`. `Number` returns its constant value; `Keyframes`
+    /// linearly interpolates between the nearest neighbors,
+    /// clamping at the endpoints. `Bool`/`String` return `None`.
+    pub fn eval_number(&self, t_seconds: f64) -> Option<f64> {
+        match self {
+            EffectValue::Number(v) => Some(*v),
+            EffectValue::Keyframes(kfs) => Some(eval_keyframes(kfs, t_seconds)),
+            _ => None,
+        }
+    }
+}
+
+fn eval_keyframes(kfs: &[Keyframe], t: f64) -> f64 {
+    if kfs.is_empty() {
+        return 0.0;
+    }
+    if kfs.len() == 1 || t <= kfs[0].time_seconds {
+        return kfs[0].value;
+    }
+    if t >= kfs[kfs.len() - 1].time_seconds {
+        return kfs[kfs.len() - 1].value;
+    }
+    // Find the segment containing t.
+    for i in 0..kfs.len() - 1 {
+        let a = kfs[i];
+        let b = kfs[i + 1];
+        if t >= a.time_seconds && t <= b.time_seconds {
+            let span = b.time_seconds - a.time_seconds;
+            if span <= 0.0 {
+                return a.value;
+            }
+            let frac = (t - a.time_seconds) / span;
+            return a.value + (b.value - a.value) * frac;
+        }
+    }
+    kfs[kfs.len() - 1].value
 }
 
 /// One effect attached to a clip or track.

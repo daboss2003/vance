@@ -134,7 +134,52 @@ export const currentProjectPath = (): Promise<string | null> =>
 
 // ---- Sequence contents (for the timeline canvas) ---------------------------
 
-export type EffectValue = number | boolean | string;
+/** Animated numeric value — list of {time_seconds, value} pinned
+ *  at clip-relative times, linearly interpolated by the engine. */
+export type Keyframe = { time_seconds: number; value: number };
+
+/** Either a plain scalar or an animated keyframes array. The
+ *  engine's `EffectValue` is `#[serde(untagged)]`, so a number
+ *  serializes as `1`, a bool as `true`, a string as `"x"`, and a
+ *  keyframes track as the array itself: `[{time_seconds, value}, …]`. */
+export type EffectValue = number | boolean | string | Keyframe[];
+
+/** True when `v` is an animated keyframes array. */
+export function isKeyframes(v: EffectValue): v is Keyframe[] {
+  return (
+    Array.isArray(v) &&
+    (v.length === 0 ||
+      (typeof v[0] === 'object' &&
+        v[0] !== null &&
+        'time_seconds' in v[0] &&
+        'value' in v[0]))
+  );
+}
+
+/** Evaluate an effect param at clip-relative `t` seconds. Mirrors
+ *  the engine's `EffectValue::eval_number`. Useful for showing
+ *  the live value in the UI without an IPC round-trip. */
+export function evalNumber(v: EffectValue, t: number, fallback = 0): number {
+  if (typeof v === 'number') return v;
+  if (isKeyframes(v)) {
+    const kfs = v;
+    if (kfs.length === 0) return fallback;
+    if (kfs.length === 1 || t <= kfs[0].time_seconds) return kfs[0].value;
+    const last = kfs[kfs.length - 1];
+    if (t >= last.time_seconds) return last.value;
+    for (let i = 0; i < kfs.length - 1; i++) {
+      const a = kfs[i], b = kfs[i + 1];
+      if (t >= a.time_seconds && t <= b.time_seconds) {
+        const span = b.time_seconds - a.time_seconds;
+        if (span <= 0) return a.value;
+        const frac = (t - a.time_seconds) / span;
+        return a.value + (b.value - a.value) * frac;
+      }
+    }
+    return last.value;
+  }
+  return fallback;
+}
 
 export type EffectInfo = {
   id: string;

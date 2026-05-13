@@ -231,24 +231,29 @@ fn clip_anchor_seconds(
     None
 }
 
-/// Product of every enabled "opacity" effect's `value` param on the
-/// clip with `clip_id`, clamped to `[0, 1]`. Defaults to `1.0` when
-/// the clip has no opacity effects.
-fn clip_opacity(seq: &Sequence, clip_id: vance_timeline::ClipId) -> f32 {
+/// Product of every enabled "opacity" effect's `value` param,
+/// evaluated at clip-relative `t_seconds`. Keyframed params
+/// interpolate; plain numbers are constant. Defaults to `1.0` when
+/// no opacity effects are attached.
+fn eval_clip_opacity(effects: &[vance_timeline::Effect], t_seconds: f64) -> f32 {
+    let mut op = 1.0_f64;
+    for e in effects {
+        if !e.enabled || e.kind != "opacity" {
+            continue;
+        }
+        if let Some(v) = e.params.get("value").and_then(|p| p.eval_number(t_seconds)) {
+            op *= v.clamp(0.0, 1.0);
+        }
+    }
+    op.clamp(0.0, 1.0) as f32
+}
+
+/// Convenience: find the clip in the sequence and evaluate its
+/// opacity at clip-relative `t_seconds`.
+fn clip_opacity_at(seq: &Sequence, clip_id: vance_timeline::ClipId, t_seconds: f64) -> f32 {
     for track in seq.tracks.iter() {
         if let Some(clip) = track.clips.iter().find(|c| c.id == clip_id) {
-            let mut op = 1.0_f32;
-            for e in clip.effects.iter() {
-                if !e.enabled {
-                    continue;
-                }
-                if e.kind == "opacity" {
-                    if let Some(EffectValue::Number(v)) = e.params.get("value") {
-                        op *= (*v as f32).clamp(0.0, 1.0);
-                    }
-                }
-            }
-            return op.clamp(0.0, 1.0);
+            return eval_clip_opacity(&clip.effects, t_seconds);
         }
     }
     1.0
@@ -264,37 +269,49 @@ struct ClipTransform {
     rotation_radians: f32,
 }
 
-fn clip_transform(seq: &Sequence, clip_id: vance_timeline::ClipId) -> ClipTransform {
+fn eval_clip_transform(
+    effects: &[vance_timeline::Effect],
+    t_seconds: f64,
+) -> ClipTransform {
     let mut t = ClipTransform {
         translate: [0.0, 0.0],
         scale: [1.0, 1.0],
         rotation_radians: 0.0,
     };
-    let f = |k: &str, ps: &std::collections::BTreeMap<String, EffectValue>| -> Option<f32> {
-        if let Some(EffectValue::Number(v)) = ps.get(k) {
-            Some(*v as f32)
-        } else {
-            None
-        }
+    let eval = |k: &str,
+                ps: &std::collections::BTreeMap<String, EffectValue>|
+     -> Option<f32> {
+        ps.get(k).and_then(|p| p.eval_number(t_seconds)).map(|v| v as f32)
     };
-    for track in seq.tracks.iter() {
-        if let Some(clip) = track.clips.iter().find(|c| c.id == clip_id) {
-            for e in clip.effects.iter() {
-                if !e.enabled || e.kind != "transform" {
-                    continue;
-                }
-                t.translate[0] += f("translate_x", &e.params).unwrap_or(0.0);
-                t.translate[1] += f("translate_y", &e.params).unwrap_or(0.0);
-                t.scale[0] *= f("scale_x", &e.params).unwrap_or(1.0);
-                t.scale[1] *= f("scale_y", &e.params).unwrap_or(1.0);
-                // rotation parameter is degrees in the UI; convert here.
-                t.rotation_radians +=
-                    f("rotation", &e.params).unwrap_or(0.0).to_radians();
-            }
-            return t;
+    for e in effects {
+        if !e.enabled || e.kind != "transform" {
+            continue;
         }
+        t.translate[0] += eval("translate_x", &e.params).unwrap_or(0.0);
+        t.translate[1] += eval("translate_y", &e.params).unwrap_or(0.0);
+        t.scale[0] *= eval("scale_x", &e.params).unwrap_or(1.0);
+        t.scale[1] *= eval("scale_y", &e.params).unwrap_or(1.0);
+        t.rotation_radians +=
+            eval("rotation", &e.params).unwrap_or(0.0).to_radians();
     }
     t
+}
+
+fn clip_transform_at(
+    seq: &Sequence,
+    clip_id: vance_timeline::ClipId,
+    t_seconds: f64,
+) -> ClipTransform {
+    for track in seq.tracks.iter() {
+        if let Some(clip) = track.clips.iter().find(|c| c.id == clip_id) {
+            return eval_clip_transform(&clip.effects, t_seconds);
+        }
+    }
+    ClipTransform {
+        translate: [0.0, 0.0],
+        scale: [1.0, 1.0],
+        rotation_radians: 0.0,
+    }
 }
 
 fn first_clip_after(
@@ -535,6 +552,15 @@ pub struct Engine {
     /// `stop_playback`. The `is_playing` auto-reap checks this to
     /// decide whether to advance or end at EOS.
     playing_sequence_active: bool,
+    /// Active clip's effects snapshot, set by `play_sequence` /
+    /// `decode_sequence_at` before they kick off a playback session.
+    /// Consumed by `start_playback` when it spawns the loop so
+    /// keyframed params animate per frame.
+    next_play_effects: Vec<vance_timeline::Effect>,
+    /// Clip-relative source-in (seconds) corresponding to
+    /// `next_play_effects`; used to map each frame's source PTS to
+    /// the clip-local time for keyframe evaluation.
+    next_play_source_in_sec: f64,
 }
 
 /// Anchors a stream-time-base playback position back to a sequence
@@ -986,6 +1012,11 @@ impl Engine {
         let ended_at_eos = Arc::new(AtomicBool::new(false));
         let ended_at_eos_clone = ended_at_eos.clone();
         let last_bounds = self.last_bounds;
+        // Consume the effects snapshot stashed by play_sequence
+        // (empty for single-file Open File… playback).
+        let clip_effects = std::mem::take(&mut self.next_play_effects);
+        let clip_source_in_sec = self.next_play_source_in_sec;
+        self.next_play_source_in_sec = 0.0;
         let handle = std::thread::Builder::new()
             .name("vance-engine.playback".into())
             .spawn(move || {
@@ -1000,6 +1031,8 @@ impl Engine {
                     audio_sync,
                     last_pts_clone,
                     ended_at_eos_clone,
+                    clip_effects,
+                    clip_source_in_sec,
                 )
             })
             .map_err(|e| EngineError::PlaybackThread(format!("spawn: {e}")))?;
@@ -1245,7 +1278,11 @@ impl Engine {
             // Find the source clip's timeline_in for the anchor.
             let (tl_in_sec, src_in_sec) = clip_anchor_seconds(seq, active.clip_id)
                 .unwrap_or((0.0, rt_to_seconds(active.source_pts)));
-            let op = clip_opacity(seq, active.clip_id);
+            // Clip-relative time at the entry point (used for the
+            // initial opacity/transform snapshot below). Each
+            // subsequent frame re-evaluates inside the playback_loop.
+            let entry_clip_t = rt_to_seconds(active.source_pts) - src_in_sec;
+            let op = clip_opacity_at(seq, active.clip_id, entry_clip_t);
             (
                 path,
                 rt_to_seconds(active.source_pts),
@@ -1259,26 +1296,39 @@ impl Engine {
         // Reopen decoder onto the active clip's media. Idempotent if
         // we're already on this file: the decoder reopens cleanly.
         self.open_file(&media_path)?;
-        // Push the active clip's effect params to the renderer. Stays
-        // in effect until the next play_sequence / decode_sequence_at
-        // swaps them.
-        let xform_opt = {
+        // Snapshot the active clip's effects so the playback_loop
+        // can re-evaluate keyframes per frame. Also push the
+        // entry-time values into the renderer so the first frame
+        // looks right before the loop has a chance to update.
+        let (entry_xform, clip_effects_snapshot) = {
             let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
             let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
             let seq = project
                 .sequence(seq_id)
                 .ok_or(EngineError::SequenceNotFound)?;
-            Some(clip_transform(seq, anchor_clip_id))
+            let entry_clip_t = source_pts_seconds - anchor_source_in;
+            let xform = clip_transform_at(seq, anchor_clip_id, entry_clip_t);
+            // Snapshot the active clip's effects.
+            let effects = seq
+                .tracks
+                .iter()
+                .find_map(|t| {
+                    t.clips
+                        .iter()
+                        .find(|c| c.id == anchor_clip_id)
+                        .map(|c| c.effects.clone())
+                })
+                .unwrap_or_default();
+            (xform, effects)
         };
         if let Some(rs) = self.render_state.as_ref() {
             let mut rs = rs.lock();
             rs.renderer.set_opacity(anchor_opacity);
-            if let Some(t) = xform_opt {
-                rs.renderer
-                    .set_transform(t.translate, t.scale, t.rotation_radians);
-            } else {
-                rs.renderer.set_transform([0.0, 0.0], [1.0, 1.0], 0.0);
-            }
+            rs.renderer.set_transform(
+                entry_xform.translate,
+                entry_xform.scale,
+                entry_xform.rotation_radians,
+            );
         }
 
         // Convert source-seconds → stream-time-base PTS.
@@ -1305,6 +1355,9 @@ impl Engine {
             opacity: anchor_opacity,
         });
         self.playing_sequence_active = true;
+        // Stash effects for the playback_loop to evaluate per frame.
+        self.next_play_effects = clip_effects_snapshot;
+        self.next_play_source_in_sec = anchor_source_in;
         self.start_playback(from_pts)
     }
 
@@ -1368,7 +1421,9 @@ impl Engine {
                 .ok_or(EngineError::MediaNotFound)?;
             let (tl_in, src_in) = clip_anchor_seconds(seq, active.clip_id)
                 .unwrap_or((0.0, rt_to_seconds(active.source_pts)));
-            let op = clip_opacity(seq, active.clip_id);
+            // Clip-relative time for keyframe eval at this seek.
+            let entry_clip_t = rt_to_seconds(active.source_pts) - src_in;
+            let op = clip_opacity_at(seq, active.clip_id, entry_clip_t);
             (
                 media.path.to_string_lossy().into_owned(),
                 rt_to_seconds(active.source_pts),
@@ -1385,13 +1440,17 @@ impl Engine {
             let seq = project
                 .sequence(seq_id)
                 .ok_or(EngineError::SequenceNotFound)?;
-            clip_transform(seq, anchor_clip_id)
+            let entry_clip_t = source_pts_seconds - anchor_source_in;
+            clip_transform_at(seq, anchor_clip_id, entry_clip_t)
         };
         if let Some(rs) = self.render_state.as_ref() {
             let mut rs = rs.lock();
             rs.renderer.set_opacity(anchor_opacity);
-            rs.renderer
-                .set_transform(xform_for_decode.translate, xform_for_decode.scale, xform_for_decode.rotation_radians);
+            rs.renderer.set_transform(
+                xform_for_decode.translate,
+                xform_for_decode.scale,
+                xform_for_decode.rotation_radians,
+            );
         }
         let info = self
             .stream_info
@@ -1977,6 +2036,14 @@ fn playback_loop(
     audio: Option<AudioSync>,
     last_pts: Arc<std::sync::atomic::AtomicI64>,
     ended_at_eos: Arc<AtomicBool>,
+    // Effects from the active clip — evaluated per frame so keyframed
+    // opacity / transform animate during continuous playback. Empty
+    // when the clip has no effects (no-ops then).
+    clip_effects: Vec<vance_timeline::Effect>,
+    // Source-domain seconds where this clip's visible range starts
+    // (i.e. the clip's `source_in`). Used to convert each frame's
+    // stream PTS into a clip-relative time for keyframe eval.
+    clip_source_in_sec: f64,
 ) -> DecoderClient {
     // Stream-time-base → seconds: pts * tb_num / tb_den.
     let (tb_num, tb_den) = info.time_base;
@@ -2075,6 +2142,17 @@ fn playback_loop(
             continue;
         }
 
+        // Per-frame effect eval — picks up keyframe animation for
+        // opacity / transform. Skip the lock dance when the clip has
+        // no effects.
+        if !clip_effects.is_empty() {
+            let clip_t = frame_sec - clip_source_in_sec;
+            let op = eval_clip_opacity(&clip_effects, clip_t);
+            let xf = eval_clip_transform(&clip_effects, clip_t);
+            let mut rs = render_state.lock();
+            rs.renderer.set_opacity(op);
+            rs.renderer.set_transform(xf.translate, xf.scale, xf.rotation_radians);
+        }
         if let Err(e) = upload_and_render(&render_state, &viewport, &frame, bounds) {
             tracing::warn!(?e, "playback: render error (continuing)");
         }

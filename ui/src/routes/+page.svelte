@@ -4,6 +4,13 @@
   import {
     backendVersion,
     currentTimelineSeconds,
+    evalNumber,
+    isKeyframes,
+    type ClipContents,
+    type EffectInfo,
+    type EffectValue,
+    type Keyframe,
+    type TrackContents,
     decodeAndRenderAt,
     decodeSequenceAt,
     diagLog,
@@ -372,6 +379,82 @@
     const name = projectState.info.name || 'Untitled';
     const bundle = `${selected}/${name}.vance`;
     await projectState.save(bundle);
+  }
+
+  /** Clip-relative time of the current playhead, clamped to >= 0. */
+  async function clipRelativeTime(c: ClipContents): Promise<number> {
+    const t = (await currentTimelineSeconds()) ?? c.timeline_in_seconds;
+    return Math.max(0, t - c.timeline_in_seconds);
+  }
+
+  /** Set or update a numeric param value. If the param is already
+   *  keyframed, this writes a keyframe at the current playhead (or
+   *  replaces the existing one at that time). Otherwise it writes a
+   *  plain `Number`. Lets the slider DTRT in both modes. */
+  async function setOrKeyframe(
+    track: TrackContents,
+    clip: ClipContents,
+    effect: EffectInfo,
+    key: string,
+    value: number
+  ) {
+    const existing = effect.params[key];
+    if (existing !== undefined && isKeyframes(existing)) {
+      const clipT = await clipRelativeTime(clip);
+      const kfs: Keyframe[] = existing.filter(
+        (k) => Math.abs(k.time_seconds - clipT) > 1e-3
+      );
+      kfs.push({ time_seconds: clipT, value });
+      kfs.sort((a, b) => a.time_seconds - b.time_seconds);
+      await projectState.updateEffectParam(track.id, clip.id, effect.id, key, kfs);
+    } else {
+      await projectState.updateEffectParam(track.id, clip.id, effect.id, key, value);
+    }
+  }
+
+  /** Pin a keyframe at the current playhead with the param's
+   *  currently-evaluated value. First click converts a plain number
+   *  into a keyframes list. */
+  async function addKeyframeAtPlayhead(
+    track: TrackContents,
+    clip: ClipContents,
+    effect: EffectInfo,
+    key: string
+  ) {
+    const clipT = await clipRelativeTime(clip);
+    const existing = effect.params[key];
+    const currentVal =
+      existing !== undefined ? evalNumber(existing, clipT, 0) : 0;
+    let kfs: Keyframe[];
+    if (existing !== undefined && isKeyframes(existing)) {
+      kfs = existing.filter((k) => Math.abs(k.time_seconds - clipT) > 1e-3);
+    } else {
+      kfs = [];
+    }
+    kfs.push({ time_seconds: clipT, value: currentVal });
+    kfs.sort((a, b) => a.time_seconds - b.time_seconds);
+    await projectState.updateEffectParam(track.id, clip.id, effect.id, key, kfs);
+  }
+
+  /** Remove a keyframe by time. If the resulting list is empty,
+   *  collapses the param back to a plain `Number(0)`. */
+  async function removeKeyframe(
+    track: TrackContents,
+    clip: ClipContents,
+    effect: EffectInfo,
+    key: string,
+    time_seconds: number
+  ) {
+    const existing = effect.params[key];
+    if (existing === undefined || !isKeyframes(existing)) return;
+    const kfs = existing.filter(
+      (k) => Math.abs(k.time_seconds - time_seconds) > 1e-3
+    );
+    if (kfs.length === 0) {
+      await projectState.updateEffectParam(track.id, clip.id, effect.id, key, 0);
+    } else {
+      await projectState.updateEffectParam(track.id, clip.id, effect.id, key, kfs);
+    }
   }
 
   /** First enabled video track on the active sequence, or null. */
@@ -1017,8 +1100,13 @@
                     </button>
                   </div>
                   {#if e.kind === 'opacity'}
-                    {@const cur = typeof e.params.value === 'number' ? e.params.value : 1}
-                    <div class="mt-1 grid grid-cols-[3rem_minmax(0,1fr)_2.25rem] items-center gap-x-2">
+                    {@const raw = e.params.value}
+                    {@const animated = raw !== undefined && isKeyframes(raw)}
+                    {@const kfs: Keyframe[] =
+                      animated && raw !== undefined && isKeyframes(raw) ? raw : []}
+                    {@const cur =
+                      raw !== undefined ? evalNumber(raw, 0, 1) : 1}
+                    <div class="mt-1 grid grid-cols-[3rem_minmax(0,1fr)_2.25rem_1rem] items-center gap-x-2">
                       <span class="text-vance-muted text-[10px]">value</span>
                       <input
                         type="range"
@@ -1029,13 +1117,35 @@
                         class="w-full min-w-0"
                         onchange={(ev) => {
                           const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
-                          projectState.updateEffectParam(t.id, c.id, e.id, 'value', v);
+                          setOrKeyframe(t, c, e, 'value', v);
                         }}
                       />
-                      <span class="font-mono text-right text-[10px]">
-                        {cur.toFixed(2)}
-                      </span>
+                      <span class="font-mono text-right text-[10px]">{cur.toFixed(2)}</span>
+                      <button
+                        class="text-[12px] leading-none {animated ? 'text-[var(--color-vance-accent)]' : 'text-vance-muted'} hover:brightness-125"
+                        onclick={() => addKeyframeAtPlayhead(t, c, e, 'value')}
+                        title="Add keyframe at playhead"
+                      >
+                        ◆
+                      </button>
                     </div>
+                    {#if animated && kfs.length > 0}
+                      <ul class="mt-1 flex flex-col gap-0.5 pl-12 text-[10px] text-vance-muted">
+                        {#each kfs as k (k.time_seconds)}
+                          <li class="flex items-center justify-between gap-2">
+                            <span class="font-mono">{k.time_seconds.toFixed(2)}s</span>
+                            <span class="font-mono">{k.value.toFixed(2)}</span>
+                            <button
+                              class="hover:text-red-400"
+                              onclick={() => removeKeyframe(t, c, e, 'value', k.time_seconds)}
+                              title="Remove keyframe"
+                            >
+                              ✕
+                            </button>
+                          </li>
+                        {/each}
+                      </ul>
+                    {/if}
                   {:else if e.kind === 'transform'}
                     {@const tx = typeof e.params.translate_x === 'number' ? e.params.translate_x : 0}
                     {@const ty = typeof e.params.translate_y === 'number' ? e.params.translate_y : 0}
