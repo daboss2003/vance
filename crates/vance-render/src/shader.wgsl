@@ -45,6 +45,15 @@ struct Params {
     contrast: f32,
     crop_lrtb: vec4<f32>,
     mix_factor: f32,
+    // (`_pad0` lives implicitly here — WGSL aligns the next vec4 to
+    // offset 64, matching the 12 bytes Rust spells out explicitly.)
+    // (r, g, b, enable) — chroma key color + on/off.
+    chroma_key: vec4<f32>,
+    // (tolerance, softness, _, _) — match radius + falloff width.
+    chroma_params: vec4<f32>,
+    // (threshold, direction, softness, enable). direction > 0 keeps
+    // bright pixels, < 0 keeps dark ones.
+    luma_key: vec4<f32>,
 };
 @group(0) @binding(4) var<uniform> params: Params;
 
@@ -120,5 +129,30 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // the perceptual feel users expect from NLE color sliders.
     rgb = (rgb - vec3<f32>(0.5)) * params.contrast + vec3<f32>(0.5) + vec3<f32>(params.brightness);
     rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
-    return vec4<f32>(rgb * params.opacity, 1.0);
+
+    // Chroma + luma keys produce a per-pixel "keep" factor in [0,1].
+    // Without a multi-track composite path in v1 we just multiply
+    // the keep factor into the final RGB — keyed pixels fade to
+    // black instead of revealing whatever's underneath. (Multi-
+    // track compositing is a later phase.)
+    var keep = 1.0;
+    if (params.chroma_key.a > 0.5) {
+        let dist = length(rgb - params.chroma_key.rgb);
+        let edge0 = params.chroma_params.x;
+        let edge1 = params.chroma_params.x + max(params.chroma_params.y, 0.0001);
+        keep = keep * smoothstep(edge0, edge1, dist);
+    }
+    if (params.luma_key.a > 0.5) {
+        let lum = dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let th = params.luma_key.x;
+        let soft = max(params.luma_key.z, 0.0001);
+        if (params.luma_key.y > 0.0) {
+            // Keep brighter than threshold.
+            keep = keep * smoothstep(th - soft, th + soft, lum);
+        } else {
+            // Keep darker than threshold.
+            keep = keep * (1.0 - smoothstep(th - soft, th + soft, lum));
+        }
+    }
+    return vec4<f32>(rgb * params.opacity * keep, 1.0);
 }

@@ -1231,6 +1231,32 @@
               >
                 + Color
               </button>
+              <button
+                class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+                onclick={() =>
+                  projectState.addEffect(t.id, c.id, 'chroma_key', {
+                    r: 0,
+                    g: 1,
+                    b: 0,
+                    tolerance: 0.2,
+                    softness: 0.08
+                  })}
+                title="Attach a chroma key (green-screen) effect"
+              >
+                + Chroma
+              </button>
+              <button
+                class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+                onclick={() =>
+                  projectState.addEffect(t.id, c.id, 'luma_key', {
+                    threshold: 0.5,
+                    direction: 1,
+                    softness: 0.05
+                  })}
+                title="Attach a luma key (brightness mask) effect"
+              >
+                + Luma
+              </button>
             </div>
           </div>
           {#if c.effects.length === 0}
@@ -1442,6 +1468,16 @@
                   {:else if e.kind === 'color'}
                     {@render numericParam('brightness', 'bright', -1, 1, 0.01, 0, 2)}
                     {@render numericParam('contrast', 'contr', 0, 3, 0.01, 1, 2)}
+                  {:else if e.kind === 'chroma_key'}
+                    {@render numericParam('r', 'R', 0, 1, 0.01, 0, 2)}
+                    {@render numericParam('g', 'G', 0, 1, 0.01, 1, 2)}
+                    {@render numericParam('b', 'B', 0, 1, 0.01, 0, 2)}
+                    {@render numericParam('tolerance', 'tol', 0, 1, 0.01, 0.2, 2)}
+                    {@render numericParam('softness', 'soft', 0, 0.5, 0.01, 0.08, 2)}
+                  {:else if e.kind === 'luma_key'}
+                    {@render numericParam('threshold', 'thr', 0, 1, 0.01, 0.5, 2)}
+                    {@render numericParam('direction', 'dir', -1, 1, 1, 1, 0)}
+                    {@render numericParam('softness', 'soft', 0, 0.5, 0.01, 0.05, 2)}
                   {/if}
                 </li>
               {/each}

@@ -111,7 +111,18 @@ struct RenderParams {
     /// All other per-clip effects (opacity / transform / crop /
     /// color) apply *after* the mix.
     mix_factor: f32,
-    _pad: [f32; 3],
+    _pad0: [f32; 3],
+    /// Chroma key: `(r, g, b, enable)`. When `enable > 0.5`, pixels
+    /// within `chroma_params.x` of the key color fade toward black
+    /// (no alpha out yet — `vance-render` doesn't blend tracks in v1).
+    chroma_key: [f32; 4],
+    /// `(tolerance, softness, _, _)` — match-distance threshold and
+    /// the falloff width.
+    chroma_params: [f32; 4],
+    /// Luma key: `(threshold, direction, softness, enable)` where
+    /// `direction > 0` keeps pixels *above* threshold and < 0 keeps
+    /// pixels below.
+    luma_key: [f32; 4],
 }
 
 impl Default for RenderParams {
@@ -125,7 +136,10 @@ impl Default for RenderParams {
             contrast: 1.0,
             crop_lrtb: [0.0; 4],
             mix_factor: 0.0,
-            _pad: [0.0; 3],
+            _pad0: [0.0; 3],
+            chroma_key: [0.0; 4],
+            chroma_params: [0.1, 0.05, 0.0, 0.0],
+            luma_key: [0.5, 1.0, 0.05, 0.0],
         }
     }
 }
@@ -405,6 +419,75 @@ impl Renderer {
     /// incoming, depending on direction) clip while A holds the other.
     pub fn upload_frame_b(&mut self, frame: &FrameData) -> Result<(), RenderError> {
         self.upload_frame_inner(frame, true)
+    }
+
+    /// Set the chroma-key params. `enable = 0.0` turns the effect off
+    /// (the shader passes pixels through); `> 0.5` enables matching.
+    /// `tolerance` is the maximum RGB distance for a "fully keyed"
+    /// match; `softness` widens the falloff so the edge doesn't pop.
+    pub fn set_chroma_key(
+        &mut self,
+        key_rgb: [f32; 3],
+        tolerance: f32,
+        softness: f32,
+        enable: f32,
+    ) {
+        let new_key = [
+            key_rgb[0].clamp(0.0, 1.0),
+            key_rgb[1].clamp(0.0, 1.0),
+            key_rgb[2].clamp(0.0, 1.0),
+            enable.clamp(0.0, 1.0),
+        ];
+        let new_params = [
+            tolerance.clamp(0.0, 2.0),
+            softness.clamp(0.0, 2.0),
+            0.0,
+            0.0,
+        ];
+        let same_key = (0..4).all(|i| {
+            (self.current_params.chroma_key[i] - new_key[i]).abs() < 1e-5
+        });
+        let same_params = (0..2).all(|i| {
+            (self.current_params.chroma_params[i] - new_params[i]).abs() < 1e-5
+        });
+        if same_key && same_params {
+            return;
+        }
+        self.current_params.chroma_key = new_key;
+        self.current_params.chroma_params = new_params;
+        self.queue.write_buffer(
+            &self.params_buffer,
+            0,
+            bytemuck::cast_slice(&[self.current_params]),
+        );
+    }
+
+    /// Set the luma-key params. `direction > 0` keeps pixels brighter
+    /// than `threshold`; `< 0` keeps pixels darker. `softness` widens
+    /// the falloff. `enable = 0.0` is a passthrough.
+    pub fn set_luma_key(
+        &mut self,
+        threshold: f32,
+        direction: f32,
+        softness: f32,
+        enable: f32,
+    ) {
+        let dir = if direction >= 0.0 { 1.0 } else { -1.0 };
+        let new = [
+            threshold.clamp(0.0, 1.0),
+            dir,
+            softness.clamp(0.0, 1.0),
+            enable.clamp(0.0, 1.0),
+        ];
+        if (0..4).all(|i| (self.current_params.luma_key[i] - new[i]).abs() < 1e-5) {
+            return;
+        }
+        self.current_params.luma_key = new;
+        self.queue.write_buffer(
+            &self.params_buffer,
+            0,
+            bytemuck::cast_slice(&[self.current_params]),
+        );
     }
 
     /// Set the A↔B mix factor. 0 = pure A (no transition), 1 = pure B,

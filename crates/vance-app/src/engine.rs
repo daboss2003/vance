@@ -413,6 +413,95 @@ fn clip_brightness_contrast_at(
     (0.0, 1.0)
 }
 
+/// First enabled "chroma_key" effect on the clip, evaluated at
+/// `t_seconds`. Returns `(key_rgb, tolerance, softness, enable)`;
+/// `enable = 0.0` means no chroma key effect is on (passthrough).
+/// Multiple chroma_key effects are *not* composed — the first one
+/// wins (NLE convention: stack the inputs, not the keys).
+fn eval_clip_chroma_key(
+    effects: &[vance_timeline::Effect],
+    t_seconds: f64,
+) -> ([f32; 3], f32, f32, f32) {
+    let eval = |k: &str,
+                ps: &std::collections::BTreeMap<String, EffectValue>,
+                fallback: f32|
+     -> f32 {
+        ps.get(k)
+            .and_then(|p| p.eval_number(t_seconds))
+            .map(|v| v as f32)
+            .unwrap_or(fallback)
+    };
+    for e in effects {
+        if !e.enabled || e.kind != "chroma_key" {
+            continue;
+        }
+        let r = eval("r", &e.params, 0.0).clamp(0.0, 1.0);
+        let g = eval("g", &e.params, 1.0).clamp(0.0, 1.0);
+        let b = eval("b", &e.params, 0.0).clamp(0.0, 1.0);
+        let tolerance = eval("tolerance", &e.params, 0.15).max(0.0);
+        let softness = eval("softness", &e.params, 0.05).max(0.0);
+        return ([r, g, b], tolerance, softness, 1.0);
+    }
+    ([0.0, 1.0, 0.0], 0.15, 0.05, 0.0)
+}
+
+/// First enabled "luma_key" effect. Returns
+/// `(threshold, direction, softness, enable)`. `direction > 0` keeps
+/// pixels brighter than `threshold`; `< 0` keeps darker.
+fn eval_clip_luma_key(
+    effects: &[vance_timeline::Effect],
+    t_seconds: f64,
+) -> (f32, f32, f32, f32) {
+    let eval = |k: &str,
+                ps: &std::collections::BTreeMap<String, EffectValue>,
+                fallback: f32|
+     -> f32 {
+        ps.get(k)
+            .and_then(|p| p.eval_number(t_seconds))
+            .map(|v| v as f32)
+            .unwrap_or(fallback)
+    };
+    for e in effects {
+        if !e.enabled || e.kind != "luma_key" {
+            continue;
+        }
+        let threshold = eval("threshold", &e.params, 0.5).clamp(0.0, 1.0);
+        // Stored as +1 / -1 (or 0 for "above" as a default). Any
+        // positive value keeps bright pixels.
+        let direction = eval("direction", &e.params, 1.0);
+        let dir = if direction >= 0.0 { 1.0 } else { -1.0 };
+        let softness = eval("softness", &e.params, 0.05).clamp(0.0, 1.0);
+        return (threshold, dir, softness, 1.0);
+    }
+    (0.5, 1.0, 0.05, 0.0)
+}
+
+fn clip_chroma_key_at(
+    seq: &Sequence,
+    clip_id: vance_timeline::ClipId,
+    t_seconds: f64,
+) -> ([f32; 3], f32, f32, f32) {
+    for track in seq.tracks.iter() {
+        if let Some(clip) = track.clips.iter().find(|c| c.id == clip_id) {
+            return eval_clip_chroma_key(&clip.effects, t_seconds);
+        }
+    }
+    ([0.0, 1.0, 0.0], 0.15, 0.05, 0.0)
+}
+
+fn clip_luma_key_at(
+    seq: &Sequence,
+    clip_id: vance_timeline::ClipId,
+    t_seconds: f64,
+) -> (f32, f32, f32, f32) {
+    for track in seq.tracks.iter() {
+        if let Some(clip) = track.clips.iter().find(|c| c.id == clip_id) {
+            return eval_clip_luma_key(&clip.effects, t_seconds);
+        }
+    }
+    (0.5, 1.0, 0.05, 0.0)
+}
+
 fn first_clip_after(
     seq: &Sequence,
     after_t: vance_core::RationalTime,
@@ -981,7 +1070,7 @@ impl Engine {
         let bounds = self.source_last_bounds;
         // Source monitor renders the raw media — reset the params the
         // Record-side sequence playback may have left on the renderer
-        // so opacity/crop/transform/color/mix don't bleed into Source.
+        // so opacity/crop/transform/color/mix/keys don't bleed into Source.
         {
             let mut rs = render_state.lock();
             rs.renderer.set_opacity(1.0);
@@ -989,6 +1078,8 @@ impl Engine {
             rs.renderer.set_brightness_contrast(0.0, 1.0);
             rs.renderer.set_crop(0.0, 0.0, 0.0, 0.0);
             rs.renderer.set_mix_factor(0.0);
+            rs.renderer.set_chroma_key([0.0, 1.0, 0.0], 0.15, 0.05, 0.0);
+            rs.renderer.set_luma_key(0.5, 1.0, 0.05, 0.0);
         }
         upload_and_render_source(&render_state, &viewport, &frame, bounds)?;
         self.source_last_pts = Some(pts);
@@ -1073,6 +1164,8 @@ impl Engine {
                 rs.renderer.set_brightness_contrast(0.0, 1.0);
                 rs.renderer.set_crop(0.0, 0.0, 0.0, 0.0);
                 rs.renderer.set_mix_factor(0.0);
+                rs.renderer.set_chroma_key([0.0, 1.0, 0.0], 0.15, 0.05, 0.0);
+                rs.renderer.set_luma_key(0.5, 1.0, 0.05, 0.0);
             }
         }
         let dec = self.decoder.as_mut().ok_or(EngineError::NoFileOpen)?;
@@ -1601,7 +1694,7 @@ impl Engine {
         // can re-evaluate keyframes per frame. Also push the
         // entry-time values into the renderer so the first frame
         // looks right before the loop has a chance to update.
-        let (entry_xform, entry_crop, entry_color, clip_effects_snapshot) = {
+        let (entry_xform, entry_crop, entry_color, entry_chroma, entry_luma, clip_effects_snapshot) = {
             let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
             let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
             let seq = project
@@ -1611,6 +1704,8 @@ impl Engine {
             let xform = clip_transform_at(seq, anchor_clip_id, entry_clip_t);
             let crop = clip_crop_at(seq, anchor_clip_id, entry_clip_t);
             let color = clip_brightness_contrast_at(seq, anchor_clip_id, entry_clip_t);
+            let chroma = clip_chroma_key_at(seq, anchor_clip_id, entry_clip_t);
+            let luma = clip_luma_key_at(seq, anchor_clip_id, entry_clip_t);
             // Snapshot the active clip's effects.
             let effects = seq
                 .tracks
@@ -1622,7 +1717,7 @@ impl Engine {
                         .map(|c| c.effects.clone())
                 })
                 .unwrap_or_default();
-            (xform, crop, color, effects)
+            (xform, crop, color, chroma, luma, effects)
         };
         if let Some(rs) = self.render_state.as_ref() {
             let mut rs = rs.lock();
@@ -1635,6 +1730,18 @@ impl Engine {
             rs.renderer.set_brightness_contrast(entry_color.0, entry_color.1);
             rs.renderer.set_crop(entry_crop[0], entry_crop[1], entry_crop[2], entry_crop[3]);
             rs.renderer.set_mix_factor(0.0);
+            rs.renderer.set_chroma_key(
+                entry_chroma.0,
+                entry_chroma.1,
+                entry_chroma.2,
+                entry_chroma.3,
+            );
+            rs.renderer.set_luma_key(
+                entry_luma.0,
+                entry_luma.1,
+                entry_luma.2,
+                entry_luma.3,
+            );
         }
 
         // Convert source-seconds → stream-time-base PTS.
@@ -1732,6 +1839,8 @@ impl Engine {
         let xform = clip_transform_at(seq, from_clip_id, from_clip_t);
         let crop = clip_crop_at(seq, from_clip_id, from_clip_t);
         let color = clip_brightness_contrast_at(seq, from_clip_id, from_clip_t);
+        let chroma = clip_chroma_key_at(seq, from_clip_id, from_clip_t);
+        let luma = clip_luma_key_at(seq, from_clip_id, from_clip_t);
 
         // Resolve A's frame. Decoder path opens the file and seeks;
         // title path rasterizes from params.
@@ -1806,6 +1915,8 @@ impl Engine {
                 .set_transform(xform.translate, xform.scale, xform.rotation_radians);
             rs.renderer.set_brightness_contrast(color.0, color.1);
             rs.renderer.set_crop(crop[0], crop[1], crop[2], crop[3]);
+            rs.renderer.set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
+            rs.renderer.set_luma_key(luma.0, luma.1, luma.2, luma.3);
             rs.renderer.set_mix_factor(active_tr.mix);
             rs.renderer.upload_frame_b(&frame_b)?;
         }
@@ -1855,7 +1966,7 @@ impl Engine {
         // not at the clip's start.
         let effective_tl_in = anchor_timeline_in + entry_offset;
         // Push the clip's effect chain into the renderer for frame 1.
-        let (xform, crop, color, effects) = {
+        let (xform, crop, color, chroma, luma, effects) = {
             let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
             let seq_id = self
                 .current_sequence_id
@@ -1878,6 +1989,8 @@ impl Engine {
                 clip_transform_at(seq, anchor_clip_id, entry_clip_t),
                 clip_crop_at(seq, anchor_clip_id, entry_clip_t),
                 clip_brightness_contrast_at(seq, anchor_clip_id, entry_clip_t),
+                clip_chroma_key_at(seq, anchor_clip_id, entry_clip_t),
+                clip_luma_key_at(seq, anchor_clip_id, entry_clip_t),
                 effects,
             )
         };
@@ -1888,6 +2001,8 @@ impl Engine {
                 .set_transform(xform.translate, xform.scale, xform.rotation_radians);
             rs.renderer.set_brightness_contrast(color.0, color.1);
             rs.renderer.set_crop(crop[0], crop[1], crop[2], crop[3]);
+            rs.renderer.set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
+            rs.renderer.set_luma_key(luma.0, luma.1, luma.2, luma.3);
             rs.renderer.set_mix_factor(0.0);
         }
         self.playing_clip_anchor = Some(ClipAnchor {
@@ -1930,10 +2045,10 @@ impl Engine {
     ) -> Result<i64, EngineError> {
         let frame = render_title_yuv420(&params)
             .map_err(|e| EngineError::Project(format!("title render: {e}")))?;
-        // Effect chain (transform / crop / color) evaluated at the
-        // clip-relative time. Titles aren't usually animated but we
-        // honor their effects for consistency.
-        let (xform, crop, color) = {
+        // Effect chain (transform / crop / color / keys) evaluated at
+        // the clip-relative time. Titles aren't usually animated but
+        // we honor their effects for consistency.
+        let (xform, crop, color, chroma, luma) = {
             let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
             let seq_id = self
                 .current_sequence_id
@@ -1946,6 +2061,8 @@ impl Engine {
                 clip_transform_at(seq, clip_id, clip_t),
                 clip_crop_at(seq, clip_id, clip_t),
                 clip_brightness_contrast_at(seq, clip_id, clip_t),
+                clip_chroma_key_at(seq, clip_id, clip_t),
+                clip_luma_key_at(seq, clip_id, clip_t),
             )
         };
         if let Some(rs) = self.render_state.as_ref() {
@@ -1955,6 +2072,8 @@ impl Engine {
                 .set_transform(xform.translate, xform.scale, xform.rotation_radians);
             rs.renderer.set_brightness_contrast(color.0, color.1);
             rs.renderer.set_crop(crop[0], crop[1], crop[2], crop[3]);
+            rs.renderer.set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
+            rs.renderer.set_luma_key(luma.0, luma.1, luma.2, luma.3);
             rs.renderer.set_mix_factor(0.0);
         }
         // Synthetic anchor — titles have no stream time base, so we
@@ -2098,7 +2217,7 @@ impl Engine {
             MediaResolved::Title(_) => unreachable!("title handled above"),
         };
         self.open_file(&media_path)?;
-        let (xform_for_decode, crop_for_decode, color_for_decode) = {
+        let (xform_for_decode, crop_for_decode, color_for_decode, chroma_for_decode, luma_for_decode) = {
             let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
             let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
             let seq = project
@@ -2109,6 +2228,8 @@ impl Engine {
                 clip_transform_at(seq, anchor_clip_id, entry_clip_t),
                 clip_crop_at(seq, anchor_clip_id, entry_clip_t),
                 clip_brightness_contrast_at(seq, anchor_clip_id, entry_clip_t),
+                clip_chroma_key_at(seq, anchor_clip_id, entry_clip_t),
+                clip_luma_key_at(seq, anchor_clip_id, entry_clip_t),
             )
         };
         if let Some(rs) = self.render_state.as_ref() {
@@ -2125,6 +2246,18 @@ impl Engine {
                 crop_for_decode[1],
                 crop_for_decode[2],
                 crop_for_decode[3],
+            );
+            rs.renderer.set_chroma_key(
+                chroma_for_decode.0,
+                chroma_for_decode.1,
+                chroma_for_decode.2,
+                chroma_for_decode.3,
+            );
+            rs.renderer.set_luma_key(
+                luma_for_decode.0,
+                luma_for_decode.1,
+                luma_for_decode.2,
+                luma_for_decode.3,
             );
         }
         let info = self
@@ -3064,19 +3197,23 @@ fn playback_loop(
         }
 
         // Per-frame effect eval — picks up keyframe animation for
-        // opacity / transform / crop / color. Skip the lock dance
-        // when the clip has no effects.
+        // opacity / transform / crop / color / keys. Skip the lock
+        // dance when the clip has no effects.
         if !clip_effects.is_empty() {
             let clip_t = frame_sec - clip_source_in_sec;
             let op = eval_clip_opacity(&clip_effects, clip_t);
             let xf = eval_clip_transform(&clip_effects, clip_t);
             let crop = eval_clip_crop(&clip_effects, clip_t);
             let (br, ct) = eval_clip_brightness_contrast(&clip_effects, clip_t);
+            let chroma = eval_clip_chroma_key(&clip_effects, clip_t);
+            let luma = eval_clip_luma_key(&clip_effects, clip_t);
             let mut rs = render_state.lock();
             rs.renderer.set_opacity(op);
             rs.renderer.set_transform(xf.translate, xf.scale, xf.rotation_radians);
             rs.renderer.set_brightness_contrast(br, ct);
             rs.renderer.set_crop(crop[0], crop[1], crop[2], crop[3]);
+            rs.renderer.set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
+            rs.renderer.set_luma_key(luma.0, luma.1, luma.2, luma.3);
         }
 
         // Transition handling — only relevant when this is sequence
