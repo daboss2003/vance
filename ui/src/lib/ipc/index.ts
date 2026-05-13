@@ -134,9 +134,18 @@ export const currentProjectPath = (): Promise<string | null> =>
 
 // ---- Sequence contents (for the timeline canvas) ---------------------------
 
-/** Animated numeric value — list of {time_seconds, value} pinned
- *  at clip-relative times, linearly interpolated by the engine. */
-export type Keyframe = { time_seconds: number; value: number };
+/** How the engine interpolates outward from this keyframe to the
+ *  next one in the list. `Linear` is the default (and the v1
+ *  shape); `Bezier` is smoothstep ease-in/ease-out; `Hold` snaps. */
+export type KeyframeInterp = 'Linear' | 'Bezier' | 'Hold';
+
+/** Animated numeric value — list of {time_seconds, value, interp}
+ *  pinned at clip-relative times, interpolated by the engine. */
+export type Keyframe = {
+  time_seconds: number;
+  value: number;
+  interp?: KeyframeInterp;
+};
 
 /** Either a plain scalar or an animated keyframes array. The
  *  engine's `EffectValue` is `#[serde(untagged)]`, so a number
@@ -157,8 +166,9 @@ export function isKeyframes(v: EffectValue): v is Keyframe[] {
 }
 
 /** Evaluate an effect param at clip-relative `t` seconds. Mirrors
- *  the engine's `EffectValue::eval_number`. Useful for showing
- *  the live value in the UI without an IPC round-trip. */
+ *  the engine's `EffectValue::eval_number` — including per-keyframe
+ *  interpolation modes — so UI live readouts match what's about
+ *  to render without an IPC round-trip. */
 export function evalNumber(v: EffectValue, t: number, fallback = 0): number {
   if (typeof v === 'number') return v;
   if (isKeyframes(v)) {
@@ -173,6 +183,12 @@ export function evalNumber(v: EffectValue, t: number, fallback = 0): number {
         const span = b.time_seconds - a.time_seconds;
         if (span <= 0) return a.value;
         const frac = (t - a.time_seconds) / span;
+        const interp: KeyframeInterp = a.interp ?? 'Linear';
+        if (interp === 'Hold') return a.value;
+        if (interp === 'Bezier') {
+          const s = frac * frac * (3 - 2 * frac);
+          return a.value + (b.value - a.value) * s;
+        }
         return a.value + (b.value - a.value) * frac;
       }
     }

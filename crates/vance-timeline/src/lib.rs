@@ -46,7 +46,7 @@ pub mod transition;
 
 pub use clip::Clip;
 pub use edit_log::{apply, EditLog, EditOp};
-pub use effect::{Effect, EffectParams, EffectValue, Keyframe};
+pub use effect::{Effect, EffectParams, EffectValue, Keyframe, KeyframeInterp};
 pub use error::{Result, TimelineError};
 pub use id::{
     ClipId, EffectId, MarkerId, MediaItemId, ProjectId, SequenceId, TrackId, TransitionId,

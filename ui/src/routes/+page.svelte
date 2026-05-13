@@ -10,6 +10,7 @@
     type EffectInfo,
     type EffectValue,
     type Keyframe,
+    type KeyframeInterp,
     type TrackContents,
     decodeAndRenderAt,
     decodeSequenceAt,
@@ -419,10 +420,20 @@
     const existing = effect.params[key];
     if (existing !== undefined && isKeyframes(existing)) {
       const clipT = await clipRelativeTime(clip);
+      // Preserve the outgoing interp of any keyframe we're
+      // overwriting so sliding the value at an existing kf doesn't
+      // silently flip its easing back to Linear.
+      const prev = existing.find(
+        (k) => Math.abs(k.time_seconds - clipT) <= 1e-3
+      );
       const kfs: Keyframe[] = existing.filter(
         (k) => Math.abs(k.time_seconds - clipT) > 1e-3
       );
-      kfs.push({ time_seconds: clipT, value });
+      kfs.push({
+        time_seconds: clipT,
+        value,
+        interp: prev?.interp ?? 'Linear',
+      });
       kfs.sort((a, b) => a.time_seconds - b.time_seconds);
       await projectState.updateEffectParam(track.id, clip.id, effect.id, key, kfs);
     } else {
@@ -444,12 +455,17 @@
     const currentVal =
       existing !== undefined ? evalNumber(existing, clipT, 0) : 0;
     let kfs: Keyframe[];
+    let prevInterp: KeyframeInterp = 'Linear';
     if (existing !== undefined && isKeyframes(existing)) {
+      const prev = existing.find(
+        (k) => Math.abs(k.time_seconds - clipT) <= 1e-3
+      );
+      if (prev?.interp) prevInterp = prev.interp;
       kfs = existing.filter((k) => Math.abs(k.time_seconds - clipT) > 1e-3);
     } else {
       kfs = [];
     }
-    kfs.push({ time_seconds: clipT, value: currentVal });
+    kfs.push({ time_seconds: clipT, value: currentVal, interp: prevInterp });
     kfs.sort((a, b) => a.time_seconds - b.time_seconds);
     await projectState.updateEffectParam(track.id, clip.id, effect.id, key, kfs);
   }
@@ -473,6 +489,40 @@
     } else {
       await projectState.updateEffectParam(track.id, clip.id, effect.id, key, kfs);
     }
+  }
+
+  /** Cycle a keyframe's outgoing interpolation: Linear → Bezier →
+   *  Hold → Linear. Affects the segment from this keyframe to the
+   *  next one in the list. */
+  async function cycleKeyframeInterp(
+    track: TrackContents,
+    clip: ClipContents,
+    effect: EffectInfo,
+    key: string,
+    time_seconds: number
+  ) {
+    const existing = effect.params[key];
+    if (existing === undefined || !isKeyframes(existing)) return;
+    const next = (cur: Keyframe['interp']): KeyframeInterp => {
+      const c = cur ?? 'Linear';
+      if (c === 'Linear') return 'Bezier';
+      if (c === 'Bezier') return 'Hold';
+      return 'Linear';
+    };
+    const kfs = existing.map((k) =>
+      Math.abs(k.time_seconds - time_seconds) <= 1e-3
+        ? { ...k, interp: next(k.interp) }
+        : k
+    );
+    await projectState.updateEffectParam(track.id, clip.id, effect.id, key, kfs);
+  }
+
+  /** One-character label for a keyframe's interp mode. */
+  function interpLabel(i: Keyframe['interp']): string {
+    const c = i ?? 'Linear';
+    if (c === 'Bezier') return 'B';
+    if (c === 'Hold') return 'H';
+    return 'L';
   }
 
   /** First enabled video track on the active sequence, or null. */
@@ -1318,7 +1368,14 @@
                         {#each kfs as k (k.time_seconds)}
                           <li class="flex items-center justify-between gap-2">
                             <span class="font-mono">{k.time_seconds.toFixed(2)}s</span>
-                            <span class="font-mono">{k.value.toFixed(precision)}</span>
+                            <span class="font-mono flex-1 text-right">{k.value.toFixed(precision)}</span>
+                            <button
+                              class="rounded border border-vance-border px-1 font-mono hover:brightness-125"
+                              onclick={() => cycleKeyframeInterp(t, c, e, key, k.time_seconds)}
+                              title="Outgoing interpolation: click to cycle Linear → Bezier → Hold"
+                            >
+                              {interpLabel(k.interp)}
+                            </button>
                             <button
                               class="hover:text-red-400"
                               onclick={() => removeKeyframe(t, c, e, key, k.time_seconds)}

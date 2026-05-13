@@ -35,12 +35,36 @@ pub enum EffectValue {
     Keyframes(Vec<Keyframe>),
 }
 
+/// How the engine should interpolate FROM this keyframe to the next
+/// one. Stored per-keyframe (outgoing side) so a curve can mix
+/// linear and eased segments. `Linear` is the default and matches
+/// the 5.5 behavior; older projects without the field deserialize
+/// to it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub enum KeyframeInterp {
+    /// Straight line between this keyframe and the next.
+    #[default]
+    Linear,
+    /// Smooth "ease in / ease out" — cubic curve with auto tangents
+    /// derived from the segment endpoints. v2 will allow custom
+    /// tangents; v1 ships the auto shape.
+    Bezier,
+    /// Step: value stays at this keyframe's value until the next one,
+    /// then snaps. Useful for boolean-like sequences.
+    Hold,
+}
+
 /// One keyframe pinning a numeric value at a specific clip-relative
 /// time (seconds from the clip's `source_in`).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Keyframe {
     pub time_seconds: f64,
     pub value: f64,
+    /// Outgoing interpolation toward the next keyframe. Defaults to
+    /// `Linear` so older project files (which lacked the field)
+    /// continue to play unchanged.
+    #[serde(default)]
+    pub interp: KeyframeInterp,
 }
 
 impl EffectValue {
@@ -77,7 +101,18 @@ fn eval_keyframes(kfs: &[Keyframe], t: f64) -> f64 {
                 return a.value;
             }
             let frac = (t - a.time_seconds) / span;
-            return a.value + (b.value - a.value) * frac;
+            // `a.interp` governs the *outgoing* side of segment i.
+            return match a.interp {
+                KeyframeInterp::Linear => a.value + (b.value - a.value) * frac,
+                KeyframeInterp::Hold => a.value,
+                KeyframeInterp::Bezier => {
+                    // Smoothstep easing (3t² − 2t³): zero derivative at
+                    // both ends, monotonic. Enough for v1; custom-
+                    // tangent cubic Bezier lands later.
+                    let s = frac * frac * (3.0 - 2.0 * frac);
+                    a.value + (b.value - a.value) * s
+                }
+            };
         }
     }
     kfs[kfs.len() - 1].value
