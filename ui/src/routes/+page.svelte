@@ -969,6 +969,40 @@
           <dt class="text-vance-muted">enabled</dt>
           <dd>{c.enabled ? 'yes' : 'muted'}</dd>
         </dl>
+
+        <!-- Effects: list each attached effect with its kind + a
+             remove button. 5.2+ adds parameter editing (opacity
+             slider, transform widgets, etc.). -->
+        <div class="mt-4">
+          <div class="mb-1 flex items-center justify-between text-[11px] uppercase tracking-wider">
+            <span class="text-vance-muted">Effects</span>
+            <button
+              class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+              onclick={() => projectState.addEffect(t.id, c.id, 'opacity', { value: 1 })}
+              title="Attach an opacity effect"
+            >
+              + Opacity
+            </button>
+          </div>
+          {#if c.effects.length === 0}
+            <p class="text-vance-muted text-xs italic">No effects.</p>
+          {:else}
+            <ul class="flex flex-col gap-1 text-xs">
+              {#each c.effects as e (e.id)}
+                <li class="flex items-center justify-between rounded border border-vance-border bg-vance-bg px-2 py-1">
+                  <span class="font-mono">{e.kind}</span>
+                  <button
+                    class="text-vance-muted hover:text-red-400"
+                    onclick={() => projectState.removeEffect(t.id, c.id, e.id)}
+                    title="Remove effect"
+                  >
+                    ✕
+                  </button>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </div>
       {:else if selectionState.count > 1}
         <p class="text-vance-muted text-xs">
           {selectionState.count} clips selected. Single-selection details

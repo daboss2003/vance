@@ -19,8 +19,9 @@ use serde::{Deserialize, Serialize};
 use vance_core::RationalTime;
 
 use crate::clip::Clip;
+use crate::effect::Effect;
 use crate::error::Result;
-use crate::id::{ClipId, TrackId};
+use crate::id::{ClipId, EffectId, TrackId};
 use crate::ops;
 use crate::sequence::Sequence;
 use crate::track::TrackKind;
@@ -124,6 +125,24 @@ pub enum EditOp {
         /// Timeline time at which to split.
         at_timeline: RationalTime,
     },
+    /// Attach an effect to a clip.
+    AddEffectToClip {
+        /// Track holding the clip.
+        track_id: TrackId,
+        /// Clip to attach the effect to.
+        clip_id: ClipId,
+        /// Effect to attach.
+        effect: Effect,
+    },
+    /// Remove an effect from a clip by its ID.
+    RemoveEffectFromClip {
+        /// Track holding the clip.
+        track_id: TrackId,
+        /// Clip the effect is attached to.
+        clip_id: ClipId,
+        /// Effect ID to remove.
+        effect_id: EffectId,
+    },
 }
 
 /// Apply a single op to a sequence, returning the new sequence.
@@ -171,6 +190,16 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
             clip_id,
             at_timeline,
         } => ops::split(seq, *track_id, *clip_id, *at_timeline),
+        EditOp::AddEffectToClip {
+            track_id,
+            clip_id,
+            effect,
+        } => ops::add_effect_to_clip(seq, *track_id, *clip_id, effect.clone()),
+        EditOp::RemoveEffectFromClip {
+            track_id,
+            clip_id,
+            effect_id,
+        } => ops::remove_effect_from_clip(seq, *track_id, *clip_id, *effect_id),
     }
 }
 

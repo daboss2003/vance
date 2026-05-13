@@ -134,6 +134,15 @@ export const currentProjectPath = (): Promise<string | null> =>
 
 // ---- Sequence contents (for the timeline canvas) ---------------------------
 
+export type EffectValue = number | boolean | string;
+
+export type EffectInfo = {
+  id: string;
+  kind: string;
+  enabled: boolean;
+  params: Record<string, EffectValue>;
+};
+
 export type ClipContents = {
   id: string;
   media_id: string;
@@ -142,6 +151,7 @@ export type ClipContents = {
   duration_seconds: number;
   source_in_seconds: number;
   enabled: boolean;
+  effects: EffectInfo[];
 };
 
 export type TrackContents = {
@@ -212,6 +222,23 @@ export const moveClipTo = (
 /** Remove a clip from its track (leaves a gap). */
 export const removeClip = (trackId: string, clipId: string): Promise<void> =>
   invoke('remove_clip', { trackId, clipId });
+
+/** Attach an effect to a clip. Returns the new effect's UUID. */
+export const addEffectToClip = (
+  trackId: string,
+  clipId: string,
+  kind: string,
+  params: Record<string, EffectValue>
+): Promise<string> =>
+  invoke('add_effect_to_clip', { trackId, clipId, kind, params });
+
+/** Remove an effect from a clip by ID. */
+export const removeEffectFromClip = (
+  trackId: string,
+  clipId: string,
+  effectId: string
+): Promise<void> =>
+  invoke('remove_effect_from_clip', { trackId, clipId, effectId });
 
 /** Trim a clip's in-point. `newSourceInSeconds` is the new visible
  *  start inside the source media; the clip's timeline_in shifts by

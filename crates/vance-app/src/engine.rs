@@ -18,8 +18,8 @@ use vance_decoder::{DecoderClient, StreamInfo};
 use vance_render::{Renderer, RendererConfig};
 use std::collections::HashMap;
 use vance_timeline::{
-    Clip, EditLog, EditOp, MediaItem, MediaItemId, MediaKind, Project, Sequence, SequenceId,
-    Track, TrackId, TrackKind,
+    Clip, Effect, EditLog, EditOp, EffectId, EffectValue, MediaItem, MediaItemId, MediaKind,
+    Project, Sequence, SequenceId, Track, TrackId, TrackKind,
 };
 use vance_viewport::{HostWindowHandle, Viewport, ViewportBounds};
 
@@ -165,6 +165,22 @@ pub struct ClipContents {
     pub source_in_seconds: f64,
     /// Whether the clip is muted.
     pub enabled: bool,
+    /// Effects attached to this clip, in display order.
+    pub effects: Vec<EffectInfo>,
+}
+
+/// One effect's worth of info for the UI.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct EffectInfo {
+    /// Effect's UUID.
+    pub id: String,
+    /// Effect kind ("opacity", "transform", ...).
+    pub kind: String,
+    /// Whether the effect contributes to the render.
+    pub enabled: bool,
+    /// Effect parameters as a JS-friendly map. Each value is a
+    /// number/boolean/string (EffectValue is `#[serde(untagged)]`).
+    pub params: std::collections::BTreeMap<String, EffectValue>,
 }
 
 fn rt_to_seconds(t: vance_core::RationalTime) -> f64 {
@@ -1276,6 +1292,48 @@ impl Engine {
         Ok(pts)
     }
 
+    /// Attach an effect to a clip. The caller picks `kind` (a string
+    /// like "opacity" or "transform") + initial params; the engine
+    /// allocates the EffectId and applies through the edit log.
+    /// Returns the new effect's UUID.
+    pub fn add_effect_to_clip(
+        &mut self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+        kind: String,
+        params: std::collections::BTreeMap<String, EffectValue>,
+    ) -> Result<String, EngineError> {
+        if self.playback.is_some() {
+            return Err(EngineError::PlaybackInProgress);
+        }
+        let mut effect = Effect::new(kind);
+        effect.params = params;
+        let id = effect.id.to_string();
+        self.apply_edit_op(EditOp::AddEffectToClip {
+            track_id,
+            clip_id,
+            effect,
+        })?;
+        Ok(id)
+    }
+
+    /// Remove an effect from a clip by ID. Undoable.
+    pub fn remove_effect_from_clip(
+        &mut self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+        effect_id: EffectId,
+    ) -> Result<(), EngineError> {
+        if self.playback.is_some() {
+            return Err(EngineError::PlaybackInProgress);
+        }
+        self.apply_edit_op(EditOp::RemoveEffectFromClip {
+            track_id,
+            clip_id,
+            effect_id,
+        })
+    }
+
     /// Remove a clip from a track (leaves a gap on the timeline).
     /// Recorded in the edit log so Cmd+Z brings it back.
     pub fn remove_clip(
@@ -1570,6 +1628,16 @@ impl Engine {
                             duration_seconds: rt_to_seconds(c.duration()),
                             source_in_seconds: rt_to_seconds(c.source_in),
                             enabled: c.enabled,
+                            effects: c
+                                .effects
+                                .iter()
+                                .map(|e| EffectInfo {
+                                    id: e.id.to_string(),
+                                    kind: e.kind.clone(),
+                                    enabled: e.enabled,
+                                    params: e.params.clone(),
+                                })
+                                .collect(),
                         })
                         .collect(),
                 })

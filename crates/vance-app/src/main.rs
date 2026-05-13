@@ -342,6 +342,57 @@ fn trim_clip_out(
 }
 
 #[tauri::command]
+fn add_effect_to_clip(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    clip_id: String,
+    kind: String,
+    params: std::collections::BTreeMap<String, vance_timeline::EffectValue>,
+) -> Result<String, String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let clip_uuid = clip_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid clip id: {e}"))?;
+    state
+        .lock()
+        .add_effect_to_clip(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            vance_timeline::ClipId::from_uuid(clip_uuid),
+            kind,
+            params,
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_effect_from_clip(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    clip_id: String,
+    effect_id: String,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let clip_uuid = clip_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid clip id: {e}"))?;
+    let effect_uuid = effect_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid effect id: {e}"))?;
+    state
+        .lock()
+        .remove_effect_from_clip(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            vance_timeline::ClipId::from_uuid(clip_uuid),
+            vance_timeline::EffectId::from_uuid(effect_uuid),
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn remove_clip(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -496,6 +547,8 @@ fn main() {
             insert_clip_at,
             move_clip_to,
             remove_clip,
+            add_effect_to_clip,
+            remove_effect_from_clip,
             trim_clip_in,
             trim_clip_out,
             play_sequence,

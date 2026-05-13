@@ -13,8 +13,10 @@ import {
   importMediaFile,
   insertClipAt,
   loadProject,
+  addEffectToClip as ipcAddEffect,
   clearSourceMarks as ipcClearSourceMarks,
   insertFromSource as ipcInsertFromSource,
+  removeEffectFromClip as ipcRemoveEffect,
   loadSource as ipcLoadSource,
   mediaList,
   moveClipTo,
@@ -30,6 +32,7 @@ import {
   trimClipIn,
   trimClipOut,
   undo as ipcUndo,
+  type EffectValue,
   type MediaItemInfo,
   type ProjectInfo,
   type SequenceContents,
@@ -266,6 +269,33 @@ class ProjectState {
     this.error = null;
     try {
       await ipcRemoveClip(trackId, clipId);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Attach an effect to a clip. */
+  async addEffect(
+    trackId: string,
+    clipId: string,
+    kind: string,
+    params: Record<string, EffectValue> = {}
+  ) {
+    this.error = null;
+    try {
+      await ipcAddEffect(trackId, clipId, kind, params);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Remove an effect from a clip by ID. */
+  async removeEffect(trackId: string, clipId: string, effectId: string) {
+    this.error = null;
+    try {
+      await ipcRemoveEffect(trackId, clipId, effectId);
       await this.commitEdit();
     } catch (e) {
       this.error = String(e);
