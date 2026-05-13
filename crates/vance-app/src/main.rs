@@ -116,6 +116,39 @@ fn source_state(state: tauri::State<'_, EngineHandle>) -> Option<SourceState> {
 }
 
 #[tauri::command]
+fn set_source_mark_in(state: tauri::State<'_, EngineHandle>) -> Result<(), String> {
+    state.lock().set_source_mark_in().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_source_mark_out(state: tauri::State<'_, EngineHandle>) -> Result<(), String> {
+    state.lock().set_source_mark_out().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn clear_source_marks(state: tauri::State<'_, EngineHandle>) {
+    state.lock().clear_source_marks();
+}
+
+#[tauri::command]
+fn insert_from_source(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    overwrite: bool,
+) -> Result<String, String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    state
+        .lock()
+        .insert_from_source(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            overwrite,
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn open_file(state: tauri::State<'_, EngineHandle>, path: String) -> Result<OpenResponse, String> {
     let info = state.lock().open_file(&path).map_err(|e| e.to_string())?;
     Ok(info.into())
@@ -440,6 +473,10 @@ fn main() {
             load_source,
             decode_source_at,
             source_state,
+            set_source_mark_in,
+            set_source_mark_out,
+            clear_source_marks,
+            insert_from_source,
             open_file,
             decode_and_render_at,
             start_playback,

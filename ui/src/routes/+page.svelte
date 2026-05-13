@@ -229,6 +229,43 @@
           deleteSelectedClips();
         }
         return;
+      case 'i':
+      case 'I':
+        if (projectState.source) {
+          e.preventDefault();
+          projectState.setSourceMarkIn();
+        }
+        return;
+      case 'o':
+      case 'O':
+        if (projectState.source) {
+          e.preventDefault();
+          projectState.setSourceMarkOut();
+        }
+        return;
+      case 'x':
+      case 'X':
+        if (projectState.source?.mark_in_pts != null || projectState.source?.mark_out_pts != null) {
+          e.preventDefault();
+          projectState.clearSourceMarks();
+        }
+        return;
+      case ',':
+        // Insert: ripple-place a source clip at the Record playhead.
+        if (projectState.source && projectState.sequence) {
+          e.preventDefault();
+          const tid = firstVideoTrackId();
+          if (tid) projectState.insertFromSource(tid, false);
+        }
+        return;
+      case '.':
+        // Overwrite at Record playhead.
+        if (projectState.source && projectState.sequence) {
+          e.preventDefault();
+          const tid = firstVideoTrackId();
+          if (tid) projectState.insertFromSource(tid, true);
+        }
+        return;
       case 'z':
       case 'Z':
         if (e.metaKey || e.ctrlKey) {
@@ -335,6 +372,13 @@
     const name = projectState.info.name || 'Untitled';
     const bundle = `${selected}/${name}.vance`;
     await projectState.save(bundle);
+  }
+
+  /** First enabled video track on the active sequence, or null. */
+  function firstVideoTrackId(): string | null {
+    const seq = projectState.sequence;
+    if (!seq) return null;
+    return seq.tracks.find((t) => t.kind === 'video' && t.enabled)?.id ?? null;
   }
 
   /** Delete every currently-selected clip from the active sequence,
@@ -706,14 +750,17 @@
             class="flex-1 rounded border border-dashed border-[#333] bg-black"
             bind:this={sourceViewportEl}
           ></div>
-          <!-- Source scrub bar + time display. Click to seek; 4.9 adds
-               in/out marks via the I/O keys. -->
+          <!-- Source scrub bar + time display. Click to seek;
+               I / O mark in/out at playhead; X clears marks;
+               , inserts, . overwrites at the Record playhead. -->
           {#if projectState.source}
             {@const s = projectState.source}
             {@const tb = s.time_base_num / s.time_base_den}
             {@const cur = (s.last_pts ?? 0) * tb}
             {@const total = (s.duration_pts ?? 0) * tb}
             {@const frac = total > 0 ? Math.min(1, Math.max(0, cur / total)) : 0}
+            {@const inSec = s.mark_in_pts != null ? s.mark_in_pts * tb : null}
+            {@const outSec = s.mark_out_pts != null ? s.mark_out_pts * tb : null}
             <div class="mt-1 flex items-center gap-2 text-[10px] text-vance-muted">
               <span class="font-mono">{formatPrecise(cur)}</span>
               <div
@@ -731,12 +778,81 @@
                   projectState.seekSource(Math.max(0, Math.min(1, x)) * total);
                 }}
               >
+                <!-- Highlight between marks. -->
+                {#if total > 0 && inSec != null && outSec != null}
+                  <div
+                    class="absolute top-0 h-full bg-[var(--color-vance-accent)]/25"
+                    style:left="{(inSec / total) * 100}%"
+                    style:width="{Math.max(0, ((outSec - inSec) / total) * 100)}%"
+                  ></div>
+                {/if}
+                <!-- Progress fill. -->
                 <div
                   class="absolute top-0 h-full bg-[var(--color-vance-accent)]/70"
                   style:width="{frac * 100}%"
                 ></div>
+                <!-- Mark-in / mark-out vertical lines. -->
+                {#if total > 0 && inSec != null}
+                  <div
+                    class="absolute top-[-2px] h-[12px] w-[2px] bg-[#f4a261]"
+                    style:left="{(inSec / total) * 100}%"
+                  ></div>
+                {/if}
+                {#if total > 0 && outSec != null}
+                  <div
+                    class="absolute top-[-2px] h-[12px] w-[2px] bg-[#f4a261]"
+                    style:left="{(outSec / total) * 100}%"
+                  ></div>
+                {/if}
               </div>
               <span class="font-mono">{formatPrecise(total)}</span>
+            </div>
+            <div class="mt-1 flex items-center gap-1 text-[10px]">
+              <button
+                class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 hover:brightness-125"
+                onclick={() => projectState.setSourceMarkIn()}
+                title="I: mark in at playhead"
+              >
+                Mark In
+              </button>
+              <button
+                class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 hover:brightness-125"
+                onclick={() => projectState.setSourceMarkOut()}
+                title="O: mark out at playhead"
+              >
+                Mark Out
+              </button>
+              <button
+                class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 hover:brightness-125 disabled:opacity-50"
+                onclick={() => projectState.clearSourceMarks()}
+                disabled={s.mark_in_pts == null && s.mark_out_pts == null}
+                title="X: clear marks"
+              >
+                Clear
+              </button>
+              <span class="mx-1 text-vance-muted">·</span>
+              <button
+                class="rounded bg-[var(--color-vance-accent)] px-2 py-0.5 font-semibold text-[#003040] hover:brightness-110 disabled:opacity-50"
+                onclick={() => {
+                  const tid = firstVideoTrackId();
+                  if (tid) projectState.insertFromSource(tid, false);
+                }}
+                disabled={!projectState.sequence}
+                title=", : insert at Record playhead"
+              >
+                Insert
+              </button>
+              <button
+                class="rounded bg-vance-bg border-vance-border border px-2 py-0.5 hover:brightness-125 disabled:opacity-50"
+                onclick={() => {
+                  const tid = firstVideoTrackId();
+                  if (tid) projectState.insertFromSource(tid, true);
+                }}
+                disabled={!projectState.sequence}
+                title=". : overwrite at Record playhead"
+              >
+                Overwrite
+              </button>
             </div>
           {/if}
         </div>

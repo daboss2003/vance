@@ -49,11 +49,30 @@ export type SourceState = {
   time_base_den: number;
   duration_pts: number | null;
   last_pts: number | null;
+  mark_in_pts: number | null;
+  mark_out_pts: number | null;
 };
 
 /** Snapshot of the Source monitor's stream + playhead, or null if
  *  nothing has been loaded into Source. */
 export const sourceState = (): Promise<SourceState | null> => invoke('source_state');
+
+/** Park the Source mark-in at the current playhead. */
+export const setSourceMarkIn = (): Promise<void> => invoke('set_source_mark_in');
+
+/** Park the Source mark-out at the current playhead. */
+export const setSourceMarkOut = (): Promise<void> => invoke('set_source_mark_out');
+
+/** Clear both Source marks. */
+export const clearSourceMarks = (): Promise<void> => invoke('clear_source_marks');
+
+/** Insert (or overwrite) a clip on the given track, sourced from
+ *  the Source media's [mark_in, mark_out] range, at the Record
+ *  playhead. Returns the new clip's UUID. */
+export const insertFromSource = (
+  trackId: string,
+  overwrite: boolean
+): Promise<string> => invoke('insert_from_source', { trackId, overwrite });
 
 export const openFile = (path: string): Promise<StreamInfo> =>
   invoke('open_file', { path });

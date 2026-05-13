@@ -276,6 +276,10 @@ pub struct SourceState {
     /// Last presented PTS in the source stream's time base, or
     /// `None` if nothing has been decoded since the last load.
     pub last_pts: Option<i64>,
+    /// Source mark-in PTS, or `None` when unset.
+    pub mark_in_pts: Option<i64>,
+    /// Source mark-out PTS, or `None` when unset.
+    pub mark_out_pts: Option<i64>,
 }
 
 /// Lightweight DTO of a `MediaItem` for the Browser panel.
@@ -385,6 +389,15 @@ pub struct Engine {
     /// Last-presented PTS on the Source viewport (after a
     /// `decode_source_at`). Cleared on `load_source`.
     source_last_pts: Option<i64>,
+    /// MediaItemId backing the Source preview — set by `load_source`
+    /// so `insert_from_source` knows which media to reference when
+    /// it constructs the new Clip.
+    source_media_id: Option<MediaItemId>,
+    /// In-mark on the Source media (PTS in source stream time base).
+    /// `None` means "start of media" when building a clip range.
+    source_mark_in_pts: Option<i64>,
+    /// Out-mark on the Source media. `None` means "end of media".
+    source_mark_out_pts: Option<i64>,
     /// Renderer + surface config, behind a Mutex so the playback scheduler
     /// can share access without taking the parent EngineHandle's lock.
     render_state: Option<Arc<Mutex<RenderState>>>,
@@ -582,6 +595,10 @@ impl Engine {
         let info = dec.open(path)?;
         self.source_stream_info = Some(info.clone());
         self.source_last_pts = None;
+        self.source_media_id = Some(media_id);
+        // New media = clear stale marks from the previous load.
+        self.source_mark_in_pts = None;
+        self.source_mark_out_pts = None;
 
         // Decode + render the first frame so the user sees a preview
         // immediately. Errors here are non-fatal — they'll surface on
@@ -590,6 +607,114 @@ impl Engine {
             tracing::warn!(?e, "load_source: first-frame render failed");
         }
         Ok(info)
+    }
+
+    /// Park the Source mark-in at the current playhead PTS.
+    pub fn set_source_mark_in(&mut self) -> Result<(), EngineError> {
+        let pts = self.source_last_pts.ok_or(EngineError::NoFileOpen)?;
+        // If a mark-out exists and we'd cross it, push it out.
+        if let Some(out) = self.source_mark_out_pts {
+            if pts >= out {
+                self.source_mark_out_pts = None;
+            }
+        }
+        self.source_mark_in_pts = Some(pts);
+        Ok(())
+    }
+
+    /// Park the Source mark-out at the current playhead PTS.
+    pub fn set_source_mark_out(&mut self) -> Result<(), EngineError> {
+        let pts = self.source_last_pts.ok_or(EngineError::NoFileOpen)?;
+        if let Some(inp) = self.source_mark_in_pts {
+            if pts <= inp {
+                self.source_mark_in_pts = None;
+            }
+        }
+        self.source_mark_out_pts = Some(pts);
+        Ok(())
+    }
+
+    /// Clear both Source marks.
+    pub fn clear_source_marks(&mut self) {
+        self.source_mark_in_pts = None;
+        self.source_mark_out_pts = None;
+    }
+
+    /// Insert a clip referencing the Source media's [mark_in, mark_out]
+    /// range (or the full duration when marks are unset) at the
+    /// current Record playhead position. If `overwrite` is true, the
+    /// clip replaces anything it overlaps; otherwise it ripples later
+    /// clips on the same track right by its duration.
+    pub fn insert_from_source(
+        &mut self,
+        track_id: TrackId,
+        overwrite: bool,
+    ) -> Result<String, EngineError> {
+        if self.playback.is_some() {
+            return Err(EngineError::PlaybackInProgress);
+        }
+        let media_id = self.source_media_id.ok_or(EngineError::NoFileOpen)?;
+        let info = self
+            .source_stream_info
+            .as_ref()
+            .ok_or(EngineError::NoFileOpen)?;
+        let (tb_n, tb_d) = info.time_base;
+        if tb_d == 0 {
+            return Err(EngineError::Project(
+                "source time base is unusable".into(),
+            ));
+        }
+
+        // Map mark PTS → source seconds. Default to (0, media.duration).
+        let mark_in_pts = self.source_mark_in_pts.unwrap_or(0);
+        let mark_out_pts = self
+            .source_mark_out_pts
+            .or(info.duration_pts)
+            .ok_or_else(|| {
+                EngineError::Project(
+                    "source media has no duration; mark an out-point first".into(),
+                )
+            })?;
+        if mark_out_pts <= mark_in_pts {
+            return Err(EngineError::Project(
+                "source mark-out is at or before mark-in".into(),
+            ));
+        }
+        let source_in_sec = (mark_in_pts as f64) * (tb_n as f64) / (tb_d as f64);
+        let source_out_sec = (mark_out_pts as f64) * (tb_n as f64) / (tb_d as f64);
+
+        // Record playhead — defaults to 0 when the user hasn't moved it.
+        let timeline_in_sec = self.current_timeline_seconds().unwrap_or(0.0).max(0.0);
+
+        // Look up the MediaItem so we can use its display name on the
+        // new clip and pass it as the source duration anchor.
+        let project = self
+            .current_project
+            .as_ref()
+            .ok_or(EngineError::NoProject)?;
+        let media = project
+            .media
+            .get(&media_id)
+            .ok_or(EngineError::MediaNotFound)?
+            .clone();
+
+        let clip = Clip::new(
+            media.id,
+            media.display_name.clone(),
+            seconds_to_rt(timeline_in_sec),
+            seconds_to_rt(source_in_sec),
+            seconds_to_rt(source_out_sec),
+        )
+        .map_err(|e| EngineError::Project(e.to_string()))?;
+        let new_clip_id = clip.id;
+
+        let op = if overwrite {
+            EditOp::OverwriteClip { track_id, clip }
+        } else {
+            EditOp::RippleInsertClip { track_id, clip }
+        };
+        self.apply_edit_op(op)?;
+        Ok(new_clip_id.to_string())
     }
 
     /// Decode the Source media at `target_pts` and render it into
@@ -621,8 +746,8 @@ impl Engine {
     }
 
     /// Snapshot of the Source monitor's state for the UI — stream
-    /// info + last-presented PTS. Returns `None` when nothing has
-    /// been loaded into Source yet.
+    /// info + last-presented PTS + marks. Returns `None` when
+    /// nothing has been loaded into Source yet.
     pub fn source_state(&self) -> Option<SourceState> {
         let info = self.source_stream_info.as_ref()?;
         Some(SourceState {
@@ -633,6 +758,8 @@ impl Engine {
             time_base_den: info.time_base.1,
             duration_pts: info.duration_pts,
             last_pts: self.source_last_pts,
+            mark_in_pts: self.source_mark_in_pts,
+            mark_out_pts: self.source_mark_out_pts,
         })
     }
 

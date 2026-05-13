@@ -13,6 +13,8 @@ import {
   importMediaFile,
   insertClipAt,
   loadProject,
+  clearSourceMarks as ipcClearSourceMarks,
+  insertFromSource as ipcInsertFromSource,
   loadSource as ipcLoadSource,
   mediaList,
   moveClipTo,
@@ -22,6 +24,8 @@ import {
   redo as ipcRedo,
   saveProject as ipcSave,
   setCurrentSequence as ipcSetSeq,
+  setSourceMarkIn as ipcSetSourceMarkIn,
+  setSourceMarkOut as ipcSetSourceMarkOut,
   sourceState as ipcSourceState,
   trimClipIn,
   trimClipOut,
@@ -175,6 +179,49 @@ class ProjectState {
     try {
       await decodeSourceAt(pts);
       this.source = await ipcSourceState();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Park the Source mark-in at the current source playhead. */
+  async setSourceMarkIn() {
+    try {
+      await ipcSetSourceMarkIn();
+      this.source = await ipcSourceState();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Park the Source mark-out at the current source playhead. */
+  async setSourceMarkOut() {
+    try {
+      await ipcSetSourceMarkOut();
+      this.source = await ipcSourceState();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Clear both Source marks. */
+  async clearSourceMarks() {
+    try {
+      await ipcClearSourceMarks();
+      this.source = await ipcSourceState();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Three-point edit: drop a clip on `trackId` sourced from the
+   *  Source media's marks, at the Record playhead. */
+  async insertFromSource(trackId: string, overwrite: boolean) {
+    this.error = null;
+    try {
+      await ipcInsertFromSource(trackId, overwrite);
+      this.info = await projectInfo();
+      await this.commitEdit();
     } catch (e) {
       this.error = String(e);
     }
