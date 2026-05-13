@@ -395,6 +395,12 @@ pub struct Engine {
     /// set_current_sequence). Each successful edit (insert/move/trim)
     /// applies through this log so it can be undone.
     edit_logs: HashMap<SequenceId, EditLog>,
+
+    /// True while sequence playback should auto-chain to the next
+    /// clip on EOS. Set by `play_sequence`; cleared by explicit
+    /// `stop_playback`. The `is_playing` auto-reap checks this to
+    /// decide whether to advance or end at EOS.
+    playing_sequence_active: bool,
 }
 
 /// Anchors a stream-time-base playback position back to a sequence
@@ -644,6 +650,9 @@ impl Engine {
     /// Stop the current playback session and return the last presented
     /// video PTS so the UI can resume from there on the next Play.
     pub fn stop_playback(&mut self) -> Result<i64, EngineError> {
+        // Explicit stop also ends sequence-chaining; the auto-reap
+        // path snapshots and re-sets the flag for itself.
+        self.playing_sequence_active = false;
         let Some(session) = self.playback.take() else {
             return Err(EngineError::NoPlayback);
         };
@@ -898,6 +907,7 @@ impl Engine {
             time_base_num: tb_n,
             time_base_den: tb_d,
         });
+        self.playing_sequence_active = true;
         self.start_playback(from_pts)
     }
 
@@ -1317,16 +1327,66 @@ impl Engine {
     /// Is playback currently running? Auto-reaps sessions whose scheduler
     /// thread has exited (e.g. natural end-of-stream) so the engine state
     /// matches reality and the decoder is reclaimed for single-shot use.
+    ///
+    /// Sequence-aware: if a sequence playback just hit EOS and there's
+    /// another clip later on the timeline, we kick off the next clip
+    /// here so playback feels continuous from the user's perspective.
     pub fn is_playing(&mut self) -> bool {
         let finished = self
             .playback
             .as_ref()
             .is_some_and(|s| s.handle.is_finished());
-        if finished {
-            let _ = self.stop_playback();
+        if !finished {
+            return self.playback.is_some();
+        }
+
+        // Snapshot the chaining flag before stop_playback clears it.
+        let chain = self.playing_sequence_active;
+        let _ = self.stop_playback();
+        if !chain {
             return false;
         }
-        self.playback.is_some()
+
+        // After natural EOS in sequence mode, look for the next clip
+        // and continue. If no next clip, playback truly ends.
+        if let Some(next_t) = self.next_clip_start_seconds() {
+            tracing::info!(next_t, "playback: chaining to next clip");
+            if self.play_sequence(next_t).is_ok() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Smallest `timeline_in` strictly greater than the current
+    /// playhead across every enabled video track on the active
+    /// sequence. Returns `None` when there's nothing to chain to.
+    fn next_clip_start_seconds(&self) -> Option<f64> {
+        let project = self.current_project.as_ref()?;
+        let seq_id = self.current_sequence_id?;
+        let seq = project.sequence(seq_id)?;
+        let current_t = self.current_timeline_seconds().unwrap_or(0.0);
+        let mut best: Option<f64> = None;
+        for track in seq.tracks.iter() {
+            if track.kind != TrackKind::Video || !track.enabled {
+                continue;
+            }
+            for c in track.clips.iter() {
+                if !c.enabled {
+                    continue;
+                }
+                let t = rt_to_seconds(c.timeline_in);
+                // Strictly greater than current_t (with epsilon) so we
+                // never re-pick the clip that just finished.
+                if t > current_t + 1e-2 {
+                    best = match best {
+                        Some(b) if b <= t => Some(b),
+                        _ => Some(t),
+                    };
+                }
+            }
+        }
+        best
     }
 
     /// Last presented PTS from the most recent finished playback session,
