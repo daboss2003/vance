@@ -21,10 +21,11 @@ use vance_core::RationalTime;
 use crate::clip::Clip;
 use crate::effect::{Effect, EffectValue};
 use crate::error::Result;
-use crate::id::{ClipId, EffectId, TrackId};
+use crate::id::{ClipId, EffectId, TrackId, TransitionId};
 use crate::ops;
 use crate::sequence::Sequence;
 use crate::track::TrackKind;
+use crate::transition::TransitionKind;
 
 /// A serializable edit. Each variant maps 1:1 to a function in
 /// `crate::ops`; see those for argument semantics.
@@ -156,6 +157,26 @@ pub enum EditOp {
         /// New value (number / bool / string).
         value: EffectValue,
     },
+    /// Add a transition at the cut following `after_clip_id` (Phase 5.4).
+    AddTransitionAtCut {
+        /// Track to attach the transition to.
+        track_id: TrackId,
+        /// Pre-allocated transition ID so replay produces stable IDs.
+        transition_id: TransitionId,
+        /// Clip whose `timeline_out` anchors the transition's center.
+        after_clip_id: ClipId,
+        /// Kind of transition (Dissolve, ...).
+        kind: TransitionKind,
+        /// Duration of the transition window.
+        duration: RationalTime,
+    },
+    /// Remove a transition by ID.
+    RemoveTransition {
+        /// Track holding the transition.
+        track_id: TrackId,
+        /// Transition to remove.
+        transition_id: TransitionId,
+    },
 }
 
 /// Apply a single op to a sequence, returning the new sequence.
@@ -227,6 +248,24 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
             key.clone(),
             value.clone(),
         ),
+        EditOp::AddTransitionAtCut {
+            track_id,
+            transition_id,
+            after_clip_id,
+            kind,
+            duration,
+        } => ops::add_transition_at_cut_with_id(
+            seq,
+            *track_id,
+            *transition_id,
+            *after_clip_id,
+            *kind,
+            *duration,
+        ),
+        EditOp::RemoveTransition {
+            track_id,
+            transition_id,
+        } => ops::remove_transition(seq, *track_id, *transition_id),
     }
 }
 

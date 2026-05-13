@@ -41,15 +41,19 @@ pub mod project;
 pub mod scene_plan;
 pub mod sequence;
 pub mod track;
+pub mod transition;
 
 pub use clip::Clip;
 pub use edit_log::{apply, EditLog, EditOp};
 pub use effect::{Effect, EffectParams, EffectValue, Keyframe};
 pub use error::{Result, TimelineError};
-pub use id::{ClipId, EffectId, MarkerId, MediaItemId, ProjectId, SequenceId, TrackId};
+pub use id::{
+    ClipId, EffectId, MarkerId, MediaItemId, ProjectId, SequenceId, TrackId, TransitionId,
+};
 pub use marker::{Marker, MarkerColor, MarkerKind};
 pub use media::{ContentHash, MediaItem, MediaKind};
 pub use project::Project;
-pub use scene_plan::{scene_at, ActiveClip, SceneAt};
+pub use scene_plan::{scene_at, transition_at, ActiveClip, ActiveTransition, SceneAt};
 pub use sequence::Sequence;
 pub use track::{Track, TrackKind};
+pub use transition::{Transition, TransitionKind};

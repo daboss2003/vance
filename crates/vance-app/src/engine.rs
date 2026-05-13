@@ -146,6 +146,21 @@ pub struct TrackContents {
     pub locked: bool,
     /// Clips on this track, in timeline order.
     pub clips: Vec<ClipContents>,
+    /// Transitions on this track (cross-dissolves so far).
+    pub transitions: Vec<TransitionInfo>,
+}
+
+/// One transition's worth of info for the UI.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct TransitionInfo {
+    /// Transition's UUID.
+    pub id: String,
+    /// Kind ("dissolve").
+    pub kind: String,
+    /// Cut position in seconds (the center of the transition window).
+    pub position_seconds: f64,
+    /// Duration of the transition window in seconds.
+    pub duration_seconds: f64,
 }
 
 /// One clip's worth of timing info for the UI.
@@ -559,6 +574,21 @@ pub struct Engine {
     /// Record decoder so previewing media doesn't have to swap the
     /// timeline decoder's open file (and vice versa).
     source_decoder: Option<DecoderClient>,
+    /// Secondary decoder slot for the *Record* side, used by
+    /// transition-aware `decode_sequence_at` to pull frames from the
+    /// "B" media while the primary decoder holds the "A" media open.
+    /// Lazy: spawned the first time a transition window is entered;
+    /// its open file may swap between calls. Cleared when the
+    /// primary decoder swaps (the secondary's previous "A" became
+    /// the new primary's "A", so the slot is stale).
+    transition_decoder: Option<DecoderClient>,
+    /// Path currently opened in `transition_decoder`. Lets us skip
+    /// reopening when scrubbing through the same B side repeatedly.
+    transition_media_path: Option<String>,
+    /// Stream info for whatever is currently opened in
+    /// `transition_decoder`. Used to convert source-seconds → PTS for
+    /// the secondary decoder's `decode_at` calls.
+    transition_stream_info: Option<StreamInfo>,
     /// Source's currently-opened media's stream info.
     source_stream_info: Option<StreamInfo>,
     /// Last-presented PTS on the Source viewport (after a
@@ -922,13 +952,14 @@ impl Engine {
         let bounds = self.source_last_bounds;
         // Source monitor renders the raw media — reset the params the
         // Record-side sequence playback may have left on the renderer
-        // so opacity/crop/transform/color don't bleed into Source.
+        // so opacity/crop/transform/color/mix don't bleed into Source.
         {
             let mut rs = render_state.lock();
             rs.renderer.set_opacity(1.0);
             rs.renderer.set_transform([0.0, 0.0], [1.0, 1.0], 0.0);
             rs.renderer.set_brightness_contrast(0.0, 1.0);
             rs.renderer.set_crop(0.0, 0.0, 0.0, 0.0);
+            rs.renderer.set_mix_factor(0.0);
         }
         upload_and_render_source(&render_state, &viewport, &frame, bounds)?;
         self.source_last_pts = Some(pts);
@@ -1012,6 +1043,7 @@ impl Engine {
                 rs.renderer.set_transform([0.0, 0.0], [1.0, 1.0], 0.0);
                 rs.renderer.set_brightness_contrast(0.0, 1.0);
                 rs.renderer.set_crop(0.0, 0.0, 0.0, 0.0);
+                rs.renderer.set_mix_factor(0.0);
             }
         }
         let dec = self.decoder.as_mut().ok_or(EngineError::NoFileOpen)?;
@@ -1421,6 +1453,7 @@ impl Engine {
             );
             rs.renderer.set_brightness_contrast(entry_color.0, entry_color.1);
             rs.renderer.set_crop(entry_crop[0], entry_crop[1], entry_crop[2], entry_crop[3]);
+            rs.renderer.set_mix_factor(0.0);
         }
 
         // Convert source-seconds → stream-time-base PTS.
@@ -1476,11 +1509,167 @@ impl Engine {
         Some(anchor.timeline_in_seconds + (source_sec - anchor.source_in_seconds))
     }
 
+    /// Open `path` in the transition decoder, spawning the sidecar
+    /// process on first use. Idempotent when `path` is already loaded.
+    fn ensure_transition_decoder(
+        &mut self,
+        path: &str,
+    ) -> Result<(), EngineError> {
+        if self.transition_decoder.is_none() {
+            let bin = locate_decoder_binary()?;
+            let client = DecoderClient::spawn(bin)?;
+            self.transition_decoder = Some(client);
+            self.transition_media_path = None;
+            self.transition_stream_info = None;
+        }
+        if self.transition_media_path.as_deref() != Some(path) {
+            let dec = self.transition_decoder.as_mut().unwrap();
+            let info = dec.open(path)?;
+            self.transition_stream_info = Some(info);
+            self.transition_media_path = Some(path.to_string());
+        }
+        Ok(())
+    }
+
+    /// Transition-aware single-shot decode + render. Pulls a frame
+    /// from each side's decoder and blends them via the renderer's
+    /// `mix_factor`. Used by `decode_sequence_at` when the timeline
+    /// position is inside an active transition window.
+    fn decode_transition_at(
+        &mut self,
+        seq: &Sequence,
+        active_tr: vance_timeline::ActiveTransition,
+        timeline_seconds: f64,
+    ) -> Result<i64, EngineError> {
+        let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
+        let from_media = project
+            .media
+            .get(&active_tr.from.media)
+            .ok_or(EngineError::MediaNotFound)?;
+        let to_media = project
+            .media
+            .get(&active_tr.to.media)
+            .ok_or(EngineError::MediaNotFound)?;
+        let from_path = from_media.path.to_string_lossy().into_owned();
+        let to_path = to_media.path.to_string_lossy().into_owned();
+        // Effects on the A clip (the outgoing one) drive opacity /
+        // transform / crop / color for the blended result. v1
+        // doesn't try to "interpolate" effects across the transition —
+        // that gets weird fast; we just use A's chain.
+        let from_clip_id = active_tr.from.clip_id;
+        let (anchor_tl_in, anchor_src_in) =
+            clip_anchor_seconds(seq, from_clip_id).unwrap_or((0.0, 0.0));
+        // Time relative to the from clip's `source_in`, for keyframe eval.
+        let from_clip_t = rt_to_seconds(active_tr.from.source_pts) - anchor_src_in;
+        let _ = timeline_seconds; // (kept for future log/diag use)
+        let op = clip_opacity_at(seq, from_clip_id, from_clip_t);
+        let xform = clip_transform_at(seq, from_clip_id, from_clip_t);
+        let crop = clip_crop_at(seq, from_clip_id, from_clip_t);
+        let color = clip_brightness_contrast_at(seq, from_clip_id, from_clip_t);
+        // Primary decoder onto A.
+        self.open_file(&from_path)?;
+        let info = self
+            .stream_info
+            .as_ref()
+            .ok_or_else(|| EngineError::Project("stream info missing post-open".into()))?
+            .clone();
+        let (tb_n, tb_d) = info.time_base;
+        let from_src_sec = rt_to_seconds(active_tr.from.source_pts);
+        let from_pts = if tb_n != 0 {
+            (from_src_sec * (tb_d as f64) / (tb_n as f64)).round() as i64
+        } else {
+            0
+        };
+        self.playing_clip_anchor = Some(ClipAnchor {
+            timeline_in_seconds: anchor_tl_in,
+            source_in_seconds: anchor_src_in,
+            time_base_num: tb_n,
+            time_base_den: tb_d,
+            opacity: op,
+        });
+        let dec = self.decoder.as_mut().ok_or(EngineError::NoFileOpen)?;
+        let frame_a = dec.decode_at(from_pts)?;
+        let pts_a = frame_a.pts;
+
+        // Secondary decoder onto B.
+        self.ensure_transition_decoder(&to_path)?;
+        let to_info = self
+            .transition_stream_info
+            .as_ref()
+            .ok_or_else(|| EngineError::Project("transition stream info missing".into()))?
+            .clone();
+        let (to_tb_n, to_tb_d) = to_info.time_base;
+        let to_src_sec = rt_to_seconds(active_tr.to.source_pts);
+        let to_pts = if to_tb_n != 0 {
+            (to_src_sec * (to_tb_d as f64) / (to_tb_n as f64)).round() as i64
+        } else {
+            0
+        };
+        let to_dec = self
+            .transition_decoder
+            .as_mut()
+            .expect("ensure_transition_decoder just initialized it");
+        let frame_b = to_dec.decode_at(to_pts)?;
+
+        // Push effect uniforms + mix factor to the renderer.
+        if let Some(rs) = self.render_state.as_ref() {
+            let mut rs = rs.lock();
+            rs.renderer.set_opacity(op);
+            rs.renderer.set_transform(xform.translate, xform.scale, xform.rotation_radians);
+            rs.renderer.set_brightness_contrast(color.0, color.1);
+            rs.renderer.set_crop(crop[0], crop[1], crop[2], crop[3]);
+            rs.renderer.set_mix_factor(active_tr.mix);
+            rs.renderer.upload_frame_b(&frame_b)?;
+        }
+
+        let viewport = self.viewport.as_ref().ok_or(EngineError::NoViewport)?.clone();
+        let render_state = self
+            .render_state
+            .as_ref()
+            .ok_or(EngineError::NoViewport)?
+            .clone();
+        upload_and_render(&render_state, &viewport, &frame_a, self.last_bounds)?;
+        self.last_resume_pts = Some(pts_a);
+        Ok(pts_a)
+    }
+
     /// Decode a single frame from the active sequence at
     /// `timeline_seconds` (used by seek-while-paused). Bypasses the
     /// playback scheduler.
     pub fn decode_sequence_at(&mut self, timeline_seconds: f64) -> Result<i64, EngineError> {
         self.pause_for_edit();
+        // If we're inside a transition window, render via the dual-
+        // decoder blend path. Otherwise reset the mix factor so a
+        // previous transition's residue doesn't bleed into the next
+        // single-clip frame.
+        if let Some(active_tr) = {
+            let project = self.current_project.as_ref();
+            let seq_id = self.current_sequence_id;
+            match (project, seq_id) {
+                (Some(p), Some(id)) => p
+                    .sequence(id)
+                    .and_then(|s| {
+                        vance_timeline::transition_at(s, seconds_to_rt(timeline_seconds))
+                    }),
+                _ => None,
+            }
+        } {
+            let seq = {
+                let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
+                let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+                project
+                    .sequence(seq_id)
+                    .ok_or(EngineError::SequenceNotFound)?
+                    .clone()
+            };
+            return self.decode_transition_at(&seq, active_tr, timeline_seconds);
+        }
+        // Not in a transition window — make sure the renderer's mix
+        // factor is 0 so the next frame is pure A.
+        if let Some(rs) = self.render_state.as_ref() {
+            let mut rs = rs.lock();
+            rs.renderer.set_mix_factor(0.0);
+        }
         let (
             media_path,
             source_pts_seconds,
@@ -1615,6 +1804,42 @@ impl Engine {
             track_id,
             clip_id,
             effect_id,
+        })
+    }
+
+    /// Add a cross-dissolve transition at the cut following
+    /// `after_clip_id`. Returns the new transition's UUID as a string
+    /// for the IPC layer. Recorded in the edit log.
+    pub fn add_transition_at_cut(
+        &mut self,
+        track_id: TrackId,
+        after_clip_id: vance_timeline::ClipId,
+        kind: vance_timeline::TransitionKind,
+        duration_seconds: f64,
+    ) -> Result<String, EngineError> {
+        self.pause_for_edit();
+        let duration = seconds_to_rt(duration_seconds.max(0.0));
+        let transition_id = vance_timeline::TransitionId::new();
+        self.apply_edit_op(EditOp::AddTransitionAtCut {
+            track_id,
+            transition_id,
+            after_clip_id,
+            kind,
+            duration,
+        })?;
+        Ok(transition_id.to_string())
+    }
+
+    /// Remove a transition by ID. Undoable.
+    pub fn remove_transition(
+        &mut self,
+        track_id: TrackId,
+        transition_id: vance_timeline::TransitionId,
+    ) -> Result<(), EngineError> {
+        self.pause_for_edit();
+        self.apply_edit_op(EditOp::RemoveTransition {
+            track_id,
+            transition_id,
         })
     }
 
@@ -1929,6 +2154,18 @@ impl Engine {
                                     params: e.params.clone(),
                                 })
                                 .collect(),
+                        })
+                        .collect(),
+                    transitions: t
+                        .transitions
+                        .iter()
+                        .map(|tr| TransitionInfo {
+                            id: tr.id.to_string(),
+                            kind: match tr.kind {
+                                vance_timeline::TransitionKind::Dissolve => "dissolve".into(),
+                            },
+                            position_seconds: rt_to_seconds(tr.position),
+                            duration_seconds: rt_to_seconds(tr.duration),
                         })
                         .collect(),
                 })

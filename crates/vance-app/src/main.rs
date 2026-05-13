@@ -423,6 +423,56 @@ fn remove_effect_from_clip(
 }
 
 #[tauri::command]
+fn add_transition_at_cut(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    after_clip_id: String,
+    kind: String,
+    duration_seconds: f64,
+) -> Result<String, String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let clip_uuid = after_clip_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid clip id: {e}"))?;
+    let kind = match kind.as_str() {
+        "dissolve" => vance_timeline::TransitionKind::Dissolve,
+        other => return Err(format!("unknown transition kind: {other}")),
+    };
+    state
+        .lock()
+        .add_transition_at_cut(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            vance_timeline::ClipId::from_uuid(clip_uuid),
+            kind,
+            duration_seconds,
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_transition(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    transition_id: String,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let transition_uuid = transition_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid transition id: {e}"))?;
+    state
+        .lock()
+        .remove_transition(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            vance_timeline::TransitionId::from_uuid(transition_uuid),
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn remove_clip(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -580,6 +630,8 @@ fn main() {
             add_effect_to_clip,
             remove_effect_from_clip,
             update_effect_param,
+            add_transition_at_cut,
+            remove_transition,
             trim_clip_in,
             trim_clip_out,
             play_sequence,

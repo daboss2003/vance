@@ -13,9 +13,10 @@
 use vance_core::{Rational, RationalTime};
 
 use crate::clip::Clip;
-use crate::id::{ClipId, MediaItemId};
+use crate::id::{ClipId, MediaItemId, TransitionId};
 use crate::sequence::Sequence;
 use crate::track::{Track, TrackKind};
+use crate::transition::Transition;
 
 /// What's on screen at a given timeline position.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -82,6 +83,101 @@ fn clip_at(track: &Track, t: RationalTime) -> Option<&Clip> {
         .iter()
         .find(|c| c.timeline_in <= t && t < c.timeline_out())
         .map(|arc| arc.as_ref())
+}
+
+/// Cross-dissolve resolution at `timeline_t`. When the time falls inside
+/// a transition's window on an enabled video track, the outgoing clip
+/// (A) is the one whose `timeline_out` equals the transition's
+/// position, and the incoming clip (B) is the immediately following
+/// clip on that same track.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ActiveTransition {
+    /// Which transition this is — used for UI selection bookkeeping.
+    pub transition_id: TransitionId,
+    /// Outgoing clip (fading out) — the renderer's A side.
+    pub from: ActiveClip,
+    /// Incoming clip (fading in) — the renderer's B side.
+    pub to: ActiveClip,
+    /// Linear mix factor in `[0, 1]`. 0 = pure A; 1 = pure B.
+    pub mix: f32,
+}
+
+/// First transition on an enabled video track whose window contains
+/// `timeline_t`, paired with the surrounding clips' source PTSes.
+/// Returns `None` when no track has a transition active at this time.
+pub fn transition_at(seq: &Sequence, timeline_t: RationalTime) -> Option<ActiveTransition> {
+    if timeline_t.0 < Rational::ZERO {
+        return None;
+    }
+    // Walk topmost-track-first so transitions on V2 win over V1, same
+    // as `scene_at`.
+    for track in seq.tracks.iter().rev() {
+        if track.kind != TrackKind::Video || !track.enabled {
+            continue;
+        }
+        for tr in track.transitions.iter() {
+            if !tr.contains(timeline_t) {
+                continue;
+            }
+            // Find the outgoing/incoming clips around the transition's
+            // position. The outgoing clip's `timeline_out` equals
+            // `tr.position` (or close); the incoming clip's
+            // `timeline_in` equals `tr.position` (or close).
+            let from = track
+                .clips
+                .iter()
+                .find(|c| c.timeline_out() == tr.position)
+                .map(|arc| arc.as_ref())?;
+            let to = track
+                .clips
+                .iter()
+                .find(|c| c.timeline_in == tr.position)
+                .map(|arc| arc.as_ref())?;
+            if !from.enabled || !to.enabled {
+                continue;
+            }
+            let mix = transition_mix(tr, timeline_t);
+            // A's source_pts is wherever we'd be if A still played at
+            // `timeline_t` (it may have ended; we virtually extend).
+            let from_src = RationalTime(
+                from.source_in.0 + (timeline_t.0 - from.timeline_in.0),
+            );
+            // B's source_pts: similarly, virtually start B early so
+            // it covers the pre-cut portion of the window.
+            let to_src = RationalTime(
+                to.source_in.0 + (timeline_t.0 - to.timeline_in.0),
+            );
+            return Some(ActiveTransition {
+                transition_id: tr.id,
+                from: ActiveClip {
+                    clip_id: from.id,
+                    media: from.media,
+                    source_pts: from_src,
+                },
+                to: ActiveClip {
+                    clip_id: to.id,
+                    media: to.media,
+                    source_pts: to_src,
+                },
+                mix,
+            });
+        }
+    }
+    None
+}
+
+/// Linear mix factor for a transition at `timeline_t`: 0 at
+/// `window_in`, 1 at `window_out`, linear between.
+fn transition_mix(tr: &Transition, timeline_t: RationalTime) -> f32 {
+    let win_in = tr.window_in();
+    let win_out = tr.window_out();
+    let span = win_out.0 - win_in.0;
+    if span <= Rational::ZERO {
+        return 0.0;
+    }
+    let into = timeline_t.0 - win_in.0;
+    let raw = (into.as_f64() / span.as_f64()).clamp(0.0, 1.0);
+    raw as f32
 }
 
 #[cfg(test)]

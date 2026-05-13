@@ -27,9 +27,12 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 }
 
 @group(0) @binding(0) var samp: sampler;
-@group(0) @binding(1) var tex_y: texture_2d<f32>;
-@group(0) @binding(2) var tex_u: texture_2d<f32>;
-@group(0) @binding(3) var tex_v: texture_2d<f32>;
+@group(0) @binding(1) var tex_y_a: texture_2d<f32>;
+@group(0) @binding(2) var tex_u_a: texture_2d<f32>;
+@group(0) @binding(3) var tex_v_a: texture_2d<f32>;
+@group(0) @binding(5) var tex_y_b: texture_2d<f32>;
+@group(0) @binding(6) var tex_u_b: texture_2d<f32>;
+@group(0) @binding(7) var tex_v_b: texture_2d<f32>;
 
 // Per-frame effect parameters. Layout must match `RenderParams` in
 // renderer.rs.
@@ -41,8 +44,21 @@ struct Params {
     brightness: f32,
     contrast: f32,
     crop_lrtb: vec4<f32>,
+    mix_factor: f32,
 };
 @group(0) @binding(4) var<uniform> params: Params;
+
+fn yuv_to_rgb(y_raw: f32, u_raw: f32, v_raw: f32) -> vec3<f32> {
+    // Rec.709 limited-range expansion.
+    let y = (y_raw - 16.0 / 255.0) * (255.0 / 219.0);
+    let u = (u_raw - 128.0 / 255.0) * (255.0 / 224.0);
+    let v = (v_raw - 128.0 / 255.0) * (255.0 / 224.0);
+    // Rec.709 Y'CbCr → R'G'B' (gamma-encoded; not linearized).
+    let r = y + 1.5748 * v;
+    let g = y - 0.1873 * u - 0.4681 * v;
+    let b = y + 1.8556 * u;
+    return clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
+}
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
@@ -79,21 +95,25 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
 
-    let y_raw = textureSample(tex_y, samp, source_uv).r;
-    let u_raw = textureSample(tex_u, samp, source_uv).r;
-    let v_raw = textureSample(tex_v, samp, source_uv).r;
+    let rgb_a = yuv_to_rgb(
+        textureSample(tex_y_a, samp, source_uv).r,
+        textureSample(tex_u_a, samp, source_uv).r,
+        textureSample(tex_v_a, samp, source_uv).r,
+    );
 
-    // Rec.709 limited-range expansion.
-    let y = (y_raw - 16.0 / 255.0) * (255.0 / 219.0);
-    let u = (u_raw - 128.0 / 255.0) * (255.0 / 224.0);
-    let v = (v_raw - 128.0 / 255.0) * (255.0 / 224.0);
-
-    // Rec.709 Y'CbCr → R'G'B' (gamma-encoded; not linearized).
-    let r = y + 1.5748 * v;
-    let g = y - 0.1873 * u - 0.4681 * v;
-    let b = y + 1.8556 * u;
-
-    var rgb = clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
+    // Cross-dissolve blend with the B-side. When mix_factor == 0
+    // (the common case) the B samples vanish; the GPU still touches
+    // those textures but the cost is negligible. Sampling B with
+    // the same source_uv assumes both clips share the resolved
+    // frame UV — the transform/crop apply uniformly to the blended
+    // image. (If we ever want per-side transforms, that's a future
+    // refactor.)
+    let rgb_b = yuv_to_rgb(
+        textureSample(tex_y_b, samp, source_uv).r,
+        textureSample(tex_u_b, samp, source_uv).r,
+        textureSample(tex_v_b, samp, source_uv).r,
+    );
+    var rgb = mix(rgb_a, rgb_b, params.mix_factor);
     // Contrast pivots around 0.5 (gamma-encoded midpoint), then
     // brightness shifts. Both apply in gamma space; that's not
     // strictly correct (linear would be cleaner), but it matches

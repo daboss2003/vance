@@ -11,6 +11,7 @@ use vance_core::RationalTime;
 
 use crate::clip::Clip;
 use crate::id::TrackId;
+use crate::transition::Transition;
 
 /// What kind of media this track holds. Drives compositing rules: video
 /// tracks blend top-to-bottom; audio tracks sum.
@@ -41,6 +42,13 @@ pub struct Track {
     /// expected to maintain this invariant; we don't enforce it on
     /// construction so callers can build freely from disk.
     pub clips: Vec<Arc<Clip>>,
+    /// Transitions anchored at cut points on this track. Each
+    /// transition's `position` is the cut between two adjacent
+    /// clips; the transition's window extends `duration / 2` on each
+    /// side. Stored as `Arc` so edit ops can share unaffected
+    /// transitions across `Track` rewrites.
+    #[serde(default)]
+    pub transitions: Vec<Arc<Transition>>,
 }
 
 impl Track {
@@ -53,6 +61,7 @@ impl Track {
             enabled: true,
             locked: false,
             clips: Vec::new(),
+            transitions: Vec::new(),
         }
     }
 
@@ -95,6 +104,7 @@ mod tests {
             enabled: true,
             locked: false,
             clips: vec![c1, c2],
+            transitions: Vec::new(),
         };
         assert_eq!(tr.duration(), t(7));
     }

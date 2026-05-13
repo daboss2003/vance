@@ -199,6 +199,13 @@ export type ClipContents = {
   effects: EffectInfo[];
 };
 
+export type TransitionInfo = {
+  id: string;
+  kind: 'dissolve';
+  position_seconds: number;
+  duration_seconds: number;
+};
+
 export type TrackContents = {
   id: string;
   kind: 'video' | 'audio';
@@ -206,6 +213,7 @@ export type TrackContents = {
   enabled: boolean;
   locked: boolean;
   clips: ClipContents[];
+  transitions: TransitionInfo[];
 };
 
 export type SequenceContents = {
@@ -294,6 +302,28 @@ export const updateEffectParam = (
   value: EffectValue
 ): Promise<void> =>
   invoke('update_effect_param', { trackId, clipId, effectId, key, value });
+
+/** Add a cross-dissolve transition at the cut following `afterClipId`.
+ *  `kind` is currently always `"dissolve"`. Returns the new transition's UUID. */
+export const addTransitionAtCut = (
+  trackId: string,
+  afterClipId: string,
+  kind: 'dissolve',
+  durationSeconds: number
+): Promise<string> =>
+  invoke('add_transition_at_cut', {
+    trackId,
+    afterClipId,
+    kind,
+    durationSeconds,
+  });
+
+/** Remove a transition by ID. Undoable. */
+export const removeTransition = (
+  trackId: string,
+  transitionId: string
+): Promise<void> =>
+  invoke('remove_transition', { trackId, transitionId });
 
 /** Trim a clip's in-point. `newSourceInSeconds` is the new visible
  *  start inside the source media; the clip's timeline_in shifts by

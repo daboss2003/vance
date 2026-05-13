@@ -53,6 +53,11 @@ impl Default for RendererConfig {
 ///
 /// Owned and reused across frames; resizes its plane textures lazily when
 /// the input dimensions change.
+///
+/// The renderer always binds *two* YUV plane sets (A and B). Single-input
+/// playback uses A only and leaves B's mix factor at 0 — the shader just
+/// returns A. Cross-dissolve transitions (Phase 5.4) upload both sides
+/// and dial `mix_factor` from 0 → 1 to blend.
 pub struct Renderer {
     adapter: wgpu::Adapter,
     device: wgpu::Device,
@@ -60,17 +65,22 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    /// (width, height) of the currently-allocated Y texture; `None` if no
-    /// frame has been uploaded yet.
-    plane_dims: Option<(u32, u32)>,
-    tex_y: Option<wgpu::Texture>,
-    tex_u: Option<wgpu::Texture>,
-    tex_v: Option<wgpu::Texture>,
+    /// (width, height) of the currently-allocated A-side Y texture;
+    /// `None` if no frame has been uploaded yet.
+    plane_dims_a: Option<(u32, u32)>,
+    tex_y_a: Option<wgpu::Texture>,
+    tex_u_a: Option<wgpu::Texture>,
+    tex_v_a: Option<wgpu::Texture>,
+    /// Same, for the B side (transition target).
+    plane_dims_b: Option<(u32, u32)>,
+    tex_y_b: Option<wgpu::Texture>,
+    tex_u_b: Option<wgpu::Texture>,
+    tex_v_b: Option<wgpu::Texture>,
     bind_group: Option<wgpu::BindGroup>,
-    /// Per-frame parameter uniform — currently `opacity` (Phase 5.2).
-    /// Future built-in effect params (transform matrix, crop, etc.)
-    /// extend this struct in place; the WGSL `Params` struct must
-    /// keep its layout in sync.
+    /// Per-frame parameter uniform — opacity (5.2), transform (5.3),
+    /// crop + brightness/contrast (5.6), and the transition mix
+    /// factor (5.4). The WGSL `Params` struct must keep its layout
+    /// in sync.
     params_buffer: wgpu::Buffer,
     current_params: RenderParams,
 }
@@ -96,6 +106,12 @@ struct RenderParams {
     /// UV. 0 = no crop; 0.1 left = drop the leftmost 10% of source.
     /// Sum on each axis must stay below 1.0 to leave something visible.
     crop_lrtb: [f32; 4],
+    /// Cross-dissolve mix factor between the A and B YUV inputs.
+    /// 0 = pure A (no transition); 1 = pure B; 0.5 = midpoint.
+    /// All other per-clip effects (opacity / transform / crop /
+    /// color) apply *after* the mix.
+    mix_factor: f32,
+    _pad: [f32; 3],
 }
 
 impl Default for RenderParams {
@@ -108,6 +124,8 @@ impl Default for RenderParams {
             brightness: 0.0,
             contrast: 1.0,
             crop_lrtb: [0.0; 4],
+            mix_factor: 0.0,
+            _pad: [0.0; 3],
         }
     }
 }
@@ -169,6 +187,9 @@ impl Renderer {
                     },
                     count: None,
                 },
+                yuv_plane_entry(5),
+                yuv_plane_entry(6),
+                yuv_plane_entry(7),
             ],
         });
 
@@ -239,10 +260,14 @@ impl Renderer {
             pipeline,
             bind_group_layout,
             sampler,
-            plane_dims: None,
-            tex_y: None,
-            tex_u: None,
-            tex_v: None,
+            plane_dims_a: None,
+            tex_y_a: None,
+            tex_u_a: None,
+            tex_v_a: None,
+            plane_dims_b: None,
+            tex_y_b: None,
+            tex_u_b: None,
+            tex_v_b: None,
             bind_group: None,
             params_buffer,
             current_params: initial_params,
@@ -366,10 +391,44 @@ impl Renderer {
         &self.queue
     }
 
-    /// Upload a decoded frame into the renderer's YUV plane textures. Splits
-    /// NV12 UV into separate U and V planes CPU-side so both formats share
-    /// the same shader path.
+    /// Upload a decoded frame into the renderer's A-side YUV plane textures.
+    /// Splits NV12 UV into separate U and V planes CPU-side so both formats
+    /// share the same shader path. Single-input playback only ever calls
+    /// this side; the B-side stays as the most recent upload (or a 1×1
+    /// dummy) and the shader ignores it while `mix_factor == 0`.
     pub fn upload_frame(&mut self, frame: &FrameData) -> Result<(), RenderError> {
+        self.upload_frame_inner(frame, false)
+    }
+
+    /// Upload a decoded frame onto the B-side YUV plane textures.
+    /// Used by cross-dissolve transitions for the outgoing (or
+    /// incoming, depending on direction) clip while A holds the other.
+    pub fn upload_frame_b(&mut self, frame: &FrameData) -> Result<(), RenderError> {
+        self.upload_frame_inner(frame, true)
+    }
+
+    /// Set the A↔B mix factor. 0 = pure A (no transition), 1 = pure B,
+    /// anything in between is a linear cross-dissolve. The renderer
+    /// initializes this to 0, so the single-input path is unaffected
+    /// until a transition explicitly opts in.
+    pub fn set_mix_factor(&mut self, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        if (self.current_params.mix_factor - v).abs() < 1e-4 {
+            return;
+        }
+        self.current_params.mix_factor = v;
+        self.queue.write_buffer(
+            &self.params_buffer,
+            0,
+            bytemuck::cast_slice(&[self.current_params]),
+        );
+    }
+
+    fn upload_frame_inner(
+        &mut self,
+        frame: &FrameData,
+        b_side: bool,
+    ) -> Result<(), RenderError> {
         let (w, h) = (frame.width, frame.height);
         let expected = frame.pixel_format.frame_size(w, h);
         if frame.bytes.len() != expected {
@@ -379,13 +438,36 @@ impl Renderer {
             });
         }
 
-        if self.plane_dims != Some((w, h)) {
-            self.allocate_plane_textures(w, h);
-            self.plane_dims = Some((w, h));
+        let needs_alloc = if b_side {
+            self.plane_dims_b != Some((w, h))
+        } else {
+            self.plane_dims_a != Some((w, h))
+        };
+        if needs_alloc {
+            self.allocate_plane_textures(w, h, b_side);
+            if b_side {
+                self.plane_dims_b = Some((w, h));
+            } else {
+                self.plane_dims_a = Some((w, h));
+            }
         }
 
         let chroma_w = w.div_ceil(2);
         let chroma_h = h.div_ceil(2);
+
+        let (tex_y, tex_u, tex_v) = if b_side {
+            (
+                self.tex_y_b.as_ref().unwrap(),
+                self.tex_u_b.as_ref().unwrap(),
+                self.tex_v_b.as_ref().unwrap(),
+            )
+        } else {
+            (
+                self.tex_y_a.as_ref().unwrap(),
+                self.tex_u_a.as_ref().unwrap(),
+                self.tex_v_a.as_ref().unwrap(),
+            )
+        };
 
         match frame.pixel_format {
             PixelFormat::Yuv420P => {
@@ -393,25 +475,24 @@ impl Renderer {
                 let chroma_size = (chroma_w * chroma_h) as usize;
                 let (y_bytes, rest) = frame.bytes.split_at(y_size);
                 let (u_bytes, v_bytes) = rest.split_at(chroma_size);
-                self.write_plane(self.tex_y.as_ref().unwrap(), w, h, y_bytes);
-                self.write_plane(self.tex_u.as_ref().unwrap(), chroma_w, chroma_h, u_bytes);
-                self.write_plane(self.tex_v.as_ref().unwrap(), chroma_w, chroma_h, v_bytes);
+                self.write_plane(tex_y, w, h, y_bytes);
+                self.write_plane(tex_u, chroma_w, chroma_h, u_bytes);
+                self.write_plane(tex_v, chroma_w, chroma_h, v_bytes);
             }
             PixelFormat::Nv12 => {
                 let y_size = (w * h) as usize;
                 let uv_size = (chroma_w * chroma_h * 2) as usize;
                 let (y_bytes, uv_bytes) = frame.bytes.split_at(y_size);
                 debug_assert_eq!(uv_bytes.len(), uv_size);
-                // Split interleaved UV → separate U and V buffers.
                 let mut u_buf = Vec::with_capacity((chroma_w * chroma_h) as usize);
                 let mut v_buf = Vec::with_capacity((chroma_w * chroma_h) as usize);
                 for chunk in uv_bytes.chunks_exact(2) {
                     u_buf.push(chunk[0]);
                     v_buf.push(chunk[1]);
                 }
-                self.write_plane(self.tex_y.as_ref().unwrap(), w, h, y_bytes);
-                self.write_plane(self.tex_u.as_ref().unwrap(), chroma_w, chroma_h, &u_buf);
-                self.write_plane(self.tex_v.as_ref().unwrap(), chroma_w, chroma_h, &v_buf);
+                self.write_plane(tex_y, w, h, y_bytes);
+                self.write_plane(tex_u, chroma_w, chroma_h, &u_buf);
+                self.write_plane(tex_v, chroma_w, chroma_h, &v_buf);
             }
         }
         Ok(())
@@ -590,28 +671,42 @@ impl Renderer {
         Ok(out)
     }
 
-    fn allocate_plane_textures(&mut self, width: u32, height: u32) {
+    fn allocate_plane_textures(&mut self, width: u32, height: u32, b_side: bool) {
         let chroma_w = width.div_ceil(2);
         let chroma_h = height.div_ceil(2);
-        self.tex_y = Some(create_r8_texture(&self.device, width, height, "tex_y"));
-        self.tex_u = Some(create_r8_texture(&self.device, chroma_w, chroma_h, "tex_u"));
-        self.tex_v = Some(create_r8_texture(&self.device, chroma_w, chroma_h, "tex_v"));
+        if b_side {
+            self.tex_y_b = Some(create_r8_texture(&self.device, width, height, "tex_y_b"));
+            self.tex_u_b = Some(create_r8_texture(&self.device, chroma_w, chroma_h, "tex_u_b"));
+            self.tex_v_b = Some(create_r8_texture(&self.device, chroma_w, chroma_h, "tex_v_b"));
+        } else {
+            self.tex_y_a = Some(create_r8_texture(&self.device, width, height, "tex_y_a"));
+            self.tex_u_a = Some(create_r8_texture(&self.device, chroma_w, chroma_h, "tex_u_a"));
+            self.tex_v_a = Some(create_r8_texture(&self.device, chroma_w, chroma_h, "tex_v_a"));
+        }
 
-        let view_y = self
-            .tex_y
-            .as_ref()
-            .unwrap()
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let view_u = self
-            .tex_u
-            .as_ref()
-            .unwrap()
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let view_v = self
-            .tex_v
-            .as_ref()
-            .unwrap()
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        // First A-side allocation also primes a 1×1 B-side dummy so
+        // the bind group always has valid views to bind. After that
+        // first call, subsequent allocations only swap the side that
+        // resized.
+        if !b_side && self.tex_y_b.is_none() {
+            self.tex_y_b = Some(create_r8_texture(&self.device, 1, 1, "tex_y_b_dummy"));
+            self.tex_u_b = Some(create_r8_texture(&self.device, 1, 1, "tex_u_b_dummy"));
+            self.tex_v_b = Some(create_r8_texture(&self.device, 1, 1, "tex_v_b_dummy"));
+            self.plane_dims_b = Some((1, 1));
+        }
+
+        self.rebuild_bind_group();
+    }
+
+    fn rebuild_bind_group(&mut self) {
+        let make_view =
+            |t: &Option<wgpu::Texture>| t.as_ref().unwrap().create_view(&Default::default());
+        let view_y_a = make_view(&self.tex_y_a);
+        let view_u_a = make_view(&self.tex_u_a);
+        let view_v_a = make_view(&self.tex_v_a);
+        let view_y_b = make_view(&self.tex_y_b);
+        let view_u_b = make_view(&self.tex_u_b);
+        let view_v_b = make_view(&self.tex_v_b);
 
         self.bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("vance-render.bg"),
@@ -623,19 +718,31 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&view_y),
+                    resource: wgpu::BindingResource::TextureView(&view_y_a),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&view_u),
+                    resource: wgpu::BindingResource::TextureView(&view_u_a),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&view_v),
+                    resource: wgpu::BindingResource::TextureView(&view_v_a),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: self.params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&view_y_b),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&view_u_b),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&view_v_b),
                 },
             ],
         }));

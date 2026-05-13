@@ -284,6 +284,7 @@
       ctx.fillRect(TRACK_HEADER_W, y, cssW - TRACK_HEADER_W, TRACK_HEIGHT);
 
       drawClips(ctx, track, y, visibleLeft, visibleRight);
+      drawTransitions(ctx, track, y, visibleLeft, visibleRight);
 
       // Row separator.
       ctx.strokeStyle = '#2a2e36';
@@ -381,6 +382,46 @@
           ctx.fillRect(Math.round(x + w) - 2, cy, 3, ch);
         }
       }
+    }
+  }
+
+  /** Draw cross-dissolve transitions on a track. Each transition
+   *  renders as a translucent overlay spanning its window, with a
+   *  diagonal stripe to signal "this is a blend, not a clip". */
+  function drawTransitions(
+    ctx: CanvasRenderingContext2D,
+    track: TrackContents,
+    y: number,
+    visibleLeft: number,
+    visibleRight: number
+  ) {
+    if (!track.transitions || track.transitions.length === 0) return;
+    for (const tr of track.transitions) {
+      const t_in = tr.position_seconds - tr.duration_seconds / 2;
+      const t_out = tr.position_seconds + tr.duration_seconds / 2;
+      if (t_out < visibleLeft || t_in > visibleRight) continue;
+      const x = timeToX(t_in);
+      const w = Math.max(2, (t_out - t_in) * pixelsPerSecond);
+      const ty = y + 4;
+      const th = TRACK_HEIGHT - 8;
+      ctx.save();
+      // Translucent body
+      ctx.fillStyle = 'rgba(120, 200, 255, 0.32)';
+      roundRect(ctx, x, ty, w, th, 3);
+      ctx.fill();
+      // Diagonal stripe — cheap "this is a blend" cue.
+      ctx.beginPath();
+      ctx.moveTo(x, ty + th);
+      ctx.lineTo(x + w, ty);
+      ctx.strokeStyle = 'rgba(120, 200, 255, 0.85)';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      // Border
+      ctx.strokeStyle = 'rgba(120, 200, 255, 0.65)';
+      ctx.lineWidth = 1;
+      roundRect(ctx, x + 0.5, ty + 0.5, Math.max(1, w - 1), th - 1, 3);
+      ctx.stroke();
+      ctx.restore();
     }
   }
 

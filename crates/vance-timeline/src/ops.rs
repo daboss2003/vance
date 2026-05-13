@@ -23,9 +23,10 @@ use vance_core::RationalTime;
 use crate::clip::Clip;
 use crate::effect::{Effect, EffectValue};
 use crate::error::{Result, TimelineError};
-use crate::id::{ClipId, EffectId, TrackId};
+use crate::id::{ClipId, EffectId, TrackId, TransitionId};
 use crate::sequence::Sequence;
 use crate::track::{Track, TrackKind};
+use crate::transition::{Transition, TransitionKind};
 
 // ---- time helpers -----------------------------------------------------------
 
@@ -149,6 +150,7 @@ pub fn add_track_with_id(
         enabled: true,
         locked: false,
         clips: Vec::new(),
+        transitions: Vec::new(),
     };
     let mut tracks = seq.tracks.clone();
     tracks.push(Arc::new(new_track));
@@ -208,6 +210,7 @@ pub fn insert_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Result<Sequ
         enabled: track.enabled,
         locked: track.locked,
         clips,
+        transitions: track.transitions.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -252,6 +255,7 @@ pub fn ripple_insert_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Resu
         enabled: track.enabled,
         locked: track.locked,
         clips,
+        transitions: track.transitions.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -312,6 +316,7 @@ pub fn overwrite_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Result<S
         enabled: track.enabled,
         locked: track.locked,
         clips: kept,
+        transitions: track.transitions.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -334,6 +339,7 @@ pub fn remove_clip(seq: &Sequence, track_id: TrackId, clip_id: ClipId) -> Result
         enabled: track.enabled,
         locked: track.locked,
         clips,
+        transitions: track.transitions.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -371,6 +377,7 @@ pub fn ripple_remove_clip(
         enabled: track.enabled,
         locked: track.locked,
         clips,
+        transitions: track.transitions.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -407,6 +414,7 @@ pub fn slip(
         enabled: track.enabled,
         locked: track.locked,
         clips,
+        transitions: track.transitions.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -446,6 +454,7 @@ pub fn slide(
         enabled: track.enabled,
         locked: track.locked,
         clips,
+        transitions: track.transitions.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -495,6 +504,7 @@ pub fn trim_in(
         enabled: track.enabled,
         locked: track.locked,
         clips,
+        transitions: track.transitions.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -537,6 +547,7 @@ pub fn trim_out(
         enabled: track.enabled,
         locked: track.locked,
         clips,
+        transitions: track.transitions.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -568,6 +579,7 @@ pub fn add_effect_to_clip(
         enabled: track.enabled,
         locked: track.locked,
         clips,
+        transitions: track.transitions.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -605,6 +617,7 @@ pub fn update_effect_param(
         enabled: track.enabled,
         locked: track.locked,
         clips,
+        transitions: track.transitions.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -634,6 +647,7 @@ pub fn remove_effect_from_clip(
         enabled: track.enabled,
         locked: track.locked,
         clips,
+        transitions: track.transitions.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -679,6 +693,113 @@ pub fn split(
         enabled: track.enabled,
         locked: track.locked,
         clips,
+        transitions: track.transitions.clone(),
+    };
+    Ok(replace_track(seq, idx, new_track))
+}
+
+// ---- Transitions (Phase 5.4) -----------------------------------------------
+
+/// Add a transition with a pre-allocated ID. EditLog replay calls this
+/// so undo/redo produces a byte-identical sequence; UI / engine calls
+/// go through the wrapper that allocates an ID for them.
+pub fn add_transition_at_cut_with_id(
+    seq: &Sequence,
+    track_id: TrackId,
+    transition_id: TransitionId,
+    after_clip_id: ClipId,
+    kind: TransitionKind,
+    duration: RationalTime,
+) -> Result<Sequence> {
+    if duration.0 <= vance_core::Rational::ZERO {
+        return Err(TimelineError::invalid(
+            "transition duration must be positive",
+        ));
+    }
+    let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    let (clip_pos, clip) = find_clip(&track, after_clip_id)?;
+    if clip_pos + 1 >= track.clips.len() {
+        return Err(TimelineError::invalid(
+            "no clip after the anchor — transition needs two adjacent clips",
+        ));
+    }
+    let next = &track.clips[clip_pos + 1];
+    let cut = clip.timeline_out();
+    if next.timeline_in < cut {
+        return Err(TimelineError::invalid(
+            "anchor clip overlaps its neighbor — split first",
+        ));
+    }
+
+    let new_t = Transition {
+        id: transition_id,
+        kind,
+        position: cut,
+        duration,
+    };
+    for existing in track.transitions.iter() {
+        if new_t.window_in() < existing.window_out()
+            && existing.window_in() < new_t.window_out()
+        {
+            return Err(TimelineError::invalid(
+                "transition window overlaps an existing transition",
+            ));
+        }
+    }
+    let mut transitions = track.transitions.clone();
+    transitions.push(Arc::new(new_t));
+    transitions.sort_by_key(|t| t.position);
+
+    let new_track = Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips: track.clips.clone(),
+        transitions,
+    };
+    Ok(replace_track(seq, idx, new_track))
+}
+
+/// Add a transition to a track at the cut after `after_clip_id`. The
+/// transition is anchored at that cut (`after_clip.timeline_out()`)
+/// and extends `duration / 2` to each side. Rejects when there is no
+/// clip immediately after the anchor clip, when `duration` is zero,
+/// or when the new transition would overlap an existing one. Returns
+/// the freshly allocated `TransitionId` so callers can record an
+/// EditOp that replays with the same ID.
+pub fn add_transition_at_cut(
+    seq: &Sequence,
+    track_id: TrackId,
+    after_clip_id: ClipId,
+    kind: TransitionKind,
+    duration: RationalTime,
+) -> Result<(Sequence, TransitionId)> {
+    let id = TransitionId::new();
+    let new_seq = add_transition_at_cut_with_id(seq, track_id, id, after_clip_id, kind, duration)?;
+    Ok((new_seq, id))
+}
+
+/// Remove a transition from a track by ID. No-op if not present.
+pub fn remove_transition(
+    seq: &Sequence,
+    track_id: TrackId,
+    transition_id: TransitionId,
+) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    let mut transitions = track.transitions.clone();
+    transitions.retain(|t| t.id != transition_id);
+    let new_track = Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips: track.clips.clone(),
+        transitions,
     };
     Ok(replace_track(seq, idx, new_track))
 }

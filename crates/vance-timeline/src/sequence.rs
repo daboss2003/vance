@@ -91,6 +91,7 @@ mod tests {
             enabled: true,
             locked: false,
             clips: vec![c_short],
+            transitions: Vec::new(),
         });
         let v2 = Arc::new(Track {
             id: TrackId::new(),
@@ -99,6 +100,7 @@ mod tests {
             enabled: true,
             locked: false,
             clips: vec![c_long],
+            transitions: Vec::new(),
         });
         let seq = Sequence {
             id: SequenceId::new(),

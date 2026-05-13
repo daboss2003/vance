@@ -14,6 +14,8 @@ import {
   insertClipAt,
   loadProject,
   addEffectToClip as ipcAddEffect,
+  addTransitionAtCut as ipcAddTransition,
+  removeTransition as ipcRemoveTransition,
   clearSourceMarks as ipcClearSourceMarks,
   insertFromSource as ipcInsertFromSource,
   removeEffectFromClip as ipcRemoveEffect,
@@ -314,6 +316,33 @@ class ProjectState {
     this.error = null;
     try {
       await ipcUpdateEffectParam(trackId, clipId, effectId, key, value);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Drop a cross-dissolve at the cut after `afterClipId`. Default
+   *  duration: 1 second. */
+  async addDissolveAtCut(
+    trackId: string,
+    afterClipId: string,
+    durationSeconds = 1
+  ) {
+    this.error = null;
+    try {
+      await ipcAddTransition(trackId, afterClipId, 'dissolve', durationSeconds);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Remove a transition from a track by ID. */
+  async removeTransition(trackId: string, transitionId: string) {
+    this.error = null;
+    try {
+      await ipcRemoveTransition(trackId, transitionId);
       await this.commitEdit();
     } catch (e) {
       this.error = String(e);

@@ -273,6 +273,14 @@
           if (tid) projectState.insertFromSource(tid, true);
         }
         return;
+      case 't':
+      case 'T':
+        // Drop a 1s cross-dissolve at the cut after the selected clip.
+        if (selectionState.count === 1 && projectState.sequence) {
+          e.preventDefault();
+          addDissolveForSelection();
+        }
+        return;
       case 'z':
       case 'Z':
         if (e.metaKey || e.ctrlKey) {
@@ -462,6 +470,33 @@
     const seq = projectState.sequence;
     if (!seq) return null;
     return seq.tracks.find((t) => t.kind === 'video' && t.enabled)?.id ?? null;
+  }
+
+  /** Toggle a 1s cross-dissolve at the cut following the single
+   *  selected clip. Adds one if absent, removes the existing one if
+   *  present, no-op if there's no clip immediately after the
+   *  selection on the same track. */
+  async function addDissolveForSelection() {
+    const seq = projectState.sequence;
+    if (!seq) return;
+    if (selectionState.count !== 1) return;
+    const id = [...selectionState.ids][0];
+    for (const t of seq.tracks) {
+      const idx = t.clips.findIndex((c) => c.id === id);
+      if (idx < 0) continue;
+      if (idx + 1 >= t.clips.length) return;
+      const clip = t.clips[idx];
+      const cutAt = clip.timeline_in_seconds + clip.duration_seconds;
+      const existing = (t.transitions ?? []).find(
+        (tr) => Math.abs(tr.position_seconds - cutAt) < 1e-3
+      );
+      if (existing) {
+        await projectState.removeTransition(t.id, existing.id);
+      } else {
+        await projectState.addDissolveAtCut(t.id, id, 1);
+      }
+      return;
+    }
   }
 
   /** Delete every currently-selected clip from the active sequence,
