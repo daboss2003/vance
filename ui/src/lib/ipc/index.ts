@@ -240,7 +240,7 @@ export type MediaItemInfo = {
   id: string;
   name: string;
   path: string;
-  kind: 'video' | 'audio' | 'image';
+  kind: 'video' | 'audio' | 'image' | 'title';
   duration_seconds: number;
   frame_rate_num: number | null;
   frame_rate_den: number | null;
@@ -250,6 +250,20 @@ export type MediaItemInfo = {
  *  in the current project's media library. */
 export const importMediaFile = (path: string): Promise<MediaItemInfo> =>
   invoke('import_media_file', { path });
+
+/** Create a synthetic title media item. No file backing — the engine
+ *  rasterizes frames from these params each time the clip plays. */
+export const createTitleMedia = (args: {
+  displayName: string;
+  durationSeconds: number;
+  text: string;
+  sizePx: number;
+  fgRgb: [number, number, number];
+  bgRgb: [number, number, number];
+  width: number;
+  height: number;
+}): Promise<MediaItemInfo> =>
+  invoke('create_title_media', args);
 
 /** All media items in the current project's library. */
 export const mediaList = (): Promise<MediaItemInfo[]> => invoke('media_list');

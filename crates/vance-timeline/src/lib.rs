@@ -40,6 +40,7 @@ pub mod ops;
 pub mod project;
 pub mod scene_plan;
 pub mod sequence;
+pub mod title;
 pub mod track;
 pub mod transition;
 
@@ -55,5 +56,6 @@ pub use media::{ContentHash, MediaItem, MediaKind};
 pub use project::Project;
 pub use scene_plan::{scene_at, transition_at, ActiveClip, ActiveTransition, SceneAt};
 pub use sequence::Sequence;
+pub use title::TitleParams;
 pub use track::{Track, TrackKind};
 pub use transition::{Transition, TransitionKind};

@@ -11,6 +11,7 @@ import {
   currentSequenceContents,
   decodeSourceAt,
   importMediaFile,
+  createTitleMedia,
   insertClipAt,
   loadProject,
   addEffectToClip as ipcAddEffect,
@@ -241,6 +242,39 @@ class ProjectState {
       this.media = [...this.media, item];
     } catch (e) {
       this.error = String(e);
+    }
+  }
+
+  /** Create a synthetic title clip in the media library. Returns the
+   *  new item's ID so the caller can immediately insert it on the
+   *  timeline (or `null` on failure). */
+  async createTitle(args: {
+    displayName: string;
+    durationSeconds: number;
+    text: string;
+    sizePx?: number;
+    fgRgb?: [number, number, number];
+    bgRgb?: [number, number, number];
+    width?: number;
+    height?: number;
+  }): Promise<string | null> {
+    this.error = null;
+    try {
+      const item = await createTitleMedia({
+        displayName: args.displayName,
+        durationSeconds: args.durationSeconds,
+        text: args.text,
+        sizePx: args.sizePx ?? 96,
+        fgRgb: args.fgRgb ?? [1, 1, 1],
+        bgRgb: args.bgRgb ?? [0, 0, 0],
+        width: args.width ?? 1280,
+        height: args.height ?? 720,
+      });
+      this.media = [...this.media, item];
+      return item.id;
+    } catch (e) {
+      this.error = String(e);
+      return null;
     }
   }
 

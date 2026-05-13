@@ -49,6 +49,16 @@
   // which Svelte 5 trips as `effect_update_depth_exceeded`. We wrap
   // the mutation in `untrack` so the read isn't tracked as a dep.
   let timelineRefreshTick = $state<number>(0);
+
+  // + Title modal state. Text + duration + style are edited inline;
+  // on submit we call projectState.createTitle which adds the
+  // synthetic media to the library. The user then drags it onto the
+  // timeline like any other clip.
+  let titleModalOpen = $state<boolean>(false);
+  let titleDraftText = $state<string>('Title');
+  let titleDraftDuration = $state<number>(3);
+  let titleDraftSize = $state<number>(96);
+  let titleSubmitting = $state<boolean>(false);
   $effect(() => {
     void projectState.info;
     void projectState.editTick;
@@ -804,12 +814,20 @@
 
         <div class="mb-3 flex items-center justify-between">
           <h3 class="text-vance-muted text-[11px] uppercase">Media</h3>
-          <button
-            class="rounded bg-vance-bg border-vance-border border px-2 py-0.5 text-[10px] hover:brightness-125"
-            onclick={handleImportMedia}
-          >
-            + Import
-          </button>
+          <div class="flex gap-1">
+            <button
+              class="rounded bg-vance-bg border-vance-border border px-2 py-0.5 text-[10px] hover:brightness-125"
+              onclick={() => (titleModalOpen = true)}
+            >
+              + Title
+            </button>
+            <button
+              class="rounded bg-vance-bg border-vance-border border px-2 py-0.5 text-[10px] hover:brightness-125"
+              onclick={handleImportMedia}
+            >
+              + Import
+            </button>
+          </div>
         </div>
         {#if projectState.media.length === 0}
           <p class="text-vance-muted text-xs italic">
@@ -1057,6 +1075,79 @@
         </span>
       </div>
     </main>
+
+    {#if titleModalOpen}
+      <div
+        class="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+        onclick={(e) => {
+          if (e.target === e.currentTarget) titleModalOpen = false;
+        }}
+        role="presentation"
+      >
+        <div class="bg-vance-panel border-vance-border w-[28rem] rounded border p-4 shadow-xl">
+          <h3 class="text-vance-fg mb-3 text-sm font-semibold">New Title</h3>
+          <label class="mb-2 block text-xs">
+            <span class="text-vance-muted mb-1 block">Text</span>
+            <input
+              type="text"
+              class="bg-vance-bg border-vance-border w-full rounded border px-2 py-1 text-sm"
+              bind:value={titleDraftText}
+              placeholder="Title text"
+            />
+          </label>
+          <div class="mb-3 grid grid-cols-2 gap-3">
+            <label class="block text-xs">
+              <span class="text-vance-muted mb-1 block">Duration (s)</span>
+              <input
+                type="number"
+                min="0.1"
+                step="0.1"
+                class="bg-vance-bg border-vance-border w-full rounded border px-2 py-1 text-sm"
+                bind:value={titleDraftDuration}
+              />
+            </label>
+            <label class="block text-xs">
+              <span class="text-vance-muted mb-1 block">Font size (px)</span>
+              <input
+                type="number"
+                min="8"
+                step="4"
+                class="bg-vance-bg border-vance-border w-full rounded border px-2 py-1 text-sm"
+                bind:value={titleDraftSize}
+              />
+            </label>
+          </div>
+          <div class="flex justify-end gap-2">
+            <button
+              type="button"
+              class="rounded bg-vance-bg border-vance-border border px-3 py-1 text-xs"
+              onclick={() => (titleModalOpen = false)}
+              disabled={titleSubmitting}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              class="rounded bg-[var(--color-vance-accent)] px-3 py-1 text-xs font-semibold text-[#003040]"
+              onclick={async () => {
+                titleSubmitting = true;
+                const id = await projectState.createTitle({
+                  displayName: titleDraftText.trim() || 'Title',
+                  durationSeconds: titleDraftDuration,
+                  text: titleDraftText,
+                  sizePx: titleDraftSize,
+                });
+                titleSubmitting = false;
+                if (id) titleModalOpen = false;
+              }}
+              disabled={titleSubmitting}
+            >
+              {titleSubmitting ? 'Creating…' : 'Add to library'}
+            </button>
+          </div>
+        </div>
+      </div>
+    {/if}
 
     <!-- Inspector -->
     <aside

@@ -15,12 +15,20 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use vance_audio::AudioPlayer;
 use vance_decoder::{DecoderClient, StreamInfo};
-use vance_render::{Renderer, RendererConfig};
+use vance_render::{render_title_yuv420, Renderer, RendererConfig};
 use std::collections::HashMap;
 use vance_timeline::{
     Clip, Effect, EditLog, EditOp, EffectId, EffectValue, MediaItem, MediaItemId, MediaKind,
-    Project, Sequence, SequenceId, Track, TrackId, TrackKind,
+    Project, Sequence, SequenceId, TitleParams, Track, TrackId, TrackKind,
 };
+
+/// Resolution of a clip's media for an engine playback / scrub call.
+/// File-backed media goes through the decoder; title media is rendered
+/// procedurally each frame via `vance_render::render_title_yuv420`.
+enum MediaResolved {
+    File(String),
+    Title(TitleParams),
+}
 use vance_viewport::{HostWindowHandle, Viewport, ViewportBounds};
 
 /// Errors surfaced through Tauri command handlers as plain strings.
@@ -504,6 +512,7 @@ impl From<&MediaItem> for MediaItemInfo {
                 MediaKind::Video => "video".into(),
                 MediaKind::Audio => "audio".into(),
                 MediaKind::Image => "image".into(),
+                MediaKind::Title => "title".into(),
             },
             duration_seconds: rt_to_seconds(m.duration),
             frame_rate_num: fr_n,
@@ -692,6 +701,19 @@ pub struct AudioOwner {
     handle: JoinHandle<()>,
 }
 
+/// Tells `start_playback_inner` whether the engine wants to spin up
+/// a real decoder-backed playback session or a synthetic title one.
+enum StartPlaybackKind {
+    Video {
+        from_pts: i64,
+    },
+    Title {
+        params: TitleParams,
+        fps: f64,
+        duration_seconds: f64,
+    },
+}
+
 /// Owned by the engine while video playback is running.
 pub struct PlaybackSession {
     stop: Arc<AtomicBool>,
@@ -710,13 +732,9 @@ pub struct PlaybackSession {
     /// B's media — see `is_playing` for the chain). The atomic
     /// stores microseconds; `i64::MIN` means "not requested".
     chain_resume_micros: Arc<std::sync::atomic::AtomicI64>,
-    /// Joins to recover both decoders (primary + optional secondary
-    /// used during cross-dissolves) and the path currently open in
-    /// the secondary, so the engine can reuse it across sessions.
-    /// The secondary is `None` when playback never crossed a
-    /// transition; the path is `None` when nothing has been opened on
-    /// the secondary yet.
-    handle: JoinHandle<(DecoderClient, Option<DecoderClient>, Option<String>)>,
+    /// Joins to recover the decoders the loop owned during the
+    /// session. See `PlaybackLoopOutput` for the contents.
+    handle: JoinHandle<PlaybackLoopOutput>,
 }
 
 impl Engine {
@@ -1091,6 +1109,15 @@ impl Engine {
     pub fn start_playback(&mut self, from_pts: i64) -> Result<(), EngineError> {
         tracing::info!(from_pts, "start_playback called");
         self.pause_for_edit();
+        self.start_playback_inner(StartPlaybackKind::Video { from_pts })
+    }
+
+    /// Wraps the heavy lifting so `start_playback` and the title-mode
+    /// entry point share thread setup, atomics, and join handling.
+    fn start_playback_inner(
+        &mut self,
+        kind: StartPlaybackKind,
+    ) -> Result<(), EngineError> {
         let viewport = self
             .viewport
             .as_ref()
@@ -1101,38 +1128,70 @@ impl Engine {
             .as_ref()
             .ok_or(EngineError::NoViewport)?
             .clone();
-        let info = self
-            .stream_info
-            .as_ref()
-            .ok_or(EngineError::NoFileOpen)?
-            .clone();
-        let media_path = self
-            .current_media_path
-            .clone()
-            .ok_or(EngineError::NoFileOpen)?;
-        let mut decoder = self.decoder.take().ok_or(EngineError::NoFileOpen)?;
 
-        // Kick off streaming on the sidecar before handing off the client.
-        if let Err(e) = decoder.start_stream(from_pts, 8) {
-            // Restore decoder so the engine isn't stuck with no decoder.
-            self.decoder = Some(decoder);
-            return Err(EngineError::DecoderClient(e));
-        }
-
-        // Best-effort audio start. If the file has no audio or audio init
-        // fails, keep going with wall-clock-only video — better degraded
-        // playback than no playback.
-        let (vtb_n, vtb_d) = info.time_base;
-        let from_seconds = if vtb_d > 0 {
-            (from_pts as f64) * (vtb_n as f64) / (vtb_d as f64)
-        } else {
-            0.0
-        };
-        let (audio_owner, audio_sync) = match start_audio(&media_path, from_seconds) {
-            Ok((owner, sync)) => (Some(owner), Some(sync)),
-            Err(e) => {
-                tracing::warn!(?e, "audio: not started; video will use wall-clock master");
-                (None, None)
+        // Construct the primary source. Video mode takes the engine's
+        // decoder out and starts streaming on it; title mode renders
+        // the title frame and leaves the decoder slot alone.
+        let (primary, audio_owner, audio_sync, from_pts) = match kind {
+            StartPlaybackKind::Video { from_pts } => {
+                let info = self
+                    .stream_info
+                    .as_ref()
+                    .ok_or(EngineError::NoFileOpen)?
+                    .clone();
+                let media_path = self
+                    .current_media_path
+                    .clone()
+                    .ok_or(EngineError::NoFileOpen)?;
+                let mut decoder = self.decoder.take().ok_or(EngineError::NoFileOpen)?;
+                if let Err(e) = decoder.start_stream(from_pts, 8) {
+                    self.decoder = Some(decoder);
+                    return Err(EngineError::DecoderClient(e));
+                }
+                let (vtb_n, vtb_d) = info.time_base;
+                let from_seconds = if vtb_d > 0 {
+                    (from_pts as f64) * (vtb_n as f64) / (vtb_d as f64)
+                } else {
+                    0.0
+                };
+                let (audio_owner, audio_sync) =
+                    match start_audio(&media_path, from_seconds) {
+                        Ok((owner, sync)) => (Some(owner), Some(sync)),
+                        Err(e) => {
+                            tracing::warn!(?e, "audio: not started; video will use wall-clock");
+                            (None, None)
+                        }
+                    };
+                (
+                    PlaybackPrimary::Decoder {
+                        client: decoder,
+                        info,
+                        from_pts,
+                    },
+                    audio_owner,
+                    audio_sync,
+                    from_pts,
+                )
+            }
+            StartPlaybackKind::Title {
+                params,
+                fps,
+                duration_seconds,
+            } => {
+                let frame = render_title_yuv420(&params)
+                    .map_err(|e| EngineError::Project(format!("title render: {e}")))?;
+                // Titles are silent in v1 — the loop's wall-clock
+                // master keeps timing honest without an audio sidecar.
+                (
+                    PlaybackPrimary::Title {
+                        frame,
+                        fps,
+                        duration_seconds,
+                    },
+                    None,
+                    None,
+                    0,
+                )
             }
         };
 
@@ -1164,10 +1223,26 @@ impl Engine {
         ) {
             project.sequence(seq_id).map(|seq| SequencePlaybackContext {
                 sequence: (**seq).clone(),
+                // File-backed media → path map; title media → params map.
+                // Skipping unknown variants here is fine — the loop only
+                // looks up media IDs that scene_at returned, and those
+                // came from the same project.
                 media_paths: project
                     .media
                     .iter()
+                    .filter(|(_, m)| m.kind != MediaKind::Title)
                     .map(|(id, m)| (*id, m.path.clone()))
+                    .collect(),
+                title_params: project
+                    .media
+                    .iter()
+                    .filter_map(|(id, m)| {
+                        if m.kind == MediaKind::Title {
+                            m.title.clone().map(|p| (*id, p))
+                        } else {
+                            None
+                        }
+                    })
                     .collect(),
                 decoder_bin: locate_decoder_binary().unwrap_or_default(),
                 anchor_timeline_in: anchor.timeline_in_seconds,
@@ -1182,9 +1257,7 @@ impl Engine {
             .name("vance-engine.playback".into())
             .spawn(move || {
                 playback_loop(
-                    decoder,
-                    info,
-                    from_pts,
+                    primary,
                     last_bounds,
                     viewport,
                     render_state,
@@ -1242,13 +1315,18 @@ impl Engine {
             session.last_pts.load(Ordering::Acquire)
         };
         match session.handle.join() {
-            Ok((decoder, secondary, secondary_path)) => {
-                self.decoder = Some(decoder);
+            Ok(out) => {
+                // Primary decoder is only set when the session was
+                // video-mode; title sessions leave the engine's
+                // existing `decoder` slot alone.
+                if let Some(d) = out.primary_decoder {
+                    self.decoder = Some(d);
+                }
                 // Reclaim the warm secondary + its open path so a
                 // subsequent scrub / playback through the same B
                 // media skips re-opening the sidecar.
-                self.transition_decoder = secondary;
-                self.transition_media_path = secondary_path;
+                self.transition_decoder = out.secondary_decoder;
+                self.transition_media_path = out.secondary_media_path;
                 self.transition_stream_info = None;
                 self.last_resume_pts = Some(resume_pts);
                 Ok(resume_pts)
@@ -1378,6 +1456,29 @@ impl Engine {
         Ok(info)
     }
 
+    /// Add a synthetic title media item to the project's library.
+    /// Returns the item's info so the UI can immediately drag it onto
+    /// the timeline. No file is created — the engine renders frames
+    /// from `params` on demand. Errors when no project is loaded.
+    pub fn create_title_media(
+        &mut self,
+        display_name: String,
+        duration_seconds: f64,
+        params: TitleParams,
+    ) -> Result<MediaItemInfo, EngineError> {
+        if self.current_project.is_none() {
+            return Err(EngineError::NoProject);
+        }
+        let duration = seconds_to_rt(duration_seconds.max(0.04));
+        let item = MediaItem::new_title(display_name, duration, params);
+        let id = item.id;
+        let info = MediaItemInfo::from(&item);
+        let project = self.current_project.as_mut().unwrap();
+        project.media.insert(id, Arc::new(item));
+        tracing::info!(id = %id, "created title media");
+        Ok(info)
+    }
+
     /// All media items registered in the current project, for the
     /// Browser panel. Empty when no project is loaded.
     pub fn media_list(&self) -> Vec<MediaItemInfo> {
@@ -1408,12 +1509,13 @@ impl Engine {
         // the clip's timeline/source anchors and effect-derived
         // opacity so the renderer fades the clip if needed.
         let (
-            media_path,
+            resolved,
             source_pts_seconds,
             anchor_timeline_in,
             anchor_source_in,
             anchor_opacity,
             anchor_clip_id,
+            clip_duration_sec,
         ) = {
             let project = self
                 .current_project
@@ -1442,11 +1544,7 @@ impl Engine {
                     next.active
                 }
             };
-            let media = project
-                .media
-                .get(&active.media)
-                .ok_or(EngineError::MediaNotFound)?;
-            let path = media.path.to_string_lossy().into_owned();
+            let resolved = self.media_for_active(active.media)?;
             // Find the source clip's timeline_in for the anchor.
             let (tl_in_sec, src_in_sec) = clip_anchor_seconds(seq, active.clip_id)
                 .unwrap_or((0.0, rt_to_seconds(active.source_pts)));
@@ -1455,14 +1553,45 @@ impl Engine {
             // subsequent frame re-evaluates inside the playback_loop.
             let entry_clip_t = rt_to_seconds(active.source_pts) - src_in_sec;
             let op = clip_opacity_at(seq, active.clip_id, entry_clip_t);
+            // Clip duration on the timeline — needed so title playback
+            // knows when to stop synthesizing frames.
+            let clip_dur = seq
+                .tracks
+                .iter()
+                .find_map(|t| {
+                    t.clips
+                        .iter()
+                        .find(|c| c.id == active.clip_id)
+                        .map(|c| rt_to_seconds(c.duration()))
+                })
+                .unwrap_or(0.0);
             (
-                path,
+                resolved,
                 rt_to_seconds(active.source_pts),
                 tl_in_sec,
                 src_in_sec,
                 op,
                 active.clip_id,
+                clip_dur,
             )
+        };
+
+        // For title clips, take the title-playback branch and skip the
+        // decoder open + audio open + stream-info logic entirely.
+        if let MediaResolved::Title(params) = resolved {
+            return self.play_title_clip(
+                params,
+                anchor_clip_id,
+                anchor_timeline_in,
+                anchor_source_in,
+                source_pts_seconds,
+                anchor_opacity,
+                clip_duration_sec,
+            );
+        }
+        let media_path = match resolved {
+            MediaResolved::File(p) => p,
+            MediaResolved::Title(_) => unreachable!("title handled above"),
         };
 
         // Reopen decoder onto the active clip's media. Idempotent if
@@ -1584,90 +1713,97 @@ impl Engine {
     }
 
     /// Transition-aware single-shot decode + render. Pulls a frame
-    /// from each side's decoder and blends them via the renderer's
-    /// `mix_factor`. Used by `decode_sequence_at` when the timeline
-    /// position is inside an active transition window.
+    /// from each side (decoder or title) and blends them via the
+    /// renderer's `mix_factor`. Used by `decode_sequence_at` when the
+    /// timeline position is inside an active transition window.
     fn decode_transition_at(
         &mut self,
         seq: &Sequence,
         active_tr: vance_timeline::ActiveTransition,
-        timeline_seconds: f64,
+        _timeline_seconds: f64,
     ) -> Result<i64, EngineError> {
-        let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
-        let from_media = project
-            .media
-            .get(&active_tr.from.media)
-            .ok_or(EngineError::MediaNotFound)?;
-        let to_media = project
-            .media
-            .get(&active_tr.to.media)
-            .ok_or(EngineError::MediaNotFound)?;
-        let from_path = from_media.path.to_string_lossy().into_owned();
-        let to_path = to_media.path.to_string_lossy().into_owned();
-        // Effects on the A clip (the outgoing one) drive opacity /
-        // transform / crop / color for the blended result. v1
-        // doesn't try to "interpolate" effects across the transition —
-        // that gets weird fast; we just use A's chain.
+        let from_resolved = self.media_for_active(active_tr.from.media)?;
+        let to_resolved = self.media_for_active(active_tr.to.media)?;
         let from_clip_id = active_tr.from.clip_id;
         let (anchor_tl_in, anchor_src_in) =
             clip_anchor_seconds(seq, from_clip_id).unwrap_or((0.0, 0.0));
-        // Time relative to the from clip's `source_in`, for keyframe eval.
         let from_clip_t = rt_to_seconds(active_tr.from.source_pts) - anchor_src_in;
-        let _ = timeline_seconds; // (kept for future log/diag use)
         let op = clip_opacity_at(seq, from_clip_id, from_clip_t);
         let xform = clip_transform_at(seq, from_clip_id, from_clip_t);
         let crop = clip_crop_at(seq, from_clip_id, from_clip_t);
         let color = clip_brightness_contrast_at(seq, from_clip_id, from_clip_t);
-        // Primary decoder onto A.
-        self.open_file(&from_path)?;
-        let info = self
-            .stream_info
-            .as_ref()
-            .ok_or_else(|| EngineError::Project("stream info missing post-open".into()))?
-            .clone();
-        let (tb_n, tb_d) = info.time_base;
-        let from_src_sec = rt_to_seconds(active_tr.from.source_pts);
-        let from_pts = if tb_n != 0 {
-            (from_src_sec * (tb_d as f64) / (tb_n as f64)).round() as i64
-        } else {
-            0
-        };
+
+        // Resolve A's frame. Decoder path opens the file and seeks;
+        // title path rasterizes from params.
+        let (frame_a, pts_a, anchor_tb): (vance_decoder::FrameData, i64, (i64, i64)) =
+            match from_resolved {
+                MediaResolved::File(from_path) => {
+                    self.open_file(&from_path)?;
+                    let info = self
+                        .stream_info
+                        .as_ref()
+                        .ok_or_else(|| EngineError::Project("stream info missing post-open".into()))?
+                        .clone();
+                    let (tb_n, tb_d) = info.time_base;
+                    let from_src_sec = rt_to_seconds(active_tr.from.source_pts);
+                    let from_pts = if tb_n != 0 {
+                        (from_src_sec * (tb_d as f64) / (tb_n as f64)).round() as i64
+                    } else {
+                        0
+                    };
+                    let dec = self.decoder.as_mut().ok_or(EngineError::NoFileOpen)?;
+                    let frame = dec.decode_at(from_pts)?;
+                    let pts = frame.pts;
+                    (frame, pts, (tb_n, tb_d))
+                }
+                MediaResolved::Title(params) => {
+                    let frame = render_title_yuv420(&params)
+                        .map_err(|e| EngineError::Project(format!("title render: {e}")))?;
+                    (frame, 0, (1, 1000))
+                }
+            };
         self.playing_clip_anchor = Some(ClipAnchor {
             timeline_in_seconds: anchor_tl_in,
             source_in_seconds: anchor_src_in,
-            time_base_num: tb_n,
-            time_base_den: tb_d,
+            time_base_num: anchor_tb.0,
+            time_base_den: anchor_tb.1,
             opacity: op,
         });
-        let dec = self.decoder.as_mut().ok_or(EngineError::NoFileOpen)?;
-        let frame_a = dec.decode_at(from_pts)?;
-        let pts_a = frame_a.pts;
 
-        // Secondary decoder onto B.
-        self.ensure_transition_decoder(&to_path)?;
-        let to_info = self
-            .transition_stream_info
-            .as_ref()
-            .ok_or_else(|| EngineError::Project("transition stream info missing".into()))?
-            .clone();
-        let (to_tb_n, to_tb_d) = to_info.time_base;
-        let to_src_sec = rt_to_seconds(active_tr.to.source_pts);
-        let to_pts = if to_tb_n != 0 {
-            (to_src_sec * (to_tb_d as f64) / (to_tb_n as f64)).round() as i64
-        } else {
-            0
+        // Resolve B's frame. Same dispatch on title vs decoder.
+        let frame_b: vance_decoder::FrameData = match to_resolved {
+            MediaResolved::File(to_path) => {
+                self.ensure_transition_decoder(&to_path)?;
+                let to_info = self
+                    .transition_stream_info
+                    .as_ref()
+                    .ok_or_else(|| {
+                        EngineError::Project("transition stream info missing".into())
+                    })?
+                    .clone();
+                let (to_tb_n, to_tb_d) = to_info.time_base;
+                let to_src_sec = rt_to_seconds(active_tr.to.source_pts);
+                let to_pts = if to_tb_n != 0 {
+                    (to_src_sec * (to_tb_d as f64) / (to_tb_n as f64)).round() as i64
+                } else {
+                    0
+                };
+                let to_dec = self
+                    .transition_decoder
+                    .as_mut()
+                    .expect("ensure_transition_decoder just initialized it");
+                to_dec.decode_at(to_pts)?
+            }
+            MediaResolved::Title(params) => render_title_yuv420(&params)
+                .map_err(|e| EngineError::Project(format!("title render: {e}")))?,
         };
-        let to_dec = self
-            .transition_decoder
-            .as_mut()
-            .expect("ensure_transition_decoder just initialized it");
-        let frame_b = to_dec.decode_at(to_pts)?;
 
         // Push effect uniforms + mix factor to the renderer.
         if let Some(rs) = self.render_state.as_ref() {
             let mut rs = rs.lock();
             rs.renderer.set_opacity(op);
-            rs.renderer.set_transform(xform.translate, xform.scale, xform.rotation_radians);
+            rs.renderer
+                .set_transform(xform.translate, xform.scale, xform.rotation_radians);
             rs.renderer.set_brightness_contrast(color.0, color.1);
             rs.renderer.set_crop(crop[0], crop[1], crop[2], crop[3]);
             rs.renderer.set_mix_factor(active_tr.mix);
@@ -1688,6 +1824,189 @@ impl Engine {
     /// Decode a single frame from the active sequence at
     /// `timeline_seconds` (used by seek-while-paused). Bypasses the
     /// playback scheduler.
+    /// Live playback of a title clip — spawns the playback thread with
+    /// a synthetic `PlaybackPrimary::Title` source. Same chain hooks
+    /// kick in at EOS (when the clip's `duration_seconds` elapses) so
+    /// the next clip on the timeline plays automatically.
+    ///
+    /// `source_pts_seconds` is the entry point inside the clip's
+    /// source range — non-zero when playback resumes mid-title after
+    /// a dissolve. The synthetic loop shrinks its remaining duration
+    /// and the anchor is shifted forward so the timeline mapping
+    /// lands at the correct spot.
+    #[allow(clippy::too_many_arguments)]
+    fn play_title_clip(
+        &mut self,
+        params: TitleParams,
+        anchor_clip_id: vance_timeline::ClipId,
+        anchor_timeline_in: f64,
+        anchor_source_in: f64,
+        source_pts_seconds: f64,
+        anchor_opacity: f32,
+        clip_duration_sec: f64,
+    ) -> Result<(), EngineError> {
+        // Entry offset into the clip's source range. 0 when we start
+        // at the title's beginning; > 0 when chained-in after a
+        // transition that crossed our timeline_in.
+        let entry_offset = (source_pts_seconds - anchor_source_in).max(0.0);
+        let remaining_dur = (clip_duration_sec - entry_offset).max(0.04);
+        // Shift the anchor forward so timeline_t = anchor_timeline_in
+        // at synthetic_pts = 0 lands at the *entry* timeline position,
+        // not at the clip's start.
+        let effective_tl_in = anchor_timeline_in + entry_offset;
+        // Push the clip's effect chain into the renderer for frame 1.
+        let (xform, crop, color, effects) = {
+            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
+            let seq_id = self
+                .current_sequence_id
+                .ok_or(EngineError::NoCurrentSequence)?;
+            let seq = project
+                .sequence(seq_id)
+                .ok_or(EngineError::SequenceNotFound)?;
+            let entry_clip_t = 0.0;
+            let effects = seq
+                .tracks
+                .iter()
+                .find_map(|t| {
+                    t.clips
+                        .iter()
+                        .find(|c| c.id == anchor_clip_id)
+                        .map(|c| c.effects.clone())
+                })
+                .unwrap_or_default();
+            (
+                clip_transform_at(seq, anchor_clip_id, entry_clip_t),
+                clip_crop_at(seq, anchor_clip_id, entry_clip_t),
+                clip_brightness_contrast_at(seq, anchor_clip_id, entry_clip_t),
+                effects,
+            )
+        };
+        if let Some(rs) = self.render_state.as_ref() {
+            let mut rs = rs.lock();
+            rs.renderer.set_opacity(anchor_opacity);
+            rs.renderer
+                .set_transform(xform.translate, xform.scale, xform.rotation_radians);
+            rs.renderer.set_brightness_contrast(color.0, color.1);
+            rs.renderer.set_crop(crop[0], crop[1], crop[2], crop[3]);
+            rs.renderer.set_mix_factor(0.0);
+        }
+        self.playing_clip_anchor = Some(ClipAnchor {
+            timeline_in_seconds: effective_tl_in,
+            // The Title primary always ticks from synthetic_pts = 0,
+            // so the anchor's source_in is the title's own source_in
+            // (typically 0); the loop's frame_sec then equals
+            // "elapsed since entry".
+            source_in_seconds: anchor_source_in,
+            // Title primary's pts_to_sec maps ms → sec (see
+            // `PlaybackPrimary::time_base`), so the anchor must match.
+            time_base_num: 1,
+            time_base_den: 1000,
+            opacity: anchor_opacity,
+        });
+        self.playing_sequence_active = true;
+        self.next_play_effects = effects;
+        self.next_play_source_in_sec = anchor_source_in;
+        self.start_playback_inner(StartPlaybackKind::Title {
+            params,
+            fps: 24.0,
+            duration_seconds: remaining_dur,
+        })
+    }
+
+    /// Single-shot title render — same role as `decode_and_render_at`
+    /// but for synthetic clips. Rasterizes the title via
+    /// `vance_render::render_title_yuv420`, applies the clip's effect
+    /// chain (opacity/transform/crop/color), uploads + presents.
+    /// Returns a synthetic PTS of 0; callers use timeline-seconds
+    /// for the playhead instead of the source PTS.
+    fn decode_title_scrub(
+        &mut self,
+        params: TitleParams,
+        clip_id: vance_timeline::ClipId,
+        anchor_timeline_in: f64,
+        anchor_source_in: f64,
+        source_pts_seconds: f64,
+        opacity: f32,
+    ) -> Result<i64, EngineError> {
+        let frame = render_title_yuv420(&params)
+            .map_err(|e| EngineError::Project(format!("title render: {e}")))?;
+        // Effect chain (transform / crop / color) evaluated at the
+        // clip-relative time. Titles aren't usually animated but we
+        // honor their effects for consistency.
+        let (xform, crop, color) = {
+            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
+            let seq_id = self
+                .current_sequence_id
+                .ok_or(EngineError::NoCurrentSequence)?;
+            let seq = project
+                .sequence(seq_id)
+                .ok_or(EngineError::SequenceNotFound)?;
+            let clip_t = source_pts_seconds - anchor_source_in;
+            (
+                clip_transform_at(seq, clip_id, clip_t),
+                clip_crop_at(seq, clip_id, clip_t),
+                clip_brightness_contrast_at(seq, clip_id, clip_t),
+            )
+        };
+        if let Some(rs) = self.render_state.as_ref() {
+            let mut rs = rs.lock();
+            rs.renderer.set_opacity(opacity);
+            rs.renderer
+                .set_transform(xform.translate, xform.scale, xform.rotation_radians);
+            rs.renderer.set_brightness_contrast(color.0, color.1);
+            rs.renderer.set_crop(crop[0], crop[1], crop[2], crop[3]);
+            rs.renderer.set_mix_factor(0.0);
+        }
+        // Synthetic anchor — titles have no stream time base, so we
+        // pin time_base=(1, 1000) and use timeline seconds as the
+        // "stream pts" surrogate (millisecond resolution). Playback
+        // chain logic does timeline-seconds math against this, so
+        // the chosen base just needs to be consistent.
+        self.playing_clip_anchor = Some(ClipAnchor {
+            timeline_in_seconds: anchor_timeline_in,
+            source_in_seconds: anchor_source_in,
+            time_base_num: 1,
+            time_base_den: 1000,
+            opacity,
+        });
+        let viewport = self.viewport.as_ref().ok_or(EngineError::NoViewport)?.clone();
+        let render_state = self
+            .render_state
+            .as_ref()
+            .ok_or(EngineError::NoViewport)?
+            .clone();
+        upload_and_render(&render_state, &viewport, &frame, self.last_bounds)?;
+        // Use the source-seconds-as-milliseconds for the PTS-like
+        // return value so the UI's "current_timeline_seconds" math
+        // works the same way it does for video clips.
+        let synthetic_pts = (source_pts_seconds * 1000.0).round() as i64;
+        self.last_resume_pts = Some(synthetic_pts);
+        Ok(synthetic_pts)
+    }
+
+    /// Resolve a clip's media to either a file path (for video/image/
+    /// audio) or a title spec (for synthetic clips). Returns the
+    /// path-or-title plus the clip's display kind so callers can
+    /// branch cheaply.
+    fn media_for_active(
+        &self,
+        media_id: MediaItemId,
+    ) -> Result<MediaResolved, EngineError> {
+        let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
+        let media = project
+            .media
+            .get(&media_id)
+            .ok_or(EngineError::MediaNotFound)?;
+        match media.kind {
+            MediaKind::Title => Ok(MediaResolved::Title(
+                media.title.clone().unwrap_or_default(),
+            )),
+            MediaKind::Video | MediaKind::Image | MediaKind::Audio => {
+                Ok(MediaResolved::File(media.path.to_string_lossy().into_owned()))
+            }
+        }
+    }
+
     pub fn decode_sequence_at(&mut self, timeline_seconds: f64) -> Result<i64, EngineError> {
         self.pause_for_edit();
         // If we're inside a transition window, render via the dual-
@@ -1723,7 +2042,7 @@ impl Engine {
             rs.renderer.set_mix_factor(0.0);
         }
         let (
-            media_path,
+            resolved,
             source_pts_seconds,
             anchor_timeline_in,
             anchor_source_in,
@@ -1748,23 +2067,35 @@ impl Engine {
                     next.active
                 }
             };
-            let media = project
-                .media
-                .get(&active.media)
-                .ok_or(EngineError::MediaNotFound)?;
+            let resolved = self.media_for_active(active.media)?;
             let (tl_in, src_in) = clip_anchor_seconds(seq, active.clip_id)
                 .unwrap_or((0.0, rt_to_seconds(active.source_pts)));
             // Clip-relative time for keyframe eval at this seek.
             let entry_clip_t = rt_to_seconds(active.source_pts) - src_in;
             let op = clip_opacity_at(seq, active.clip_id, entry_clip_t);
             (
-                media.path.to_string_lossy().into_owned(),
+                resolved,
                 rt_to_seconds(active.source_pts),
                 tl_in,
                 src_in,
                 op,
                 active.clip_id,
             )
+        };
+        // For title clips: render procedurally and bypass the decoder.
+        if let MediaResolved::Title(params) = resolved {
+            return self.decode_title_scrub(
+                params,
+                anchor_clip_id,
+                anchor_timeline_in,
+                anchor_source_in,
+                source_pts_seconds,
+                anchor_opacity,
+            );
+        }
+        let media_path = match resolved {
+            MediaResolved::File(p) => p,
+            MediaResolved::Title(_) => unreachable!("title handled above"),
         };
         self.open_file(&media_path)?;
         let (xform_for_decode, crop_for_decode, color_for_decode) = {
@@ -2362,8 +2693,13 @@ pub struct SequencePlaybackContext {
     /// cross-thread locking on the engine.
     pub sequence: Sequence,
     /// Resolves `MediaItemId` (from `ActiveTransition.to.media`) to a
-    /// filesystem path the secondary decoder can open.
+    /// filesystem path the secondary decoder can open. Title media
+    /// has no path; its `MediaItemId` instead lands in `title_params`.
     pub media_paths: std::collections::HashMap<MediaItemId, PathBuf>,
+    /// Title parameters for synthetic (no-file) media items. When a
+    /// transition's B-side media is in here, the loop renders the
+    /// title frame inline instead of using the secondary decoder.
+    pub title_params: std::collections::HashMap<MediaItemId, TitleParams>,
     /// Path to the decoder binary used to spawn the secondary sidecar
     /// lazily on first transition entry.
     pub decoder_bin: PathBuf,
@@ -2454,16 +2790,89 @@ fn locate_audio_binary() -> Result<PathBuf, EngineError> {
 
 /// Background scheduler. Pulls frames from the decoder in PTS order;
 /// for each, presents at the right time relative to the **audio clock**
+/// What the playback loop is driving on the primary side.
+/// Cross-dissolves between titles and video need both variants to be
+/// first-class, otherwise live playback would have to break out at
+/// every title/video boundary.
+pub enum PlaybackPrimary {
+    /// A real video clip — frames stream from the FFmpeg sidecar.
+    Decoder {
+        /// The sidecar client. The loop calls `next_frame()` each iteration.
+        client: DecoderClient,
+        /// Stream info captured at open time, drives PTS→seconds math.
+        info: StreamInfo,
+        /// First PTS the stream was started at (logged + used by the
+        /// loop's pre-arm consistency checks).
+        from_pts: i64,
+    },
+    /// A synthetic title clip — frames are rasterized once on the
+    /// host side, then re-presented at `fps` cadence until the clip's
+    /// `duration_seconds` elapses (synthetic EOS).
+    Title {
+        /// Pre-rasterized YUV frame; the loop reuses it every tick.
+        /// Its `pts` field is rewritten in place each iteration.
+        frame: vance_decoder::FrameData,
+        /// Playback frame rate.
+        fps: f64,
+        /// Total duration of the title clip on the timeline.
+        duration_seconds: f64,
+    },
+}
+
+impl PlaybackPrimary {
+    /// `(time_base_num, time_base_den)` for converting the primary's
+    /// PTS values back to seconds. Title primaries fake one at
+    /// `(1, 1000)` so milliseconds round-trip cleanly.
+    fn time_base(&self) -> (i64, i64) {
+        match self {
+            PlaybackPrimary::Decoder { info, .. } => info.time_base,
+            PlaybackPrimary::Title { .. } => (1, 1000),
+        }
+    }
+
+    /// Initial PTS — 0 for synthetic, the stream's chosen start
+    /// otherwise. Logged only; the loop's own per-frame timing
+    /// derives from the actual frame PTS.
+    fn from_pts(&self) -> i64 {
+        match self {
+            PlaybackPrimary::Decoder { from_pts, .. } => *from_pts,
+            PlaybackPrimary::Title { .. } => 0,
+        }
+    }
+
+    /// On thread exit, the engine wants the DecoderClient back so it
+    /// can reuse the open file for single-shot decodes. Title
+    /// primaries have no DecoderClient — the engine's slot stays as
+    /// it was before playback.
+    fn into_decoder(self) -> Option<DecoderClient> {
+        match self {
+            PlaybackPrimary::Decoder { client, .. } => Some(client),
+            PlaybackPrimary::Title { .. } => None,
+        }
+    }
+}
+
+/// What `playback_loop` returns when it exits — bundles the reclaimed
+/// primary + secondary decoders for the engine to put back into its
+/// own slots.
+pub struct PlaybackLoopOutput {
+    /// The primary decoder, when one was in use. `None` after title
+    /// playback so the engine's `decoder` slot is left untouched.
+    pub primary_decoder: Option<DecoderClient>,
+    /// Warm secondary used during dissolves, plus its currently-open
+    /// path. Both `None` when no transition was crossed.
+    pub secondary_decoder: Option<DecoderClient>,
+    pub secondary_media_path: Option<String>,
+}
+
 /// (when present) or wall clock (audio missing/failed).
 ///
-/// Returns the `DecoderClient` so the engine can resume single-shot use,
-/// plus the (optional) secondary decoder used during cross-dissolves so
-/// the engine can hold onto a warm sidecar for the next playback.
+/// Returns a `PlaybackLoopOutput` so the engine can reclaim both
+/// decoders (primary if it was a real video, plus the secondary warm
+/// from any dissolves crossed during this session).
 #[allow(clippy::too_many_arguments)]
 fn playback_loop(
-    mut decoder: DecoderClient,
-    info: StreamInfo,
-    from_pts: i64,
+    mut primary: PlaybackPrimary,
     initial_bounds: ViewportBounds,
     viewport: Arc<Viewport>,
     render_state: Arc<Mutex<RenderState>>,
@@ -2496,9 +2905,10 @@ fn playback_loop(
     // before playback). Used to skip a re-open when scrubbing /
     // playing through the same B media repeatedly.
     mut transition_media_path: Option<String>,
-) -> (DecoderClient, Option<DecoderClient>, Option<String>) {
-    // Stream-time-base → seconds: pts * tb_num / tb_den.
-    let (tb_num, tb_den) = info.time_base;
+) -> PlaybackLoopOutput {
+    // Stream-time-base → seconds. For Decoder primaries this is
+    // their time_base; for Title primaries the synthetic 1/fps tick.
+    let (tb_num, tb_den) = primary.time_base();
     let pts_to_sec = |pts: i64| -> f64 {
         if tb_den == 0 {
             0.0
@@ -2506,6 +2916,7 @@ fn playback_loop(
             (pts as f64) * (tb_num as f64) / (tb_den as f64)
         }
     };
+    let from_pts = primary.from_pts();
 
     // Anchor wall clock to the moment we receive the FIRST frame, mapped
     // to its PTS. Subsequent frames' target time = anchor + (pts - first).
@@ -2536,20 +2947,67 @@ fn playback_loop(
     // false (resetting the renderer's mix factor) when we leave.
     let mut in_transition = false;
 
+    // Title-mode synthetic pacing. We tick the title's PTS forward by
+    // `1000 / fps` ms per loop iteration, treating each tick as one
+    // "frame" presentation. EOS hits when total_seconds >=
+    // duration_seconds.
+    let mut title_tick_ms: i64 = 0;
+
     loop {
         if stop.load(Ordering::Acquire) {
             break;
         }
-        let frame = match decoder.next_frame() {
-            Ok(Some(f)) => f,
-            Ok(None) => {
-                tracing::info!("playback: end of stream");
-                ended_at_eos.store(true, Ordering::Release);
-                break;
-            }
-            Err(e) => {
-                tracing::error!(?e, "playback: decoder error");
-                break;
+        // Borrow the frame to present this iteration. For Decoder we
+        // pull from the sidecar; for Title we tick the pre-rendered
+        // frame's PTS forward and present it again.
+        let frame: vance_decoder::FrameData = match &mut primary {
+            PlaybackPrimary::Decoder { client, .. } => match client.next_frame() {
+                Ok(Some(f)) => f,
+                Ok(None) => {
+                    tracing::info!("playback: end of stream");
+                    ended_at_eos.store(true, Ordering::Release);
+                    break;
+                }
+                Err(e) => {
+                    tracing::error!(?e, "playback: decoder error");
+                    break;
+                }
+            },
+            PlaybackPrimary::Title {
+                frame,
+                fps,
+                duration_seconds,
+            } => {
+                let tick_dt_ms = (1000.0 / fps.max(1.0)).round() as i64;
+                frame.pts = title_tick_ms;
+                let elapsed_sec = (title_tick_ms as f64) / 1000.0;
+                title_tick_ms = title_tick_ms.saturating_add(tick_dt_ms);
+                if elapsed_sec >= *duration_seconds {
+                    tracing::info!(
+                        elapsed_sec,
+                        duration_seconds = *duration_seconds,
+                        "playback: title duration reached"
+                    );
+                    ended_at_eos.store(true, Ordering::Release);
+                    // Tell the chain to resume just past our
+                    // timeline_out so scene_at picks up whatever
+                    // clip starts at the same moment. The
+                    // `next_clip_start_seconds` fallback uses strict
+                    // `>` and would otherwise miss an exactly-abutting
+                    // neighbor. (Skip if the transition-exit branch
+                    // already parked a resume target.)
+                    if chain_resume_micros.load(Ordering::Acquire) == i64::MIN {
+                        if let Some(ctx) = seq_ctx.as_ref() {
+                            let end_t = ctx.anchor_timeline_in
+                                + (elapsed_sec - ctx.anchor_source_in);
+                            let resume_micros =
+                                (end_t * 1_000_000.0).round() as i64 + 1000;
+                            chain_resume_micros.store(resume_micros, Ordering::Release);
+                        }
+                    }
+                    break;
+                }
+                frame.clone()
             }
         };
         let frame_sec = pts_to_sec(frame.pts);
@@ -2632,8 +3090,27 @@ fn playback_loop(
             let timeline_sec = ctx.anchor_timeline_in + (frame_sec - ctx.anchor_source_in);
             let timeline_rt = seconds_to_rt(timeline_sec);
             if let Some(at) = vance_timeline::transition_at(&ctx.sequence, timeline_rt) {
-                // Resolve B's filesystem path.
-                if let Some(b_path) = ctx.media_paths.get(&at.to.media) {
+                // First branch: if the B-side media is a title, render
+                // it procedurally and skip the secondary decoder entirely.
+                if let Some(b_title) = ctx.title_params.get(&at.to.media) {
+                    match render_title_yuv420(b_title) {
+                        Ok(mut f) => {
+                            // Synthetic PTS for B — tied to the
+                            // transition's mix so the engine logs are
+                            // useful; not actually consumed downstream.
+                            f.pts = (at.mix as f64 * 1_000_000.0) as i64;
+                            active_b_frame = Some(f);
+                            active_mix = at.mix;
+                            in_transition = true;
+                            let resume_micros =
+                                (timeline_sec * 1_000_000.0).round() as i64;
+                            chain_resume_micros.store(resume_micros, Ordering::Release);
+                        }
+                        Err(e) => {
+                            tracing::warn!(?e, "transition: title B render failed");
+                        }
+                    }
+                } else if let Some(b_path) = ctx.media_paths.get(&at.to.media) {
                     let b_path_str = b_path.to_string_lossy().into_owned();
                     // Spawn the secondary sidecar on first use.
                     if transition_decoder.is_none() {
@@ -2765,11 +3242,16 @@ fn playback_loop(
     }
     tracing::info!(frames_presented, total_drops, "playback: thread exiting");
 
-    let _ = decoder.stop_stream();
-    // Return the warm secondary + its currently-open path so the
-    // engine can re-use it on the next session without re-opening
-    // the same B-side media.
-    (decoder, transition_decoder, transition_media_path)
+    // Stop the primary's stream (decoder only — title primaries have
+    // nothing to stop) and return whatever we own back to the engine.
+    if let PlaybackPrimary::Decoder { client, .. } = &mut primary {
+        let _ = client.stop_stream();
+    }
+    PlaybackLoopOutput {
+        primary_decoder: primary.into_decoder(),
+        secondary_decoder: transition_decoder,
+        secondary_media_path: transition_media_path,
+    }
 }
 
 /// Source-monitor variant of `upload_and_render` — uses the Source

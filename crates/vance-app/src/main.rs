@@ -423,6 +423,32 @@ fn remove_effect_from_clip(
 }
 
 #[tauri::command]
+fn create_title_media(
+    state: tauri::State<'_, EngineHandle>,
+    display_name: String,
+    duration_seconds: f64,
+    text: String,
+    size_px: f32,
+    fg_rgb: [f32; 3],
+    bg_rgb: [f32; 3],
+    width: u32,
+    height: u32,
+) -> Result<MediaItemInfo, String> {
+    let params = vance_timeline::TitleParams {
+        text,
+        size_px,
+        fg: fg_rgb,
+        bg: bg_rgb,
+        width,
+        height,
+    };
+    state
+        .lock()
+        .create_title_media(display_name, duration_seconds, params)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn add_transition_at_cut(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -632,6 +658,7 @@ fn main() {
             update_effect_param,
             add_transition_at_cut,
             remove_transition,
+            create_title_media,
             trim_clip_in,
             trim_clip_out,
             play_sequence,

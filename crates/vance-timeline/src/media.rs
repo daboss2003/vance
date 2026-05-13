@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use vance_core::{FrameRate, RationalTime};
 
 use crate::id::MediaItemId;
+use crate::title::TitleParams;
 
 /// What kind of asset this media item represents. Drives which tracks
 /// can host clips that reference it.
@@ -22,6 +23,9 @@ pub enum MediaKind {
     Audio,
     /// Still image; usable on video tracks (treated as a held frame).
     Image,
+    /// Synthetic title — parameter-driven, no file backing. Its
+    /// `path` is empty; the engine reads `title` for rasterization.
+    Title,
 }
 
 /// A 32-byte content hash used for relink-by-content. We only require it
@@ -30,12 +34,13 @@ pub enum MediaKind {
 pub type ContentHash = [u8; 32];
 
 /// One source asset registered in the project's media library.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MediaItem {
     /// Stable ID; survives save/load.
     pub id: MediaItemId,
     /// Path on disk. Stored as written by the user; the bundle
-    /// serializer is responsible for any relativization.
+    /// serializer is responsible for any relativization. Empty for
+    /// synthetic media (titles).
     pub path: PathBuf,
     /// Human-readable name shown in the browser. Defaults to the file
     /// stem when not explicitly set.
@@ -49,6 +54,11 @@ pub struct MediaItem {
     /// BLAKE3 / SHA256 of the file contents, when computed. Used for
     /// relink-by-content if the file moves.
     pub content_hash: Option<ContentHash>,
+    /// Parameters for synthetic titles. Set when `kind == Title`,
+    /// `None` otherwise. `#[serde(default)]` so older projects round-
+    /// trip without this field.
+    #[serde(default)]
+    pub title: Option<TitleParams>,
 }
 
 impl MediaItem {
@@ -67,6 +77,27 @@ impl MediaItem {
             duration,
             frame_rate: None,
             content_hash: None,
+            title: None,
+        }
+    }
+
+    /// Construct a synthetic title media item. The library entry has
+    /// no file backing — the engine renders frames from `params`
+    /// directly. Title media defaults to 24 fps for chain timing.
+    pub fn new_title(
+        display_name: impl Into<String>,
+        duration: RationalTime,
+        params: TitleParams,
+    ) -> Self {
+        Self {
+            id: MediaItemId::new(),
+            path: PathBuf::new(),
+            display_name: display_name.into(),
+            kind: MediaKind::Title,
+            duration,
+            frame_rate: Some(vance_core::FrameRate::FPS_24),
+            content_hash: None,
+            title: Some(params),
         }
     }
 

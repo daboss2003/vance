@@ -11,11 +11,15 @@ publish = false
 [dependencies]
 vance-core = { workspace = true }
 vance-decoder = { workspace = true }
+vance-timeline = { workspace = true }
 wgpu = "29"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Pure-Rust glyph rasterizer used by the title renderer. Loads a
+# system font lazily (see `title::system_font_candidates`).
+fontdue = "0.9"
 
 [dev-dependencies]
 # For the headless golden-frame test we just need the renderer to map
