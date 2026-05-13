@@ -123,6 +123,17 @@ struct RenderParams {
     /// `direction > 0` keeps pixels *above* threshold and < 0 keeps
     /// pixels below.
     luma_key: [f32; 4],
+    /// Color-pipeline flags packed as a `vec4<u32>` in WGSL —
+    /// `(input_transfer, output_transfer, input_range, output_range)`.
+    /// Transfer / range IDs match `vance_color::pipeline`.
+    pipeline_flags: [u32; 4],
+    /// Linear-RGB matrix: input primaries → working primaries.
+    /// Stored as 3 rows × 4 cols (4th col padding) so the WGSL side
+    /// can read it as `array<vec4<f32>, 3>`. Identity when input
+    /// primaries already match working primaries.
+    pipeline_in_to_working: [[f32; 4]; 3],
+    /// Linear-RGB matrix: working primaries → output primaries.
+    pipeline_working_to_out: [[f32; 4]; 3],
 }
 
 impl Default for RenderParams {
@@ -140,8 +151,44 @@ impl Default for RenderParams {
             chroma_key: [0.0; 4],
             chroma_params: [0.1, 0.05, 0.0, 0.0],
             luma_key: [0.5, 1.0, 0.05, 0.0],
+            // Default = "Rec.709-limited → linear Rec.709 → sRGB"
+            // (matches the unwritten Phase 1-5 assumption). Transfer
+            // 2 = Rec709, 1 = sRGB; range 0 = Limited, 1 = Full.
+            pipeline_flags: [2, 1, 0, 1],
+            pipeline_in_to_working: identity_row3(),
+            pipeline_working_to_out: identity_row3(),
         }
     }
+}
+
+#[inline]
+fn identity_row3() -> [[f32; 4]; 3] {
+    [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ]
+}
+
+#[inline]
+fn matrix_to_row3(t: &vance_color::Transform) -> [[f32; 4]; 3] {
+    [
+        [t.0[0][0], t.0[0][1], t.0[0][2], 0.0],
+        [t.0[1][0], t.0[1][1], t.0[1][2], 0.0],
+        [t.0[2][0], t.0[2][1], t.0[2][2], 0.0],
+    ]
+}
+
+#[inline]
+fn matrices_equal(a: &[[f32; 4]; 3], b: &[[f32; 4]; 3]) -> bool {
+    for r in 0..3 {
+        for c in 0..3 {
+            if (a[r][c] - b[r][c]).abs() > 1e-6 {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 impl Renderer {
@@ -419,6 +466,38 @@ impl Renderer {
     /// incoming, depending on direction) clip while A holds the other.
     pub fn upload_frame_b(&mut self, frame: &FrameData) -> Result<(), RenderError> {
         self.upload_frame_inner(frame, true)
+    }
+
+    /// Push the color-pipeline params (Phase 6.3). These come from
+    /// `vance_color::PipelineParams::compute()` and drive the
+    /// shader's linearize → primary-change → encode chain. If the
+    /// caller doesn't update them, the renderer keeps using whatever
+    /// was last set (defaulting to Rec.709 limited → linear Rec.709
+    /// → sRGB, which matches the pre-Phase-6 behavior).
+    pub fn set_pipeline(&mut self, params: vance_color::PipelineParams) {
+        let new_flags = [
+            params.input_transfer,
+            params.output_transfer,
+            params.input_range,
+            params.output_range,
+        ];
+        let in_to_working = matrix_to_row3(&params.input_to_working);
+        let working_to_out = matrix_to_row3(&params.working_to_output);
+        let same_flags = (0..4).all(|i| self.current_params.pipeline_flags[i] == new_flags[i]);
+        let same_in = matrices_equal(&self.current_params.pipeline_in_to_working, &in_to_working);
+        let same_out =
+            matrices_equal(&self.current_params.pipeline_working_to_out, &working_to_out);
+        if same_flags && same_in && same_out {
+            return;
+        }
+        self.current_params.pipeline_flags = new_flags;
+        self.current_params.pipeline_in_to_working = in_to_working;
+        self.current_params.pipeline_working_to_out = working_to_out;
+        self.queue.write_buffer(
+            &self.params_buffer,
+            0,
+            bytemuck::cast_slice(&[self.current_params]),
+        );
     }
 
     /// Set the chroma-key params. `enable = 0.0` turns the effect off

@@ -1117,6 +1117,22 @@ impl Engine {
         // Source monitor renders the raw media — reset the params the
         // Record-side sequence playback may have left on the renderer
         // so opacity/crop/transform/color/mix/keys don't bleed into Source.
+        // Pipeline: source's tagged input → linear Rec.709 (a sane
+        // intermediate; the source preview doesn't honor the project
+        // working space) → sRGB.
+        let source_pipeline = self.source_media_id.and_then(|id| {
+            let project = self.current_project.as_ref()?;
+            let media = project.media.get(&id)?;
+            let input = media
+                .input_color_space
+                .unwrap_or(vance_color::ColorSpace::Rec709Limited);
+            vance_color::Pipeline {
+                input,
+                working: vance_color::ColorSpace::LinearRec709,
+                output: vance_color::ColorSpace::Srgb,
+            }
+            .to_params()
+        });
         {
             let mut rs = render_state.lock();
             rs.renderer.set_opacity(1.0);
@@ -1126,6 +1142,9 @@ impl Engine {
             rs.renderer.set_mix_factor(0.0);
             rs.renderer.set_chroma_key([0.0, 1.0, 0.0], 0.15, 0.05, 0.0);
             rs.renderer.set_luma_key(0.5, 1.0, 0.05, 0.0);
+            if let Some(params) = source_pipeline {
+                rs.renderer.set_pipeline(params);
+            }
         }
         upload_and_render_source(&render_state, &viewport, &frame, bounds)?;
         self.source_last_pts = Some(pts);
@@ -1810,6 +1829,24 @@ impl Engine {
                 .unwrap_or_default();
             (xform, crop, color, chroma, luma, effects)
         };
+        let entry_pipeline = {
+            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
+            let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+            let seq = project
+                .sequence(seq_id)
+                .ok_or(EngineError::SequenceNotFound)?;
+            let media_id = seq
+                .tracks
+                .iter()
+                .find_map(|t| {
+                    t.clips
+                        .iter()
+                        .find(|c| c.id == anchor_clip_id)
+                        .map(|c| c.media)
+                })
+                .ok_or(EngineError::Project("clip not found".into()))?;
+            self.pipeline_for_media(media_id)
+        };
         if let Some(rs) = self.render_state.as_ref() {
             let mut rs = rs.lock();
             rs.renderer.set_opacity(anchor_opacity);
@@ -1833,6 +1870,9 @@ impl Engine {
                 entry_luma.2,
                 entry_luma.3,
             );
+            if let Some(p) = entry_pipeline {
+                rs.renderer.set_pipeline(p);
+            }
         }
 
         // Convert source-seconds → stream-time-base PTS.
@@ -1998,7 +2038,13 @@ impl Engine {
                 .map_err(|e| EngineError::Project(format!("title render: {e}")))?,
         };
 
-        // Push effect uniforms + mix factor to the renderer.
+        // Push effect uniforms + mix factor to the renderer. The
+        // pipeline params follow A's media (the outgoing side) — v1
+        // limitation: if A and B have different input color spaces,
+        // B's frames pass through A's pipeline, which can tint the
+        // transition window slightly. Two-sided pipelines are a
+        // future shader extension.
+        let a_pipeline = self.pipeline_for_media(active_tr.from.media);
         if let Some(rs) = self.render_state.as_ref() {
             let mut rs = rs.lock();
             rs.renderer.set_opacity(op);
@@ -2009,6 +2055,9 @@ impl Engine {
             rs.renderer.set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
             rs.renderer.set_luma_key(luma.0, luma.1, luma.2, luma.3);
             rs.renderer.set_mix_factor(active_tr.mix);
+            if let Some(p) = a_pipeline {
+                rs.renderer.set_pipeline(p);
+            }
             rs.renderer.upload_frame_b(&frame_b)?;
         }
 
@@ -2085,6 +2134,12 @@ impl Engine {
                 effects,
             )
         };
+        let title_pipeline = vance_color::Pipeline {
+            input: vance_color::ColorSpace::Srgb,
+            working: self.project_working_space(),
+            output: vance_color::ColorSpace::Srgb,
+        }
+        .to_params();
         if let Some(rs) = self.render_state.as_ref() {
             let mut rs = rs.lock();
             rs.renderer.set_opacity(anchor_opacity);
@@ -2095,6 +2150,9 @@ impl Engine {
             rs.renderer.set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
             rs.renderer.set_luma_key(luma.0, luma.1, luma.2, luma.3);
             rs.renderer.set_mix_factor(0.0);
+            if let Some(p) = title_pipeline {
+                rs.renderer.set_pipeline(p);
+            }
         }
         self.playing_clip_anchor = Some(ClipAnchor {
             timeline_in_seconds: effective_tl_in,
@@ -2156,6 +2214,14 @@ impl Engine {
                 clip_luma_key_at(seq, clip_id, clip_t),
             )
         };
+        // Title media is tagged sRGB; route it through the project
+        // working space so it matches the rest of the timeline.
+        let title_pipeline = vance_color::Pipeline {
+            input: vance_color::ColorSpace::Srgb,
+            working: self.project_working_space(),
+            output: vance_color::ColorSpace::Srgb,
+        }
+        .to_params();
         if let Some(rs) = self.render_state.as_ref() {
             let mut rs = rs.lock();
             rs.renderer.set_opacity(opacity);
@@ -2166,6 +2232,9 @@ impl Engine {
             rs.renderer.set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
             rs.renderer.set_luma_key(luma.0, luma.1, luma.2, luma.3);
             rs.renderer.set_mix_factor(0.0);
+            if let Some(p) = title_pipeline {
+                rs.renderer.set_pipeline(p);
+            }
         }
         // Synthetic anchor — titles have no stream time base, so we
         // pin time_base=(1, 1000) and use timeline seconds as the
@@ -2192,6 +2261,39 @@ impl Engine {
         let synthetic_pts = (source_pts_seconds * 1000.0).round() as i64;
         self.last_resume_pts = Some(synthetic_pts);
         Ok(synthetic_pts)
+    }
+
+    /// Working color space currently active on the project. Falls
+    /// back to LinearRec709 when no project is loaded (single-file
+    /// Open File… playback path).
+    fn project_working_space(&self) -> vance_color::ColorSpace {
+        self.current_project
+            .as_ref()
+            .map(|p| p.working_color_space)
+            .unwrap_or(vance_color::ColorSpace::LinearRec709)
+    }
+
+    /// Build the color-pipeline params for a given media item, using
+    /// the project's working space as the intermediate and sRGB as
+    /// the output (matches the viewport's Rgba8UnormSrgb surface).
+    /// Returns `None` when the result would route through an HDR /
+    /// log transfer the built-in path can't handle yet — the OCIO
+    /// shim (6.1b) will fill that in.
+    fn pipeline_for_media(
+        &self,
+        media_id: MediaItemId,
+    ) -> Option<vance_color::PipelineParams> {
+        let project = self.current_project.as_ref()?;
+        let media = project.media.get(&media_id)?;
+        let input = media
+            .input_color_space
+            .unwrap_or(vance_color::ColorSpace::Rec709Limited);
+        let pipeline = vance_color::Pipeline {
+            input,
+            working: project.working_color_space,
+            output: vance_color::ColorSpace::Srgb,
+        };
+        pipeline.to_params()
     }
 
     /// Resolve a clip's media to either a file path (for video/image/
@@ -2307,6 +2409,27 @@ impl Engine {
             MediaResolved::File(p) => p,
             MediaResolved::Title(_) => unreachable!("title handled above"),
         };
+        // Resolve and push the color pipeline for this clip's media
+        // before opening the file — render state stays consistent if
+        // open_file fails later.
+        let pipeline_params = {
+            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
+            let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+            let seq = project
+                .sequence(seq_id)
+                .ok_or(EngineError::SequenceNotFound)?;
+            let media_id = seq
+                .tracks
+                .iter()
+                .find_map(|t| {
+                    t.clips
+                        .iter()
+                        .find(|c| c.id == anchor_clip_id)
+                        .map(|c| c.media)
+                })
+                .ok_or(EngineError::Project("clip not found".into()))?;
+            self.pipeline_for_media(media_id)
+        };
         self.open_file(&media_path)?;
         let (xform_for_decode, crop_for_decode, color_for_decode, chroma_for_decode, luma_for_decode) = {
             let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
@@ -2350,6 +2473,9 @@ impl Engine {
                 luma_for_decode.2,
                 luma_for_decode.3,
             );
+            if let Some(p) = pipeline_params {
+                rs.renderer.set_pipeline(p);
+            }
         }
         let info = self
             .stream_info

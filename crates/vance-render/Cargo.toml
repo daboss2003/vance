@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 vance-core = { workspace = true }
+vance-color = { workspace = true }
 vance-decoder = { workspace = true }
 vance-timeline = { workspace = true }
 wgpu = "29"

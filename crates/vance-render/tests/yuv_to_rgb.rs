@@ -72,22 +72,18 @@ fn assert_rgb_close(got: [u8; 4], want_rgb: [u8; 3], tol: i32, label: &str) {
     );
 }
 
-/// Apply the same Rec.709 limited-range conversion the shader does, then
-/// the sRGB OETF (since the target texture is `Rgba8UnormSrgb`, wgpu
-/// gamma-encodes the linear-light fragment output before storing).
+/// Model the Phase-6.3 pipeline end-to-end and predict the byte the
+/// renderer should produce:
+/// 1. YUV → R'G'B' (Rec.709 matrix, limited-range expansion).
+/// 2. Linearize via Rec.709 inverse OETF.
+/// 3. Working == input primaries == Rec.709, so no matrix change.
+/// 4. Surface format `Rgba8UnormSrgb` applies sRGB OETF on store.
 ///
-/// Wait — the shader writes gamma-encoded R'G'B' directly (no linearization),
-/// and the Srgb target reinterprets stored bytes as gamma-encoded. So writing
-/// `r'g'b'` *to* an Srgb target actually inverts: the shader must output
-/// linear-light values for the storage to come out as r'g'b'. The shader as
-/// written produces R'G'B' (NOT linearized), so the read-back will be the
-/// shader's `r,g,b` lifted into sRGB-encoded space — i.e. it's been
-/// *linearized then re-encoded* by wgpu, which round-trips visually but
-/// shifts the byte values.
-///
-/// Concretely: shader writes `c` (where `c` is intended as gamma-encoded);
-/// wgpu treats that as linear, applies sRGB OETF on store. So stored byte
-/// = sRGB-encode(c). To predict the read-back, apply the OETF here too.
+/// Pre-6.3 the shader skipped step 2 — bytes were "double-encoded"
+/// (gamma → treated-as-linear → re-encoded). Visuals approximately
+/// matched because Rec.709 and sRGB transfer curves are close, but
+/// midtone bytes drifted. After 6.3 the math is right; the
+/// `renders_solid_red_yuv420p` test caught the difference.
 fn yuv709_limited_to_srgb_byte(y: u8, u: u8, v: u8) -> [u8; 3] {
     let yf = (y as f32 - 16.0) / 219.0;
     let uf = (u as f32 - 128.0) / 224.0;
@@ -95,7 +91,18 @@ fn yuv709_limited_to_srgb_byte(y: u8, u: u8, v: u8) -> [u8; 3] {
     let r = (yf + 1.5748 * vf).clamp(0.0, 1.0);
     let g = (yf - 0.1873 * uf - 0.4681 * vf).clamp(0.0, 1.0);
     let b = (yf + 1.8556 * uf).clamp(0.0, 1.0);
-    [srgb_oetf(r), srgb_oetf(g), srgb_oetf(b)]
+    let r_lin = rec709_inv_oetf(r);
+    let g_lin = rec709_inv_oetf(g);
+    let b_lin = rec709_inv_oetf(b);
+    [srgb_oetf(r_lin), srgb_oetf(g_lin), srgb_oetf(b_lin)]
+}
+
+fn rec709_inv_oetf(encoded: f32) -> f32 {
+    if encoded < 0.081 {
+        encoded / 4.5
+    } else {
+        ((encoded + 0.099) / 1.099).powf(1.0 / 0.45)
+    }
 }
 
 fn srgb_oetf(linear: f32) -> u8 {

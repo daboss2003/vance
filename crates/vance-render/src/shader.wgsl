@@ -54,19 +54,71 @@ struct Params {
     // (threshold, direction, softness, enable). direction > 0 keeps
     // bright pixels, < 0 keeps dark ones.
     luma_key: vec4<f32>,
+    // (input_transfer, output_transfer, input_range, output_range)
+    // — IDs match vance_color::pipeline.
+    pipeline_flags: vec4<u32>,
+    // 3×3 linear-RGB matrices stored as 3 rows × 4 cols (last col
+    // padding). Maps input primaries → working, then working → out.
+    pipeline_in_to_working: array<vec4<f32>, 3>,
+    pipeline_working_to_out: array<vec4<f32>, 3>,
 };
 @group(0) @binding(4) var<uniform> params: Params;
 
-fn yuv_to_rgb(y_raw: f32, u_raw: f32, v_raw: f32) -> vec3<f32> {
-    // Rec.709 limited-range expansion.
-    let y = (y_raw - 16.0 / 255.0) * (255.0 / 219.0);
-    let u = (u_raw - 128.0 / 255.0) * (255.0 / 224.0);
-    let v = (v_raw - 128.0 / 255.0) * (255.0 / 224.0);
-    // Rec.709 Y'CbCr → R'G'B' (gamma-encoded; not linearized).
+fn yuv_to_rgb(y_raw: f32, u_raw: f32, v_raw: f32, range: u32) -> vec3<f32> {
+    // Range expansion. Limited (0): Y' ∈ [16, 235], chroma ∈ [16, 240].
+    // Full (1): pass through.
+    var y: f32;
+    var u: f32;
+    var v: f32;
+    if (range == 0u) {
+        y = (y_raw - 16.0 / 255.0) * (255.0 / 219.0);
+        u = (u_raw - 128.0 / 255.0) * (255.0 / 224.0);
+        v = (v_raw - 128.0 / 255.0) * (255.0 / 224.0);
+    } else {
+        y = y_raw;
+        u = u_raw - 128.0 / 255.0;
+        v = v_raw - 128.0 / 255.0;
+    }
+    // Rec.709 Y'CbCr → R'G'B' (gamma-encoded; transfer applied
+    // separately by `linearize`). v1 assumes all YUV inputs use the
+    // 709 matrix; a 2020-coefficient matrix can be picked up via the
+    // input primaries flag in a later refinement.
     let r = y + 1.5748 * v;
     let g = y - 0.1873 * u - 0.4681 * v;
     let b = y + 1.8556 * u;
     return clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// Transfer-function IDs — keep in sync with vance_color::pipeline.
+// 0 = Linear, 1 = sRGB, 2 = Rec.709, 3 = Rec.2020,
+// 4 = PQ, 5 = HLG, 6 = ACEScct. v1 ships 0/1/2/3; 4/5/6 fall through
+// as passthrough (Phase 6.1b's OCIO path handles them).
+fn linearize(rgb: vec3<f32>, id: u32) -> vec3<f32> {
+    if (id == 1u) {
+        // sRGB inverse EOTF. Piecewise: linear toe below 0.04045,
+        // pow((v + 0.055) / 1.055, 2.4) above.
+        let toe = rgb / vec3<f32>(12.92);
+        let lift = pow(max(rgb + vec3<f32>(0.055), vec3<f32>(0.0)) / vec3<f32>(1.055), vec3<f32>(2.4));
+        return select(toe, lift, rgb > vec3<f32>(0.04045));
+    } else if (id == 2u || id == 3u) {
+        // Rec.709 / Rec.2020 inverse OETF. Linear below 0.081 (709
+        // breakpoint; 2020 is 0.0812 for 12-bit which we round here).
+        let toe = rgb / vec3<f32>(4.5);
+        let lift = pow(max(rgb + vec3<f32>(0.099), vec3<f32>(0.0)) / vec3<f32>(1.099), vec3<f32>(1.0 / 0.45));
+        return select(toe, lift, rgb > vec3<f32>(0.081));
+    }
+    return rgb;
+}
+
+fn apply_mat3(rgb: vec3<f32>, m: array<vec4<f32>, 3>) -> vec3<f32> {
+    let m0 = m[0].xyz;
+    let m1 = m[1].xyz;
+    let m2 = m[2].xyz;
+    return vec3<f32>(
+        dot(m0, rgb),
+        dot(m1, rgb),
+        dot(m2, rgb),
+    );
 }
 
 @fragment
@@ -104,10 +156,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
 
-    let rgb_a = yuv_to_rgb(
+    let input_range = params.pipeline_flags.z;
+    let rgb_a_enc = yuv_to_rgb(
         textureSample(tex_y_a, samp, source_uv).r,
         textureSample(tex_u_a, samp, source_uv).r,
         textureSample(tex_v_a, samp, source_uv).r,
+        input_range,
     );
 
     // Cross-dissolve blend with the B-side. When mix_factor == 0
@@ -117,17 +171,29 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // frame UV — the transform/crop apply uniformly to the blended
     // image. (If we ever want per-side transforms, that's a future
     // refactor.)
-    let rgb_b = yuv_to_rgb(
+    let rgb_b_enc = yuv_to_rgb(
         textureSample(tex_y_b, samp, source_uv).r,
         textureSample(tex_u_b, samp, source_uv).r,
         textureSample(tex_v_b, samp, source_uv).r,
+        input_range,
     );
-    var rgb = mix(rgb_a, rgb_b, params.mix_factor);
-    // Contrast pivots around 0.5 (gamma-encoded midpoint), then
-    // brightness shifts. Both apply in gamma space; that's not
-    // strictly correct (linear would be cleaner), but it matches
-    // the perceptual feel users expect from NLE color sliders.
-    rgb = (rgb - vec3<f32>(0.5)) * params.contrast + vec3<f32>(0.5) + vec3<f32>(params.brightness);
+
+    // 1. Mix in gamma-encoded space so the cross-dissolve curve
+    //    behaves the same way the renderer did pre-6.3. We could
+    //    blend in linear, but for SDR sources the perceptual change
+    //    is minor and the gamma-space mix is what colorists expect.
+    let rgb_enc = mix(rgb_a_enc, rgb_b_enc, params.mix_factor);
+    // 2. Linearize via input transfer, then change primaries to the
+    //    working space. Effects from here on operate on linear-RGB.
+    let input_transfer = params.pipeline_flags.x;
+    let rgb_lin_in = linearize(rgb_enc, input_transfer);
+    let rgb_lin_working = apply_mat3(rgb_lin_in, params.pipeline_in_to_working);
+    // 3. Contrast pivots around 0.5 *linear* — in linear-light that
+    //    midpoint is darker than gamma-0.5, so sliders feel more
+    //    sensitive in the shadows. Documented behavior change in
+    //    6.3's commit; matches how Resolve operates in ACEScct/cg.
+    var rgb = (rgb_lin_working - vec3<f32>(0.5)) * params.contrast
+        + vec3<f32>(0.5) + vec3<f32>(params.brightness);
     rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
 
     // Chroma + luma keys produce a per-pixel "keep" factor in [0,1].
@@ -154,5 +220,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             keep = keep * (1.0 - smoothstep(th - soft, th + soft, lum));
         }
     }
-    return vec4<f32>(rgb * params.opacity * keep, 1.0);
+    // 4. Working → output primaries. For the v1 sRGB surface this is
+    //    identity when working == LinearRec709 (Rec.709 primaries
+    //    match sRGB's), so the matrix multiply is effectively a
+    //    no-op in the common case but lights up automatically when
+    //    the user picks a different working space (e.g., ACEScg).
+    var rgb_out = apply_mat3(rgb, params.pipeline_working_to_out);
+    // 5. The surface format (Rgba8UnormSrgb) handles the linear →
+    //    sRGB encoding on write, so we leave the output linear here.
+    //    `pipeline_flags.y` (output_transfer) is recorded for
+    //    future use when we land non-sRGB surface targets (HDR).
+    rgb_out = clamp(rgb_out, vec3<f32>(0.0), vec3<f32>(1.0));
+    return vec4<f32>(rgb_out * params.opacity * keep, 1.0);
 }
