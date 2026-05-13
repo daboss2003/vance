@@ -31,6 +31,11 @@ pub struct Project {
     /// pre-Phase-6 path). `#[serde(default)]` so older projects open.
     #[serde(default = "default_working_space")]
     pub working_color_space: ColorSpace,
+    /// Display LUT (Phase 6.5). Path to a .cube / .3dl applied *only*
+    /// to the viewport for monitoring — export bypasses it.
+    /// `None` for an unfiltered preview.
+    #[serde(default)]
+    pub view_lut_path: Option<std::path::PathBuf>,
 }
 
 fn default_working_space() -> ColorSpace {
@@ -46,6 +51,7 @@ impl Project {
             media: BTreeMap::new(),
             sequences: Vec::new(),
             working_color_space: default_working_space(),
+            view_lut_path: None,
         }
     }
 

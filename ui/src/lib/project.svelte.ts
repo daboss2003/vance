@@ -14,6 +14,7 @@ import {
   createTitleMedia,
   setMediaInputColorSpace,
   setProjectWorkingColorSpace,
+  setProjectViewLut,
   insertClipAt,
   loadProject,
   addEffectToClip as ipcAddEffect,
@@ -308,6 +309,19 @@ class ProjectState {
       await setProjectWorkingColorSpace(space);
       if (this.info) {
         this.info = { ...this.info, working_color_space: space };
+      }
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Set or clear the project's display LUT (Phase 6.5). */
+  async setViewLut(path: string | null) {
+    this.error = null;
+    try {
+      await setProjectViewLut(path);
+      if (this.info) {
+        this.info = { ...this.info, view_lut_path: path };
       }
     } catch (e) {
       this.error = String(e);

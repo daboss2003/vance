@@ -34,6 +34,7 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 @group(0) @binding(6) var tex_u_b: texture_2d<f32>;
 @group(0) @binding(7) var tex_v_b: texture_2d<f32>;
 @group(0) @binding(8) var tex_lut: texture_3d<f32>;
+@group(0) @binding(9) var tex_view_lut: texture_3d<f32>;
 
 // Per-frame effect parameters. Layout must match `RenderParams` in
 // renderer.rs.
@@ -64,6 +65,8 @@ struct Params {
     pipeline_working_to_out: array<vec4<f32>, 3>,
     // (enable, _, _, _) — toggle the bound LUT.
     lut_params: vec4<f32>,
+    // View-LUT enable. Applies post-output as a monitoring stage.
+    view_lut_params: vec4<f32>,
 };
 @group(0) @binding(4) var<uniform> params: Params;
 
@@ -251,5 +254,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     //    `pipeline_flags.y` (output_transfer) is recorded for
     //    future use when we land non-sRGB surface targets (HDR).
     rgb_out = clamp(rgb_out, vec3<f32>(0.0), vec3<f32>(1.0));
+    // 6. Optional view LUT — a monitoring transform applied *after*
+    //    the project's color pipeline. Export bypasses this slot
+    //    so the on-disk render isn't tinted by the display look.
+    if (params.view_lut_params.x > 0.5) {
+        let size_minus_1 = max(1.0, f32(textureDimensions(tex_view_lut).x) - 1.0);
+        let half_texel = 0.5 / f32(textureDimensions(tex_view_lut).x);
+        let uvw = clamp(rgb_out, vec3<f32>(0.0), vec3<f32>(1.0))
+            * (size_minus_1 / f32(textureDimensions(tex_view_lut).x))
+            + vec3<f32>(half_texel);
+        rgb_out = textureSample(tex_view_lut, samp, uvw).rgb;
+    }
     return vec4<f32>(rgb_out * params.opacity * keep, 1.0);
 }

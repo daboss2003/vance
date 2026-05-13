@@ -111,6 +111,9 @@ pub struct ProjectInfo {
     pub current_sequence_id: Option<String>,
     /// Working color space (Phase 6.2) — stringified for the IPC layer.
     pub working_color_space: String,
+    /// Path of the active display LUT (Phase 6.5), or `null` when
+    /// monitoring is unfiltered.
+    pub view_lut_path: Option<String>,
 }
 
 /// One row in `ProjectInfo.sequences`.
@@ -635,6 +638,10 @@ impl From<&Project> for ProjectInfo {
                 .collect(),
             current_sequence_id: None,
             working_color_space: color_space_to_str(p.working_color_space),
+            view_lut_path: p
+                .view_lut_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
         }
     }
 }
@@ -1520,6 +1527,9 @@ impl Engine {
         }
         self.current_project_path = Some(PathBuf::from(path));
         self.current_project = Some(project);
+        // Light up the project's saved view LUT (if any) so the
+        // viewport reflects the user's last monitoring preference.
+        self.apply_view_lut();
         Ok(info)
     }
 
@@ -1546,6 +1556,7 @@ impl Engine {
         self.edit_logs.clear();
         self.edit_logs.insert(seq_id, EditLog::new(seq_for_log));
         self.current_project = Some(project);
+        self.apply_view_lut();
         Ok(info)
     }
 
@@ -1665,6 +1676,69 @@ impl Engine {
             .ok_or(EngineError::NoProject)?;
         project.working_color_space = space;
         Ok(())
+    }
+
+    /// Set (or clear) the project's display LUT path. The renderer's
+    /// view-LUT slot picks it up on the next `apply_view_lut` call —
+    /// done immediately so the viewport reflects the change.
+    /// Phase 6.5.
+    pub fn set_project_view_lut(
+        &mut self,
+        path: Option<&str>,
+    ) -> Result<(), EngineError> {
+        {
+            let project = self
+                .current_project
+                .as_mut()
+                .ok_or(EngineError::NoProject)?;
+            project.view_lut_path = path
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from);
+        }
+        self.apply_view_lut();
+        Ok(())
+    }
+
+    /// Load the project's `view_lut_path` (if any) into the renderer's
+    /// view-LUT slot, or disable the slot. Called on project load,
+    /// when the user picks a new LUT, and on every active-clip
+    /// transition so re-entry to the engine state lights up the LUT.
+    fn apply_view_lut(&mut self) {
+        let Some(rs) = self.render_state.as_ref() else {
+            return;
+        };
+        let path = match self
+            .current_project
+            .as_ref()
+            .and_then(|p| p.view_lut_path.clone())
+        {
+            Some(p) => p,
+            None => {
+                let mut rs = rs.lock();
+                rs.renderer.set_view_lut_enable(0.0);
+                return;
+            }
+        };
+        if let Some(lut) = self.lut_cache.get(&path).cloned() {
+            let mut rs = rs.lock();
+            rs.renderer.upload_view_lut(&lut);
+            rs.renderer.set_view_lut_enable(1.0);
+            return;
+        }
+        match vance_color::load_lut(&path) {
+            Ok(lut) => {
+                let arc = Arc::new(lut);
+                self.lut_cache.insert(path.clone(), arc.clone());
+                let mut rs = rs.lock();
+                rs.renderer.upload_view_lut(&arc);
+                rs.renderer.set_view_lut_enable(1.0);
+            }
+            Err(e) => {
+                tracing::warn!(?e, ?path, "view-lut: load failed");
+                let mut rs = rs.lock();
+                rs.renderer.set_view_lut_enable(0.0);
+            }
+        }
     }
 
     /// Add a synthetic title media item to the project's library.

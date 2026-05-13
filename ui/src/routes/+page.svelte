@@ -519,6 +519,22 @@
     await projectState.updateEffectParam(track.id, clip.id, effect.id, key, kfs);
   }
 
+  /** Open a file dialog for the project-wide view LUT (Phase 6.5).
+   *  Wraps `projectState.setViewLut` so the engine + viewport
+   *  light up immediately. */
+  async function pickViewLut() {
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      filters: [
+        { name: 'LUT', extensions: ['cube', '3dl'] },
+        { name: 'All files', extensions: ['*'] }
+      ]
+    });
+    if (typeof selected !== 'string') return;
+    await projectState.setViewLut(selected);
+  }
+
   /** Open a file dialog filtered to .cube / .3dl and write the
    *  chosen path back to a LUT effect's `path` param. */
   async function pickLutFile(
@@ -820,6 +836,32 @@
             <option value={opt.value}>{opt.label}</option>
           {/each}
         </select>
+        <span class="text-vance-muted ml-2">·</span>
+        <span class="text-vance-muted">View LUT:</span>
+        {#if projectState.info.view_lut_path}
+          <button
+            class="bg-vance-bg border-vance-border rounded border px-1 py-0.5 text-[10px] truncate max-w-[12rem]"
+            onclick={pickViewLut}
+            title={projectState.info.view_lut_path}
+          >
+            {projectState.info.view_lut_path.split('/').pop() ?? '(unnamed)'}
+          </button>
+          <button
+            class="text-vance-muted hover:text-red-400 text-[10px]"
+            onclick={() => projectState.setViewLut(null)}
+            title="Clear the display LUT (unfiltered preview)"
+          >
+            ✕
+          </button>
+        {:else}
+          <button
+            class="bg-vance-bg border-vance-border rounded border px-1 py-0.5 text-[10px]"
+            onclick={pickViewLut}
+            title="Pick a .cube / .3dl monitoring LUT"
+          >
+            (none)
+          </button>
+        {/if}
       </span>
     {/if}
 

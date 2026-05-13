@@ -452,6 +452,17 @@ fn set_project_working_color_space(
 }
 
 #[tauri::command]
+fn set_project_view_lut(
+    state: tauri::State<'_, EngineHandle>,
+    path: Option<String>,
+) -> Result<(), String> {
+    state
+        .lock()
+        .set_project_view_lut(path.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn create_title_media(
     state: tauri::State<'_, EngineHandle>,
     display_name: String,
@@ -690,6 +701,7 @@ fn main() {
             create_title_media,
             set_media_input_color_space,
             set_project_working_color_space,
+            set_project_view_lut,
             trim_clip_in,
             trim_clip_out,
             play_sequence,

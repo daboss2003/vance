@@ -85,6 +85,11 @@ pub struct Renderer {
     /// dummy is bound. Used to skip a re-upload when the new LUT
     /// has the same dimensions.
     lut_size: u32,
+    /// Display-side LUT (Phase 6.5). Same shape as `tex_lut` but
+    /// applied at the very end of the pipeline (post working→output
+    /// matrix). Used for monitoring transforms; export bypasses it.
+    tex_view_lut: Option<wgpu::Texture>,
+    view_lut_size: u32,
     bind_group: Option<wgpu::BindGroup>,
     /// Per-frame parameter uniform — opacity (5.2), transform (5.3),
     /// crop + brightness/contrast (5.6), and the transition mix
@@ -148,6 +153,12 @@ struct RenderParams {
     /// source-space gamma) before the linearize stage — matches
     /// how colorists author Rec.709 / sRGB LUTs.
     lut_params: [f32; 4],
+    /// View-LUT params: `(enable, _, _, _)`. The *view* LUT is a
+    /// monitoring transform — applies at the very end of the
+    /// pipeline (post working→output matrix), but its contribution
+    /// is meant for display only (export bypasses it). Independent
+    /// of the per-clip LUT effect.
+    view_lut_params: [f32; 4],
 }
 
 impl Default for RenderParams {
@@ -172,6 +183,7 @@ impl Default for RenderParams {
             pipeline_in_to_working: identity_row3(),
             pipeline_working_to_out: identity_row3(),
             lut_params: [0.0; 4],
+            view_lut_params: [0.0; 4],
         }
     }
 }
@@ -303,6 +315,16 @@ impl Renderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -383,6 +405,8 @@ impl Renderer {
             tex_v_b: None,
             tex_lut: None,
             lut_size: 1,
+            tex_view_lut: None,
+            view_lut_size: 1,
             bind_group: None,
             params_buffer,
             current_params: initial_params,
@@ -588,6 +612,74 @@ impl Renderer {
             return;
         }
         self.current_params.lut_params[0] = v;
+        self.queue.write_buffer(
+            &self.params_buffer,
+            0,
+            bytemuck::cast_slice(&[self.current_params]),
+        );
+    }
+
+    /// Upload a 3D LUT into the *view* slot (Phase 6.5). Same shape
+    /// as `upload_lut` but the renderer routes this one to the
+    /// post-output sampling stage — a display LUT, not a clip
+    /// effect.
+    pub fn upload_view_lut(&mut self, lut: &vance_color::Lut3d) {
+        let size = lut.size;
+        if self.tex_view_lut.is_none() || self.view_lut_size != size {
+            self.tex_view_lut = Some(self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("vance-render.tex_view_lut"),
+                size: wgpu::Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: size,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            }));
+            self.view_lut_size = size;
+            self.rebuild_bind_group();
+        }
+        let n = size as usize;
+        let mut packed: Vec<u16> = Vec::with_capacity(n * n * n * 4);
+        for triple in lut.values.chunks_exact(3) {
+            packed.push(f32_to_f16_bits(triple[0]));
+            packed.push(f32_to_f16_bits(triple[1]));
+            packed.push(f32_to_f16_bits(triple[2]));
+            packed.push(f32_to_f16_bits(1.0));
+        }
+        let bytes: &[u8] = bytemuck::cast_slice(&packed);
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: self.tex_view_lut.as_ref().unwrap(),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size * 4 * 2),
+                rows_per_image: Some(size),
+            },
+            wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: size,
+            },
+        );
+    }
+
+    /// Toggle the view LUT.
+    pub fn set_view_lut_enable(&mut self, enable: f32) {
+        let v = enable.clamp(0.0, 1.0);
+        if (self.current_params.view_lut_params[0] - v).abs() < 1e-5 {
+            return;
+        }
+        self.current_params.view_lut_params[0] = v;
         self.queue.write_buffer(
             &self.params_buffer,
             0,
@@ -999,9 +1091,9 @@ impl Renderer {
         // LUT slot — prime a 1×1×1 dummy so the bind group is valid
         // before the user loads anything. The shader gates against
         // `lut_params.enable`, so the dummy never contributes.
-        if self.tex_lut.is_none() {
-            self.tex_lut = Some(self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("vance-render.tex_lut_dummy"),
+        let dummy_3d = |dev: &wgpu::Device, label: &str| -> wgpu::Texture {
+            dev.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
                 size: wgpu::Extent3d {
                     width: 1,
                     height: 1,
@@ -1013,11 +1105,23 @@ impl Renderer {
                 format: wgpu::TextureFormat::Rgba16Float,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
-            }));
+            })
+        };
+        if self.tex_lut.is_none() {
+            self.tex_lut = Some(dummy_3d(&self.device, "vance-render.tex_lut_dummy"));
             self.lut_size = 1;
+        }
+        if self.tex_view_lut.is_none() {
+            self.tex_view_lut = Some(dummy_3d(&self.device, "vance-render.tex_view_lut_dummy"));
+            self.view_lut_size = 1;
         }
         let view_lut = self
             .tex_lut
+            .as_ref()
+            .unwrap()
+            .create_view(&Default::default());
+        let view_view_lut = self
+            .tex_view_lut
             .as_ref()
             .unwrap()
             .create_view(&Default::default());
@@ -1061,6 +1165,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 8,
                     resource: wgpu::BindingResource::TextureView(&view_lut),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(&view_view_lut),
                 },
             ],
         }));

@@ -136,6 +136,8 @@ export type ProjectInfo = {
   sequences: SequenceInfo[];
   current_sequence_id: string | null;
   working_color_space: ColorSpaceLabel;
+  /** Active display LUT (Phase 6.5). `null` for unfiltered preview. */
+  view_lut_path: string | null;
 };
 
 /** Load a `.vance/` bundle and make it the engine's current project. */
@@ -328,6 +330,10 @@ export const setProjectWorkingColorSpace = (
   colorSpace: ColorSpaceLabel
 ): Promise<void> =>
   invoke('set_project_working_color_space', { colorSpace });
+
+/** Set the project's display LUT (Phase 6.5). Pass `null` to clear. */
+export const setProjectViewLut = (path: string | null): Promise<void> =>
+  invoke('set_project_view_lut', { path });
 
 /** All media items in the current project's library. */
 export const mediaList = (): Promise<MediaItemInfo[]> => invoke('media_list');
