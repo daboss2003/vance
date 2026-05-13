@@ -264,6 +264,27 @@ fn trim_clip_out(
 }
 
 #[tauri::command]
+fn remove_clip(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    clip_id: String,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let clip_uuid = clip_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid clip id: {e}"))?;
+    state
+        .lock()
+        .remove_clip(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            vance_timeline::ClipId::from_uuid(clip_uuid),
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn move_clip_to(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -388,6 +409,7 @@ fn main() {
             media_list,
             insert_clip_at,
             move_clip_to,
+            remove_clip,
             trim_clip_in,
             trim_clip_out,
             play_sequence,

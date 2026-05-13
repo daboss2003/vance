@@ -159,6 +159,10 @@ export const moveClipTo = (
 ): Promise<void> =>
   invoke('move_clip_to', { trackId, clipId, timelineSeconds });
 
+/** Remove a clip from its track (leaves a gap). */
+export const removeClip = (trackId: string, clipId: string): Promise<void> =>
+  invoke('remove_clip', { trackId, clipId });
+
 /** Trim a clip's in-point. `newSourceInSeconds` is the new visible
  *  start inside the source media; the clip's timeline_in shifts by
  *  the same delta so the right edge stays put on the timeline. */

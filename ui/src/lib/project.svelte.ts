@@ -14,6 +14,7 @@ import {
   loadProject,
   mediaList,
   moveClipTo,
+  removeClip as ipcRemoveClip,
   newProject as ipcNew,
   projectInfo,
   redo as ipcRedo,
@@ -166,6 +167,17 @@ class ProjectState {
     this.error = null;
     try {
       await moveClipTo(trackId, clipId, timelineSeconds);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Remove a clip from its track. */
+  async removeClip(trackId: string, clipId: string) {
+    this.error = null;
+    try {
+      await ipcRemoveClip(trackId, clipId);
       await this.commitEdit();
     } catch (e) {
       this.error = String(e);

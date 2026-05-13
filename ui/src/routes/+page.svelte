@@ -219,6 +219,13 @@
           selectionState.clear();
         }
         return;
+      case 'Delete':
+      case 'Backspace':
+        if (selectionState.count > 0 && projectState.sequence) {
+          e.preventDefault();
+          deleteSelectedClips();
+        }
+        return;
       case 'z':
       case 'Z':
         if (e.metaKey || e.ctrlKey) {
@@ -320,6 +327,30 @@
     const name = projectState.info.name || 'Untitled';
     const bundle = `${selected}/${name}.vance`;
     await projectState.save(bundle);
+  }
+
+  /** Delete every currently-selected clip from the active sequence,
+   *  one engine call per clip. Each becomes its own undo step. */
+  async function deleteSelectedClips() {
+    const seq = projectState.sequence;
+    if (!seq) return;
+    const ids = [...selectionState.ids];
+    // Build (trackId, clipId) pairs first, then issue removes. We can't
+    // rely on `projectState.sequence` after the first await because it
+    // refreshes mid-loop.
+    const targets: { trackId: string; clipId: string }[] = [];
+    for (const id of ids) {
+      for (const t of seq.tracks) {
+        if (t.clips.some((c) => c.id === id)) {
+          targets.push({ trackId: t.id, clipId: id });
+          break;
+        }
+      }
+    }
+    selectionState.clear();
+    for (const { trackId, clipId } of targets) {
+      await projectState.removeClip(trackId, clipId);
+    }
   }
 
   async function handleImportMedia() {

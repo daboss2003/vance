@@ -988,6 +988,19 @@ impl Engine {
         Ok(pts)
     }
 
+    /// Remove a clip from a track (leaves a gap on the timeline).
+    /// Recorded in the edit log so Cmd+Z brings it back.
+    pub fn remove_clip(
+        &mut self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+    ) -> Result<(), EngineError> {
+        if self.playback.is_some() {
+            return Err(EngineError::PlaybackInProgress);
+        }
+        self.apply_edit_op(EditOp::RemoveClip { track_id, clip_id })
+    }
+
     /// Trim a clip's in-point. `new_source_in_seconds` is the new
     /// visible start inside the source media; the clip's `timeline_in`
     /// shifts by the same delta so the right-hand content keeps its
