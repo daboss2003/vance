@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use vance_color::ColorSpace;
 use vance_core::{FrameRate, RationalTime};
 
 use crate::id::MediaItemId;
@@ -59,6 +60,13 @@ pub struct MediaItem {
     /// trip without this field.
     #[serde(default)]
     pub title: Option<TitleParams>,
+    /// What color space the decoded samples live in (Phase 6.2). On
+    /// import we leave this `None`; the engine then falls back to
+    /// `ColorSpace::Rec709Limited` — the existing pre-color-pipeline
+    /// behavior. The UI lets the user override per item once they
+    /// know better (camera raw, P3 capture, etc.).
+    #[serde(default)]
+    pub input_color_space: Option<ColorSpace>,
 }
 
 impl MediaItem {
@@ -78,6 +86,7 @@ impl MediaItem {
             frame_rate: None,
             content_hash: None,
             title: None,
+            input_color_space: None,
         }
     }
 
@@ -98,6 +107,11 @@ impl MediaItem {
             frame_rate: Some(vance_core::FrameRate::FPS_24),
             content_hash: None,
             title: Some(params),
+            // Titles are rasterized in sRGB-ish space (see
+            // `vance-render::title`). Tag accordingly so they round-
+            // trip through the pipeline correctly when the working
+            // space differs.
+            input_color_space: Some(ColorSpace::Srgb),
         }
     }
 

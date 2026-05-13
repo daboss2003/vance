@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use vance_color::ColorSpace;
 
 use crate::id::{MediaItemId, ProjectId, SequenceId};
 use crate::media::MediaItem;
@@ -25,6 +26,15 @@ pub struct Project {
     pub media: BTreeMap<MediaItemId, Arc<MediaItem>>,
     /// All sequences in insertion order.
     pub sequences: Vec<Arc<Sequence>>,
+    /// Working color space — what color grading + render compositing
+    /// happens in. v1 default is `LinearRec709` (matches the existing
+    /// pre-Phase-6 path). `#[serde(default)]` so older projects open.
+    #[serde(default = "default_working_space")]
+    pub working_color_space: ColorSpace,
+}
+
+fn default_working_space() -> ColorSpace {
+    ColorSpace::LinearRec709
 }
 
 impl Project {
@@ -35,6 +45,7 @@ impl Project {
             name: name.into(),
             media: BTreeMap::new(),
             sequences: Vec::new(),
+            working_color_space: default_working_space(),
         }
     }
 

@@ -105,6 +105,8 @@ pub struct ProjectInfo {
     pub sequences: Vec<SequenceInfo>,
     /// Currently active sequence's ID, if any.
     pub current_sequence_id: Option<String>,
+    /// Working color space (Phase 6.2) — stringified for the IPC layer.
+    pub working_color_space: String,
 }
 
 /// One row in `ProjectInfo.sequences`.
@@ -578,13 +580,16 @@ pub struct MediaItemInfo {
     pub name: String,
     /// Absolute path on disk.
     pub path: String,
-    /// "video", "audio", or "image".
+    /// "video", "audio", "image", or "title".
     pub kind: String,
     /// Total duration in seconds.
     pub duration_seconds: f64,
     /// Source frame rate as `(num, den)`, or null when unknown.
     pub frame_rate_num: Option<i64>,
     pub frame_rate_den: Option<i64>,
+    /// Stringified input color space (Phase 6.2). `None` when the
+    /// user hasn't picked one (engine uses Rec.709 Limited fallback).
+    pub input_color_space: Option<String>,
 }
 
 impl From<&MediaItem> for MediaItemInfo {
@@ -606,6 +611,7 @@ impl From<&MediaItem> for MediaItemInfo {
             duration_seconds: rt_to_seconds(m.duration),
             frame_rate_num: fr_n,
             frame_rate_den: fr_d,
+            input_color_space: m.input_color_space.map(color_space_to_str),
         }
     }
 }
@@ -624,8 +630,48 @@ impl From<&Project> for ProjectInfo {
                 })
                 .collect(),
             current_sequence_id: None,
+            working_color_space: color_space_to_str(p.working_color_space),
         }
     }
+}
+
+/// Stringify a `ColorSpace` for the IPC layer. The TypeScript side
+/// uses these labels in dropdowns and persists user picks back the
+/// same way.
+fn color_space_to_str(s: vance_color::ColorSpace) -> String {
+    use vance_color::ColorSpace::*;
+    match s {
+        Rec709Limited => "rec709-limited".into(),
+        Rec709Full => "rec709-full".into(),
+        Srgb => "srgb".into(),
+        LinearRec709 => "linear-rec709".into(),
+        LinearRec2020 => "linear-rec2020".into(),
+        Rec2020Limited => "rec2020-limited".into(),
+        Rec2020Pq => "rec2020-pq".into(),
+        Rec2020Hlg => "rec2020-hlg".into(),
+        DisplayP3 => "display-p3".into(),
+        Acescg => "acescg".into(),
+        Acescct => "acescct".into(),
+    }
+}
+
+/// Parse a stringified `ColorSpace`. Symmetric with `color_space_to_str`.
+fn color_space_from_str(s: &str) -> Option<vance_color::ColorSpace> {
+    use vance_color::ColorSpace::*;
+    Some(match s {
+        "rec709-limited" => Rec709Limited,
+        "rec709-full" => Rec709Full,
+        "srgb" => Srgb,
+        "linear-rec709" => LinearRec709,
+        "linear-rec2020" => LinearRec2020,
+        "rec2020-limited" => Rec2020Limited,
+        "rec2020-pq" => Rec2020Pq,
+        "rec2020-hlg" => Rec2020Hlg,
+        "display-p3" => DisplayP3,
+        "acescg" => Acescg,
+        "acescct" => Acescct,
+        _ => return None,
+    })
 }
 
 /// Shared, internally-mutable engine handle. Cheap to clone.
@@ -1547,6 +1593,51 @@ impl Engine {
             "imported media"
         );
         Ok(info)
+    }
+
+    /// Override a media item's tagged input color space. Pass `None`
+    /// to clear (engine then falls back to Rec.709 Limited). `space`
+    /// strings are the labels used by `color_space_to_str` / the UI
+    /// dropdown — invalid strings return an error. Phase 6.2.
+    pub fn set_media_input_color_space(
+        &mut self,
+        media_id: MediaItemId,
+        space: Option<&str>,
+    ) -> Result<(), EngineError> {
+        let resolved = match space {
+            None | Some("") => None,
+            Some(s) => Some(color_space_from_str(s).ok_or_else(|| {
+                EngineError::Project(format!("unknown color space label: {s}"))
+            })?),
+        };
+        let project = self
+            .current_project
+            .as_mut()
+            .ok_or(EngineError::NoProject)?;
+        let existing = project
+            .media
+            .get(&media_id)
+            .ok_or(EngineError::MediaNotFound)?
+            .clone();
+        let mut updated = (*existing).clone();
+        updated.input_color_space = resolved;
+        project.media.insert(media_id, Arc::new(updated));
+        Ok(())
+    }
+
+    /// Replace the project's working color space. Phase 6.2.
+    pub fn set_project_working_color_space(
+        &mut self,
+        space: &str,
+    ) -> Result<(), EngineError> {
+        let space = color_space_from_str(space)
+            .ok_or_else(|| EngineError::Project(format!("unknown color space label: {space}")))?;
+        let project = self
+            .current_project
+            .as_mut()
+            .ok_or(EngineError::NoProject)?;
+        project.working_color_space = space;
+        Ok(())
     }
 
     /// Add a synthetic title media item to the project's library.

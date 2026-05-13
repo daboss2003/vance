@@ -12,6 +12,8 @@ import {
   decodeSourceAt,
   importMediaFile,
   createTitleMedia,
+  setMediaInputColorSpace,
+  setProjectWorkingColorSpace,
   insertClipAt,
   loadProject,
   addEffectToClip as ipcAddEffect,
@@ -36,6 +38,7 @@ import {
   trimClipIn,
   trimClipOut,
   undo as ipcUndo,
+  type ColorSpaceLabel,
   type EffectValue,
   type MediaItemInfo,
   type ProjectInfo,
@@ -279,6 +282,38 @@ class ProjectState {
   }
 
   /** Drop a clip on the timeline. */
+  /** Override the input color space tag on a media library item.
+   *  `null` clears the override (engine falls back to default). */
+  async setMediaInputColorSpace(
+    mediaId: string,
+    space: ColorSpaceLabel | null
+  ) {
+    this.error = null;
+    try {
+      await setMediaInputColorSpace(mediaId, space);
+      // Refresh the local copy of media so the dropdown reflects
+      // the new value immediately.
+      this.media = this.media.map((m) =>
+        m.id === mediaId ? { ...m, input_color_space: space } : m
+      );
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Replace the project's working color space. */
+  async setWorkingColorSpace(space: ColorSpaceLabel) {
+    this.error = null;
+    try {
+      await setProjectWorkingColorSpace(space);
+      if (this.info) {
+        this.info = { ...this.info, working_color_space: space };
+      }
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
   async insertClip(trackId: string, mediaId: string, timelineSeconds: number) {
     this.error = null;
     try {

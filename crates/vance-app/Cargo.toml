@@ -31,6 +31,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wgpu = "29"
 pollster = "0.4"
 vance-core = { workspace = true }
+vance-color = { workspace = true }
 vance-time = { workspace = true }
 vance-decoder = { workspace = true }
 vance-render = { workspace = true }

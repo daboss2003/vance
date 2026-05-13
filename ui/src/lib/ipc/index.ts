@@ -101,10 +101,41 @@ export type SequenceInfo = {
   clip_count: number;
 };
 
+/** Stringified color-space labels — match `color_space_to_str` in
+ *  engine.rs. Extend here when the engine adds a new variant. */
+export type ColorSpaceLabel =
+  | 'rec709-limited'
+  | 'rec709-full'
+  | 'srgb'
+  | 'linear-rec709'
+  | 'linear-rec2020'
+  | 'rec2020-limited'
+  | 'rec2020-pq'
+  | 'rec2020-hlg'
+  | 'display-p3'
+  | 'acescg'
+  | 'acescct';
+
+/** All built-in color-space options in display order. */
+export const COLOR_SPACE_OPTIONS: { value: ColorSpaceLabel; label: string }[] = [
+  { value: 'rec709-limited', label: 'Rec.709 (limited)' },
+  { value: 'rec709-full', label: 'Rec.709 (full)' },
+  { value: 'srgb', label: 'sRGB' },
+  { value: 'linear-rec709', label: 'Linear Rec.709' },
+  { value: 'linear-rec2020', label: 'Linear Rec.2020' },
+  { value: 'rec2020-limited', label: 'Rec.2020 (limited)' },
+  { value: 'rec2020-pq', label: 'Rec.2020 PQ (HDR)' },
+  { value: 'rec2020-hlg', label: 'Rec.2020 HLG (HDR)' },
+  { value: 'display-p3', label: 'Display P3' },
+  { value: 'acescg', label: 'ACEScg' },
+  { value: 'acescct', label: 'ACEScct' },
+];
+
 export type ProjectInfo = {
   name: string;
   sequences: SequenceInfo[];
   current_sequence_id: string | null;
+  working_color_space: ColorSpaceLabel;
 };
 
 /** Load a `.vance/` bundle and make it the engine's current project. */
@@ -260,6 +291,9 @@ export type MediaItemInfo = {
   duration_seconds: number;
   frame_rate_num: number | null;
   frame_rate_den: number | null;
+  /** User-overridable input color space (Phase 6.2). `null` means
+   *  "use engine default" (Rec.709 limited today). */
+  input_color_space: ColorSpaceLabel | null;
 };
 
 /** Pull metadata from a media file via the decoder and register it
@@ -280,6 +314,20 @@ export const createTitleMedia = (args: {
   height: number;
 }): Promise<MediaItemInfo> =>
   invoke('create_title_media', args);
+
+/** Override (or clear, by passing `null`) the input color space tag
+ *  for a media library item. Phase 6.2. */
+export const setMediaInputColorSpace = (
+  mediaId: string,
+  colorSpace: ColorSpaceLabel | null
+): Promise<void> =>
+  invoke('set_media_input_color_space', { mediaId, colorSpace });
+
+/** Replace the project's working color space (Phase 6.2). */
+export const setProjectWorkingColorSpace = (
+  colorSpace: ColorSpaceLabel
+): Promise<void> =>
+  invoke('set_project_working_color_space', { colorSpace });
 
 /** All media items in the current project's library. */
 export const mediaList = (): Promise<MediaItemInfo[]> => invoke('media_list');

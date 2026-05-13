@@ -6,6 +6,8 @@
     currentTimelineSeconds,
     evalNumber,
     isKeyframes,
+    COLOR_SPACE_OPTIONS,
+    type ColorSpaceLabel,
     type ClipContents,
     type EffectInfo,
     type EffectValue,
@@ -769,7 +771,7 @@
     <span class="text-vance-muted text-xs">Phase 4 · M4.2</span>
 
     {#if projectState.info}
-      <span class="ml-3 text-xs text-vance-muted">
+      <span class="ml-3 text-xs text-vance-muted flex items-center gap-1">
         Project: <span class="text-vance-fg font-medium">{projectState.info.name}</span>
         {#if projectState.path}
           <span class="text-vance-muted">·</span>
@@ -778,6 +780,21 @@
           <span class="text-vance-muted">·</span>
           <span class="text-yellow-400">unsaved</span>
         {/if}
+        <span class="text-vance-muted ml-2">·</span>
+        <span class="text-vance-muted">Working space:</span>
+        <select
+          class="bg-vance-bg border-vance-border rounded border px-1 py-0.5 text-[10px]"
+          value={projectState.info.working_color_space}
+          onchange={(ev) => {
+            const v = (ev.currentTarget as HTMLSelectElement).value as ColorSpaceLabel;
+            projectState.setWorkingColorSpace(v);
+          }}
+          title="Project working color space (Phase 6.2)"
+        >
+          {#each COLOR_SPACE_OPTIONS as opt (opt.value)}
+            <option value={opt.value}>{opt.label}</option>
+          {/each}
+        </select>
       </span>
     {/if}
 
@@ -903,6 +920,30 @@
                   <div class="font-medium truncate">{m.name}</div>
                   <div class="text-[10px] text-vance-muted">
                     {m.kind} · {formatDuration(m.duration_seconds)}
+                  </div>
+                  <div
+                    class="mt-1 text-[10px] flex items-center gap-1"
+                    onmousedown={(e) => e.stopPropagation()}
+                    role="presentation"
+                  >
+                    <span class="text-vance-muted">space:</span>
+                    <select
+                      class="bg-vance-panel border-vance-border rounded border px-1 py-0.5 text-[10px]"
+                      value={m.input_color_space ?? ''}
+                      onchange={(ev) => {
+                        const v = (ev.currentTarget as HTMLSelectElement).value;
+                        projectState.setMediaInputColorSpace(
+                          m.id,
+                          v === '' ? null : (v as ColorSpaceLabel)
+                        );
+                      }}
+                      title="Override the input color space tag for this item"
+                    >
+                      <option value="">(default)</option>
+                      {#each COLOR_SPACE_OPTIONS as opt (opt.value)}
+                        <option value={opt.value}>{opt.label}</option>
+                      {/each}
+                    </select>
                   </div>
                 </div>
               </li>

@@ -423,6 +423,35 @@ fn remove_effect_from_clip(
 }
 
 #[tauri::command]
+fn set_media_input_color_space(
+    state: tauri::State<'_, EngineHandle>,
+    media_id: String,
+    color_space: Option<String>,
+) -> Result<(), String> {
+    let uuid = media_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid media id: {e}"))?;
+    state
+        .lock()
+        .set_media_input_color_space(
+            vance_timeline::MediaItemId::from_uuid(uuid),
+            color_space.as_deref(),
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_project_working_color_space(
+    state: tauri::State<'_, EngineHandle>,
+    color_space: String,
+) -> Result<(), String> {
+    state
+        .lock()
+        .set_project_working_color_space(&color_space)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn create_title_media(
     state: tauri::State<'_, EngineHandle>,
     display_name: String,
@@ -659,6 +688,8 @@ fn main() {
             add_transition_at_cut,
             remove_transition,
             create_title_media,
+            set_media_input_color_space,
+            set_project_working_color_space,
             trim_clip_in,
             trim_clip_out,
             play_sequence,
