@@ -67,6 +67,29 @@ pub struct Renderer {
     tex_u: Option<wgpu::Texture>,
     tex_v: Option<wgpu::Texture>,
     bind_group: Option<wgpu::BindGroup>,
+    /// Per-frame parameter uniform — currently `opacity` (Phase 5.2).
+    /// Future built-in effect params (transform matrix, crop, etc.)
+    /// extend this struct in place; the WGSL `Params` struct must
+    /// keep its layout in sync.
+    params_buffer: wgpu::Buffer,
+    current_params: RenderParams,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct RenderParams {
+    /// Output color multiplier. 1.0 = passthrough, 0.0 = full fade.
+    opacity: f32,
+    _pad: [f32; 3],
+}
+
+impl Default for RenderParams {
+    fn default() -> Self {
+        Self {
+            opacity: 1.0,
+            _pad: [0.0; 3],
+        }
+    }
 }
 
 impl Renderer {
@@ -116,6 +139,16 @@ impl Renderer {
                 yuv_plane_entry(1),
                 yuv_plane_entry(2),
                 yuv_plane_entry(3),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -170,6 +203,15 @@ impl Renderer {
             ..Default::default()
         });
 
+        let initial_params = RenderParams::default();
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("vance-render.params"),
+            size: std::mem::size_of::<RenderParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&params_buffer, 0, bytemuck::cast_slice(&[initial_params]));
+
         Ok(Self {
             adapter,
             device,
@@ -182,7 +224,25 @@ impl Renderer {
             tex_u: None,
             tex_v: None,
             bind_group: None,
+            params_buffer,
+            current_params: initial_params,
         })
+    }
+
+    /// Set the per-frame opacity uniform. `1.0` = passthrough,
+    /// `0.0` = fade to black. The new value is uploaded immediately
+    /// and applies to the next `render_to` call.
+    pub fn set_opacity(&mut self, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        if (self.current_params.opacity - v).abs() < 1e-4 {
+            return;
+        }
+        self.current_params.opacity = v;
+        self.queue.write_buffer(
+            &self.params_buffer,
+            0,
+            bytemuck::cast_slice(&[self.current_params]),
+        );
     }
 
     /// Reference to the underlying wgpu device. Exposed for callers that
@@ -462,6 +522,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&view_v),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.params_buffer.as_entire_binding(),
                 },
             ],
         }));

@@ -987,17 +987,40 @@
           {#if c.effects.length === 0}
             <p class="text-vance-muted text-xs italic">No effects.</p>
           {:else}
-            <ul class="flex flex-col gap-1 text-xs">
+            <ul class="flex flex-col gap-2 text-xs">
               {#each c.effects as e (e.id)}
-                <li class="flex items-center justify-between rounded border border-vance-border bg-vance-bg px-2 py-1">
-                  <span class="font-mono">{e.kind}</span>
-                  <button
-                    class="text-vance-muted hover:text-red-400"
-                    onclick={() => projectState.removeEffect(t.id, c.id, e.id)}
-                    title="Remove effect"
-                  >
-                    ✕
-                  </button>
+                <li class="rounded border border-vance-border bg-vance-bg px-2 py-1.5">
+                  <div class="flex items-center justify-between">
+                    <span class="font-mono">{e.kind}</span>
+                    <button
+                      class="text-vance-muted hover:text-red-400"
+                      onclick={() => projectState.removeEffect(t.id, c.id, e.id)}
+                      title="Remove effect"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                  {#if e.kind === 'opacity'}
+                    {@const cur = typeof e.params.value === 'number' ? e.params.value : 1}
+                    <div class="mt-1 flex items-center gap-2">
+                      <span class="text-vance-muted w-10 text-[10px]">value</span>
+                      <input
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.01"
+                        value={cur}
+                        class="flex-1"
+                        onchange={(ev) => {
+                          const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
+                          projectState.updateEffectParam(t.id, c.id, e.id, 'value', v);
+                        }}
+                      />
+                      <span class="font-mono w-10 text-right text-[10px]">
+                        {cur.toFixed(2)}
+                      </span>
+                    </div>
+                  {/if}
                 </li>
               {/each}
             </ul>

@@ -240,6 +240,16 @@ export const removeEffectFromClip = (
 ): Promise<void> =>
   invoke('remove_effect_from_clip', { trackId, clipId, effectId });
 
+/** Update one parameter on an effect attached to a clip. */
+export const updateEffectParam = (
+  trackId: string,
+  clipId: string,
+  effectId: string,
+  key: string,
+  value: EffectValue
+): Promise<void> =>
+  invoke('update_effect_param', { trackId, clipId, effectId, key, value });
+
 /** Trim a clip's in-point. `newSourceInSeconds` is the new visible
  *  start inside the source media; the clip's timeline_in shifts by
  *  the same delta so the right edge stays put on the timeline. */

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use vance_core::RationalTime;
 
 use crate::clip::Clip;
-use crate::effect::Effect;
+use crate::effect::{Effect, EffectValue};
 use crate::error::Result;
 use crate::id::{ClipId, EffectId, TrackId};
 use crate::ops;
@@ -143,6 +143,19 @@ pub enum EditOp {
         /// Effect ID to remove.
         effect_id: EffectId,
     },
+    /// Update one parameter on an effect attached to a clip.
+    UpdateEffectParam {
+        /// Track holding the clip.
+        track_id: TrackId,
+        /// Clip the effect is attached to.
+        clip_id: ClipId,
+        /// Effect to mutate.
+        effect_id: EffectId,
+        /// Parameter key.
+        key: String,
+        /// New value (number / bool / string).
+        value: EffectValue,
+    },
 }
 
 /// Apply a single op to a sequence, returning the new sequence.
@@ -200,6 +213,20 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
             clip_id,
             effect_id,
         } => ops::remove_effect_from_clip(seq, *track_id, *clip_id, *effect_id),
+        EditOp::UpdateEffectParam {
+            track_id,
+            clip_id,
+            effect_id,
+            key,
+            value,
+        } => ops::update_effect_param(
+            seq,
+            *track_id,
+            *clip_id,
+            *effect_id,
+            key.clone(),
+            value.clone(),
+        ),
     }
 }
 

@@ -31,6 +31,14 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 @group(0) @binding(2) var tex_u: texture_2d<f32>;
 @group(0) @binding(3) var tex_v: texture_2d<f32>;
 
+// Per-frame effect parameters. Layout must match the
+// `RenderParams` struct in renderer.rs (currently just opacity +
+// 12 bytes of padding to make it 16-byte aligned).
+struct Params {
+    opacity: f32,
+};
+@group(0) @binding(4) var<uniform> params: Params;
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let y_raw = textureSample(tex_y, samp, in.uv).r;
@@ -49,5 +57,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let g = y - 0.1873 * u - 0.4681 * v;
     let b = y + 1.8556 * u;
 
-    return vec4<f32>(clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    let rgb = clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
+    // Opacity fades toward the layer's black background. Premultiplied
+    // so the framebuffer alpha stays at 1.0 (we render with blend: None;
+    // see RendererConfig).
+    return vec4<f32>(rgb * params.opacity, 1.0);
 }

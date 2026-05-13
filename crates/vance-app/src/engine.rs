@@ -231,6 +231,29 @@ fn clip_anchor_seconds(
     None
 }
 
+/// Product of every enabled "opacity" effect's `value` param on the
+/// clip with `clip_id`, clamped to `[0, 1]`. Defaults to `1.0` when
+/// the clip has no opacity effects.
+fn clip_opacity(seq: &Sequence, clip_id: vance_timeline::ClipId) -> f32 {
+    for track in seq.tracks.iter() {
+        if let Some(clip) = track.clips.iter().find(|c| c.id == clip_id) {
+            let mut op = 1.0_f32;
+            for e in clip.effects.iter() {
+                if !e.enabled {
+                    continue;
+                }
+                if e.kind == "opacity" {
+                    if let Some(EffectValue::Number(v)) = e.params.get("value") {
+                        op *= (*v as f32).clamp(0.0, 1.0);
+                    }
+                }
+            }
+            return op.clamp(0.0, 1.0);
+        }
+    }
+    1.0
+}
+
 fn first_clip_after(
     seq: &Sequence,
     after_t: vance_core::RationalTime,
@@ -480,6 +503,10 @@ pub struct ClipAnchor {
     pub source_in_seconds: f64,
     pub time_base_num: i64,
     pub time_base_den: i64,
+    /// Product of every "opacity" effect's `value` param on the
+    /// active clip (clamped to [0, 1]). 1.0 when no opacity effects
+    /// are attached. Phase 5.2's wiring.
+    pub opacity: f32,
 }
 
 /// Owns the AudioPlayer on a dedicated thread. The thread parks until
@@ -824,6 +851,14 @@ impl Engine {
         if self.playback.is_some() {
             return Err(EngineError::PlaybackInProgress);
         }
+        // Reset opacity to 1.0 when nothing else has anchored an
+        // effect-derived value — keeps single-file `Open File…`
+        // playback unaffected by a previous sequence preview's fade.
+        if self.playing_clip_anchor.is_none() {
+            if let Some(rs) = self.render_state.as_ref() {
+                rs.lock().renderer.set_opacity(1.0);
+            }
+        }
         let dec = self.decoder.as_mut().ok_or(EngineError::NoFileOpen)?;
         let frame = dec.decode_at(target_pts)?;
         let pts = frame.pts;
@@ -1134,9 +1169,9 @@ impl Engine {
         }
         // Scope the immutable project borrow tightly so we can call
         // `self.open_file` (mutable borrow) afterwards. Also capture
-        // the clip's timeline/source anchors so the UI can translate
-        // the running source-PTS back to a timeline position.
-        let (media_path, source_pts_seconds, anchor_timeline_in, anchor_source_in) = {
+        // the clip's timeline/source anchors and effect-derived
+        // opacity so the renderer fades the clip if needed.
+        let (media_path, source_pts_seconds, anchor_timeline_in, anchor_source_in, anchor_opacity) = {
             let project = self
                 .current_project
                 .as_ref()
@@ -1172,12 +1207,24 @@ impl Engine {
             // Find the source clip's timeline_in for the anchor.
             let (tl_in_sec, src_in_sec) = clip_anchor_seconds(seq, active.clip_id)
                 .unwrap_or((0.0, rt_to_seconds(active.source_pts)));
-            (path, rt_to_seconds(active.source_pts), tl_in_sec, src_in_sec)
+            let op = clip_opacity(seq, active.clip_id);
+            (
+                path,
+                rt_to_seconds(active.source_pts),
+                tl_in_sec,
+                src_in_sec,
+                op,
+            )
         };
 
         // Reopen decoder onto the active clip's media. Idempotent if
         // we're already on this file: the decoder reopens cleanly.
         self.open_file(&media_path)?;
+        // Push opacity to the renderer for this clip. Stays in effect
+        // until the next play_sequence / decode_sequence_at swaps it.
+        if let Some(rs) = self.render_state.as_ref() {
+            rs.lock().renderer.set_opacity(anchor_opacity);
+        }
 
         // Convert source-seconds → stream-time-base PTS.
         let info = self
@@ -1200,6 +1247,7 @@ impl Engine {
             source_in_seconds: anchor_source_in,
             time_base_num: tb_n,
             time_base_den: tb_d,
+            opacity: anchor_opacity,
         });
         self.playing_sequence_active = true;
         self.start_playback(from_pts)
@@ -1235,7 +1283,7 @@ impl Engine {
         if self.playback.is_some() {
             return Err(EngineError::PlaybackInProgress);
         }
-        let (media_path, source_pts_seconds, anchor_timeline_in, anchor_source_in) = {
+        let (media_path, source_pts_seconds, anchor_timeline_in, anchor_source_in, anchor_opacity) = {
             let project = self
                 .current_project
                 .as_ref()
@@ -1260,14 +1308,19 @@ impl Engine {
                 .ok_or(EngineError::MediaNotFound)?;
             let (tl_in, src_in) = clip_anchor_seconds(seq, active.clip_id)
                 .unwrap_or((0.0, rt_to_seconds(active.source_pts)));
+            let op = clip_opacity(seq, active.clip_id);
             (
                 media.path.to_string_lossy().into_owned(),
                 rt_to_seconds(active.source_pts),
                 tl_in,
                 src_in,
+                op,
             )
         };
         self.open_file(&media_path)?;
+        if let Some(rs) = self.render_state.as_ref() {
+            rs.lock().renderer.set_opacity(anchor_opacity);
+        }
         let info = self
             .stream_info
             .as_ref()
@@ -1283,6 +1336,7 @@ impl Engine {
             source_in_seconds: anchor_source_in,
             time_base_num: tb_n,
             time_base_den: tb_d,
+            opacity: anchor_opacity,
         });
         let pts = self.decode_and_render_at(target_pts)?;
         // Park the engine's "where am I" pointer at the just-rendered
@@ -1331,6 +1385,29 @@ impl Engine {
             track_id,
             clip_id,
             effect_id,
+        })
+    }
+
+    /// Update one parameter on an effect (e.g. opacity's `value`).
+    pub fn update_effect_param(
+        &mut self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+        effect_id: EffectId,
+        key: String,
+        value: EffectValue,
+    ) -> Result<(), EngineError> {
+        // Allow live updates while playing? For now, refuse — same as
+        // other clip ops — so we don't fight the playback thread.
+        if self.playback.is_some() {
+            return Err(EngineError::PlaybackInProgress);
+        }
+        self.apply_edit_op(EditOp::UpdateEffectParam {
+            track_id,
+            clip_id,
+            effect_id,
+            key,
+            value,
         })
     }
 

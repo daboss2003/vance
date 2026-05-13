@@ -21,7 +21,7 @@ use std::sync::Arc;
 use vance_core::RationalTime;
 
 use crate::clip::Clip;
-use crate::effect::Effect;
+use crate::effect::{Effect, EffectValue};
 use crate::error::{Result, TimelineError};
 use crate::id::{ClipId, EffectId, TrackId};
 use crate::sequence::Sequence;
@@ -561,6 +561,43 @@ pub fn add_effect_to_clip(
     let mut clips = track.clips.clone();
     clips[clip_idx] = Arc::new(updated);
 
+    let new_track = Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips,
+    };
+    Ok(replace_track(seq, idx, new_track))
+}
+
+/// Update (or insert) a single parameter on a clip's effect by ID.
+/// Returns an error if the clip/effect can't be found. Each call is
+/// its own EditLog entry — slider-style live updates will compound
+/// into many undo steps; 5.5 (keyframes) will batch them.
+pub fn update_effect_param(
+    seq: &Sequence,
+    track_id: TrackId,
+    clip_id: ClipId,
+    effect_id: EffectId,
+    key: String,
+    value: EffectValue,
+) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    let (clip_idx, clip) = find_clip(&track, clip_id)?;
+
+    let mut updated = (*clip).clone();
+    let target = updated
+        .effects
+        .iter_mut()
+        .find(|e| e.id == effect_id)
+        .ok_or_else(|| TimelineError::invalid(format!("effect {effect_id} not on clip")))?;
+    target.params.insert(key, value);
+
+    let mut clips = track.clips.clone();
+    clips[clip_idx] = Arc::new(updated);
     let new_track = Track {
         id: track.id,
         kind: track.kind,

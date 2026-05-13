@@ -17,6 +17,7 @@ import {
   clearSourceMarks as ipcClearSourceMarks,
   insertFromSource as ipcInsertFromSource,
   removeEffectFromClip as ipcRemoveEffect,
+  updateEffectParam as ipcUpdateEffectParam,
   loadSource as ipcLoadSource,
   mediaList,
   moveClipTo,
@@ -296,6 +297,23 @@ class ProjectState {
     this.error = null;
     try {
       await ipcRemoveEffect(trackId, clipId, effectId);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Update one parameter on an effect (e.g. opacity's `value`). */
+  async updateEffectParam(
+    trackId: string,
+    clipId: string,
+    effectId: string,
+    key: string,
+    value: EffectValue
+  ) {
+    this.error = null;
+    try {
+      await ipcUpdateEffectParam(trackId, clipId, effectId, key, value);
       await this.commitEdit();
     } catch (e) {
       this.error = String(e);
