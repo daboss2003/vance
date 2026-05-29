@@ -20,6 +20,7 @@ import {
   ocioListColorspaces,
   computeScopes,
   setScopesEnabled as ipcSetScopesEnabled,
+  setMatteNode as ipcSetMatteNode,
   insertClipAt,
   loadProject,
   addEffectToClip as ipcAddEffect,
@@ -396,6 +397,17 @@ class ProjectState {
       await ipcSetScopesEnabled(on);
     } catch (e) {
       console.debug('setScopesEnabled', e);
+    }
+  }
+
+  /** Solo a grade node's qualifier matte to the viewport, or clear it
+   *  (`effectId: null`). Transient viewer state (Phase 6.9). */
+  async setMatteNode(clipId: string, effectId: string | null) {
+    this.error = null;
+    try {
+      await ipcSetMatteNode(clipId, effectId);
+    } catch (e) {
+      this.error = String(e);
     }
   }
 

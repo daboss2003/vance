@@ -602,6 +602,30 @@ fn ocio_list_colorspaces(
         .map_err(|e| e.to_string())
 }
 
+/// Solo a grade node's HSL-qualifier matte to the viewport, or clear it
+/// (pass `effectId: null`). Transient viewer state — never persisted.
+/// Phase 6.9.
+#[tauri::command]
+fn set_matte_node(
+    state: tauri::State<'_, EngineHandle>,
+    clip_id: String,
+    effect_id: Option<String>,
+) -> Result<(), String> {
+    let clip_uuid = clip_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid clip id: {e}"))?;
+    let effect = match effect_id {
+        Some(s) => Some(vance_timeline::EffectId::from_uuid(
+            s.parse::<uuid::Uuid>().map_err(|e| format!("invalid effect id: {e}"))?,
+        )),
+        None => None,
+    };
+    state
+        .lock()
+        .set_matte_node(vance_timeline::ClipId::from_uuid(clip_uuid), effect)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn set_scopes_enabled(state: tauri::State<'_, EngineHandle>, on: bool) -> Result<(), String> {
     state.lock().set_scopes_enabled(on);
@@ -878,6 +902,7 @@ fn main() {
             ocio_list_colorspaces,
             set_scopes_enabled,
             compute_scopes,
+            set_matte_node,
             trim_clip_in,
             trim_clip_out,
             play_sequence,

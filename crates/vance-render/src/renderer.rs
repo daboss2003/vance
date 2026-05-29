@@ -189,8 +189,12 @@ struct RenderParams {
 const MAX_GRADES: usize = 8;
 
 /// One color-grade node's GPU params. All `vec4` fields (no bare f32
-/// arrays) to dodge std140 stride traps — 6 × 16 = 96 bytes. The WGSL
+/// arrays) to dodge std140 stride traps — 9 × 16 = 144 bytes. The WGSL
 /// `GradeNode` struct must match this layout byte-for-byte.
+///
+/// The last three vec4 carry the Phase 6.9 HSL qualifier (secondary
+/// key); `qual_c.zw` are reserved for the Phase 6.10 power-window mask
+/// (the final node mask is `qualifier_mask * window_mask`).
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct GradeNode {
@@ -208,20 +212,30 @@ struct GradeNode {
     /// per-channel log balances ride `lift`/`gamma`/`gain` slots when
     /// `mode == log` (documented in the shader's `apply_log`).
     log_smh: [f32; 4],
-    /// `(enabled, mode, _, _)`. `enabled`: 1 = apply, 0 = bypass.
-    /// `mode`: 0 = primary (lift/gamma/gain), 1 = log.
+    /// `(enabled, mode, qual_enable, qual_invert)`. `enabled`: 1 = apply,
+    /// 0 = bypass. `mode`: 0 = primary, 1 = log, 2 = curves.
+    /// `qual_enable`: 1 = restrict the node to the HSL qualifier mask.
+    /// `qual_invert`: 1 = invert the mask.
     flags: [f32; 4],
+    /// Qualifier `(hue_center, hue_range, sat_lo, sat_hi)` (6.9).
+    qual_a: [f32; 4],
+    /// Qualifier `(luma_lo, luma_hi, hue_soft, sat_soft)` (6.9).
+    qual_b: [f32; 4],
+    /// Qualifier `(luma_soft, show_mask, window_rsvd0, window_rsvd1)`.
+    /// `show_mask`: 1 = solo this node's matte to the viewport.
+    /// `window_rsvd*` reserved for the 6.10 power-window mask.
+    qual_c: [f32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<GradeNode>() == 96);
+const _: () = assert!(std::mem::size_of::<GradeNode>() == 144);
 // Compile-time gate on the FULL uniform size so a field add/reorder
 // that diverges from the WGSL std140 `Params` layout fails the build,
-// not just `cargo test`. 272-byte header + 8 × 96-byte GradeNode.
-const _: () = assert!(std::mem::size_of::<RenderParams>() == 1040);
+// not just `cargo test`. 272-byte header + 8 × 144-byte GradeNode.
+const _: () = assert!(std::mem::size_of::<RenderParams>() == 1424);
 
 impl GradeNode {
     /// Identity node: passthrough (disabled, primary mode, neutral
-    /// lift/gamma/gain).
+    /// lift/gamma/gain, qualifier off).
     fn identity() -> Self {
         Self {
             lift: [0.0, 0.0, 0.0, 0.0],
@@ -230,6 +244,9 @@ impl GradeNode {
             log_offset: [0.0; 4],
             log_smh: [0.0; 4],
             flags: [0.0, 0.0, 0.0, 0.0],
+            qual_a: [0.0; 4],
+            qual_b: [0.0; 4],
+            qual_c: [0.0; 4],
         }
     }
 }
@@ -305,6 +322,45 @@ pub struct GradeNodeParams {
     pub highlight: [f32; 3],
     /// Curve control points (only meaningful when `mode == Curves`).
     pub curves: Option<CurveSet>,
+    /// HSL qualifier (secondary key) — restricts the node to a hue/sat/
+    /// luma range. Mode-INDEPENDENT (applies in primary/log/curves).
+    /// Phase 6.9.
+    pub qual: Qualifier,
+}
+
+/// HSL qualifier / secondary-key params (Phase 6.9). When `enabled`, the
+/// node's correction is masked to pixels whose hue is within
+/// `hue_center ± hue_range/2` AND whose saturation/luma fall in the
+/// `[lo, hi]` bands, each feathered by its softness. Defaults are
+/// WIDE-OPEN (range / hi = 1.0) so enabling + setting only a hue doesn't
+/// accidentally key to nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Qualifier {
+    /// Restrict the node to the mask.
+    pub enabled: bool,
+    /// Invert the mask.
+    pub invert: bool,
+    /// Solo this node's matte to the viewport (display-only).
+    pub show_mask: bool,
+    /// Hue `(center, range, softness)`, all in `[0, 1]` (cyclic center).
+    pub hue: [f32; 3],
+    /// Saturation `(lo, hi, softness)` in `[0, 1]`.
+    pub sat: [f32; 3],
+    /// Luma `(lo, hi, softness)` in `[0, 1]`.
+    pub luma: [f32; 3],
+}
+
+impl Default for Qualifier {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            invert: false,
+            show_mask: false,
+            hue: [0.0, 1.0, 0.05],
+            sat: [0.0, 1.0, 0.05],
+            luma: [0.0, 1.0, 0.05],
+        }
+    }
 }
 
 impl Default for GradeNodeParams {
@@ -320,14 +376,27 @@ impl Default for GradeNodeParams {
             midtone: [0.0; 3],
             highlight: [0.0; 3],
             curves: None,
+            qual: Qualifier::default(),
         }
     }
 }
 
 impl GradeNodeParams {
+    /// Stamp the qualifier params into a (mode-specific) GradeNode. The
+    /// qualifier is mode-independent, so every `to_gpu` arm runs this.
+    fn write_qual(&self, mut n: GradeNode) -> GradeNode {
+        let q = &self.qual;
+        n.flags[2] = if q.enabled { 1.0 } else { 0.0 };
+        n.flags[3] = if q.invert { 1.0 } else { 0.0 };
+        n.qual_a = [q.hue[0], q.hue[1], q.sat[0], q.sat[1]];
+        n.qual_b = [q.luma[0], q.luma[1], q.hue[2], q.sat[2]];
+        n.qual_c = [q.luma[2], if q.show_mask { 1.0 } else { 0.0 }, 0.0, 0.0];
+        n
+    }
+
     fn to_gpu(&self) -> GradeNode {
         let enabled = if self.enabled { 1.0 } else { 0.0 };
-        match self.mode {
+        let base = match self.mode {
             GradeMode::Log => GradeNode {
                 // In log mode the per-channel shadow/mid/highlight
                 // balances ride the lift/gamma/gain vec4 slots (r,g,b);
@@ -338,6 +407,7 @@ impl GradeNodeParams {
                 log_offset: [self.offset[0], self.offset[1], self.offset[2], 0.0],
                 log_smh: [0.0; 4],
                 flags: [enabled, 1.0, 0.0, 0.0],
+                ..GradeNode::identity()
             },
             GradeMode::Curves => {
                 // Curve data lives in the atlas (row = node index); the
@@ -355,6 +425,7 @@ impl GradeNodeParams {
                     log_offset: [0.0; 4],
                     log_smh: [non_identity, 0.0, 0.0, 0.0],
                     flags: [enabled, 2.0, 0.0, 0.0],
+                    ..GradeNode::identity()
                 }
             }
             GradeMode::Primary => GradeNode {
@@ -364,8 +435,10 @@ impl GradeNodeParams {
                 log_offset: [0.0; 4],
                 log_smh: [0.0; 4],
                 flags: [enabled, 0.0, 0.0, 0.0],
+                ..GradeNode::identity()
             },
-        }
+        };
+        self.write_qual(base)
     }
 }
 
@@ -495,6 +568,12 @@ fn grade_nodes_eq(a: &GradeNode, b: &GradeNode) -> bool {
         && eq4(&a.log_offset, &b.log_offset)
         && eq4(&a.log_smh, &b.log_smh)
         && eq4(&a.flags, &b.flags)
+        // Qualifier lanes (6.9) — MUST be compared or a hue/sat/luma
+        // slider change is wrongly judged "unchanged" and the stale mask
+        // stays on the GPU.
+        && eq4(&a.qual_a, &b.qual_a)
+        && eq4(&a.qual_b, &b.qual_b)
+        && eq4(&a.qual_c, &b.qual_c)
 }
 
 #[inline]
@@ -1752,9 +1831,11 @@ mod layout_tests {
         //  chroma_key 64, chroma_params 80, luma_key 96,
         //  pipeline_flags 112, in_to_working 128, working_to_out 176,
         //  lut_params 224, view_lut_params 240, grade_count 256,
-        //  grades 272 (8 * 96 = 768) -> total 1040.
-        assert_eq!(std::mem::size_of::<RenderParams>(), 1040);
-        assert_eq!(std::mem::size_of::<GradeNode>(), 96);
+        //  grades 272 (8 * 144 = 1152) -> total 1424.
+        // GradeNode is 9 vec4 = 144: lift/gamma/gain/log_offset/log_smh/
+        // flags + qual_a (96) + qual_b (112) + qual_c (128) per node (6.9).
+        assert_eq!(std::mem::size_of::<RenderParams>(), 1424);
+        assert_eq!(std::mem::size_of::<GradeNode>(), 144);
     }
 
     #[test]
@@ -1906,5 +1987,70 @@ mod layout_tests {
         let r = eval_curve_or_identity(&cs.r, m);
         assert!((m - 0.3).abs() < 1e-9);
         assert!((r - 0.3).abs() < 1e-9, "identity R passes master through");
+    }
+
+    #[test]
+    fn qualifier_to_gpu_maps_lanes() {
+        let p = GradeNodeParams {
+            qual: Qualifier {
+                enabled: true,
+                invert: true,
+                show_mask: true,
+                hue: [0.0, 0.5, 0.1],
+                sat: [0.2, 0.8, 0.05],
+                luma: [0.1, 0.9, 0.07],
+            },
+            ..Default::default()
+        };
+        let n = p.to_gpu();
+        assert_eq!(n.flags[2], 1.0); // qual_enable
+        assert_eq!(n.flags[3], 1.0); // qual_invert
+        assert_eq!(n.qual_a, [0.0, 0.5, 0.2, 0.8]); // hueC, hueRange, satLo, satHi
+        assert_eq!(n.qual_b, [0.1, 0.9, 0.1, 0.05]); // lumaLo, lumaHi, hueSoft, satSoft
+        assert_eq!(n.qual_c, [0.07, 1.0, 0.0, 0.0]); // lumaSoft, showMask, rsvd, rsvd
+    }
+
+    #[test]
+    fn qualifier_default_is_off_in_gpu() {
+        let n = GradeNodeParams::default().to_gpu();
+        assert_eq!(n.flags[2], 0.0, "qualifier must default off (whole-frame)");
+    }
+
+    #[test]
+    fn qualifier_written_in_all_modes() {
+        // The qualifier is mode-independent — a mode switch must never
+        // drop the key.
+        for mode in [GradeMode::Primary, GradeMode::Log, GradeMode::Curves] {
+            let p = GradeNodeParams {
+                mode,
+                qual: Qualifier {
+                    enabled: true,
+                    hue: [0.25, 0.3, 0.05],
+                    ..Qualifier::default()
+                },
+                ..Default::default()
+            };
+            let n = p.to_gpu();
+            assert_eq!(n.flags[2], 1.0, "qualifier dropped in {mode:?}");
+            assert_eq!(n.qual_a[0], 0.25, "hue center lost in {mode:?}");
+        }
+    }
+
+    #[test]
+    fn grade_nodes_eq_detects_qualifier_change() {
+        // The set_grades idempotency gate keys on grade_nodes_eq; if it
+        // ignores the qualifier lanes, a hue/sat/luma slider change is
+        // wrongly skipped and the stale mask stays on the GPU.
+        let a = GradeNode::identity();
+        assert!(grade_nodes_eq(&a, &a), "identical nodes must compare equal");
+        for mutate in [
+            |n: &mut GradeNode| n.qual_a[0] = 0.5, // hue center
+            |n: &mut GradeNode| n.qual_b[2] = 0.2, // hue softness
+            |n: &mut GradeNode| n.qual_c[0] = 0.3, // luma softness
+        ] {
+            let mut b = a;
+            mutate(&mut b);
+            assert!(!grade_nodes_eq(&a, &b), "qualifier-lane change must register as different");
+        }
     }
 }

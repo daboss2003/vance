@@ -72,8 +72,8 @@ struct Params {
     view_lut_params: vec4<f32>,
     // Number of active grade nodes; only .x is read.
     grade_count: vec4<u32>,
-    // Serial color-grade chain (Phase 6.6/6.7). Must match the Rust
-    // GradeNode layout (6 vec4 = 96 bytes) byte-for-byte.
+    // Serial color-grade chain (Phase 6.6/6.7/6.9). Must match the Rust
+    // GradeNode layout (9 vec4 = 144 bytes) byte-for-byte.
     grades: array<GradeNode, 8>,
 };
 
@@ -83,10 +83,18 @@ struct GradeNode {
     gamma: vec4<f32>,       // (r, g, b, master)
     gain: vec4<f32>,        // (r, g, b, master)
     log_offset: vec4<f32>,  // (offset_r, offset_g, offset_b, _)
-    log_smh: vec4<f32>,     // reserved (luma-window widths)
-    flags: vec4<f32>,       // (enabled, mode 0=primary/1=log, _, _)
+    log_smh: vec4<f32>,     // (.x = curves non-identity flag)
+    flags: vec4<f32>,       // (enabled, mode 0=primary/1=log/2=curves, qual_enable, qual_invert)
+    qual_a: vec4<f32>,      // (hue_center, hue_range, sat_lo, sat_hi)
+    qual_b: vec4<f32>,      // (luma_lo, luma_hi, hue_soft, sat_soft)
+    qual_c: vec4<f32>,      // (luma_soft, show_mask, window_rsvd0, window_rsvd1)
 };
 @group(0) @binding(4) var<uniform> params: Params;
+
+// Set by apply_grades when a node's qualifier "show mask" is on; fs_main
+// returns the raw grayscale matte BEFORE the downstream contrast / keys /
+// output matrix / view-LUT (which would otherwise tint it). Per-invocation.
+var<private> g_matte_hit: bool = false;
 
 // Primary grade: per-channel lift/gamma/gain with a master fold.
 // DaVinci-style (NOT ASC-CDL): the gamma exponent is the RECIPROCAL,
@@ -156,26 +164,104 @@ fn apply_curve(rgb: vec3<f32>, i: u32) -> vec3<f32> {
     return out;
 }
 
+// ---- HSL qualifier (secondary key), Phase 6.9 -----------------------------
+//
+// The key is computed in a PERCEPTUAL encoding (approx gamma 1/2.2) of the
+// node's linear input — consistent with apply_log's tonal windowing, and
+// because hue/sat are numerically unstable for dark pixels in linear light
+// (a "red shirt" must key by appearance). The encode is clamped to [0,1]
+// for KEY STABILITY only; the graded value itself is never clamped.
+
+// RGB (linear) -> HSL on the perceptual encoding. Returns (h in [0,1),
+// s in [0,1], l in [0,1]).
+fn rgb_to_hsl(rgb_lin: vec3<f32>) -> vec3<f32> {
+    let c = pow(clamp(rgb_lin, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
+    let mx = max(c.r, max(c.g, c.b));
+    let mn = min(c.r, min(c.g, c.b));
+    let d = mx - mn;
+    let l = 0.5 * (mx + mn);
+    var h = 0.0;
+    if (d > 1e-6) {
+        if (mx == c.r) {
+            h = (c.g - c.b) / d + select(0.0, 6.0, c.g < c.b);
+        } else if (mx == c.g) {
+            h = (c.b - c.r) / d + 2.0;
+        } else {
+            h = (c.r - c.g) / d + 4.0;
+        }
+        h = h / 6.0;
+    }
+    let s = select(0.0, d / (1.0 - abs(2.0 * l - 1.0) + 1e-6), d > 1e-6);
+    return vec3<f32>(h, clamp(s, 0.0, 1.0), clamp(l, 0.0, 1.0));
+}
+
+// Cyclic hue distance in [0, 0.5] (wraps at 1.0).
+fn hue_dist(a: f32, b: f32) -> f32 {
+    return abs(fract(a - b + 0.5) - 0.5);
+}
+
+// One-sided soft band: 1 inside |dist| <= half, feathered to 0 over `soft`.
+fn soft_band(dist: f32, half_width: f32, soft: f32) -> f32 {
+    return 1.0 - smoothstep(half_width, half_width + max(soft, 1e-4), dist);
+}
+
+// Two-sided soft range: 1 inside [lo, hi], feathered by `soft` on each edge.
+fn soft_range(x: f32, lo: f32, hi: f32, soft: f32) -> f32 {
+    let s = max(soft, 1e-4);
+    return smoothstep(lo - s, lo, x) * (1.0 - smoothstep(hi, hi + s, x));
+}
+
+// Qualifier mask in [0,1] for the node's input pixel: hue wedge ∩ sat band
+// ∩ luma band, optionally inverted. (6.10 will multiply in a window mask.)
+fn qualifier_mask(rgb_lin: vec3<f32>, n: GradeNode) -> f32 {
+    let hsl = rgb_to_hsl(rgb_lin);
+    let k_h = soft_band(hue_dist(hsl.x, n.qual_a.x), n.qual_a.y * 0.5, n.qual_b.z);
+    let k_s = soft_range(hsl.y, n.qual_a.z, n.qual_a.w, n.qual_b.w);
+    let k_l = soft_range(hsl.z, n.qual_b.x, n.qual_b.y, n.qual_c.x);
+    var m = k_h * k_s * k_l;
+    if (n.flags.w > 0.5) { m = 1.0 - m; }   // invert
+    return clamp(m, 0.0, 1.0);
+}
+
 // Apply the serial grade chain in linear working space. Intermediate
 // values are NOT clamped to [0,1] (only floored at 0) so nodes compose
 // like a real grade graph; the downstream brightness/contrast block
 // (and the output stage) bound the final SDR result.
+//
+// Each node's correction is masked by its HSL qualifier (when enabled):
+// out = mix(input, graded, mask), with the mask computed on the node's
+// INPUT pixel (standard secondary behavior). A disabled qualifier yields
+// mask=1 (exact passthrough of the pre-6.9 behavior).
 fn apply_grades(rgb_in: vec3<f32>) -> vec3<f32> {
     var rgb = rgb_in;
     let count = params.grade_count.x;
     for (var i = 0u; i < count; i = i + 1u) {
         let n = params.grades[i];
         if (n.flags.x < 0.5) { continue; }      // bypassed node
+        let src = rgb;
+        var graded = src;
         if (n.flags.y < 0.5) {
-            rgb = apply_primary(rgb, n);
+            graded = apply_primary(src, n);
         } else if (n.flags.y < 1.5) {
-            rgb = apply_log(rgb, n);
+            graded = apply_log(src, n);
         } else {
             // mode 2 = curves; skip the 4 samples for identity nodes
             // (log_smh.x == 0 means every curve is the identity ramp).
             if (n.log_smh.x > 0.5) {
-                rgb = apply_curve(rgb, i);
+                graded = apply_curve(src, i);
             }
+        }
+        var mask = 1.0;
+        if (n.flags.z > 0.5) {                  // qualifier enabled
+            mask = qualifier_mask(src, n);
+        }
+        rgb = mix(src, graded, mask);
+        // Matte solo: show this node's mask as grayscale and stop. The
+        // first matte-enabled node wins (UI keeps it mutually exclusive).
+        if (n.flags.z > 0.5 && n.qual_c.y > 0.5) {
+            g_matte_hit = true;
+            rgb = vec3<f32>(mask);
+            break;
         }
     }
     return rgb;
@@ -328,6 +414,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     //     Pipeline contract: grade chain -> brightness/contrast ->
     //     keys -> working->output -> view-LUT.
     rgb_lin_working = apply_grades(rgb_lin_working);
+    // Qualifier matte solo (6.9): a grade node requested "show mask", so
+    // return the raw grayscale matte BEFORE contrast / keys / output
+    // matrix / view-LUT (any of which would tint a mid-gray matte).
+    if (g_matte_hit) {
+        return vec4<f32>(rgb_lin_working, 1.0);
+    }
     // 3. Contrast pivots around 0.5 *linear* — in linear-light that
     //    midpoint is darker than gamma-0.5, so sliders feel more
     //    sensitive in the shadows. Documented behavior change in

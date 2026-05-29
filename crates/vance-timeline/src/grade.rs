@@ -116,6 +116,40 @@ pub const KEY_HI_R: &str = "hi_r";
 pub const KEY_HI_G: &str = "hi_g";
 pub const KEY_HI_B: &str = "hi_b";
 
+// ---- HSL qualifier / secondary key (Phase 6.9) ------------------------
+//
+// When `qual_enable` is on, the node's correction is masked to pixels
+// whose hue is within `hue_c ± hue_range/2` AND whose saturation/luma
+// fall in the `[lo, hi]` bands, each feathered by its softness. The
+// range/hi defaults are WIDE-OPEN (1.0) so enabling the qualifier and
+// setting only a hue doesn't accidentally key to nothing. All values are
+// `EffectValue` numbers, so they're keyframe-animatable for free.
+/// Restrict the node to the qualifier mask. 0/1, default 0.
+pub const KEY_QUAL_ENABLE: &str = "qual_enable";
+/// Hue center (cyclic, 0..1). Default 0.
+pub const KEY_QUAL_HUE_C: &str = "qual_hue_c";
+/// Hue range / full width (0..1). Default 1.0 (no hue restriction).
+pub const KEY_QUAL_HUE_RANGE: &str = "qual_hue_range";
+/// Hue edge softness. Default 0.05.
+pub const KEY_QUAL_HUE_SOFT: &str = "qual_hue_soft";
+/// Saturation low bound (0..1). Default 0.
+pub const KEY_QUAL_SAT_LO: &str = "qual_sat_lo";
+/// Saturation high bound (0..1). Default 1.0.
+pub const KEY_QUAL_SAT_HI: &str = "qual_sat_hi";
+/// Saturation edge softness. Default 0.05.
+pub const KEY_QUAL_SAT_SOFT: &str = "qual_sat_soft";
+/// Luma low bound (0..1). Default 0.
+pub const KEY_QUAL_LUMA_LO: &str = "qual_luma_lo";
+/// Luma high bound (0..1). Default 1.0.
+pub const KEY_QUAL_LUMA_HI: &str = "qual_luma_hi";
+/// Luma edge softness. Default 0.05.
+pub const KEY_QUAL_LUMA_SOFT: &str = "qual_luma_soft";
+/// Invert the mask. 0/1, default 0.
+pub const KEY_QUAL_INVERT: &str = "qual_invert";
+// NOTE: "show mask" (matte solo) is intentionally NOT a persisted param.
+// It's a transient viewer state driven by the engine's `set_matte_node`
+// (Phase 6.9) so a saved project never reopens stuck in matte view.
+
 /// Max grade nodes the single-pass renderer evaluates per clip. Nodes
 /// beyond this are ignored (the UI should warn). Matches the GPU
 /// uniform array size in `vance-render`.

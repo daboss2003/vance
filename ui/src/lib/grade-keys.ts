@@ -52,4 +52,31 @@ export function gradeDefault(key: string): number {
   return 0;
 }
 
+// HSL qualifier / secondary key (Phase 6.9). Mirror of grade.rs. The
+// range/hi defaults are WIDE-OPEN (1.0) so enabling the qualifier and
+// setting only a hue doesn't key to nothing.
+export const QUALIFIER_KEYS = {
+  enable: 'qual_enable',
+  hueC: 'qual_hue_c',
+  hueRange: 'qual_hue_range',
+  hueSoft: 'qual_hue_soft',
+  satLo: 'qual_sat_lo',
+  satHi: 'qual_sat_hi',
+  satSoft: 'qual_sat_soft',
+  lumaLo: 'qual_luma_lo',
+  lumaHi: 'qual_luma_hi',
+  lumaSoft: 'qual_luma_soft',
+  invert: 'qual_invert'
+  // NOTE: "show mask" is NOT a param — it's transient viewer state driven
+  // by the `set_matte_node` IPC command (never persisted).
+} as const;
+
+/** Default for a qualifier param: range/hi → 1, the three softs → 0.05,
+ *  everything else (enable/center/lo/invert/show) → 0. */
+export function qualifierDefault(key: string): number {
+  if (key === 'qual_hue_range' || key === 'qual_sat_hi' || key === 'qual_luma_hi') return 1;
+  if (key.endsWith('_soft')) return 0.05;
+  return 0;
+}
+
 export const MAX_GRADE_NODES = 8;

@@ -371,3 +371,189 @@ fn identity_curves_node_is_noop() {
 
     assert_eq!(base, graded, "identity curves node must not change the image");
 }
+
+// ---- HSL qualifier / secondary key (Phase 6.9) ---------------------------
+
+use vance_render::{GradeMode, GradeNodeParams, Qualifier};
+
+// Build a primary node with a strong master gain (×2) and an attached
+// qualifier. Mask-modulated: where mask==0 the node is a no-op.
+fn gain_node(qual: Qualifier) -> GradeNodeParams {
+    GradeNodeParams {
+        enabled: true,
+        mode: GradeMode::Primary,
+        gain: [1.0, 1.0, 1.0, 2.0],
+        qual,
+        ..GradeNodeParams::default()
+    }
+}
+
+fn matte_node(qual: Qualifier) -> GradeNodeParams {
+    let mut q = qual;
+    q.enabled = true;
+    q.show_mask = true;
+    GradeNodeParams {
+        enabled: true,
+        mode: GradeMode::Primary,
+        qual: q,
+        ..GradeNodeParams::default()
+    }
+}
+
+fn render_center(grades: &[GradeNodeParams], frame: &vance_decoder::FrameData) -> [u8; 4] {
+    let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
+    r.upload_frame(frame).expect("upload");
+    r.set_grades(grades);
+    center(&r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64)
+}
+
+// A disabled qualifier (even with non-neutral ranges) must be a true
+// passthrough — mask==1, so the node behaves exactly as pre-6.9.
+#[test]
+fn qualifier_off_is_passthrough() {
+    let gray = solid_yuv420p(64, 64, 128, 128, 128);
+    let plain = render_center(&[gain_node(Qualifier::default())], &gray);
+    let weird_but_off = render_center(
+        &[gain_node(Qualifier {
+            enabled: false,
+            hue: [0.3, 0.1, 0.02],
+            sat: [0.8, 0.9, 0.01],
+            luma: [0.1, 0.2, 0.01],
+            ..Qualifier::default()
+        })],
+        &gray,
+    );
+    assert_eq!(plain, weird_but_off, "disabled qualifier must not change output");
+}
+
+// Wide-open qualifier (default ranges) -> mask==1 everywhere -> matte white.
+#[test]
+fn matte_wide_open_is_white() {
+    let gray = solid_yuv420p(64, 64, 128, 128, 128);
+    let m = render_center(&[matte_node(Qualifier::default())], &gray);
+    assert!(m[0] > 250 && m[1] > 250 && m[2] > 250, "expected white matte, got {m:?}");
+}
+
+// A saturation window that excludes a neutral gray (sat==0) -> mask 0 ->
+// black matte.
+#[test]
+fn matte_sat_window_excludes_gray() {
+    let gray = solid_yuv420p(64, 64, 128, 128, 128);
+    let m = render_center(
+        &[matte_node(Qualifier {
+            sat: [0.5, 1.0, 0.02],
+            ..Qualifier::default()
+        })],
+        &gray,
+    );
+    assert!(m[0] < 5 && m[1] < 5 && m[2] < 5, "expected black matte, got {m:?}");
+}
+
+// Invert flips the excluded gray back to fully keyed (white).
+#[test]
+fn matte_invert_flips() {
+    let gray = solid_yuv420p(64, 64, 128, 128, 128);
+    let m = render_center(
+        &[matte_node(Qualifier {
+            sat: [0.5, 1.0, 0.02],
+            invert: true,
+            ..Qualifier::default()
+        })],
+        &gray,
+    );
+    assert!(m[0] > 250 && m[1] > 250 && m[2] > 250, "inverted matte should be white, got {m:?}");
+}
+
+// Luma window keys a near-white frame only when its band includes ~1.0.
+#[test]
+fn matte_luma_window_selects_by_brightness() {
+    let white = solid_yuv420p(64, 64, 235, 128, 128);
+    let included = render_center(
+        &[matte_node(Qualifier {
+            luma: [0.5, 1.0, 0.02],
+            ..Qualifier::default()
+        })],
+        &white,
+    );
+    let excluded = render_center(
+        &[matte_node(Qualifier {
+            luma: [0.0, 0.4, 0.02],
+            ..Qualifier::default()
+        })],
+        &white,
+    );
+    assert!(included[0] > 250, "white in [0.5,1] luma band should key white, got {included:?}");
+    assert!(excluded[0] < 5, "white outside [0,0.4] luma band should be black, got {excluded:?}");
+}
+
+// Hue keying: a red frame (hue ~= 0) is keyed by a narrow band at hue 0
+// and excluded by the opposite band at hue 0.5 (tests cyclic distance).
+#[test]
+fn matte_hue_key_red_in_excluded_at_opposite() {
+    let red = solid_yuv420p(64, 64, 63, 102, 240);
+    let keyed = render_center(
+        &[matte_node(Qualifier {
+            hue: [0.0, 0.2, 0.02],
+            ..Qualifier::default()
+        })],
+        &red,
+    );
+    let not_keyed = render_center(
+        &[matte_node(Qualifier {
+            hue: [0.5, 0.2, 0.02],
+            ..Qualifier::default()
+        })],
+        &red,
+    );
+    assert!(keyed[0] > 240, "red should key at hue 0, got {keyed:?}");
+    assert!(not_keyed[0] < 15, "red should be excluded at hue 0.5, got {not_keyed:?}");
+}
+
+// Out-of-key correction is a bypass: a gain node keyed to a hue the frame
+// lacks leaves the image byte-identical to ungraded.
+#[test]
+fn out_of_key_is_bypass() {
+    let red = solid_yuv420p(64, 64, 63, 102, 240);
+    let base = render_center(&[], &red);
+    let off_hue = render_center(
+        &[gain_node(Qualifier {
+            enabled: true,
+            hue: [0.5, 0.2, 0.02], // cyan key — red is excluded
+            ..Qualifier::default()
+        })],
+        &red,
+    );
+    assert_eq!(base, off_hue, "out-of-key node must be a pixel-exact bypass");
+    // Sanity: an in-key version DOES change the pixel.
+    let in_key = render_center(
+        &[gain_node(Qualifier {
+            enabled: true,
+            hue: [0.0, 0.2, 0.02],
+            ..Qualifier::default()
+        })],
+        &red,
+    );
+    assert_ne!(base, in_key, "in-key node should change the pixel");
+}
+
+// The qualifier gates identically regardless of node mode (log here).
+#[test]
+fn qualifier_is_mode_agnostic() {
+    let red = solid_yuv420p(64, 64, 63, 102, 240);
+    let base = render_center(&[], &red);
+    let log_off_key = render_center(
+        &[GradeNodeParams {
+            enabled: true,
+            mode: GradeMode::Log,
+            offset: [0.3, 0.3, 0.3],
+            qual: Qualifier {
+                enabled: true,
+                hue: [0.5, 0.2, 0.02], // exclude red
+                ..Qualifier::default()
+            },
+            ..GradeNodeParams::default()
+        }],
+        &red,
+    );
+    assert_eq!(base, log_off_key, "out-of-key LOG node must also bypass");
+}

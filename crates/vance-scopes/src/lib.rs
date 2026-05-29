@@ -226,6 +226,15 @@ pub fn compute_all(rgba: &[u8], w: u32, h: u32, cfg: &ScopeConfig) -> Result<Sco
 /// Binary blob magic ("SCP1") for the raw-bytes IPC transport.
 pub const SCOPE_BLOB_MAGIC: u32 = 0x53435031;
 
+// `to_bytes` uses `bytemuck::cast_slice` (native-endian) for the bulk
+// arrays while the TS parser reads them as little-endian. That only
+// matches on little-endian hosts — fail the build loudly on a big-endian
+// target rather than silently shipping byte-swapped scopes.
+const _: () = assert!(
+    cfg!(target_endian = "little"),
+    "vance-scopes::ScopeData::to_bytes assumes a little-endian target for the IPC blob"
+);
+
 impl ScopeData {
     /// Serialize to a compact little-endian byte blob for raw-bytes IPC.
     /// Layout (all multi-byte values little-endian):

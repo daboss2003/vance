@@ -449,6 +449,11 @@ function parseScopeBlob(buf: ArrayBuffer): ScopeData | null {
 export const setScopesEnabled = (on: boolean): Promise<void> =>
   invoke('set_scopes_enabled', { on });
 
+/** Solo a grade node's HSL-qualifier matte to the viewport, or clear it
+ *  (pass `effectId: null`). Transient — not persisted. Phase 6.9. */
+export const setMatteNode = (clipId: string, effectId: string | null): Promise<void> =>
+  invoke('set_matte_node', { clipId, effectId });
+
 /** Compute the current frame's scope data. Returns `null` when there's
  *  no update (scopes disabled, playing, or no cached frame). */
 export async function computeScopes(

@@ -370,6 +370,9 @@
     if (key && key !== lastColorSeekKey) {
       const mid = d!.clip.timeline_in_seconds + d!.clip.duration_seconds / 2;
       untrack(() => {
+        // Switching clips drops any active matte (it belonged to the
+        // previous clip's node).
+        if (matteNodeId) clearMatte();
         lastColorSeekKey = key;
         decodeSequenceAt(mid)
           .then(() => projectState.refreshScopes(256, 144, scopePreLut))
@@ -377,6 +380,7 @@
       });
     } else if (!key && lastColorSeekKey) {
       untrack(() => {
+        if (matteNodeId) clearMatte();
         lastColorSeekKey = '';
       });
     }
@@ -394,6 +398,9 @@
     untrack(() => {
       projectState.setScopesEnabled(on);
       if (on) projectState.refreshScopes(256, 144, scopePreLut);
+      // Matte solo is a Color-page viewer state — never leak it onto the
+      // Edit page's preview.
+      else clearMatte();
     });
   });
 
@@ -899,6 +906,67 @@
     await projectState.updateEffectParams(d.track.id, d.clip.id, node.id, curveParam(ch, points));
     refreshScopesNow();
   }
+
+  // ---- HSL qualifier / secondary key (Phase 6.9) ---------------------------
+
+  /** Which node's qualifier matte is soloed to the viewport, or null.
+   *  Transient (engine-side), mutually exclusive by construction. */
+  let matteNodeId = $state<string | null>(null);
+  let matteClipId: string | null = null;
+
+  function readQual(node: EffectInfo, key: string): number {
+    const raw = node.params[key];
+    if (raw === undefined) return GK.qualifierDefault(key);
+    return evalNumber(raw, 0, GK.qualifierDefault(key));
+  }
+  function qualOn(node: EffectInfo): boolean {
+    return readQual(node, GK.QUALIFIER_KEYS.enable) > 0.5;
+  }
+  /** Live-preview a qualifier param during a slider drag (non-undoable). */
+  function previewQual(node: EffectInfo, key: string, value: number) {
+    const d = selectedClipDetails;
+    if (!d) return;
+    projectState.previewGradeParams(d.clip.id, node.id, [[key, value]]);
+    refreshScopesNow();
+  }
+  /** Commit a qualifier param as one undoable edit. */
+  async function commitQual(node: EffectInfo, key: string, value: number) {
+    const d = selectedClipDetails;
+    if (!d) return;
+    await projectState.updateEffectParams(d.track.id, d.clip.id, node.id, [[key, value]]);
+    refreshScopesNow();
+  }
+  function toggleQualBool(node: EffectInfo, key: string) {
+    commitQual(node, key, readQual(node, key) > 0.5 ? 0 : 1);
+  }
+
+  /** Solo / unsolo this node's qualifier matte (engine viewer state). */
+  function toggleMatte(node: EffectInfo) {
+    const d = selectedClipDetails;
+    if (!d) return;
+    if (matteNodeId === node.id) {
+      clearMatte();
+    } else {
+      matteNodeId = node.id;
+      matteClipId = d.clip.id;
+      projectState.setMatteNode(d.clip.id, node.id);
+    }
+  }
+  function clearMatte() {
+    if (matteNodeId && matteClipId) projectState.setMatteNode(matteClipId, null);
+    matteNodeId = null;
+    matteClipId = null;
+  }
+
+  // If the soloed node is deleted (or otherwise vanishes from the chain),
+  // drop the stale matte so the toggle can't stay "active" on a node that
+  // no longer exists.
+  $effect(() => {
+    const nodes = gradeNodes;
+    untrack(() => {
+      if (matteNodeId && !nodes.some((n) => n.id === matteNodeId)) clearMatte();
+    });
+  });
 
   /** First enabled video track on the active sequence, or null. */
   function firstVideoTrackId(): string | null {
@@ -1934,6 +2002,67 @@
         {:else}
           {@const node = activeNode}
           {@const mode = nodeMode(node)}
+
+          <!-- HSL qualifier / secondary key (Phase 6.9). Present for ALL
+               modes — set the key first, then grade inside it. -->
+          {@const qOn = qualOn(node)}
+          <div class="mb-4 rounded border border-vance-border p-2">
+            <div class="mb-2 flex items-center justify-between">
+              <label class="flex items-center gap-1.5 text-[11px]">
+                <input type="checkbox" checked={qOn} onchange={() => toggleQualBool(node, GK.QUALIFIER_KEYS.enable)} />
+                <span class="text-vance-muted uppercase tracking-wider">Qualifier</span>
+              </label>
+              <div class="flex gap-1 text-[10px]">
+                <button
+                  class="rounded border px-1 py-0.5 {readQual(node, GK.QUALIFIER_KEYS.invert) > 0.5
+                    ? 'border-[var(--color-vance-accent)] bg-[#003040]'
+                    : 'bg-vance-bg border-vance-border'} disabled:opacity-40"
+                  disabled={!qOn}
+                  onclick={() => toggleQualBool(node, GK.QUALIFIER_KEYS.invert)}
+                  title="Invert the mask"
+                >
+                  invert
+                </button>
+                <button
+                  class="rounded border px-1 py-0.5 {matteNodeId === node.id
+                    ? 'border-yellow-400 bg-[#3a3320] text-yellow-200'
+                    : 'bg-vance-bg border-vance-border'} disabled:opacity-40"
+                  disabled={!qOn}
+                  onclick={() => toggleMatte(node)}
+                  title="Solo the matte (B/W) to the viewport"
+                >
+                  ◧ mask
+                </button>
+              </div>
+            </div>
+            {#if qOn}
+              <div class="flex flex-col gap-2 text-[10px]" class:opacity-40={!qOn}>
+                {#each [['Hue', [GK.QUALIFIER_KEYS.hueC, GK.QUALIFIER_KEYS.hueRange, GK.QUALIFIER_KEYS.hueSoft]], ['Sat', [GK.QUALIFIER_KEYS.satLo, GK.QUALIFIER_KEYS.satHi, GK.QUALIFIER_KEYS.satSoft]], ['Luma', [GK.QUALIFIER_KEYS.lumaLo, GK.QUALIFIER_KEYS.lumaHi, GK.QUALIFIER_KEYS.lumaSoft]]] as [label, keys] (label)}
+                  {@const labels = label === 'Hue' ? ['center', 'range', 'soft'] : ['lo', 'hi', 'soft']}
+                  <div>
+                    <div class="text-vance-muted mb-0.5">{label}</div>
+                    <div class="grid grid-cols-3 gap-1">
+                      {#each keys as k, i (k)}
+                        <label class="flex flex-col">
+                          <span class="text-vance-muted text-[9px]">{labels[i]}</span>
+                          <input
+                            type="range"
+                            min="0"
+                            max={labels[i] === 'soft' ? 0.5 : 1}
+                            step="0.001"
+                            value={readQual(node, k)}
+                            oninput={(e) => previewQual(node, k, parseFloat((e.currentTarget as HTMLInputElement).value))}
+                            onchange={(e) => commitQual(node, k, parseFloat((e.currentTarget as HTMLInputElement).value))}
+                          />
+                        </label>
+                      {/each}
+                    </div>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </div>
+
           {#if mode === 'primary'}
             {#each ['lift', 'gamma', 'gain'] as group (group)}
               {@const w = readWheel(node, group)}

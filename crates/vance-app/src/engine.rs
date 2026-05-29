@@ -456,6 +456,7 @@ fn clip_brightness_contrast_at(
 fn eval_clip_grades(
     effects: &[vance_timeline::Effect],
     t_seconds: f64,
+    matte_node: Option<EffectId>,
 ) -> Vec<vance_render::GradeNodeParams> {
     use vance_timeline::grade as gk;
     let num = |ps: &std::collections::BTreeMap<String, EffectValue>, k: &str, default: f32| -> f32 {
@@ -504,6 +505,11 @@ fn eval_clip_grades(
             Some(EffectValue::String(s)) if s == gk::MODE_CURVES => vance_render::GradeMode::Curves,
             _ => vance_render::GradeMode::Primary,
         };
+        // Matte solo is a transient VIEWER state (never persisted): the
+        // engine forces show_mask (and enable, so the mask computes) on
+        // the one node the UI is inspecting. This avoids serializing a
+        // "show mask" param that would reopen the project in matte view.
+        let is_matte = matte_node == Some(e.id);
         let curves = if matches!(mode, vance_render::GradeMode::Curves) {
             Some(vance_render::CurveSet {
                 master: curve(&e.params, gk::KEY_CURVE_MASTER),
@@ -557,6 +563,30 @@ fn eval_clip_grades(
                 num(&e.params, gk::KEY_HI_G, 0.0),
                 num(&e.params, gk::KEY_HI_B, 0.0),
             ],
+            // HSL qualifier (6.9) — read for EVERY node regardless of
+            // mode (the key is mode-independent). Wide-open defaults
+            // (range/hi = 1.0) so an enabled-but-untuned qualifier keys
+            // the whole frame rather than nothing.
+            qual: vance_render::Qualifier {
+                enabled: num(&e.params, gk::KEY_QUAL_ENABLE, 0.0) > 0.5 || is_matte,
+                invert: num(&e.params, gk::KEY_QUAL_INVERT, 0.0) > 0.5,
+                show_mask: is_matte,
+                hue: [
+                    num(&e.params, gk::KEY_QUAL_HUE_C, 0.0),
+                    num(&e.params, gk::KEY_QUAL_HUE_RANGE, 1.0),
+                    num(&e.params, gk::KEY_QUAL_HUE_SOFT, 0.05),
+                ],
+                sat: [
+                    num(&e.params, gk::KEY_QUAL_SAT_LO, 0.0),
+                    num(&e.params, gk::KEY_QUAL_SAT_HI, 1.0),
+                    num(&e.params, gk::KEY_QUAL_SAT_SOFT, 0.05),
+                ],
+                luma: [
+                    num(&e.params, gk::KEY_QUAL_LUMA_LO, 0.0),
+                    num(&e.params, gk::KEY_QUAL_LUMA_HI, 1.0),
+                    num(&e.params, gk::KEY_QUAL_LUMA_SOFT, 0.05),
+                ],
+            },
         });
     }
     out
@@ -566,10 +596,11 @@ fn clip_grades_at(
     seq: &Sequence,
     clip_id: vance_timeline::ClipId,
     t_seconds: f64,
+    matte_node: Option<EffectId>,
 ) -> Vec<vance_render::GradeNodeParams> {
     for track in seq.tracks.iter() {
         if let Some(clip) = track.clips.iter().find(|c| c.id == clip_id) {
-            return eval_clip_grades(&clip.effects, t_seconds);
+            return eval_clip_grades(&clip.effects, t_seconds, matte_node);
         }
     }
     Vec::new()
@@ -1000,6 +1031,12 @@ pub struct Engine {
     /// when the render lock is momentarily contended (so the UI keeps the
     /// previous frame's scopes instead of flickering empty).
     last_scopes: Option<vance_scopes::ScopeData>,
+
+    /// Grade node whose HSL-qualifier matte is soloed to the viewport
+    /// (Phase 6.9). Transient VIEWER state — never serialized — so a
+    /// project never reopens stuck in matte view. Applied during grade
+    /// evaluation by forcing `show_mask` on the matching node.
+    matte_node: Option<EffectId>,
 }
 
 /// Anchors a stream-time-base playback position back to a sequence
@@ -2040,6 +2077,43 @@ impl Engine {
         vance_ocio::list_colorspaces(path.as_deref()).map_err(|e| EngineError::Ocio(e.to_string()))
     }
 
+    /// Solo a grade node's HSL-qualifier matte to the viewport, or clear
+    /// it (`None`). Transient — not persisted. Re-evaluates `clip_id`'s
+    /// grades with the matte override and repaints so the matte
+    /// appears/disappears immediately (paused-workflow, like preview).
+    /// Phase 6.9.
+    pub fn set_matte_node(
+        &mut self,
+        clip_id: vance_timeline::ClipId,
+        effect_id: Option<EffectId>,
+    ) -> Result<(), EngineError> {
+        self.matte_node = effect_id;
+        let grades = {
+            let project = match self.current_project.as_ref() {
+                Some(p) => p,
+                None => return Ok(()),
+            };
+            let seq_id = match self.current_sequence_id {
+                Some(id) => id,
+                None => return Ok(()),
+            };
+            let seq = match project.sequence(seq_id) {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+            clip_grades_at(seq, clip_id, 0.0, self.matte_node)
+        };
+        if let Some(rs) = self.render_state.as_ref() {
+            rs.lock().renderer.set_grades(&grades);
+        }
+        if let (Some(rs), Some(vp)) = (self.render_state.as_ref(), self.viewport.as_ref()) {
+            let rs = rs.clone();
+            let vp = vp.clone();
+            present_record_only(&rs, &vp)?;
+        }
+        Ok(())
+    }
+
     /// Enable/disable scope computation (Phase 6.12). The UI sets this
     /// when the scopes panel becomes visible/hidden so `compute_scopes`
     /// is a no-op (no GPU readback) while scopes aren't shown.
@@ -2298,6 +2372,7 @@ impl Engine {
             rs.renderer.set_grades(&eval_clip_grades(
                 &clip_effects_snapshot,
                 source_pts_seconds - anchor_source_in,
+                self.matte_node,
             ));
             if let Some(p) = entry_pipeline {
                 rs.renderer.set_pipeline(p);
@@ -2484,7 +2559,8 @@ impl Engine {
             rs.renderer.set_crop(crop[0], crop[1], crop[2], crop[3]);
             rs.renderer.set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
             rs.renderer.set_luma_key(luma.0, luma.1, luma.2, luma.3);
-            rs.renderer.set_grades(&clip_grades_at(seq, from_clip_id, from_clip_t));
+            rs.renderer
+                .set_grades(&clip_grades_at(seq, from_clip_id, from_clip_t, self.matte_node));
             rs.renderer.set_mix_factor(active_tr.mix);
             if let Some(p) = a_pipeline {
                 rs.renderer.set_pipeline(p);
@@ -2581,7 +2657,7 @@ impl Engine {
             rs.renderer.set_crop(crop[0], crop[1], crop[2], crop[3]);
             rs.renderer.set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
             rs.renderer.set_luma_key(luma.0, luma.1, luma.2, luma.3);
-            rs.renderer.set_grades(&eval_clip_grades(&effects, 0.0));
+            rs.renderer.set_grades(&eval_clip_grades(&effects, 0.0, self.matte_node));
             rs.renderer.set_mix_factor(0.0);
             if let Some(p) = title_pipeline {
                 rs.renderer.set_pipeline(p);
@@ -2646,7 +2722,7 @@ impl Engine {
                 clip_brightness_contrast_at(seq, clip_id, clip_t),
                 clip_chroma_key_at(seq, clip_id, clip_t),
                 clip_luma_key_at(seq, clip_id, clip_t),
-                clip_grades_at(seq, clip_id, clip_t),
+                clip_grades_at(seq, clip_id, clip_t, self.matte_node),
             )
         };
         // Title media is tagged sRGB; route it through the project
@@ -2948,7 +3024,7 @@ impl Engine {
                 clip_brightness_contrast_at(seq, anchor_clip_id, entry_clip_t),
                 clip_chroma_key_at(seq, anchor_clip_id, entry_clip_t),
                 clip_luma_key_at(seq, anchor_clip_id, entry_clip_t),
-                clip_grades_at(seq, anchor_clip_id, entry_clip_t),
+                clip_grades_at(seq, anchor_clip_id, entry_clip_t, self.matte_node),
             )
         };
         if let Some(rs) = self.render_state.as_ref() {
@@ -3212,7 +3288,7 @@ impl Engine {
             // Grade params aren't usually keyframed during a live drag;
             // eval at t=0 is a fine preview. The pointer-up commit
             // re-renders at the real playhead time.
-            eval_clip_grades(&effects, 0.0)
+            eval_clip_grades(&effects, 0.0, self.matte_node)
         };
         if let Some(rs) = self.render_state.as_ref() {
             rs.lock().renderer.set_grades(&grades);
@@ -4052,7 +4128,8 @@ fn playback_loop(
             let (br, ct) = eval_clip_brightness_contrast(&clip_effects, clip_t);
             let chroma = eval_clip_chroma_key(&clip_effects, clip_t);
             let luma = eval_clip_luma_key(&clip_effects, clip_t);
-            let grades = eval_clip_grades(&clip_effects, clip_t);
+            // Live playback: matte solo is a paused-only viewer state.
+            let grades = eval_clip_grades(&clip_effects, clip_t, None);
             let mut rs = render_state.lock();
             rs.renderer.set_opacity(op);
             rs.renderer.set_transform(xf.translate, xf.scale, xf.rotation_radians);
