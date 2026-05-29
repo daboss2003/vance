@@ -14,6 +14,7 @@
     master,
     masterMin = -1,
     masterMax = 1,
+    showMaster = true,
     onInput,
     onCommit
   }: {
@@ -22,6 +23,7 @@
     master: number;
     masterMin?: number;
     masterMax?: number;
+    showMaster?: boolean;
     onInput: (rgb: Rgb, master: number) => void;
     onCommit: (rgb: Rgb, master: number) => void;
   } = $props();
@@ -49,7 +51,11 @@
   }
 
   let puck = $derived(rgbToPuck(rgb));
-  let puckPx = $derived({ x: CX + puck.x * R, y: CY + puck.y * R });
+  // Clamp the *display* position to the ring even when the underlying
+  // rgb balance (imported / keyframed) exceeds the wheel's travel; the
+  // stored values stay intact.
+  let puckClamped = $derived(clampUnit(puck.x, puck.y));
+  let puckPx = $derived({ x: CX + puckClamped.x * R, y: CY + puckClamped.y * R });
 
   let dragging = $state(false);
 
@@ -85,6 +91,16 @@
     onCommit(pointerToRgb(ev, el), master);
   }
 
+  // If the OS/browser cancels the gesture (context menu, capture loss),
+  // pointerup never fires. Without this the move handler would stay
+  // armed (puck dragging with no button) and the live preview would
+  // never be committed. Commit the current rgb and disarm.
+  function onWheelCancel() {
+    if (!dragging) return;
+    dragging = false;
+    onCommit(rgb, master);
+  }
+
   // Double-click resets the wheel balance to neutral.
   function resetWheel() {
     onCommit([0, 0, 0], master);
@@ -109,11 +125,16 @@
       class="cursor-crosshair touch-none select-none"
       role="slider"
       tabindex="0"
-      aria-label={`${label} balance`}
+      aria-label={`${label} balance trackball`}
+      aria-valuemin={-1}
+      aria-valuemax={1}
       aria-valuenow={0}
+      aria-valuetext={`R ${rgb[0].toFixed(2)} G ${rgb[1].toFixed(2)} B ${rgb[2].toFixed(2)}`}
       onpointerdown={onWheelDown}
       onpointermove={onWheelMove}
       onpointerup={onWheelUp}
+      onpointercancel={onWheelCancel}
+      onlostpointercapture={onWheelCancel}
       ondblclick={resetWheel}
     >
       <!-- Ring background -->
@@ -135,19 +156,23 @@
         stroke-width="1.5"
       />
     </svg>
-    <!-- Master slider -->
-    <input
-      type="range"
-      class="vance-vrange h-[96px]"
-      min={masterMin}
-      max={masterMax}
-      step="0.001"
-      value={master}
-      oninput={onMasterInput}
-      onchange={onMasterCommit}
-      aria-label={`${label} master`}
-      title={`${label} master ${master.toFixed(3)}`}
-    />
+    <!-- Master slider — only for groups that have a master channel
+         (primary lift/gamma/gain). Log groups have no master, so the
+         slider would be dead UI; hide it. -->
+    {#if showMaster}
+      <input
+        type="range"
+        class="vance-vrange h-[96px]"
+        min={masterMin}
+        max={masterMax}
+        step="0.001"
+        value={master}
+        oninput={onMasterInput}
+        onchange={onMasterCommit}
+        aria-label={`${label} master`}
+        title={`${label} master ${master.toFixed(3)}`}
+      />
+    {/if}
   </div>
   <span class="font-mono text-[9px] text-vance-muted">
     {rgb[0].toFixed(2)} {rgb[1].toFixed(2)} {rgb[2].toFixed(2)} · {master.toFixed(2)}

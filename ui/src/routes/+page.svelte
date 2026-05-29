@@ -71,6 +71,9 @@
   let activePage = $state<'edit' | 'color'>('edit');
   // Which grade node's wheels are shown on the Color page.
   let selectedNodeId = $state<string | null>(null);
+  // Guards the color-page auto-seek so we only decode once per
+  // (page, clip) change rather than on every editTick refresh.
+  let lastColorSeekKey = $state<string>('');
   $effect(() => {
     void projectState.info;
     void projectState.editTick;
@@ -351,6 +354,27 @@
     requestAnimationFrame(reportBounds);
   });
 
+  // Color page: when the user switches to Color or selects a different
+  // clip, seek the Record viewport into that clip's range so the
+  // preview shows the clip being graded (not whatever the timeline
+  // playhead last decoded). Guarded by lastColorSeekKey so an editTick
+  // refresh that re-derives selectedClipDetails doesn't re-decode.
+  $effect(() => {
+    const d = selectedClipDetails;
+    const key = activePage === 'color' && d ? d.clip.id : '';
+    if (key && key !== lastColorSeekKey) {
+      const mid = d!.clip.timeline_in_seconds + d!.clip.duration_seconds / 2;
+      untrack(() => {
+        lastColorSeekKey = key;
+        decodeSequenceAt(mid).catch(() => {});
+      });
+    } else if (!key && lastColorSeekKey) {
+      untrack(() => {
+        lastColorSeekKey = '';
+      });
+    }
+  });
+
   async function handleOpen() {
     openError = null;
     const selected = await open({
@@ -621,6 +645,25 @@
     });
   }
 
+  // Node-list actions — each captures selectedClipDetails once (instead
+  // of repeating a `!` non-null assertion at every call site) so a
+  // stale async fire can't dereference null.
+  async function toggleNodeEnabled(node: EffectInfo) {
+    const d = selectedClipDetails;
+    if (!d) return;
+    await projectState.setNodeEnabled(d.track.id, d.clip.id, node.id, !node.enabled);
+  }
+  async function moveNode(node: EffectInfo, newIndex: number) {
+    const d = selectedClipDetails;
+    if (!d) return;
+    await projectState.moveGradeNode(d.track.id, d.clip.id, node.id, newIndex);
+  }
+  async function deleteNode(node: EffectInfo) {
+    const d = selectedClipDetails;
+    if (!d) return;
+    await projectState.removeEffect(d.track.id, d.clip.id, node.id);
+  }
+
   /** Live-preview a wheel group's three channel values + master during
    *  a drag (non-undoable), then nothing is committed until pointer-up
    *  (`commitWheel`). `group` is e.g. 'lift' | 'gamma' | 'gain' (primary)
@@ -640,7 +683,26 @@
     };
   }
 
-  /** Push a wheel change live to the engine preview (no undo step). */
+  /** All (key, value) pairs a wheel change touches — R/G/B plus master
+   *  (primary only). Batched so preview + commit each move as a unit. */
+  function wheelParams(
+    group: string,
+    rgb: [number, number, number],
+    master: number
+  ): [string, EffectValue][] {
+    const k = wheelKeys(group);
+    const out: [string, EffectValue][] = [
+      [k.rgb[0], rgb[0]],
+      [k.rgb[1], rgb[1]],
+      [k.rgb[2], rgb[2]]
+    ];
+    if (k.master) out.push([k.master, master]);
+    return out;
+  }
+
+  /** Push a wheel change live to the engine preview (no undo step). All
+   *  channels go in ONE batched call so the preview shows every channel
+   *  at once (a per-key sequence would only show the last). */
   function previewWheel(
     node: EffectInfo,
     group: string,
@@ -649,16 +711,10 @@
   ) {
     const d = selectedClipDetails;
     if (!d) return;
-    const k = wheelKeys(group);
-    // Preview applies one key at a time; push all four (or three) keys
-    // by overriding them in sequence on the engine fast-path.
-    projectState.previewGradeParam(d.clip.id, node.id, k.rgb[0], rgb[0]);
-    projectState.previewGradeParam(d.clip.id, node.id, k.rgb[1], rgb[1]);
-    projectState.previewGradeParam(d.clip.id, node.id, k.rgb[2], rgb[2]);
-    if (k.master) projectState.previewGradeParam(d.clip.id, node.id, k.master, master);
+    projectState.previewGradeParams(d.clip.id, node.id, wheelParams(group, rgb, master));
   }
 
-  /** Commit a wheel change as undoable edits (on pointer-up). */
+  /** Commit a wheel change as ONE undoable edit (on pointer-up). */
   async function commitWheel(
     node: EffectInfo,
     group: string,
@@ -667,13 +723,12 @@
   ) {
     const d = selectedClipDetails;
     if (!d) return;
-    const k = wheelKeys(group);
-    await projectState.updateEffectParam(d.track.id, d.clip.id, node.id, k.rgb[0], rgb[0]);
-    await projectState.updateEffectParam(d.track.id, d.clip.id, node.id, k.rgb[1], rgb[1]);
-    await projectState.updateEffectParam(d.track.id, d.clip.id, node.id, k.rgb[2], rgb[2]);
-    if (k.master) {
-      await projectState.updateEffectParam(d.track.id, d.clip.id, node.id, k.master, master);
-    }
+    await projectState.updateEffectParams(
+      d.track.id,
+      d.clip.id,
+      node.id,
+      wheelParams(group, rgb, master)
+    );
   }
 
   /** First enabled video track on the active sequence, or null. */
@@ -1090,13 +1145,7 @@
                 <input
                   type="checkbox"
                   checked={node.enabled}
-                  onchange={() =>
-                    projectState.setNodeEnabled(
-                      selectedClipDetails!.track.id,
-                      selectedClipDetails!.clip.id,
-                      node.id,
-                      !node.enabled
-                    )}
+                  onchange={() => toggleNodeEnabled(node)}
                   title="Bypass / enable this node"
                 />
                 <button
@@ -1107,13 +1156,7 @@
                 </button>
                 <button
                   class="text-vance-muted hover:brightness-125 disabled:opacity-30"
-                  onclick={() =>
-                    projectState.moveGradeNode(
-                      selectedClipDetails!.track.id,
-                      selectedClipDetails!.clip.id,
-                      node.id,
-                      i - 1
-                    )}
+                  onclick={() => moveNode(node, i - 1)}
                   disabled={i === 0}
                   title="Move up (earlier in chain)"
                 >
@@ -1121,13 +1164,7 @@
                 </button>
                 <button
                   class="text-vance-muted hover:brightness-125 disabled:opacity-30"
-                  onclick={() =>
-                    projectState.moveGradeNode(
-                      selectedClipDetails!.track.id,
-                      selectedClipDetails!.clip.id,
-                      node.id,
-                      i + 1
-                    )}
+                  onclick={() => moveNode(node, i + 1)}
                   disabled={i === gradeNodes.length - 1}
                   title="Move down (later in chain)"
                 >
@@ -1135,12 +1172,7 @@
                 </button>
                 <button
                   class="text-vance-muted hover:text-red-400"
-                  onclick={() =>
-                    projectState.removeEffect(
-                      selectedClipDetails!.track.id,
-                      selectedClipDetails!.clip.id,
-                      node.id
-                    )}
+                  onclick={() => deleteNode(node)}
                   title="Delete node"
                 >
                   ✕
@@ -1594,8 +1626,7 @@
                   label={group}
                   rgb={w.rgb}
                   master={w.master}
-                  masterMin={-0.5}
-                  masterMax={0.5}
+                  showMaster={false}
                   onInput={(rgb, m) => previewWheel(node, group, rgb, m)}
                   onCommit={(rgb, m) => commitWheel(node, group, rgb, m)}
                 />

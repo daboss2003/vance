@@ -396,16 +396,25 @@ export const setEffectEnabled = (
 ): Promise<void> =>
   invoke('set_effect_enabled', { trackId, clipId, effectId, enabled });
 
-/** Live, NON-undoable preview of one grade param mid-drag. Repaints
- *  the Record viewport with the override; the caller commits one
- *  `updateEffectParam` on pointer-up for a single undo step. */
-export const previewGradeParam = (
+/** Update several effect params in one undoable step. The color-page
+ *  wheel commit writes R/G/B/master together so a drag is one undo. */
+export const updateEffectParams = (
+  trackId: string,
   clipId: string,
   effectId: string,
-  key: string,
-  value: EffectValue
+  params: [string, EffectValue][]
 ): Promise<void> =>
-  invoke('preview_grade_param', { clipId, effectId, key, value });
+  invoke('update_effect_params', { trackId, clipId, effectId, params });
+
+/** Live, NON-undoable preview of several grade params mid-drag.
+ *  Repaints the Record viewport with the overrides applied together;
+ *  the caller commits once via `updateEffectParams` on pointer-up. */
+export const previewGradeParams = (
+  clipId: string,
+  effectId: string,
+  params: [string, EffectValue][]
+): Promise<void> =>
+  invoke('preview_grade_params', { clipId, effectId, params });
 
 /** Update one parameter on an effect attached to a clip. */
 export const updateEffectParam = (

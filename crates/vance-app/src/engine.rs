@@ -2850,6 +2850,25 @@ impl Engine {
         })
     }
 
+    /// Update several effect params in one undoable step. The color
+    /// page commits a wheel (R/G/B + master) through this so a single
+    /// drag is a single undo entry — not 3-4.
+    pub fn update_effect_params(
+        &mut self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+        effect_id: EffectId,
+        params: Vec<(String, EffectValue)>,
+    ) -> Result<(), EngineError> {
+        self.pause_for_edit();
+        self.apply_edit_op(EditOp::UpdateEffectParams {
+            track_id,
+            clip_id,
+            effect_id,
+            params,
+        })
+    }
+
     /// Reorder an effect within a clip's chain (color-page node
     /// reorder). Undoable.
     pub fn move_effect_on_clip(
@@ -2885,19 +2904,29 @@ impl Engine {
         })
     }
 
-    /// Live, NON-undoable preview of one grade param mid-drag. Rebuilds
-    /// the clip's grade chain with `key` overridden to `value` on
-    /// `effect_id`, pushes it to the renderer, and repaints the Record
-    /// viewport from the textures already loaded — no decode, no edit
-    /// log entry. The UI commits exactly one `update_effect_param` on
-    /// pointer-up so the EditLog gets a single coalesced step. Silently
-    /// no-ops if no project/clip is loaded.
-    pub fn preview_grade_param(
+    /// Live, NON-undoable preview of one or more grade params mid-drag.
+    /// Rebuilds the clip's grade chain with ALL `params` overridden
+    /// together on `effect_id` (a wheel drag moves R/G/B + master at
+    /// once, so a single-key preview would only show the last channel),
+    /// pushes it to the renderer, and repaints. The UI commits exactly
+    /// one `update_effect_params` on pointer-up so the EditLog gets a
+    /// single step. No-ops if no project/clip is loaded.
+    ///
+    /// The UI seeks the Record viewport onto the selected clip when the
+    /// Color page selection changes (see the color-seek `$effect`), so
+    /// by the time a wheel is dragged the loaded frame already belongs
+    /// to the clip being graded. This fast path therefore only rebuilds
+    /// the grade chain and repaints — no decode.
+    ///
+    /// Note: this does NOT pause playback (it's a real-time fast path).
+    /// Grading is a paused workflow — you judge color on a still frame —
+    /// so if a clip is playing the per-frame playback push will overwrite
+    /// the preview on the next frame. That's intentional, not a bug.
+    pub fn preview_grade_params(
         &mut self,
         clip_id: vance_timeline::ClipId,
         effect_id: EffectId,
-        key: String,
-        value: EffectValue,
+        params: Vec<(String, EffectValue)>,
     ) -> Result<(), EngineError> {
         let grades = {
             let project = match self.current_project.as_ref() {
@@ -2912,7 +2941,7 @@ impl Engine {
                 Some(s) => s,
                 None => return Ok(()),
             };
-            // Find the clip, clone its effects, override the one param.
+            // Find the clip, clone its effects, override all params.
             let mut effects = match seq
                 .tracks
                 .iter()
@@ -2922,7 +2951,9 @@ impl Engine {
                 None => return Ok(()),
             };
             if let Some(e) = effects.iter_mut().find(|e| e.id == effect_id) {
-                e.params.insert(key, value);
+                for (k, v) in &params {
+                    e.params.insert(k.clone(), v.clone());
+                }
             }
             // Grade params aren't usually keyframed during a live drag;
             // eval at t=0 is a fine preview. The pointer-up commit

@@ -622,6 +622,45 @@ pub fn update_effect_param(
     Ok(replace_track(seq, idx, new_track))
 }
 
+/// Update (or insert) *several* parameters on a clip's effect in one
+/// shot. Used by the color page so a wheel drag (which moves R, G, B
+/// and master together) commits as a single undoable step instead of
+/// N. Errors if the clip/effect can't be found.
+pub fn update_effect_params(
+    seq: &Sequence,
+    track_id: TrackId,
+    clip_id: ClipId,
+    effect_id: EffectId,
+    params: &[(String, EffectValue)],
+) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    let (clip_idx, clip) = find_clip(&track, clip_id)?;
+
+    let mut updated = (*clip).clone();
+    let target = updated
+        .effects
+        .iter_mut()
+        .find(|e| e.id == effect_id)
+        .ok_or_else(|| TimelineError::invalid(format!("effect {effect_id} not on clip")))?;
+    for (k, v) in params {
+        target.params.insert(k.clone(), v.clone());
+    }
+
+    let mut clips = track.clips.clone();
+    clips[clip_idx] = Arc::new(updated);
+    let new_track = Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips,
+        transitions: track.transitions.clone(),
+    };
+    Ok(replace_track(seq, idx, new_track))
+}
+
 /// Remove an effect (by ID) from a clip's effects list. No-op if
 /// the effect isn't on the clip.
 pub fn remove_effect_from_clip(
@@ -1135,5 +1174,41 @@ mod tests {
     fn set_effect_enabled_unknown_id_errors() {
         let (seq, tid, cid, _ids) = seed_clip_with_effects();
         assert!(set_effect_enabled(&seq, tid, cid, EffectId::new(), false).is_err());
+    }
+
+    #[test]
+    fn update_effect_params_writes_all_keys() {
+        let (seq, tid, cid, ids) = seed_clip_with_effects();
+        let seq = update_effect_params(
+            &seq,
+            tid,
+            cid,
+            ids[0],
+            &[
+                ("gain_r".into(), EffectValue::Number(1.5)),
+                ("gain_g".into(), EffectValue::Number(1.2)),
+                ("gain_b".into(), EffectValue::Number(0.8)),
+            ],
+        )
+        .unwrap();
+        let track = seq.tracks.iter().find(|t| t.id == tid).unwrap();
+        let clip = track.clips.iter().find(|c| c.id == cid).unwrap();
+        let e = clip.effects.iter().find(|e| e.id == ids[0]).unwrap();
+        assert_eq!(e.params.get("gain_r"), Some(&EffectValue::Number(1.5)));
+        assert_eq!(e.params.get("gain_g"), Some(&EffectValue::Number(1.2)));
+        assert_eq!(e.params.get("gain_b"), Some(&EffectValue::Number(0.8)));
+    }
+
+    #[test]
+    fn update_effect_params_unknown_id_errors() {
+        let (seq, tid, cid, _ids) = seed_clip_with_effects();
+        assert!(update_effect_params(
+            &seq,
+            tid,
+            cid,
+            EffectId::new(),
+            &[("gain_r".into(), EffectValue::Number(2.0))]
+        )
+        .is_err());
     }
 }

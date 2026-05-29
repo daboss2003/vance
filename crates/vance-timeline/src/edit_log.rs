@@ -201,6 +201,18 @@ pub enum EditOp {
         /// New enabled state.
         enabled: bool,
     },
+    /// Update several effect params in one undoable step (color-page
+    /// wheel commit writes R/G/B/master together).
+    UpdateEffectParams {
+        /// Track holding the clip.
+        track_id: TrackId,
+        /// Clip holding the effect.
+        clip_id: ClipId,
+        /// Effect to mutate.
+        effect_id: EffectId,
+        /// `(key, value)` pairs applied together.
+        params: Vec<(String, EffectValue)>,
+    },
 }
 
 /// Apply a single op to a sequence, returning the new sequence.
@@ -302,6 +314,12 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
             effect_id,
             enabled,
         } => ops::set_effect_enabled(seq, *track_id, *clip_id, *effect_id, *enabled),
+        EditOp::UpdateEffectParams {
+            track_id,
+            clip_id,
+            effect_id,
+            params,
+        } => ops::update_effect_params(seq, *track_id, *clip_id, *effect_id, params),
     }
 }
 

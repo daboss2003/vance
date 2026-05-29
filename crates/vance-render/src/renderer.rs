@@ -200,6 +200,10 @@ struct GradeNode {
 }
 
 const _: () = assert!(std::mem::size_of::<GradeNode>() == 96);
+// Compile-time gate on the FULL uniform size so a field add/reorder
+// that diverges from the WGSL std140 `Params` layout fails the build,
+// not just `cargo test`. 272-byte header + 8 × 96-byte GradeNode.
+const _: () = assert!(std::mem::size_of::<RenderParams>() == 1040);
 
 impl GradeNode {
     /// Identity node: passthrough (disabled, primary mode, neutral

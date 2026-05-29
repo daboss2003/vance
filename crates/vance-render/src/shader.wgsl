@@ -86,31 +86,45 @@ struct GradeNode {
 @group(0) @binding(4) var<uniform> params: Params;
 
 // Primary grade: per-channel lift/gamma/gain with a master fold.
-// out = pow(clamp(in*gain + lift, 0, 1), 1/gamma), channelwise.
+// DaVinci-style (NOT ASC-CDL): the gamma exponent is the RECIPROCAL,
+// so gamma > 1 brightens midtones. Order: out = pow(max(in*gain +
+// lift, 0), 1/gamma), channelwise. We do NOT clamp the upper bound —
+// values may exceed 1.0 between nodes so a later node can pull a
+// highlight back down (true serial-chain behavior); the pow base is
+// only floored at 0 because pow of a negative base is undefined.
 fn apply_primary(rgb: vec3<f32>, n: GradeNode) -> vec3<f32> {
     let gain = n.gain.xyz * n.gain.w;
     let lift = n.lift.xyz + vec3<f32>(n.lift.w);
     // Guard gamma away from 0; master multiplies the per-channel gamma.
     let gamma = max(n.gamma.xyz * n.gamma.w, vec3<f32>(1e-3));
-    let lifted = clamp(rgb * gain + lift, vec3<f32>(0.0), vec3<f32>(1.0));
+    let lifted = max(rgb * gain + lift, vec3<f32>(0.0));
     return pow(lifted, vec3<f32>(1.0) / gamma);
 }
 
-// Log grade: an overall offset plus luma-windowed shadow / midtone /
+// Log grade: an overall offset plus tonal-band shadow / midtone /
 // highlight balances. Shadow rides `lift.xyz`, midtone `gamma.xyz`,
 // highlight `gain.xyz` (see GradeNodeParams::to_gpu in renderer.rs).
+// The bands are windowed in a PERCEPTUAL encoding (approx gamma-2.2 of
+// the linear luma) so "midtone" lands near perceptual mid-gray
+// (linear ~0.18) rather than linear 0.5 — matching what a colorist's
+// eye expects from a printer-lights/log tool. No upper clamp, for the
+// same serial-chain reason as apply_primary.
 fn apply_log(rgb: vec3<f32>, n: GradeNode) -> vec3<f32> {
-    let luma = dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
-    // Smooth luma-band weights summing ~1 across the range.
+    let luma_lin = dot(max(rgb, vec3<f32>(0.0)), vec3<f32>(0.2126, 0.7152, 0.0722));
+    let luma = pow(min(luma_lin, 1.0), 1.0 / 2.2);
+    // Smooth tonal-band weights partitioning [0,1] (sum == 1).
     let w_sh = 1.0 - smoothstep(0.0, 0.5, luma);
     let w_hi = smoothstep(0.5, 1.0, luma);
     let w_mid = 1.0 - w_sh - w_hi;
     var out = rgb + n.log_offset.xyz;
     out = out + n.lift.xyz * w_sh + n.gamma.xyz * w_mid + n.gain.xyz * w_hi;
-    return clamp(out, vec3<f32>(0.0), vec3<f32>(1.0));
+    return max(out, vec3<f32>(0.0));
 }
 
-// Apply the serial grade chain in linear working space.
+// Apply the serial grade chain in linear working space. Intermediate
+// values are NOT clamped to [0,1] (only floored at 0) so nodes compose
+// like a real grade graph; the downstream brightness/contrast block
+// (and the output stage) bound the final SDR result.
 fn apply_grades(rgb_in: vec3<f32>) -> vec3<f32> {
     var rgb = rgb_in;
     let count = params.grade_count.x;

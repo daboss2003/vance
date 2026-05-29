@@ -479,12 +479,39 @@ fn set_effect_enabled(
 }
 
 #[tauri::command]
-fn preview_grade_param(
+fn update_effect_params(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    clip_id: String,
+    effect_id: String,
+    params: Vec<(String, vance_timeline::EffectValue)>,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let clip_uuid = clip_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid clip id: {e}"))?;
+    let effect_uuid = effect_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid effect id: {e}"))?;
+    state
+        .lock()
+        .update_effect_params(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            vance_timeline::ClipId::from_uuid(clip_uuid),
+            vance_timeline::EffectId::from_uuid(effect_uuid),
+            params,
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn preview_grade_params(
     state: tauri::State<'_, EngineHandle>,
     clip_id: String,
     effect_id: String,
-    key: String,
-    value: vance_timeline::EffectValue,
+    params: Vec<(String, vance_timeline::EffectValue)>,
 ) -> Result<(), String> {
     let clip_uuid = clip_id
         .parse::<uuid::Uuid>()
@@ -494,11 +521,10 @@ fn preview_grade_param(
         .map_err(|e| format!("invalid effect id: {e}"))?;
     state
         .lock()
-        .preview_grade_param(
+        .preview_grade_params(
             vance_timeline::ClipId::from_uuid(clip_uuid),
             vance_timeline::EffectId::from_uuid(effect_uuid),
-            key,
-            value,
+            params,
         )
         .map_err(|e| e.to_string())
 }
@@ -779,7 +805,8 @@ fn main() {
             update_effect_param,
             move_effect_on_clip,
             set_effect_enabled,
-            preview_grade_param,
+            update_effect_params,
+            preview_grade_params,
             add_transition_at_cut,
             remove_transition,
             create_title_media,

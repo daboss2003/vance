@@ -213,3 +213,60 @@ fn render_without_upload_errors() {
     let err = r.render_to_rgba_buffer(64, 64).unwrap_err();
     assert!(matches!(err, vance_render::RenderError::NoFrame));
 }
+
+// ---- Phase 6.6/6.7: grade-node chain end-to-end -------------------------
+
+// A non-zero grade_count must actually grade — this pins the grades[]
+// base offset, the 96-byte stride, and GradeNode field order on-device
+// (the layout the CPU size tests can't validate). Upload a mid-gray
+// frame, apply one enabled primary node with gain=2 (master), and
+// assert the readback brightened versus the ungraded baseline.
+#[test]
+fn primary_grade_gain_brightens() {
+    use vance_render::GradeNodeParams;
+    // Rec.709 limited mid-gray: Y≈128, U=V=128.
+    let frame = solid_yuv420p(64, 64, 128, 128, 128);
+
+    let mut base_r = Renderer::new(RendererConfig::default()).expect("renderer");
+    base_r.upload_frame(&frame).expect("upload");
+    let base = center(&base_r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64);
+
+    let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
+    r.upload_frame(&frame).expect("upload");
+    r.set_grades(&[GradeNodeParams {
+        enabled: true,
+        log_mode: false,
+        gain: [1.0, 1.0, 1.0, 2.0], // master gain ×2
+        ..GradeNodeParams::default()
+    }]);
+    let graded = center(&r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64);
+
+    // gain ×2 in linear working space must brighten the mid-gray.
+    assert!(
+        graded[0] > base[0] + 10 && graded[1] > base[1] + 10 && graded[2] > base[2] + 10,
+        "expected gain=2 to brighten: base={base:?} graded={graded:?}"
+    );
+}
+
+// A disabled node must be a true no-op (bypassed in the shader), even
+// with non-neutral params — verifies the flags.x gate.
+#[test]
+fn disabled_grade_node_is_noop() {
+    use vance_render::GradeNodeParams;
+    let frame = solid_yuv420p(64, 64, 128, 128, 128);
+
+    let mut base_r = Renderer::new(RendererConfig::default()).expect("renderer");
+    base_r.upload_frame(&frame).expect("upload");
+    let base = center(&base_r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64);
+
+    let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
+    r.upload_frame(&frame).expect("upload");
+    r.set_grades(&[GradeNodeParams {
+        enabled: false, // bypassed
+        gain: [1.0, 1.0, 1.0, 4.0],
+        ..GradeNodeParams::default()
+    }]);
+    let graded = center(&r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64);
+
+    assert_eq!(base, graded, "disabled node must not change the image");
+}

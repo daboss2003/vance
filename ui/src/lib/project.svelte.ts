@@ -26,7 +26,8 @@ import {
   updateEffectParam as ipcUpdateEffectParam,
   moveEffectOnClip as ipcMoveEffect,
   setEffectEnabled as ipcSetEffectEnabled,
-  previewGradeParam as ipcPreviewGradeParam,
+  updateEffectParams as ipcUpdateEffectParams,
+  previewGradeParams as ipcPreviewGradeParams,
   loadSource as ipcLoadSource,
   mediaList,
   moveClipTo,
@@ -430,20 +431,37 @@ class ProjectState {
     }
   }
 
-  /** Live, non-undoable preview of a grade param during a wheel drag.
-   *  Does NOT commitEdit — the caller commits one `updateEffectParam`
-   *  on pointer-up so the undo history gets a single step. */
-  async previewGradeParam(
+  /** Commit several effect params as one undoable step (color-page
+   *  wheel release writes R/G/B/master together → single undo). */
+  async updateEffectParams(
+    trackId: string,
     clipId: string,
     effectId: string,
-    key: string,
-    value: EffectValue
+    params: [string, EffectValue][]
+  ) {
+    this.error = null;
+    try {
+      await ipcUpdateEffectParams(trackId, clipId, effectId, params);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Live, non-undoable preview of several grade params during a wheel
+   *  drag. Does NOT commitEdit — the caller commits once via
+   *  `updateEffectParams` on pointer-up so the undo history gets a
+   *  single step. */
+  async previewGradeParams(
+    clipId: string,
+    effectId: string,
+    params: [string, EffectValue][]
   ) {
     try {
-      await ipcPreviewGradeParam(clipId, effectId, key, value);
+      await ipcPreviewGradeParams(clipId, effectId, params);
     } catch (e) {
       // Preview is best-effort; don't surface transient drag errors.
-      console.debug('previewGradeParam', e);
+      console.debug('previewGradeParams', e);
     }
   }
 
