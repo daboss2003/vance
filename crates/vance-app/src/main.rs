@@ -570,6 +570,39 @@ fn set_project_view_lut(
 }
 
 #[tauri::command]
+fn set_ocio_view_transform(
+    state: tauri::State<'_, EngineHandle>,
+    config: Option<String>,
+    src: String,
+    dst: String,
+    size: u32,
+) -> Result<(), String> {
+    state
+        .lock()
+        .set_ocio_view_transform(config.as_deref(), &src, &dst, size)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn clear_ocio_view_transform(state: tauri::State<'_, EngineHandle>) -> Result<(), String> {
+    state
+        .lock()
+        .clear_ocio_view_transform()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn ocio_list_colorspaces(
+    state: tauri::State<'_, EngineHandle>,
+    config: Option<String>,
+) -> Result<Vec<String>, String> {
+    state
+        .lock()
+        .ocio_list_colorspaces(config.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn create_title_media(
     state: tauri::State<'_, EngineHandle>,
     display_name: String,
@@ -813,6 +846,9 @@ fn main() {
             set_media_input_color_space,
             set_project_working_color_space,
             set_project_view_lut,
+            set_ocio_view_transform,
+            clear_ocio_view_transform,
+            ocio_list_colorspaces,
             trim_clip_in,
             trim_clip_out,
             play_sequence,

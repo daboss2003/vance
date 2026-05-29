@@ -131,6 +131,13 @@ export const COLOR_SPACE_OPTIONS: { value: ColorSpaceLabel; label: string }[] = 
   { value: 'acescct', label: 'ACEScct' },
 ];
 
+export type OcioViewInfo = {
+  config_path: string | null;
+  src: string;
+  dst: string;
+  size: number;
+};
+
 export type ProjectInfo = {
   name: string;
   sequences: SequenceInfo[];
@@ -138,6 +145,10 @@ export type ProjectInfo = {
   working_color_space: ColorSpaceLabel;
   /** Active display LUT (Phase 6.5). `null` for unfiltered preview. */
   view_lut_path: string | null;
+  /** Active OpenColorIO display transform (Phase 6.1b), or `null`. */
+  ocio_view: OcioViewInfo | null;
+  /** Whether this build links OpenColorIO. */
+  ocio_available: boolean;
 };
 
 /** Load a `.vance/` bundle and make it the engine's current project. */
@@ -334,6 +345,24 @@ export const setProjectWorkingColorSpace = (
 /** Set the project's display LUT (Phase 6.5). Pass `null` to clear. */
 export const setProjectViewLut = (path: string | null): Promise<void> =>
   invoke('set_project_view_lut', { path });
+
+/** Set the project's OCIO display transform (Phase 6.1b). `config` is an
+ *  `.ocio` path, or `null` for the `$OCIO` env config. */
+export const setOcioViewTransform = (
+  config: string | null,
+  src: string,
+  dst: string,
+  size: number
+): Promise<void> => invoke('set_ocio_view_transform', { config, src, dst, size });
+
+/** Clear the project's OCIO display transform (Phase 6.1b). */
+export const clearOcioViewTransform = (): Promise<void> =>
+  invoke('clear_ocio_view_transform');
+
+/** List colorspace names in an OCIO config for UI pickers (Phase 6.1b).
+ *  `config` is an `.ocio` path, or `null` for the `$OCIO` env config. */
+export const ocioListColorspaces = (config: string | null): Promise<string[]> =>
+  invoke('ocio_list_colorspaces', { config });
 
 /** All media items in the current project's library. */
 export const mediaList = (): Promise<MediaItemInfo[]> => invoke('media_list');

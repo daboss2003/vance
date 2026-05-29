@@ -90,6 +90,20 @@ pub struct Renderer {
     /// matrix). Used for monitoring transforms; export bypasses it.
     tex_view_lut: Option<wgpu::Texture>,
     view_lut_size: u32,
+    /// Color-curve LUT atlas (Phase 6.8): a 256×8 Rgba16Float 2D
+    /// texture, one row per grade node, packing the baked tone
+    /// curves (R/G/B in rgb, luma in alpha). `None` until the first
+    /// curves node is uploaded; a 1×1 dummy keeps the bind group valid.
+    tex_curve_atlas: Option<wgpu::Texture>,
+    /// Width of the currently-allocated `tex_curve_atlas` (1 while it's
+    /// the dummy). Compared in `upload_curve_atlas` so the real atlas
+    /// replaces the dummy instead of overrunning it — mirrors how
+    /// `lut_size` guards the LUT texture.
+    curve_atlas_width: u32,
+    /// Curve inputs baked into `tex_curve_atlas` on the last upload,
+    /// keyed by node index. Compared each `set_grades` so unchanged
+    /// curves skip the (expensive) re-bake + texture write.
+    last_curve_inputs: Vec<(usize, CurveSet)>,
     bind_group: Option<wgpu::BindGroup>,
     /// Per-frame parameter uniform — opacity (5.2), transform (5.3),
     /// crop + brightness/contrast (5.6), and the transition mix
@@ -220,15 +234,61 @@ impl GradeNode {
     }
 }
 
+/// Which family of color ops a grade node applies. Maps to the
+/// shader's `flags.y` (0 primary, 1 log, 2 curves).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GradeMode {
+    /// Lift / gamma / gain primary wheels.
+    Primary,
+    /// Offset / shadow / midtone / highlight log wheels.
+    Log,
+    /// Per-channel tone curves (master + R/G/B + luma). Phase 6.8.
+    Curves,
+}
+
+/// Curve control points for a `Curves`-mode grade node. Each is the
+/// raw `Keyframe` list from the clip's `curve_*` param (x = input
+/// level, y = output level); the renderer bakes them into the LUT
+/// atlas inside `set_grades`. Empty lists bake to the identity ramp.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CurveSet {
+    /// Master curve (folded into R/G/B at bake time).
+    pub master: Vec<vance_timeline::Keyframe>,
+    /// Red channel curve.
+    pub r: Vec<vance_timeline::Keyframe>,
+    /// Green channel curve.
+    pub g: Vec<vance_timeline::Keyframe>,
+    /// Blue channel curve.
+    pub b: Vec<vance_timeline::Keyframe>,
+    /// Luma curve (applied as a hue-preserving ratio).
+    pub luma: Vec<vance_timeline::Keyframe>,
+}
+
+impl CurveSet {
+    /// True when every curve is empty (or trivially identity) — the
+    /// shader can skip sampling the atlas for such a node.
+    fn is_identity(&self) -> bool {
+        let id = |p: &[vance_timeline::Keyframe]| {
+            p.is_empty()
+                || (p.len() == 2
+                    && (p[0].time_seconds - p[0].value).abs() < 1e-6
+                    && (p[1].time_seconds - p[1].value).abs() < 1e-6
+                    && p[0].time_seconds.abs() < 1e-6
+                    && (p[1].time_seconds - 1.0).abs() < 1e-6)
+        };
+        id(&self.master) && id(&self.r) && id(&self.g) && id(&self.b) && id(&self.luma)
+    }
+}
+
 /// Public, `vance-color`-free description of one grade node the engine
 /// hands to [`Renderer::set_grades`]. Mirror of the GPU `GradeNode`
 /// but with named fields the engine fills from evaluated effect params.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GradeNodeParams {
     /// Enabled (false = bypass).
     pub enabled: bool,
-    /// True = log mode (offset/shadow/mid/highlight); false = primary.
-    pub log_mode: bool,
+    /// Which op family this node applies.
+    pub mode: GradeMode,
     /// Lift `(r, g, b, master)`.
     pub lift: [f32; 4],
     /// Gamma `(r, g, b, master)`.
@@ -243,13 +303,15 @@ pub struct GradeNodeParams {
     pub midtone: [f32; 3],
     /// Log highlight balance `(r, g, b)`.
     pub highlight: [f32; 3],
+    /// Curve control points (only meaningful when `mode == Curves`).
+    pub curves: Option<CurveSet>,
 }
 
 impl Default for GradeNodeParams {
     fn default() -> Self {
         Self {
             enabled: true,
-            log_mode: false,
+            mode: GradeMode::Primary,
             lift: [0.0, 0.0, 0.0, 0.0],
             gamma: [1.0, 1.0, 1.0, 1.0],
             gain: [1.0, 1.0, 1.0, 1.0],
@@ -257,34 +319,52 @@ impl Default for GradeNodeParams {
             shadow: [0.0; 3],
             midtone: [0.0; 3],
             highlight: [0.0; 3],
+            curves: None,
         }
     }
 }
 
 impl GradeNodeParams {
-    fn to_gpu(self) -> GradeNode {
-        // In log mode the per-channel shadow/mid/highlight balances
-        // ride the lift/gamma/gain vec4 slots (r,g,b) — the shader's
-        // `apply_log` reads them from there; log_offset carries the
-        // offset, log_smh is reserved for future luma-window widths.
-        if self.log_mode {
-            GradeNode {
+    fn to_gpu(&self) -> GradeNode {
+        let enabled = if self.enabled { 1.0 } else { 0.0 };
+        match self.mode {
+            GradeMode::Log => GradeNode {
+                // In log mode the per-channel shadow/mid/highlight
+                // balances ride the lift/gamma/gain vec4 slots (r,g,b);
+                // log_offset carries the offset.
                 lift: [self.shadow[0], self.shadow[1], self.shadow[2], 0.0],
                 gamma: [self.midtone[0], self.midtone[1], self.midtone[2], 0.0],
                 gain: [self.highlight[0], self.highlight[1], self.highlight[2], 0.0],
                 log_offset: [self.offset[0], self.offset[1], self.offset[2], 0.0],
                 log_smh: [0.0; 4],
-                flags: [if self.enabled { 1.0 } else { 0.0 }, 1.0, 0.0, 0.0],
+                flags: [enabled, 1.0, 0.0, 0.0],
+            },
+            GradeMode::Curves => {
+                // Curve data lives in the atlas (row = node index); the
+                // GPU node only flags the mode + whether it's identity
+                // (so the shader can skip the atlas sample).
+                let non_identity = self
+                    .curves
+                    .as_ref()
+                    .map(|c| if c.is_identity() { 0.0 } else { 1.0 })
+                    .unwrap_or(0.0);
+                GradeNode {
+                    lift: [0.0; 4],
+                    gamma: [1.0, 1.0, 1.0, 1.0],
+                    gain: [1.0, 1.0, 1.0, 1.0],
+                    log_offset: [0.0; 4],
+                    log_smh: [non_identity, 0.0, 0.0, 0.0],
+                    flags: [enabled, 2.0, 0.0, 0.0],
+                }
             }
-        } else {
-            GradeNode {
+            GradeMode::Primary => GradeNode {
                 lift: self.lift,
                 gamma: self.gamma,
                 gain: self.gain,
                 log_offset: [0.0; 4],
                 log_smh: [0.0; 4],
-                flags: [if self.enabled { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
-            }
+                flags: [enabled, 0.0, 0.0, 0.0],
+            },
         }
     }
 }
@@ -361,6 +441,49 @@ fn f32_to_f16_bits(v: f32) -> u16 {
         return (sign << 15) | 0x7c00;
     }
     (sign << 15) | ((new_exp as u16) << 10) | ((mant >> 13) as u16)
+}
+
+/// Evaluate a curve's control points at input `x`, returning the
+/// IDENTITY (`y = x`) when the curve is empty — `eval_curve` returns
+/// 0.0 for an empty list (the keyframe convention), which would crush
+/// the channel to black. Output is clamped to the LUT's `[0, 1]`
+/// domain.
+#[inline]
+fn eval_curve_or_identity(points: &[vance_timeline::Keyframe], x: f64) -> f64 {
+    if points.is_empty() {
+        return x.clamp(0.0, 1.0);
+    }
+    vance_timeline::eval_curve(points, x).clamp(0.0, 1.0)
+}
+
+/// Clean a curve's control points before baking. The interactive editor
+/// guarantees sorted, finite, in-range points, but a project loaded from
+/// disk or authored by an external tool / CLI does NOT — and
+/// `eval_keyframes` assumes ascending order. So we:
+///   * drop points with a non-finite (NaN/inf) input or output — those
+///     would pack to a NaN/inf atlas texel and corrupt every pixel;
+///   * clamp the OUTPUT to `[0, 1]` (the displayable / LUT range), making
+///     the otherwise-silent bake-time clamp explicit at the data edge;
+///   * sort ascending by input level so the segment search is correct.
+/// The input level is left unclamped: a control point past `x = 1` is
+/// simply never reached by the `[0, 1]` sampling (eval clamps at the
+/// endpoints), so clamping it would only distort the last segment.
+fn sanitize_curve(points: &[vance_timeline::Keyframe]) -> Vec<vance_timeline::Keyframe> {
+    let mut out: Vec<vance_timeline::Keyframe> = points
+        .iter()
+        .filter(|k| k.time_seconds.is_finite() && k.value.is_finite())
+        .map(|k| vance_timeline::Keyframe {
+            time_seconds: k.time_seconds,
+            value: k.value.clamp(0.0, 1.0),
+            interp: k.interp,
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        a.time_seconds
+            .partial_cmp(&b.time_seconds)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
 }
 
 #[inline]
@@ -466,6 +589,17 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // binding 10: curve LUT atlas (Phase 6.8), a 2D texture.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -548,6 +682,9 @@ impl Renderer {
             lut_size: 1,
             tex_view_lut: None,
             view_lut_size: 1,
+            tex_curve_atlas: None,
+            curve_atlas_width: 1,
+            last_curve_inputs: Vec::new(),
             bind_group: None,
             params_buffer,
             current_params: initial_params,
@@ -814,11 +951,14 @@ impl Renderer {
         );
     }
 
-    /// Set the serial color-grade node chain (Phase 6.6/6.7). Nodes
-    /// apply in order in linear working space, where the
+    /// Set the serial color-grade node chain (Phase 6.6/6.7/6.8).
+    /// Nodes apply in order in linear working space, where the
     /// brightness/contrast block already runs. Anything past
-    /// `MAX_GRADES` is dropped (the UI warns). Idempotency-gated: a
-    /// no-op call (same nodes + count) skips the buffer write.
+    /// `MAX_GRADES` is dropped (the UI warns). Two idempotency gates:
+    /// the uniform write skips when the GPU node array is unchanged,
+    /// and the (expensive) curve-atlas re-bake skips when no curve
+    /// inputs changed. Baking lives here so every push site gets
+    /// curves for free.
     pub fn set_grades(&mut self, nodes: &[GradeNodeParams]) {
         let count = nodes.len().min(MAX_GRADES);
         let mut next = [GradeNode::identity(); MAX_GRADES];
@@ -826,17 +966,137 @@ impl Renderer {
             next[i] = n.to_gpu();
         }
         let same_count = self.current_params.grade_count[0] as usize == count;
-        let same_nodes = same_count
+        let grades_unchanged = same_count
             && (0..count).all(|i| grade_nodes_eq(&self.current_params.grades[i], &next[i]));
-        if same_count && same_nodes {
+
+        // Collect this call's curve inputs (node index → CurveSet) to
+        // (a) gate the atlas re-bake and (b) bake the atlas rows.
+        let curve_inputs: Vec<(usize, CurveSet)> = nodes
+            .iter()
+            .take(count)
+            .enumerate()
+            .filter(|(_, n)| n.mode == GradeMode::Curves)
+            .filter_map(|(i, n)| n.curves.clone().map(|c| (i, c)))
+            .collect();
+        let curves_unchanged = curve_inputs == self.last_curve_inputs;
+
+        if grades_unchanged && curves_unchanged {
             return;
         }
-        self.current_params.grade_count = [count as u32, 0, 0, 0];
-        self.current_params.grades = next;
-        self.queue.write_buffer(
-            &self.params_buffer,
-            0,
-            bytemuck::cast_slice(&[self.current_params]),
+        if !grades_unchanged {
+            self.current_params.grade_count = [count as u32, 0, 0, 0];
+            self.current_params.grades = next;
+            self.queue.write_buffer(
+                &self.params_buffer,
+                0,
+                bytemuck::cast_slice(&[self.current_params]),
+            );
+        }
+        if !curves_unchanged {
+            self.bake_and_upload_curve_atlas(&curve_inputs);
+            self.last_curve_inputs = curve_inputs;
+        }
+    }
+
+    /// Bake the per-node tone curves into the 256×8 LUT atlas and
+    /// upload. Rows for non-curve / identity nodes get the identity
+    /// ramp (harmless — only curves-mode nodes sample the atlas). The
+    /// master curve is composited into R/G/B here so the shader does a
+    /// single sample per channel.
+    fn bake_and_upload_curve_atlas(&mut self, curve_inputs: &[(usize, CurveSet)]) {
+        let w = vance_timeline::grade::CURVE_LUT_WIDTH; // 256
+        // Atlas: MAX_GRADES rows × w cols × 4 channels (f32, packed → f16).
+        let mut atlas = vec![0.0_f32; MAX_GRADES * w * 4];
+        // Default every row to identity (y = x on all four lanes).
+        for row in 0..MAX_GRADES {
+            for u in 0..w {
+                let x = u as f32 / (w as f32 - 1.0);
+                let off = (row * w + u) * 4;
+                atlas[off] = x;
+                atlas[off + 1] = x;
+                atlas[off + 2] = x;
+                atlas[off + 3] = x;
+            }
+        }
+        // Bake each curves node's row.
+        for (row, cs) in curve_inputs {
+            if *row >= MAX_GRADES {
+                continue;
+            }
+            // Sanitize ONCE per channel before the per-sample loop:
+            // eval_keyframes assumes ascending, finite control points,
+            // but project files / external tools aren't guaranteed to be
+            // sorted, finite, or in-range (only the interactive editor
+            // is). An unsorted curve would otherwise read garbage; a NaN
+            // point would pack to a NaN texel and corrupt every pixel.
+            let m_pts = sanitize_curve(&cs.master);
+            let r_pts = sanitize_curve(&cs.r);
+            let g_pts = sanitize_curve(&cs.g);
+            let b_pts = sanitize_curve(&cs.b);
+            let l_pts = sanitize_curve(&cs.luma);
+            for u in 0..w {
+                let x = u as f64 / (w as f64 - 1.0);
+                let m = eval_curve_or_identity(&m_pts, x);
+                let r = eval_curve_or_identity(&r_pts, m);
+                let g = eval_curve_or_identity(&g_pts, m);
+                let b = eval_curve_or_identity(&b_pts, m);
+                let l = eval_curve_or_identity(&l_pts, x);
+                let off = (*row * w + u) * 4;
+                atlas[off] = r as f32;
+                atlas[off + 1] = g as f32;
+                atlas[off + 2] = b as f32;
+                atlas[off + 3] = l as f32;
+            }
+        }
+        self.upload_curve_atlas(&atlas, w as u32);
+    }
+
+    /// Upload the baked curve atlas (`rows = MAX_GRADES`, `width`
+    /// columns, 4 f32 channels) to the GPU as an Rgba16Float 2D
+    /// texture. Lazily allocates on first call (then rebuilds the bind
+    /// group). Mirrors the `upload_lut` packing path.
+    fn upload_curve_atlas(&mut self, atlas: &[f32], width: u32) {
+        let height = MAX_GRADES as u32;
+        // Replace the texture when absent OR still the 1×1 dummy (or any
+        // stale width) — otherwise write_texture would overrun it.
+        if self.tex_curve_atlas.is_none() || self.curve_atlas_width != width {
+            self.tex_curve_atlas = Some(self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("vance-render.tex_curve_atlas"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            }));
+            self.curve_atlas_width = width;
+            self.rebuild_bind_group();
+        }
+        let packed: Vec<u16> = atlas.iter().map(|v| f32_to_f16_bits(*v)).collect();
+        let bytes: &[u8] = bytemuck::cast_slice(&packed);
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: self.tex_curve_atlas.as_ref().unwrap(),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4 * 2),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
     }
 
@@ -1282,6 +1542,24 @@ impl Renderer {
             self.tex_view_lut = Some(dummy_3d(&self.device, "vance-render.tex_view_lut_dummy"));
             self.view_lut_size = 1;
         }
+        // 1×1 D2 dummy for the curve atlas before any curves node loads.
+        if self.tex_curve_atlas.is_none() {
+            self.tex_curve_atlas = Some(self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("vance-render.tex_curve_atlas_dummy"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            }));
+            self.curve_atlas_width = 1;
+        }
         let view_lut = self
             .tex_lut
             .as_ref()
@@ -1289,6 +1567,11 @@ impl Renderer {
             .create_view(&Default::default());
         let view_view_lut = self
             .tex_view_lut
+            .as_ref()
+            .unwrap()
+            .create_view(&Default::default());
+        let view_curve_atlas = self
+            .tex_curve_atlas
             .as_ref()
             .unwrap()
             .create_view(&Default::default());
@@ -1336,6 +1619,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 9,
                     resource: wgpu::BindingResource::TextureView(&view_view_lut),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(&view_curve_atlas),
                 },
             ],
         }));
@@ -1462,7 +1749,7 @@ mod layout_tests {
     #[test]
     fn log_mode_routes_balances_into_slots() {
         let p = GradeNodeParams {
-            log_mode: true,
+            mode: GradeMode::Log,
             offset: [0.1, 0.2, 0.3],
             shadow: [0.4, 0.0, 0.0],
             midtone: [0.0, 0.5, 0.0],
@@ -1475,5 +1762,126 @@ mod layout_tests {
         assert_eq!(n.lift, [0.4, 0.0, 0.0, 0.0]); // shadow
         assert_eq!(n.gamma, [0.0, 0.5, 0.0, 0.0]); // midtone
         assert_eq!(n.gain, [0.0, 0.0, 0.6, 0.0]); // highlight
+    }
+
+    fn ckf(x: f64, y: f64) -> vance_timeline::Keyframe {
+        vance_timeline::Keyframe {
+            time_seconds: x,
+            value: y,
+            interp: vance_timeline::KeyframeInterp::Linear,
+        }
+    }
+
+    #[test]
+    fn eval_curve_or_identity_empty_is_identity_clamped() {
+        // Empty curve must be y = x (NOT 0.0), clamped to the LUT domain.
+        assert_eq!(eval_curve_or_identity(&[], 0.5), 0.5);
+        assert_eq!(eval_curve_or_identity(&[], -0.3), 0.0);
+        assert_eq!(eval_curve_or_identity(&[], 1.7), 1.0);
+    }
+
+    #[test]
+    fn eval_curve_or_identity_clamps_output_to_lut_domain() {
+        // A curve whose output leaves [0,1] is clamped so the f16 atlas
+        // sample stays in range.
+        let c = [ckf(0.0, -0.5), ckf(1.0, 1.5)];
+        assert_eq!(eval_curve_or_identity(&c, 0.0), 0.0);
+        assert_eq!(eval_curve_or_identity(&c, 1.0), 1.0);
+    }
+
+    #[test]
+    fn curveset_is_identity_detects_empty_and_diagonal() {
+        // All-empty = identity.
+        assert!(CurveSet::default().is_identity());
+        // Explicit 2-point diagonal = identity.
+        let diag = vec![ckf(0.0, 0.0), ckf(1.0, 1.0)];
+        let cs = CurveSet {
+            master: diag.clone(),
+            r: diag.clone(),
+            g: diag.clone(),
+            b: diag.clone(),
+            luma: diag,
+        };
+        assert!(cs.is_identity());
+        // A lifted master breaks identity.
+        let cs2 = CurveSet {
+            master: vec![ckf(0.0, 0.3), ckf(1.0, 1.0)],
+            ..CurveSet::default()
+        };
+        assert!(!cs2.is_identity());
+    }
+
+    #[test]
+    fn curves_mode_to_gpu_flags_identity_vs_active() {
+        // Identity curves → flags.y = 2 (curves), log_smh.x = 0 (skip).
+        let id = GradeNodeParams {
+            mode: GradeMode::Curves,
+            curves: Some(CurveSet::default()),
+            ..GradeNodeParams::default()
+        }
+        .to_gpu();
+        assert_eq!(id.flags[1], 2.0);
+        assert_eq!(id.log_smh[0], 0.0);
+        // Non-identity curves → log_smh.x = 1 (sample the atlas).
+        let active = GradeNodeParams {
+            mode: GradeMode::Curves,
+            curves: Some(CurveSet {
+                master: vec![ckf(0.0, 0.3), ckf(1.0, 1.0)],
+                ..CurveSet::default()
+            }),
+            ..GradeNodeParams::default()
+        }
+        .to_gpu();
+        assert_eq!(active.flags[1], 2.0);
+        assert_eq!(active.log_smh[0], 1.0);
+    }
+
+    #[test]
+    fn sanitize_curve_sorts_drops_nonfinite_and_clamps_output() {
+        // Out-of-order + a NaN point + an out-of-range y.
+        let dirty = vec![
+            ckf(1.0, 1.0),
+            ckf(f64::NAN, 0.5),       // dropped (non-finite x)
+            ckf(0.5, 1.7),            // y clamped to 1.0
+            ckf(0.0, -0.3),           // y clamped to 0.0
+            ckf(0.25, f64::INFINITY), // dropped (non-finite y)
+        ];
+        let clean = sanitize_curve(&dirty);
+        // NaN-x and inf-y points removed; remaining sorted ascending by x.
+        assert_eq!(clean.len(), 3);
+        assert!(clean[0].time_seconds <= clean[1].time_seconds);
+        assert!(clean[1].time_seconds <= clean[2].time_seconds);
+        // Outputs clamped into [0,1].
+        assert!(clean.iter().all(|k| (0.0..=1.0).contains(&k.value)));
+        assert_eq!(clean[0].value, 0.0); // was -0.3 at x=0.0
+        assert_eq!(clean[2].value, 1.0); // was 1.0 at x=1.0
+    }
+
+    #[test]
+    fn sanitize_curve_unsorted_evaluates_correctly() {
+        // Same control points, shuffled — must evaluate identically once
+        // sanitized (guards the eval_keyframes ascending-order assumption).
+        let sorted = vec![ckf(0.0, 0.0), ckf(0.5, 0.7), ckf(1.0, 1.0)];
+        let shuffled = vec![ckf(1.0, 1.0), ckf(0.0, 0.0), ckf(0.5, 0.7)];
+        let a = sanitize_curve(&sorted);
+        let b = sanitize_curve(&shuffled);
+        for &x in &[0.0, 0.25, 0.5, 0.75, 1.0] {
+            assert!((eval_curve_or_identity(&a, x) - eval_curve_or_identity(&b, x)).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn master_curve_folds_into_rgb_channels() {
+        // Bake math: r-lane = curveR(curveM(x)). With identity R and a
+        // lifting master, the baked r value should equal master(x).
+        let cs = CurveSet {
+            master: vec![ckf(0.0, 0.3), ckf(1.0, 1.0)],
+            ..CurveSet::default()
+        };
+        let x = 0.0_f64;
+        let m = eval_curve_or_identity(&cs.master, x);
+        let r = eval_curve_or_identity(&cs.r, m);
+        assert!((m - 0.3).abs() < 1e-9);
+        assert!((r - 0.3).abs() < 1e-9, "identity R passes master through");
     }
 }

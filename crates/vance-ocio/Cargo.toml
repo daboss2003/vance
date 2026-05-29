@@ -1,0 +1,27 @@
+[package]
+name = "vance-ocio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# OpenColorIO FFI (Phase 6.1b). The `ocio` feature links the native
+# `libOpenColorIO` C++ library through a tiny `extern "C"` shim. Without
+# the feature the crate still BUILDS (so a fresh checkout / CI without the
+# library compiles fine) and every entry point returns
+# `OcioError::Unavailable`. To enable it the system needs the library
+# discoverable by pkg-config — on macOS: `brew install opencolorio`.
+[features]
+default = []
+ocio = []
+
+[dependencies]
+vance-color = { path = "../vance-color" }
+thiserror = { workspace = true }
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"

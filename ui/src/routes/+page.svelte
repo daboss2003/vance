@@ -32,6 +32,7 @@
   import { selectionState } from '$lib/selection.svelte';
   import Timeline from '$lib/timeline/Timeline.svelte';
   import ColorWheel from '$lib/color/ColorWheel.svelte';
+  import CurveEditor from '$lib/color/CurveEditor.svelte';
   import * as GK from '$lib/grade-keys';
 
   let backend = $state<string>('checking…');
@@ -568,6 +569,73 @@
     await projectState.setViewLut(selected);
   }
 
+  // ---- OCIO display transform (Phase 6.1b) ---------------------------------
+
+  let ocioPanelOpen = $state(false);
+  let ocioConfigPath = $state(''); // empty => $OCIO env config
+  let ocioColorspaces = $state<string[]>([]);
+  let ocioSrc = $state('');
+  let ocioDst = $state('');
+  let ocioSize = $state(33);
+  let ocioLoading = $state(false);
+
+  // Seed the panel fields from the project's persisted OCIO transform
+  // whenever it opens, so editing starts from the current state.
+  function openOcioPanel() {
+    const v = projectState.info?.ocio_view;
+    if (v) {
+      ocioConfigPath = v.config_path ?? '';
+      ocioSrc = v.src;
+      ocioDst = v.dst;
+      ocioSize = v.size;
+    }
+    ocioPanelOpen = true;
+    void loadOcioColorspaces();
+  }
+
+  /** Open a file dialog to pick the `.ocio` config. */
+  async function pickOcioConfig() {
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      filters: [
+        { name: 'OCIO config', extensions: ['ocio'] },
+        { name: 'All files', extensions: ['*'] }
+      ]
+    });
+    if (typeof selected !== 'string') return;
+    ocioConfigPath = selected;
+    await loadOcioColorspaces();
+  }
+
+  /** Populate the src/dst dropdowns from the chosen config (or $OCIO). */
+  async function loadOcioColorspaces() {
+    ocioLoading = true;
+    try {
+      ocioColorspaces = await projectState.ocioListColorspaces(ocioConfigPath || null);
+      // Keep current picks if still valid; otherwise default sensibly.
+      if (ocioColorspaces.length && !ocioColorspaces.includes(ocioSrc)) {
+        ocioSrc = ocioColorspaces[0];
+      }
+      if (ocioColorspaces.length && !ocioColorspaces.includes(ocioDst)) {
+        ocioDst = ocioColorspaces[ocioColorspaces.length - 1];
+      }
+    } finally {
+      ocioLoading = false;
+    }
+  }
+
+  async function applyOcio() {
+    if (!ocioSrc || !ocioDst) return;
+    await projectState.setOcioViewTransform(ocioConfigPath || null, ocioSrc, ocioDst, ocioSize);
+    if (!projectState.error) ocioPanelOpen = false;
+  }
+
+  async function clearOcio() {
+    await projectState.clearOcioViewTransform();
+    ocioPanelOpen = false;
+  }
+
   /** Open a file dialog filtered to .cube / .3dl and write the
    *  chosen path back to a LUT effect's `path` param. */
   async function pickLutFile(
@@ -625,8 +693,11 @@
     return `Node ${index + 1}`;
   }
 
-  function nodeMode(node: EffectInfo): 'primary' | 'log' {
-    return node.params[GK.KEY_MODE] === GK.MODE_LOG ? 'log' : 'primary';
+  function nodeMode(node: EffectInfo): 'primary' | 'log' | 'curves' {
+    const m = node.params[GK.KEY_MODE];
+    if (m === GK.MODE_LOG) return 'log';
+    if (m === GK.MODE_CURVES) return 'curves';
+    return 'primary';
   }
 
   /** Read a numeric grade param's current value (static or evaluated). */
@@ -636,8 +707,8 @@
     return evalNumber(raw, 0, GK.gradeDefault(key));
   }
 
-  /** Append a new primary grade node to the selected clip. */
-  async function addGradeNode(mode: 'primary' | 'log' = 'primary') {
+  /** Append a new grade node (primary / log / curves) to the clip. */
+  async function addGradeNode(mode: 'primary' | 'log' | 'curves' = 'primary') {
     const d = selectedClipDetails;
     if (!d) return;
     await projectState.addEffect(d.track.id, d.clip.id, GK.GRADE_KIND, {
@@ -729,6 +800,66 @@
       node.id,
       wheelParams(group, rgb, master)
     );
+  }
+
+  // ---- Curves (Phase 6.8) --------------------------------------------------
+
+  type CurveChannel = 'master' | 'r' | 'g' | 'b' | 'luma';
+  type CurvePt = { x: number; y: number };
+
+  /** Which channel's curve is shown in the editor. */
+  let curveChannel = $state<CurveChannel>('master');
+
+  const CURVE_CHANNELS: { key: CurveChannel; label: string; color: string }[] = [
+    { key: 'master', label: 'Master', color: '#e6ebf5' },
+    { key: 'r', label: 'Red', color: '#e0524d' },
+    { key: 'g', label: 'Green', color: '#5fb86b' },
+    { key: 'b', label: 'Blue', color: '#5b8def' },
+    { key: 'luma', label: 'Luma', color: '#d8b24a' }
+  ];
+
+  // HSL hue-wheel curve tabs are defined in the data model (6.8b) but
+  // not yet rendered — greyed out here so the layout is forward-looking.
+  const HSL_CURVE_TABS = ['Hue/Hue', 'Hue/Sat', 'Hue/Lum', 'Sat/Sat', 'Lum/Lum'];
+
+  function curveKeyFor(ch: CurveChannel): string {
+    return GK.CURVE_KEYS[ch];
+  }
+
+  /** Read a channel's control points as `{x,y}[]` (empty = identity). */
+  function readCurve(node: EffectInfo, ch: CurveChannel): CurvePt[] {
+    const raw = node.params[curveKeyFor(ch)];
+    if (!isKeyframes(raw)) return [];
+    return raw.map((k) => ({ x: k.time_seconds, y: k.value }));
+  }
+
+  /** Build the EffectValue (Keyframes) for a channel from its points. An
+   *  identity curve is sent as an empty list so the engine bakes the
+   *  exact identity ramp (and `is_identity` skips sampling). Linear
+   *  interp keeps the editor WYSIWYG with the baked LUT. */
+  function curveParam(ch: CurveChannel, points: CurvePt[]): [string, EffectValue][] {
+    const isIdentity =
+      points.length === 2 &&
+      Math.abs(points[0].x) < 1e-6 &&
+      Math.abs(points[0].y) < 1e-6 &&
+      Math.abs(points[1].x - 1) < 1e-6 &&
+      Math.abs(points[1].y - 1) < 1e-6;
+    const value: EffectValue = isIdentity
+      ? []
+      : points.map((p) => ({ time_seconds: p.x, value: p.y, interp: 'Linear' as const }));
+    return [[curveKeyFor(ch), value]];
+  }
+
+  function previewCurve(node: EffectInfo, ch: CurveChannel, points: CurvePt[]) {
+    const d = selectedClipDetails;
+    if (!d) return;
+    projectState.previewGradeParams(d.clip.id, node.id, curveParam(ch, points));
+  }
+
+  async function commitCurve(node: EffectInfo, ch: CurveChannel, points: CurvePt[]) {
+    const d = selectedClipDetails;
+    if (!d) return;
+    await projectState.updateEffectParams(d.track.id, d.clip.id, node.id, curveParam(ch, points));
   }
 
   /** First enabled video track on the active sequence, or null. */
@@ -1045,6 +1176,102 @@
             (none)
           </button>
         {/if}
+
+        <!-- OCIO display transform (Phase 6.1b) -->
+        <span class="text-vance-muted ml-2">·</span>
+        <span class="text-vance-muted">OCIO:</span>
+        <div class="relative inline-block">
+          <button
+            class="bg-vance-bg border-vance-border rounded border px-1 py-0.5 text-[10px] disabled:opacity-40 max-w-[12rem] truncate"
+            onclick={openOcioPanel}
+            disabled={!projectState.info.ocio_available}
+            title={projectState.info.ocio_available
+              ? 'Configure an OpenColorIO display transform'
+              : 'OCIO not enabled in this build (rebuild with --features ocio)'}
+          >
+            {#if projectState.info.ocio_view}
+              {projectState.info.ocio_view.src} → {projectState.info.ocio_view.dst}
+            {:else}
+              (off)
+            {/if}
+          </button>
+          {#if ocioPanelOpen}
+            <div
+              class="border-vance-border bg-vance-panel absolute left-0 top-full z-50 mt-1 flex w-72 flex-col gap-2 rounded border p-3 text-[11px] shadow-lg"
+            >
+              <div class="flex items-center justify-between">
+                <span class="text-vance-fg font-medium">OCIO Display Transform</span>
+                <button class="text-vance-muted hover:brightness-150" onclick={() => (ocioPanelOpen = false)}>✕</button>
+              </div>
+              <label class="text-vance-muted flex flex-col gap-1">
+                Config (.ocio, blank = $OCIO env)
+                <div class="flex gap-1">
+                  <input
+                    class="bg-vance-bg border-vance-border flex-1 truncate rounded border px-1 py-0.5"
+                    value={ocioConfigPath}
+                    oninput={(e) => (ocioConfigPath = (e.currentTarget as HTMLInputElement).value)}
+                    placeholder="$OCIO"
+                  />
+                  <button class="bg-vance-bg border-vance-border rounded border px-1.5" onclick={pickOcioConfig}>…</button>
+                </div>
+              </label>
+              <button
+                class="bg-vance-bg border-vance-border self-start rounded border px-1.5 py-0.5"
+                onclick={loadOcioColorspaces}
+                disabled={ocioLoading}
+              >
+                {ocioLoading ? 'Loading…' : 'Load colorspaces'}
+              </button>
+              <label class="text-vance-muted flex flex-col gap-1">
+                Source
+                <select
+                  class="bg-vance-bg border-vance-border rounded border px-1 py-0.5"
+                  value={ocioSrc}
+                  onchange={(e) => (ocioSrc = (e.currentTarget as HTMLSelectElement).value)}
+                >
+                  {#each ocioColorspaces as cs (cs)}
+                    <option value={cs}>{cs}</option>
+                  {/each}
+                </select>
+              </label>
+              <label class="text-vance-muted flex flex-col gap-1">
+                Display
+                <select
+                  class="bg-vance-bg border-vance-border rounded border px-1 py-0.5"
+                  value={ocioDst}
+                  onchange={(e) => (ocioDst = (e.currentTarget as HTMLSelectElement).value)}
+                >
+                  {#each ocioColorspaces as cs (cs)}
+                    <option value={cs}>{cs}</option>
+                  {/each}
+                </select>
+              </label>
+              <label class="text-vance-muted flex items-center gap-2">
+                LUT size
+                <input
+                  type="number"
+                  min="2"
+                  max="129"
+                  class="bg-vance-bg border-vance-border w-16 rounded border px-1 py-0.5"
+                  value={ocioSize}
+                  oninput={(e) => (ocioSize = parseInt((e.currentTarget as HTMLInputElement).value, 10) || 33)}
+                />
+              </label>
+              <div class="flex gap-2">
+                <button
+                  class="rounded border border-[var(--color-vance-accent)] bg-[#003040] px-2 py-0.5 disabled:opacity-40"
+                  onclick={applyOcio}
+                  disabled={!ocioSrc || !ocioDst}
+                >
+                  Apply
+                </button>
+                <button class="bg-vance-bg border-vance-border rounded border px-2 py-0.5" onclick={clearOcio}>
+                  Clear
+                </button>
+              </div>
+            </div>
+          {/if}
+        </div>
       </span>
     {/if}
 
@@ -1121,6 +1348,14 @@
               title="Add a log (offset/shadow/mid/highlight) grade node"
             >
               + Log
+            </button>
+            <button
+              class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125 disabled:opacity-50"
+              onclick={() => addGradeNode('curves')}
+              disabled={!selectedClipDetails}
+              title="Add a curves (per-channel tone curve) grade node"
+            >
+              + Curves
             </button>
           </div>
         </div>
@@ -1618,7 +1853,7 @@
                 />
               </div>
             {/each}
-          {:else}
+          {:else if mode === 'log'}
             {#each ['offset', 'shadow', 'midtone', 'highlight'] as group (group)}
               {@const w = readWheel(node, group)}
               <div class="mb-4">
@@ -1632,6 +1867,39 @@
                 />
               </div>
             {/each}
+          {:else}
+            <!-- Curves mode -->
+            {@const chMeta = CURVE_CHANNELS.find((c) => c.key === curveChannel) ?? CURVE_CHANNELS[0]}
+            <div class="mb-2 flex flex-wrap gap-1">
+              {#each CURVE_CHANNELS as ch (ch.key)}
+                <button
+                  class="rounded border px-1.5 py-0.5 text-[10px] {curveChannel === ch.key
+                    ? 'border-[var(--color-vance-accent)] bg-[#003040]'
+                    : 'bg-vance-bg border-vance-border hover:brightness-125'}"
+                  style={`color:${ch.color}`}
+                  onclick={() => (curveChannel = ch.key)}
+                >
+                  {ch.label}
+                </button>
+              {/each}
+            </div>
+            <div class="mb-3 flex flex-wrap gap-1 opacity-40">
+              {#each HSL_CURVE_TABS as t (t)}
+                <span
+                  class="bg-vance-bg border-vance-border cursor-not-allowed rounded border px-1.5 py-0.5 text-[10px]"
+                  title="HSL hue-wheel curves arrive in 6.8b"
+                >
+                  {t}
+                </span>
+              {/each}
+            </div>
+            <CurveEditor
+              label={chMeta.label}
+              color={chMeta.color}
+              points={readCurve(node, curveChannel)}
+              onInput={(pts) => previewCurve(node, curveChannel, pts)}
+              onCommit={(pts) => commitCurve(node, curveChannel, pts)}
+            />
           {/if}
         {/if}
         {#if projectState.error}

@@ -19,6 +19,13 @@ path = "src/main.rs"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+default = []
+# Pass-through to light up the native OpenColorIO path (Phase 6.1b).
+# Build/run with `--features ocio`; needs `brew install opencolorio`.
+# Without it, OCIO commands return a clear "not enabled" error.
+ocio = ["vance-ocio/ocio"]
+
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
@@ -32,6 +39,7 @@ wgpu = "29"
 pollster = "0.4"
 vance-core = { workspace = true }
 vance-color = { workspace = true }
+vance-ocio = { workspace = true }
 vance-time = { workspace = true }
 vance-decoder = { workspace = true }
 vance-render = { workspace = true }

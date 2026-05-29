@@ -235,7 +235,7 @@ fn primary_grade_gain_brightens() {
     r.upload_frame(&frame).expect("upload");
     r.set_grades(&[GradeNodeParams {
         enabled: true,
-        log_mode: false,
+        mode: vance_render::GradeMode::Primary,
         gain: [1.0, 1.0, 1.0, 2.0], // master gain ×2
         ..GradeNodeParams::default()
     }]);
@@ -269,4 +269,105 @@ fn disabled_grade_node_is_noop() {
     let graded = center(&r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64);
 
     assert_eq!(base, graded, "disabled node must not change the image");
+}
+
+// A curves node with a lifting master curve must brighten mid-gray.
+// The grade chain runs in linear light, so a curve that raises the low
+// end (0 → 0.3) pushes the mid-gray's linear value up. Verifies the
+// atlas bake + binding 10 + shader apply_curve dispatch end-to-end.
+#[test]
+fn curves_master_lift_brightens_midgray() {
+    use vance_render::{CurveSet, GradeMode, GradeNodeParams};
+    use vance_timeline::{Keyframe, KeyframeInterp};
+    let frame = solid_yuv420p(64, 64, 128, 128, 128);
+
+    let mut base_r = Renderer::new(RendererConfig::default()).expect("renderer");
+    base_r.upload_frame(&frame).expect("upload");
+    let base = center(&base_r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64);
+
+    let ckf = |x: f64, y: f64| Keyframe {
+        time_seconds: x,
+        value: y,
+        interp: KeyframeInterp::Linear,
+    };
+    let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
+    r.upload_frame(&frame).expect("upload");
+    r.set_grades(&[GradeNodeParams {
+        enabled: true,
+        mode: GradeMode::Curves,
+        curves: Some(CurveSet {
+            master: vec![ckf(0.0, 0.3), ckf(1.0, 1.0)],
+            ..CurveSet::default()
+        }),
+        ..GradeNodeParams::default()
+    }]);
+    let graded = center(&r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64);
+
+    assert!(
+        graded[0] > base[0] + 10 && graded[1] > base[1] + 10 && graded[2] > base[2] + 10,
+        "expected lifting master curve to brighten: base={base:?} graded={graded:?}"
+    );
+}
+
+// The LUMA curve (atlas alpha lane) must brighten via the hue-preserving
+// ratio path — exercises a different lane than the rgb-channel test and
+// the input-luma sampling in apply_curve.
+#[test]
+fn curves_luma_lift_brightens_midgray() {
+    use vance_render::{CurveSet, GradeMode, GradeNodeParams};
+    use vance_timeline::{Keyframe, KeyframeInterp};
+    let frame = solid_yuv420p(64, 64, 128, 128, 128);
+
+    let mut base_r = Renderer::new(RendererConfig::default()).expect("renderer");
+    base_r.upload_frame(&frame).expect("upload");
+    let base = center(&base_r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64);
+
+    let ckf = |x: f64, y: f64| Keyframe {
+        time_seconds: x,
+        value: y,
+        interp: KeyframeInterp::Linear,
+    };
+    let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
+    r.upload_frame(&frame).expect("upload");
+    r.set_grades(&[GradeNodeParams {
+        enabled: true,
+        mode: GradeMode::Curves,
+        curves: Some(CurveSet {
+            // Lift the whole luminance range: out *= curve(l)/l > 1.
+            luma: vec![ckf(0.0, 0.3), ckf(1.0, 1.0)],
+            ..CurveSet::default()
+        }),
+        ..GradeNodeParams::default()
+    }]);
+    let graded = center(&r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64);
+
+    assert!(
+        graded[0] > base[0] + 8 && graded[1] > base[1] + 8 && graded[2] > base[2] + 8,
+        "expected luma lift to brighten: base={base:?} graded={graded:?}"
+    );
+}
+
+// An all-identity curves node must be a true no-op (the shader skips
+// sampling when log_smh.x == 0). Guards against the atlas default rows
+// or the identity-skip flag drifting.
+#[test]
+fn identity_curves_node_is_noop() {
+    use vance_render::{CurveSet, GradeMode, GradeNodeParams};
+    let frame = solid_yuv420p(64, 64, 96, 140, 110);
+
+    let mut base_r = Renderer::new(RendererConfig::default()).expect("renderer");
+    base_r.upload_frame(&frame).expect("upload");
+    let base = center(&base_r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64);
+
+    let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
+    r.upload_frame(&frame).expect("upload");
+    r.set_grades(&[GradeNodeParams {
+        enabled: true,
+        mode: GradeMode::Curves,
+        curves: Some(CurveSet::default()), // all empty = identity
+        ..GradeNodeParams::default()
+    }]);
+    let graded = center(&r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64);
+
+    assert_eq!(base, graded, "identity curves node must not change the image");
 }

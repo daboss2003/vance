@@ -58,7 +58,10 @@ pub enum KeyframeInterp {
 /// time (seconds from the clip's `source_in`).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Keyframe {
+    /// Clip-relative time in seconds (for animation), or input level
+    /// when this `Keyframe` is reused as a curve control point (6.8).
     pub time_seconds: f64,
+    /// Pinned numeric value, or output level for a curve control point.
     pub value: f64,
     /// Outgoing interpolation toward the next keyframe. Defaults to
     /// `Linear` so older project files (which lacked the field)
@@ -79,6 +82,22 @@ impl EffectValue {
             _ => None,
         }
     }
+}
+
+/// Evaluate a curve given as control points at input level `x`.
+///
+/// Phase 6.8 color curves reuse the [`Keyframe`] shape as curve control
+/// points — `time_seconds` is the input level and `value` the output
+/// level, with `interp` the segment shape (Linear / Bezier=smoothstep /
+/// Hold). This is exactly the [`eval_keyframes`] math (sorted,
+/// clamp-at-endpoints, per-segment interp), so curves bake with no new
+/// interpolation code.
+///
+/// NOTE: an *empty* point list returns 0.0 (the keyframe convention) —
+/// callers baking a curve LUT must treat empty as the identity ramp
+/// `y = x`, never 0, or the curve silently crushes to black.
+pub fn eval_curve(points: &[Keyframe], x: f64) -> f64 {
+    eval_keyframes(points, x)
 }
 
 fn eval_keyframes(kfs: &[Keyframe], t: f64) -> f64 {
@@ -155,5 +174,68 @@ mod tests {
         assert!(e.enabled);
         assert!(e.params.is_empty());
         assert_eq!(e.kind, "opacity");
+    }
+
+    fn kf(x: f64, y: f64, interp: KeyframeInterp) -> Keyframe {
+        Keyframe {
+            time_seconds: x,
+            value: y,
+            interp,
+        }
+    }
+
+    #[test]
+    fn eval_curve_empty_returns_zero() {
+        // The keyframe convention — callers baking a LUT must treat an
+        // empty list as identity themselves (the renderer does).
+        assert_eq!(eval_curve(&[], 0.5), 0.0);
+    }
+
+    #[test]
+    fn eval_curve_identity_two_point_is_y_equals_x() {
+        let id = [
+            kf(0.0, 0.0, KeyframeInterp::Linear),
+            kf(1.0, 1.0, KeyframeInterp::Linear),
+        ];
+        for &x in &[0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0] {
+            assert!((eval_curve(&id, x) - x).abs() < 1e-9, "x={x}");
+        }
+    }
+
+    #[test]
+    fn eval_curve_linear_lift_maps_endpoints_and_mid() {
+        // Lift shadows: (0, 0.3) → (1, 1.0). Endpoints exact; midpoint
+        // is the linear interpolation 0.3 + 0.5*(1-0.3) = 0.65.
+        let c = [
+            kf(0.0, 0.3, KeyframeInterp::Linear),
+            kf(1.0, 1.0, KeyframeInterp::Linear),
+        ];
+        assert!((eval_curve(&c, 0.0) - 0.3).abs() < 1e-9);
+        assert!((eval_curve(&c, 1.0) - 1.0).abs() < 1e-9);
+        assert!((eval_curve(&c, 0.5) - 0.65).abs() < 1e-9);
+    }
+
+    #[test]
+    fn eval_curve_clamps_at_endpoints_outside_domain() {
+        let c = [
+            kf(0.2, 0.1, KeyframeInterp::Linear),
+            kf(0.8, 0.9, KeyframeInterp::Linear),
+        ];
+        assert_eq!(eval_curve(&c, -1.0), 0.1); // below first → first value
+        assert_eq!(eval_curve(&c, 2.0), 0.9); // above last → last value
+    }
+
+    #[test]
+    fn eval_curve_three_point_uses_correct_segment() {
+        // S-ish: (0,0) (0.5,0.7) (1,1). Mid of first segment = 0.35.
+        let c = [
+            kf(0.0, 0.0, KeyframeInterp::Linear),
+            kf(0.5, 0.7, KeyframeInterp::Linear),
+            kf(1.0, 1.0, KeyframeInterp::Linear),
+        ];
+        assert!((eval_curve(&c, 0.25) - 0.35).abs() < 1e-9);
+        assert!((eval_curve(&c, 0.5) - 0.7).abs() < 1e-9);
+        // Second segment midpoint: 0.7 + 0.5*(1-0.7) = 0.85.
+        assert!((eval_curve(&c, 0.75) - 0.85).abs() < 1e-9);
     }
 }

@@ -47,14 +47,14 @@ pub mod transition;
 
 pub use clip::Clip;
 pub use edit_log::{apply, EditLog, EditOp};
-pub use effect::{Effect, EffectParams, EffectValue, Keyframe, KeyframeInterp};
+pub use effect::{eval_curve, Effect, EffectParams, EffectValue, Keyframe, KeyframeInterp};
 pub use error::{Result, TimelineError};
 pub use id::{
     ClipId, EffectId, MarkerId, MediaItemId, ProjectId, SequenceId, TrackId, TransitionId,
 };
 pub use marker::{Marker, MarkerColor, MarkerKind};
 pub use media::{ContentHash, MediaItem, MediaKind};
-pub use project::Project;
+pub use project::{OcioView, Project};
 pub use scene_plan::{scene_at, transition_at, ActiveClip, ActiveTransition, SceneAt};
 pub use sequence::Sequence;
 pub use title::TitleParams;

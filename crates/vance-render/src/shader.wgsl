@@ -35,6 +35,9 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 @group(0) @binding(7) var tex_v_b: texture_2d<f32>;
 @group(0) @binding(8) var tex_lut: texture_3d<f32>;
 @group(0) @binding(9) var tex_view_lut: texture_3d<f32>;
+// Curve LUT atlas (Phase 6.8): 256 wide × 8 rows (one per grade node).
+// rgb lanes = baked R/G/B tone curves (master folded in), alpha = luma.
+@group(0) @binding(10) var tex_curve_atlas: texture_2d<f32>;
 
 // Per-frame effect parameters. Layout must match `RenderParams` in
 // renderer.rs.
@@ -121,6 +124,38 @@ fn apply_log(rgb: vec3<f32>, n: GradeNode) -> vec3<f32> {
     return max(out, vec3<f32>(0.0));
 }
 
+// Curves grade: per-channel tone curve sampled from the atlas row for
+// node `i`. The atlas is a function LUT — column p of a row holds the
+// curve's output at input level p. Master is folded into R/G/B at bake
+// time, so each channel is one sample. The luma curve (alpha lane) is
+// applied as a hue-preserving ratio.
+//
+// The luma curve reads the *input* luma (computed from `rgb`, BEFORE the
+// R/G/B curves) rather than the post-R/G/B luma: this decouples the luma
+// curve from the R/G/B curves so a colorist's luma adjustment is
+// predictable from the source pixel and independent of channel curves.
+// (With an identity luma curve `cl == l`, so the ratio is exactly 1
+// regardless of which luma is used — the choice only matters when both
+// the luma curve and the R/G/B curves are non-identity.)
+//
+// Sample COORDINATEs are clamped to the LUT's [0,1] domain (super-1.0
+// inputs flatten to the curve endpoint), but the output is not
+// upper-clamped — same serial-chain convention as apply_primary. Uses
+// textureSampleLevel because we're in the (non-uniform) grade loop where
+// implicit-derivative sampling is illegal in WGSL.
+fn apply_curve(rgb: vec3<f32>, i: u32) -> vec3<f32> {
+    let rowv = (f32(i) + 0.5) / 8.0;
+    let cr = textureSampleLevel(tex_curve_atlas, samp, vec2<f32>(clamp(rgb.r, 0.0, 1.0), rowv), 0.0).r;
+    let cg = textureSampleLevel(tex_curve_atlas, samp, vec2<f32>(clamp(rgb.g, 0.0, 1.0), rowv), 0.0).g;
+    let cb = textureSampleLevel(tex_curve_atlas, samp, vec2<f32>(clamp(rgb.b, 0.0, 1.0), rowv), 0.0).b;
+    var out = vec3<f32>(cr, cg, cb);
+    let l = dot(max(rgb, vec3<f32>(0.0)), vec3<f32>(0.2126, 0.7152, 0.0722));
+    let cl = textureSampleLevel(tex_curve_atlas, samp, vec2<f32>(clamp(l, 0.0, 1.0), rowv), 0.0).a;
+    // Scale by curve(input_luma)/input_luma to keep hue; guard near black.
+    out = select(out, out * (cl / max(l, 1e-4)), l > 1e-4);
+    return out;
+}
+
 // Apply the serial grade chain in linear working space. Intermediate
 // values are NOT clamped to [0,1] (only floored at 0) so nodes compose
 // like a real grade graph; the downstream brightness/contrast block
@@ -133,8 +168,14 @@ fn apply_grades(rgb_in: vec3<f32>) -> vec3<f32> {
         if (n.flags.x < 0.5) { continue; }      // bypassed node
         if (n.flags.y < 0.5) {
             rgb = apply_primary(rgb, n);
-        } else {
+        } else if (n.flags.y < 1.5) {
             rgb = apply_log(rgb, n);
+        } else {
+            // mode 2 = curves; skip the 4 samples for identity nodes
+            // (log_smh.x == 0 means every curve is the identity ramp).
+            if (n.log_smh.x > 0.5) {
+                rgb = apply_curve(rgb, i);
+            }
         }
     }
     return rgb;

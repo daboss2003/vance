@@ -36,6 +36,34 @@ pub struct Project {
     /// `None` for an unfiltered preview.
     #[serde(default)]
     pub view_lut_path: Option<std::path::PathBuf>,
+    /// OpenColorIO display transform (Phase 6.1b). When set, the engine
+    /// bakes a `src → dst` 3D LUT via OCIO and drives the SAME viewport
+    /// display-LUT slot as [`Self::view_lut_path`] — so the OCIO
+    /// transform takes precedence over a plain file LUT when both are
+    /// present. `None` leaves the file LUT (or nothing) in charge.
+    #[serde(default)]
+    pub ocio_view: Option<OcioView>,
+}
+
+/// A persisted OpenColorIO display-transform spec (Phase 6.1b). Plain
+/// data only — the actual conversion lives in the `vance-ocio` crate so
+/// `vance-timeline` stays free of the native dependency.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OcioView {
+    /// Path to the `.ocio` config, or `None` to use the `$OCIO` env config.
+    #[serde(default)]
+    pub config_path: Option<std::path::PathBuf>,
+    /// Source colorspace / role name.
+    pub src: String,
+    /// Destination (display) colorspace / role name.
+    pub dst: String,
+    /// Baked cube side length. 33 is the usual quality/size sweet spot.
+    #[serde(default = "default_ocio_size")]
+    pub size: u32,
+}
+
+fn default_ocio_size() -> u32 {
+    33
 }
 
 fn default_working_space() -> ColorSpace {
@@ -52,6 +80,7 @@ impl Project {
             sequences: Vec::new(),
             working_color_space: default_working_space(),
             view_lut_path: None,
+            ocio_view: None,
         }
     }
 
@@ -106,5 +135,30 @@ mod tests {
         p.sequences.push(Arc::new(s));
         assert!(p.sequence(id).is_some());
         assert_eq!(p.sequence(id).unwrap().name, "Seq 01");
+    }
+
+    #[test]
+    fn ocio_view_round_trips() {
+        let mut p = Project::new("p");
+        p.ocio_view = Some(OcioView {
+            config_path: Some(PathBuf::from("/cfg/studio.ocio")),
+            src: "ACEScg".into(),
+            dst: "sRGB - Display".into(),
+            size: 33,
+        });
+        let json = serde_json::to_string(&p).unwrap();
+        let back: Project = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.ocio_view, p.ocio_view);
+    }
+
+    #[test]
+    fn project_without_ocio_view_deserializes_to_none() {
+        // Back-compat: a project serialized before 6.1b has no
+        // `ocio_view` key. `#[serde(default)]` must fill in `None`.
+        let p = Project::new("legacy");
+        let mut value: serde_json::Value = serde_json::to_value(&p).unwrap();
+        value.as_object_mut().unwrap().remove("ocio_view");
+        let back: Project = serde_json::from_value(value).unwrap();
+        assert!(back.ocio_view.is_none());
     }
 }

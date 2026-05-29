@@ -15,6 +15,9 @@ import {
   setMediaInputColorSpace,
   setProjectWorkingColorSpace,
   setProjectViewLut,
+  setOcioViewTransform,
+  clearOcioViewTransform,
+  ocioListColorspaces,
   insertClipAt,
   loadProject,
   addEffectToClip as ipcAddEffect,
@@ -326,6 +329,48 @@ class ProjectState {
       await setProjectViewLut(path);
       if (this.info) {
         this.info = { ...this.info, view_lut_path: path };
+      }
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** List colorspaces in an OCIO config (Phase 6.1b). Returns [] and sets
+   *  `error` on failure (e.g. OCIO not enabled, bad config). */
+  async ocioListColorspaces(config: string | null): Promise<string[]> {
+    this.error = null;
+    try {
+      return await ocioListColorspaces(config);
+    } catch (e) {
+      this.error = String(e);
+      return [];
+    }
+  }
+
+  /** Apply an OCIO display transform (Phase 6.1b). On success updates the
+   *  cached project info so the UI reflects it without a refetch. */
+  async setOcioViewTransform(config: string | null, src: string, dst: string, size: number) {
+    this.error = null;
+    try {
+      await setOcioViewTransform(config, src, dst, size);
+      if (this.info) {
+        this.info = {
+          ...this.info,
+          ocio_view: { config_path: config, src, dst, size }
+        };
+      }
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Clear the OCIO display transform (Phase 6.1b). */
+  async clearOcioViewTransform() {
+    this.error = null;
+    try {
+      await clearOcioViewTransform();
+      if (this.info) {
+        this.info = { ...this.info, ocio_view: null };
       }
     } catch (e) {
       this.error = String(e);

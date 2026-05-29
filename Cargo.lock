@@ -5266,6 +5266,7 @@ dependencies = [
  "vance-color",
  "vance-core",
  "vance-decoder",
+ "vance-ocio",
  "vance-project",
  "vance-render",
  "vance-time",
@@ -5375,6 +5376,16 @@ name = "vance-media"
 version = "0.0.0"
 
 [[package]]
+name = "vance-ocio"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "pkg-config",
+ "thiserror 2.0.18",
+ "vance-color",
+]
+
+[[package]]
 name = "vance-otio"
 version = "0.0.0"
 
@@ -5429,6 +5440,7 @@ version = "0.0.0"
 dependencies = [
  "proptest",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "uuid",
  "vance-color",

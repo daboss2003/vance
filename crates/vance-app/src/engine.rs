@@ -90,6 +90,10 @@ pub enum EngineError {
     /// `insert_clip_at` referenced a `MediaItemId` not in the library.
     #[error("media item not found in project library")]
     MediaNotFound,
+
+    /// OpenColorIO error (not enabled in build, bad config / colorspace).
+    #[error("ocio: {0}")]
+    Ocio(String),
 }
 
 impl EngineError {
@@ -114,6 +118,24 @@ pub struct ProjectInfo {
     /// Path of the active display LUT (Phase 6.5), or `null` when
     /// monitoring is unfiltered.
     pub view_lut_path: Option<String>,
+    /// Active OpenColorIO display transform (Phase 6.1b), or `null`.
+    pub ocio_view: Option<OcioViewInfo>,
+    /// Whether this build links OpenColorIO (so the UI can grey the
+    /// OCIO controls when it doesn't).
+    pub ocio_available: bool,
+}
+
+/// IPC-facing view of the project's OCIO display transform.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct OcioViewInfo {
+    /// `.ocio` config path, or `null` for the `$OCIO` env config.
+    pub config_path: Option<String>,
+    /// Source colorspace / role name.
+    pub src: String,
+    /// Destination (display) colorspace / role name.
+    pub dst: String,
+    /// Baked cube side length.
+    pub size: u32,
 }
 
 /// One row in `ProjectInfo.sequences`.
@@ -438,6 +460,33 @@ fn eval_clip_grades(
             .map(|v| v as f32)
             .unwrap_or(default)
     };
+    // Curve control points live in an `EffectValue::Keyframes` whose
+    // points are (input level, output level) pairs — static, NOT read
+    // at `t_seconds` (the curve shape itself isn't keyframe-animated in
+    // 6.8). Absent/other variants yield an empty list, which the baker
+    // treats as the identity ramp.
+    let curve = |ps: &std::collections::BTreeMap<String, EffectValue>, k: &str| -> Vec<vance_timeline::Keyframe> {
+        match ps.get(k) {
+            Some(EffectValue::Keyframes(pts)) => pts.clone(),
+            _ => Vec::new(),
+        }
+    };
+    // The renderer evaluates at most MAX_GRADE_NODES per clip; extras are
+    // dropped. The UI warns interactively, but a project loaded from disk
+    // or authored by an external tool has no such guard — so surface the
+    // truncation here too. Warn once per process (this runs per frame, so
+    // an unconditional log would spam the console at the frame rate).
+    let grade_count = effects.iter().filter(|e| e.kind == gk::GRADE_KIND).count();
+    if grade_count > gk::MAX_GRADE_NODES {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                grade_count,
+                max = gk::MAX_GRADE_NODES,
+                "clip has more grade nodes than the renderer supports; extra nodes are ignored"
+            );
+        }
+    }
     let mut out = Vec::new();
     for e in effects {
         if e.kind != gk::GRADE_KIND {
@@ -446,13 +495,26 @@ fn eval_clip_grades(
         if out.len() >= gk::MAX_GRADE_NODES {
             break;
         }
-        let log_mode = matches!(
-            e.params.get(gk::KEY_MODE),
-            Some(EffectValue::String(s)) if s == gk::MODE_LOG
-        );
+        let mode = match e.params.get(gk::KEY_MODE) {
+            Some(EffectValue::String(s)) if s == gk::MODE_LOG => vance_render::GradeMode::Log,
+            Some(EffectValue::String(s)) if s == gk::MODE_CURVES => vance_render::GradeMode::Curves,
+            _ => vance_render::GradeMode::Primary,
+        };
+        let curves = if matches!(mode, vance_render::GradeMode::Curves) {
+            Some(vance_render::CurveSet {
+                master: curve(&e.params, gk::KEY_CURVE_MASTER),
+                r: curve(&e.params, gk::KEY_CURVE_R),
+                g: curve(&e.params, gk::KEY_CURVE_G),
+                b: curve(&e.params, gk::KEY_CURVE_B),
+                luma: curve(&e.params, gk::KEY_CURVE_LUMA),
+            })
+        } else {
+            None
+        };
         out.push(vance_render::GradeNodeParams {
             enabled: e.enabled,
-            log_mode,
+            mode,
+            curves,
             lift: [
                 num(&e.params, gk::KEY_LIFT_R, 0.0),
                 num(&e.params, gk::KEY_LIFT_G, 0.0),
@@ -729,6 +791,13 @@ impl From<&Project> for ProjectInfo {
                 .view_lut_path
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
+            ocio_view: p.ocio_view.as_ref().map(|v| OcioViewInfo {
+                config_path: v.config_path.as_ref().map(|c| c.to_string_lossy().into_owned()),
+                src: v.src.clone(),
+                dst: v.dst.clone(),
+                size: v.size,
+            }),
+            ocio_available: vance_ocio::is_available(),
         }
     }
 }
@@ -912,6 +981,12 @@ pub struct Engine {
     /// `next_play_effects`; used to map each frame's source PTS to
     /// the clip-local time for keyframe evaluation.
     next_play_source_in_sec: f64,
+
+    /// Caches the last OCIO-baked display LUT keyed by its spec, so the
+    /// per-clip-transition `apply_view_lut` doesn't re-run OCIO's CPU
+    /// processor over the cube lattice every time. Invalidated whenever
+    /// the project's `ocio_view` differs from the cached spec. Phase 6.1b.
+    ocio_lut_cache: Option<(vance_timeline::OcioView, Arc<vance_color::Lut3d>)>,
 }
 
 /// Anchors a stream-time-base playback position back to a sequence
@@ -1793,9 +1868,21 @@ impl Engine {
     /// when the user picks a new LUT, and on every active-clip
     /// transition so re-entry to the engine state lights up the LUT.
     fn apply_view_lut(&mut self) {
-        let Some(rs) = self.render_state.as_ref() else {
+        if self.render_state.is_none() {
             return;
-        };
+        }
+        // OCIO display transform takes precedence over a plain file LUT —
+        // both drive the single viewport display-LUT slot, and OCIO is the
+        // more specific, color-managed choice when configured.
+        let ocio_view = self
+            .current_project
+            .as_ref()
+            .and_then(|p| p.ocio_view.clone());
+        if let Some(view) = ocio_view {
+            self.apply_ocio_view_lut(&view);
+            return;
+        }
+        let rs = self.render_state.as_ref().unwrap();
         let path = match self
             .current_project
             .as_ref()
@@ -1828,6 +1915,111 @@ impl Engine {
                 rs.renderer.set_view_lut_enable(0.0);
             }
         }
+    }
+
+    /// Bake `view`'s `src → dst` conversion into a 3D LUT via OpenColorIO
+    /// and load it into the viewport display-LUT slot. Cached by spec so
+    /// repeated `apply_view_lut` calls (every clip transition) don't
+    /// re-run OCIO. On bake failure the slot is disabled and the error is
+    /// logged — a missing/invalid config must not blank the viewport
+    /// silently or wedge the engine. Phase 6.1b.
+    fn apply_ocio_view_lut(&mut self, view: &vance_timeline::OcioView) {
+        let Some(rs) = self.render_state.as_ref() else {
+            return;
+        };
+        // Cache hit: re-upload the already-baked LUT, no OCIO call.
+        if let Some((cached_spec, lut)) = self.ocio_lut_cache.as_ref() {
+            if cached_spec == view {
+                let mut rs = rs.lock();
+                rs.renderer.upload_view_lut(lut);
+                rs.renderer.set_view_lut_enable(1.0);
+                return;
+            }
+        }
+        let config = view.config_path.as_deref();
+        match vance_ocio::bake_lut(config, &view.src, &view.dst, view.size) {
+            Ok(lut) => {
+                let arc = Arc::new(lut);
+                self.ocio_lut_cache = Some((view.clone(), arc.clone()));
+                let mut rs = rs.lock();
+                rs.renderer.upload_view_lut(&arc);
+                rs.renderer.set_view_lut_enable(1.0);
+            }
+            Err(e) => {
+                tracing::warn!(?e, src = %view.src, dst = %view.dst, "ocio: bake failed");
+                let mut rs = rs.lock();
+                rs.renderer.set_view_lut_enable(0.0);
+            }
+        }
+    }
+
+    /// Set the project's OpenColorIO display transform (`src → dst`) and
+    /// apply it to the viewport immediately. `config` is an `.ocio` path
+    /// or `None` for the `$OCIO` env config. Returns an error (without
+    /// changing state) when OCIO isn't compiled in or the bake fails, so
+    /// the UI can surface it rather than silently no-op. Phase 6.1b.
+    pub fn set_ocio_view_transform(
+        &mut self,
+        config: Option<&str>,
+        src: &str,
+        dst: &str,
+        size: u32,
+    ) -> Result<(), EngineError> {
+        if !vance_ocio::is_available() {
+            return Err(EngineError::Ocio(
+                "OpenColorIO support is not enabled in this build".into(),
+            ));
+        }
+        let view = vance_timeline::OcioView {
+            config_path: config.filter(|s| !s.is_empty()).map(PathBuf::from),
+            src: src.to_string(),
+            dst: dst.to_string(),
+            size,
+        };
+        // Validate by baking up front, so a bad colorspace fails the
+        // command instead of silently disabling the slot later.
+        vance_ocio::bake_lut(view.config_path.as_deref(), &view.src, &view.dst, view.size)
+            .map_err(|e| EngineError::Ocio(e.to_string()))?;
+        {
+            let project = self
+                .current_project
+                .as_mut()
+                .ok_or(EngineError::NoProject)?;
+            project.ocio_view = Some(view);
+        }
+        self.apply_view_lut();
+        Ok(())
+    }
+
+    /// Clear the project's OCIO display transform, reverting the viewport
+    /// to the file view-LUT (or unfiltered). Phase 6.1b.
+    pub fn clear_ocio_view_transform(&mut self) -> Result<(), EngineError> {
+        {
+            let project = self
+                .current_project
+                .as_mut()
+                .ok_or(EngineError::NoProject)?;
+            project.ocio_view = None;
+        }
+        self.ocio_lut_cache = None;
+        self.apply_view_lut();
+        Ok(())
+    }
+
+    /// List the colorspace names in an OCIO config (for UI pickers).
+    /// `config` is an `.ocio` path or `None` for the `$OCIO` env config.
+    /// Phase 6.1b.
+    pub fn ocio_list_colorspaces(
+        &self,
+        config: Option<&str>,
+    ) -> Result<Vec<String>, EngineError> {
+        if !vance_ocio::is_available() {
+            return Err(EngineError::Ocio(
+                "OpenColorIO support is not enabled in this build".into(),
+            ));
+        }
+        let path = config.filter(|s| !s.is_empty()).map(PathBuf::from);
+        vance_ocio::list_colorspaces(path.as_deref()).map_err(|e| EngineError::Ocio(e.to_string()))
     }
 
     /// Add a synthetic title media item to the project's library.

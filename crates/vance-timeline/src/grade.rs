@@ -21,9 +21,9 @@
 /// `Effect.kind` value identifying a color-grade node.
 pub const GRADE_KIND: &str = "grade";
 
-/// Param key: node mode — `"primary"` (lift/gamma/gain wheels) or
-/// `"log"` (offset/shadow/midtone/highlight wheels). Defaults to
-/// `"primary"` when absent.
+/// Param key: node mode — `"primary"` (lift/gamma/gain wheels),
+/// `"log"` (offset/shadow/midtone/highlight wheels), or `"curves"`
+/// (per-channel tone curves). Defaults to `"primary"` when absent.
 pub const KEY_MODE: &str = "mode";
 /// Param key: human-readable node label (defaults to "Node N").
 pub const KEY_LABEL: &str = "label";
@@ -32,6 +32,54 @@ pub const KEY_LABEL: &str = "label";
 pub const MODE_PRIMARY: &str = "primary";
 /// Mode value: log (offset/shadow/midtone/highlight) wheels.
 pub const MODE_LOG: &str = "log";
+/// Mode value: tone curves (master + R/G/B + luma). Phase 6.8.
+pub const MODE_CURVES: &str = "curves";
+
+// ---- Curve keys (Phase 6.8) -------------------------------------------
+//
+// Each curve_* key holds an `EffectValue::Keyframes` whose points are
+// CURVE CONTROL POINTS, not animation keyframes: `time_seconds` is the
+// input level (x, 0..1) and `value` is the output level (y, 0..1), with
+// `interp` the segment shape. The engine bakes them into a 1-D LUT row
+// via `vance_timeline::eval_curve`. An ABSENT or EMPTY curve bakes to
+// the identity ramp `y = x` (never 0). The master curve is composited
+// into each of R/G/B at bake time: `curve_r(curve_m(x))`.
+/// Master tone curve (folded into R/G/B at bake time).
+pub const KEY_CURVE_MASTER: &str = "curve_m";
+/// Red channel tone curve.
+pub const KEY_CURVE_R: &str = "curve_r";
+/// Green channel tone curve.
+pub const KEY_CURVE_G: &str = "curve_g";
+/// Blue channel tone curve.
+pub const KEY_CURVE_B: &str = "curve_b";
+/// Luma curve (applied as a hue-preserving ratio).
+pub const KEY_CURVE_LUMA: &str = "curve_luma";
+
+// ---- HSL hue-wheel curve keys (Phase 6.8b — defined, not yet rendered)
+//
+// These are STRUCTURALLY different from the tone curves above: the
+// input channel differs from the output channel (e.g. hue-vs-sat looks
+// up by the pixel's hue but scales its saturation), the hue domain is
+// cyclic (0..1 wraps), and applying them needs an RGB<->HSL conversion
+// in the shader. 6.8 defines + round-trips these keys so projects
+// authored now carry the data, but the v1 baker ignores them and the
+// UI greys the HSL tabs. 6.8b adds: a wrapping (Repeat) sampler for the
+// hue domain, the RGB<->HSL math, extra atlas rows per node, and an
+// `apply_hsl_curves` block; the atlas grows in height (rows-per-node)
+// with no format break.
+/// Hue → hue rotation curve. (6.8b)
+pub const KEY_CURVE_HUE_HUE: &str = "curve_hh";
+/// Hue → saturation scale curve. (6.8b)
+pub const KEY_CURVE_HUE_SAT: &str = "curve_hs";
+/// Hue → luminance scale curve. (6.8b)
+pub const KEY_CURVE_HUE_LUM: &str = "curve_hl";
+/// Saturation → saturation curve. (6.8b)
+pub const KEY_CURVE_SAT_SAT: &str = "curve_ss";
+/// Luminance → luminance curve (in HSL space). (6.8b)
+pub const KEY_CURVE_LUM_LUM: &str = "curve_ll";
+
+/// Width of the baked curve LUT (one column per input level).
+pub const CURVE_LUT_WIDTH: usize = 256;
 
 // ---- Primary mode keys (lift / gamma / gain, per channel + master) ----
 /// Lift (shadows) per-channel + master. Default 0.0.
