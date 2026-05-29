@@ -18,6 +18,8 @@ import {
   setOcioViewTransform,
   clearOcioViewTransform,
   ocioListColorspaces,
+  computeScopes,
+  setScopesEnabled as ipcSetScopesEnabled,
   insertClipAt,
   loadProject,
   addEffectToClip as ipcAddEffect,
@@ -50,6 +52,7 @@ import {
   type EffectValue,
   type MediaItemInfo,
   type ProjectInfo,
+  type ScopeData,
   type SequenceContents,
   type SourceState,
   type StreamInfo
@@ -62,6 +65,8 @@ class ProjectState {
   path = $state<string | null>(null);
   /** Last error string from a project IPC call; `null` when clean. */
   error = $state<string | null>(null);
+  /** Latest computed scope data (Phase 6.12); `null` until first refresh. */
+  scopeData = $state<ScopeData | null>(null);
   /** Media items in the project's library, for the Browser panel. */
   media = $state<MediaItemInfo[]>([]);
   /** Counter bumped after every edit (clip insert, etc.) so the
@@ -374,6 +379,48 @@ class ProjectState {
       }
     } catch (e) {
       this.error = String(e);
+    }
+  }
+
+  // ---- Scopes (Phase 6.12) -------------------------------------------------
+
+  #scopeBusy = false;
+  #scopeAgain = false;
+  #scopeArgs = { w: 256, h: 144, pre: false };
+
+  /** Tell the engine whether to compute scopes (skips the GPU readback
+   *  entirely when the panel is hidden). Best-effort. */
+  async setScopesEnabled(on: boolean) {
+    if (!on) this.scopeData = null;
+    try {
+      await ipcSetScopesEnabled(on);
+    } catch (e) {
+      console.debug('setScopesEnabled', e);
+    }
+  }
+
+  /** Recompute scopes for the current frame, coalescing bursts: if a
+   *  refresh is already in flight, the latest request's params are kept
+   *  and run once the current one settles (single-in-flight). Scopes are
+   *  best-effort — failures don't surface as a project error. */
+  async refreshScopes(w = 256, h = 144, pre = false) {
+    this.#scopeArgs = { w, h, pre };
+    if (this.#scopeBusy) {
+      this.#scopeAgain = true;
+      return;
+    }
+    this.#scopeBusy = true;
+    try {
+      do {
+        this.#scopeAgain = false;
+        const { w: cw, h: ch, pre: cpre } = this.#scopeArgs;
+        const d = await computeScopes(cw, ch, cpre);
+        if (d) this.scopeData = d;
+      } while (this.#scopeAgain);
+    } catch (e) {
+      console.debug('refreshScopes', e);
+    } finally {
+      this.#scopeBusy = false;
     }
   }
 

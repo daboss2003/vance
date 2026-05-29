@@ -6,6 +6,7 @@ members = [
     "crates/vance-time",
     "crates/vance-color",
     "crates/vance-ocio",
+    "crates/vance-scopes",
     "crates/vance-media",
     "crates/vance-ffmpeg-sys",
     "crates/vance-decoder",
@@ -44,6 +45,7 @@ vance-core = { path = "crates/vance-core" }
 vance-time = { path = "crates/vance-time" }
 vance-color = { path = "crates/vance-color" }
 vance-ocio = { path = "crates/vance-ocio" }
+vance-scopes = { path = "crates/vance-scopes" }
 vance-media = { path = "crates/vance-media" }
 vance-ffmpeg-sys = { path = "crates/vance-ffmpeg-sys" }
 vance-decoder = { path = "crates/vance-decoder" }

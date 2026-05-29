@@ -603,6 +603,33 @@ fn ocio_list_colorspaces(
 }
 
 #[tauri::command]
+fn set_scopes_enabled(state: tauri::State<'_, EngineHandle>, on: bool) -> Result<(), String> {
+    state.lock().set_scopes_enabled(on);
+    Ok(())
+}
+
+/// Compute video-scope data and return it as a RAW little-endian byte
+/// blob (see `ScopeData::to_bytes`) via `tauri::ipc::Response` — the JS
+/// side receives an ArrayBuffer, avoiding JSON-stringification of the
+/// hundreds-of-thousands of integer counts. An empty response means
+/// "no update" (scopes disabled, playing, or no cached frame). Phase 6.12.
+#[tauri::command]
+fn compute_scopes(
+    state: tauri::State<'_, EngineHandle>,
+    width: u32,
+    height: u32,
+    pre_view_lut: bool,
+) -> Result<tauri::ipc::Response, String> {
+    let cfg = vance_scopes::ScopeConfig::default();
+    let data = state
+        .lock()
+        .compute_scopes(cfg, width, height, pre_view_lut)
+        .map_err(|e| e.to_string())?;
+    let bytes = data.map(|d| d.to_bytes()).unwrap_or_default();
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+#[tauri::command]
 fn create_title_media(
     state: tauri::State<'_, EngineHandle>,
     display_name: String,
@@ -849,6 +876,8 @@ fn main() {
             set_ocio_view_transform,
             clear_ocio_view_transform,
             ocio_list_colorspaces,
+            set_scopes_enabled,
+            compute_scopes,
             trim_clip_in,
             trim_clip_out,
             play_sequence,

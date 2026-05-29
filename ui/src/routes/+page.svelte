@@ -33,6 +33,7 @@
   import Timeline from '$lib/timeline/Timeline.svelte';
   import ColorWheel from '$lib/color/ColorWheel.svelte';
   import CurveEditor from '$lib/color/CurveEditor.svelte';
+  import ScopeCanvas from '$lib/color/ScopeCanvas.svelte';
   import * as GK from '$lib/grade-keys';
 
   let backend = $state<string>('checking…');
@@ -370,7 +371,9 @@
       const mid = d!.clip.timeline_in_seconds + d!.clip.duration_seconds / 2;
       untrack(() => {
         lastColorSeekKey = key;
-        decodeSequenceAt(mid).catch(() => {});
+        decodeSequenceAt(mid)
+          .then(() => projectState.refreshScopes(256, 144, scopePreLut))
+          .catch(() => {});
       });
     } else if (!key && lastColorSeekKey) {
       untrack(() => {
@@ -378,6 +381,28 @@
       });
     }
   });
+
+  // ---- Scopes (Phase 6.12) -------------------------------------------------
+  let scopeKind = $state<'waveform' | 'parade' | 'vector' | 'histogram'>('waveform');
+  let scopeLog = $state(true);
+  let scopePreLut = $state(false);
+
+  // Tell the engine to compute scopes only while the Color page is open
+  // (it skips the GPU readback otherwise — zero cost).
+  $effect(() => {
+    const on = activePage === 'color';
+    untrack(() => {
+      projectState.setScopesEnabled(on);
+      if (on) projectState.refreshScopes(256, 144, scopePreLut);
+    });
+  });
+
+  // Recompute scopes for the current frame. Single-in-flight coalescing
+  // lives in projectState.refreshScopes, so calling this on every grade
+  // drag tick is safe.
+  function refreshScopesNow() {
+    if (activePage === 'color') projectState.refreshScopes(256, 144, scopePreLut);
+  }
 
   async function handleOpen() {
     openError = null;
@@ -792,6 +817,7 @@
     const d = selectedClipDetails;
     if (!d) return;
     projectState.previewGradeParams(d.clip.id, node.id, wheelParams(group, rgb, master));
+    refreshScopesNow();
   }
 
   /** Commit a wheel change as ONE undoable edit (on pointer-up). */
@@ -809,6 +835,7 @@
       node.id,
       wheelParams(group, rgb, master)
     );
+    refreshScopesNow();
   }
 
   // ---- Curves (Phase 6.8) --------------------------------------------------
@@ -863,12 +890,14 @@
     const d = selectedClipDetails;
     if (!d) return;
     projectState.previewGradeParams(d.clip.id, node.id, curveParam(ch, points));
+    refreshScopesNow();
   }
 
   async function commitCurve(node: EffectInfo, ch: CurveChannel, points: CurvePt[]) {
     const d = selectedClipDetails;
     if (!d) return;
     await projectState.updateEffectParams(d.track.id, d.clip.id, node.id, curveParam(ch, points));
+    refreshScopesNow();
   }
 
   /** First enabled video track on the active sequence, or null. */
@@ -1850,6 +1879,49 @@
       <aside
         class="border-vance-border bg-vance-panel w-80 flex-shrink-0 overflow-y-auto overflow-x-hidden border-l p-4"
       >
+        <!-- Scopes (Phase 6.12) -->
+        <div class="mb-4">
+          <div class="mb-2 flex items-center justify-between">
+            <h2 class="text-vance-muted text-xs uppercase tracking-wider">Scopes</h2>
+            <div class="flex gap-1 text-[10px]">
+              <button
+                class="rounded border px-1 py-0.5 {scopeLog
+                  ? 'border-[var(--color-vance-accent)] bg-[#003040]'
+                  : 'bg-vance-bg border-vance-border'}"
+                onclick={() => (scopeLog = !scopeLog)}
+                title="Toggle log / linear intensity scaling"
+              >
+                {scopeLog ? 'log' : 'lin'}
+              </button>
+              <button
+                class="rounded border px-1 py-0.5 {scopePreLut
+                  ? 'border-[var(--color-vance-accent)] bg-[#003040]'
+                  : 'bg-vance-bg border-vance-border'}"
+                onclick={() => {
+                  scopePreLut = !scopePreLut;
+                  refreshScopesNow();
+                }}
+                title="Analyze the signal before the display/view LUT"
+              >
+                {scopePreLut ? 'pre-LUT' : 'display'}
+              </button>
+            </div>
+          </div>
+          <div class="mb-2 flex gap-1 text-[10px]">
+            {#each [['waveform', 'Wave'], ['parade', 'RGB'], ['vector', 'Vector'], ['histogram', 'Hist']] as [k, label] (k)}
+              <button
+                class="flex-1 rounded border px-1 py-0.5 {scopeKind === k
+                  ? 'border-[var(--color-vance-accent)] bg-[#003040]'
+                  : 'bg-vance-bg border-vance-border hover:brightness-125'}"
+                onclick={() => (scopeKind = k as typeof scopeKind)}
+              >
+                {label}
+              </button>
+            {/each}
+          </div>
+          <ScopeCanvas kind={scopeKind} data={projectState.scopeData} log={scopeLog} width={288} height={180} />
+        </div>
+
         <h2 class="text-vance-muted mb-3 text-xs uppercase tracking-wider">
           {activeNode ? nodeLabel(activeNode, gradeNodes.indexOf(activeNode)) : 'Wheels'}
         </h2>

@@ -1479,6 +1479,29 @@ impl Renderer {
         Ok(out)
     }
 
+    /// Render the current frame to an offscreen RGBA8 buffer for scope
+    /// analysis (Phase 6.12). Identical to [`Self::render_to_rgba_buffer`]
+    /// except that when `pre_view_lut` is true the display/view LUT is
+    /// temporarily bypassed so the scopes read the signal *before* the
+    /// monitoring transform. The view-LUT enable flag is snapshotted and
+    /// RESTORED on every return path (incl. error), so the live monitor
+    /// is never left corrupted.
+    pub fn render_scope_buffer(
+        &mut self,
+        width: u32,
+        height: u32,
+        pre_view_lut: bool,
+    ) -> Result<Vec<u8>, RenderError> {
+        if !pre_view_lut {
+            return self.render_to_rgba_buffer(width, height);
+        }
+        let saved = self.current_params.view_lut_params[0];
+        self.set_view_lut_enable(0.0);
+        let result = self.render_to_rgba_buffer(width, height);
+        self.set_view_lut_enable(saved);
+        result
+    }
+
     fn allocate_plane_textures(&mut self, width: u32, height: u32, b_side: bool) {
         let chroma_w = width.div_ceil(2);
         let chroma_h = height.div_ceil(2);

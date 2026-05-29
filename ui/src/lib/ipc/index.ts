@@ -364,6 +364,117 @@ export const clearOcioViewTransform = (): Promise<void> =>
 export const ocioListColorspaces = (config: string | null): Promise<string[]> =>
   invoke('ocio_list_colorspaces', { config });
 
+// ---- Scopes (Phase 6.12) -------------------------------------------------
+
+export type ScopeIntensityGrid = { cols: number; levels: number; bins: Uint32Array };
+export type ScopeHistogram = {
+  r: Uint32Array;
+  g: Uint32Array;
+  b: Uint32Array;
+  luma: Uint32Array;
+};
+export type ScopeVectorscope = {
+  size: number;
+  bins: Uint32Array;
+  /** Six 75%-bar (vx, vy) grid coords, flat [x0,y0,x1,y1,...]. */
+  targets: Float32Array;
+  skinLineDeg: number;
+};
+export type ScopeData = {
+  sourceW: number;
+  sourceH: number;
+  histogram: ScopeHistogram;
+  waveformLuma: ScopeIntensityGrid;
+  parade: { r: ScopeIntensityGrid; g: ScopeIntensityGrid; b: ScopeIntensityGrid };
+  vectorscope: ScopeVectorscope;
+};
+
+const SCOPE_BLOB_MAGIC = 0x53435031;
+
+/** Parse the raw little-endian scope blob (mirror of
+ *  `ScopeData::to_bytes` in crates/vance-scopes/src/lib.rs). The header
+ *  is 9×4 bytes (8 u32 + 1 f32), keeping every following u32/f32 array
+ *  4-byte aligned so we can view them zero-copy over the buffer. */
+function parseScopeBlob(buf: ArrayBuffer): ScopeData | null {
+  if (buf.byteLength < 36) return null;
+  const dv = new DataView(buf);
+  let o = 0;
+  const u32 = () => {
+    const v = dv.getUint32(o, true);
+    o += 4;
+    return v;
+  };
+  const f32 = () => {
+    const v = dv.getFloat32(o, true);
+    o += 4;
+    return v;
+  };
+  if (u32() !== SCOPE_BLOB_MAGIC) return null;
+  const sourceW = u32();
+  const sourceH = u32();
+  const histBins = u32();
+  const wfCols = u32();
+  const wfLevels = u32();
+  const vecSize = u32();
+  const targetsCount = u32();
+  const skinLineDeg = f32();
+  const takeU32 = (n: number) => {
+    const a = new Uint32Array(buf, o, n);
+    o += n * 4;
+    return a;
+  };
+  const histogram: ScopeHistogram = {
+    r: takeU32(histBins),
+    g: takeU32(histBins),
+    b: takeU32(histBins),
+    luma: takeU32(histBins)
+  };
+  const wfN = wfCols * wfLevels;
+  const grid = (bins: Uint32Array): ScopeIntensityGrid => ({ cols: wfCols, levels: wfLevels, bins });
+  const waveformLuma = grid(takeU32(wfN));
+  const parade = { r: grid(takeU32(wfN)), g: grid(takeU32(wfN)), b: grid(takeU32(wfN)) };
+  const vbins = takeU32(vecSize * vecSize);
+  const targets = new Float32Array(buf, o, targetsCount * 2);
+  return {
+    sourceW,
+    sourceH,
+    histogram,
+    waveformLuma,
+    parade,
+    vectorscope: { size: vecSize, bins: vbins, targets, skinLineDeg }
+  };
+}
+
+/** Enable/disable scope computation in the engine (Phase 6.12). */
+export const setScopesEnabled = (on: boolean): Promise<void> =>
+  invoke('set_scopes_enabled', { on });
+
+/** Compute the current frame's scope data. Returns `null` when there's
+ *  no update (scopes disabled, playing, or no cached frame). */
+export async function computeScopes(
+  width: number,
+  height: number,
+  preViewLut: boolean
+): Promise<ScopeData | null> {
+  const resp = await invoke<ArrayBuffer | Uint8Array>('compute_scopes', {
+    width,
+    height,
+    preViewLut
+  });
+  // Tauri raw responses arrive as ArrayBuffer; normalize to a clean,
+  // 0-offset ArrayBuffer so typed-array views are 4-byte aligned.
+  let buf: ArrayBuffer;
+  if (resp instanceof ArrayBuffer) {
+    buf = resp;
+  } else if (resp instanceof Uint8Array) {
+    buf = resp.buffer.slice(resp.byteOffset, resp.byteOffset + resp.byteLength) as ArrayBuffer;
+  } else {
+    return null;
+  }
+  if (buf.byteLength === 0) return null;
+  return parseScopeBlob(buf);
+}
+
 /** All media items in the current project's library. */
 export const mediaList = (): Promise<MediaItemInfo[]> => invoke('media_list');
 

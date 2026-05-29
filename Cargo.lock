@@ -5269,6 +5269,7 @@ dependencies = [
  "vance-ocio",
  "vance-project",
  "vance-render",
+ "vance-scopes",
  "vance-time",
  "vance-timeline",
  "vance-viewport",
@@ -5424,6 +5425,15 @@ dependencies = [
  "vance-decoder",
  "vance-timeline",
  "wgpu",
+]
+
+[[package]]
+name = "vance-scopes"
+version = "0.0.0"
+dependencies = [
+ "bytemuck",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

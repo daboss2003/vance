@@ -1,0 +1,19 @@
+[package]
+name = "vance-scopes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# Pure colorimetry — no wgpu/tauri. Computes video-scope data
+# (waveform / parade / vectorscope / histogram) from an RGBA8 frame
+# buffer, so every accumulator is unit-testable in isolation (and
+# reusable from vance-cli). Presentation lives entirely in the UI.
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+bytemuck = { version = "1", features = ["derive"] }

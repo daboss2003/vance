@@ -94,6 +94,10 @@ pub enum EngineError {
     /// OpenColorIO error (not enabled in build, bad config / colorspace).
     #[error("ocio: {0}")]
     Ocio(String),
+
+    /// Scope computation error (Phase 6.12).
+    #[error("scopes: {0}")]
+    Scopes(String),
 }
 
 impl EngineError {
@@ -987,6 +991,15 @@ pub struct Engine {
     /// processor over the cube lattice every time. Invalidated whenever
     /// the project's `ocio_view` differs from the cached spec. Phase 6.1b.
     ocio_lut_cache: Option<(vance_timeline::OcioView, Arc<vance_color::Lut3d>)>,
+
+    /// Whether the Color-page scopes panel is visible (Phase 6.12). When
+    /// false, `compute_scopes` skips the GPU readback entirely — zero
+    /// cost while scopes are hidden.
+    scopes_enabled: bool,
+    /// Last computed scope data, returned as a fallback while playing or
+    /// when the render lock is momentarily contended (so the UI keeps the
+    /// previous frame's scopes instead of flickering empty).
+    last_scopes: Option<vance_scopes::ScopeData>,
 }
 
 /// Anchors a stream-time-base playback position back to a sequence
@@ -2025,6 +2038,50 @@ impl Engine {
         }
         let path = config.filter(|s| !s.is_empty()).map(PathBuf::from);
         vance_ocio::list_colorspaces(path.as_deref()).map_err(|e| EngineError::Ocio(e.to_string()))
+    }
+
+    /// Enable/disable scope computation (Phase 6.12). The UI sets this
+    /// when the scopes panel becomes visible/hidden so `compute_scopes`
+    /// is a no-op (no GPU readback) while scopes aren't shown.
+    pub fn set_scopes_enabled(&mut self, on: bool) {
+        self.scopes_enabled = on;
+    }
+
+    /// Compute video-scope data (waveform/parade/vectorscope/histogram)
+    /// from the current frame at `width`×`height` analysis resolution.
+    /// Phase 6.12.
+    ///
+    /// This is a PAUSED-workflow tool and must never stall playback:
+    /// - returns the cached scopes (a no-op) while a playback session is
+    ///   live or scopes are disabled — no lock attempt, no readback;
+    /// - otherwise `try_lock`s the render state and, if it's momentarily
+    ///   contended, returns the cache rather than blocking the scheduler.
+    /// The GPU readback runs while holding the render lock; the (pure)
+    /// accumulation runs AFTER the lock is released.
+    pub fn compute_scopes(
+        &mut self,
+        cfg: vance_scopes::ScopeConfig,
+        width: u32,
+        height: u32,
+        pre_view_lut: bool,
+    ) -> Result<Option<vance_scopes::ScopeData>, EngineError> {
+        if self.playback.is_some() || !self.scopes_enabled {
+            return Ok(self.last_scopes.clone());
+        }
+        let Some(rs) = self.render_state.as_ref() else {
+            return Ok(self.last_scopes.clone());
+        };
+        let rgba = {
+            let Some(mut guard) = rs.try_lock() else {
+                // Scheduler/other path holds the lock — never block it.
+                return Ok(self.last_scopes.clone());
+            };
+            guard.renderer.render_scope_buffer(width, height, pre_view_lut)?
+        };
+        let data = vance_scopes::compute_all(&rgba, width, height, &cfg)
+            .map_err(|e| EngineError::Scopes(e.to_string()))?;
+        self.last_scopes = Some(data.clone());
+        Ok(Some(data))
     }
 
     /// Add a synthetic title media item to the project's library.
@@ -4341,4 +4398,35 @@ fn locate_decoder_binary() -> Result<PathBuf, EngineError> {
         }
     }
     Err(EngineError::DecoderBinaryMissing(tried))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_scopes_is_noop_when_disabled() {
+        // Scopes default to disabled — compute must short-circuit to the
+        // cache (None) without touching render state, so it's safe to
+        // call even with no GPU / no project (and never stalls playback).
+        let mut e = Engine::default();
+        assert!(!e.scopes_enabled);
+        let out = e
+            .compute_scopes(vance_scopes::ScopeConfig::default(), 16, 16, false)
+            .expect("noop ok");
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn set_scopes_enabled_toggles_flag() {
+        let mut e = Engine::default();
+        e.set_scopes_enabled(true);
+        assert!(e.scopes_enabled);
+        // Even enabled, with no render_state it returns the (empty) cache
+        // rather than erroring.
+        let out = e
+            .compute_scopes(vance_scopes::ScopeConfig::default(), 16, 16, false)
+            .expect("ok without render state");
+        assert!(out.is_none());
+    }
 }
