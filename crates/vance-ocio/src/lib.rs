@@ -211,34 +211,55 @@ mod imp {
             Some(p) => Some(CString::new(p.to_string_lossy().into_owned()).map_err(|_| OcioError::NulString)?),
             None => None,
         };
+        let cfg_ptr = config_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
         let mut errbuf = [0i8; 1024];
-        // 256 KiB holds thousands of colorspace names; pathological
-        // configs beyond that truncate the tail (count is still correct).
-        let mut namebuf = vec![0i8; 256 * 1024];
-        // SAFETY: buffers are valid for the call; the shim NUL-terminates
-        // both and catches every C++ exception.
-        let count = unsafe {
-            vance_ocio_list_colorspaces(
-                config_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
-                namebuf.as_mut_ptr(),
-                namebuf.len() as c_long,
-                errbuf.as_mut_ptr(),
-                errbuf.len() as c_long,
-            )
-        };
-        if count < 0 {
-            let msg = unsafe { CStr::from_ptr(errbuf.as_ptr()) }
+
+        // The shim joins names with '\n' into `namebuf` and returns the
+        // TRUE count even if the buffer was too small and the join got
+        // truncated (possibly mid-name). So we grow the buffer and retry
+        // until the number of names we actually parse matches the count —
+        // never returning a truncated / corrupt list silently. Capped so
+        // a pathological config can't drive unbounded allocation.
+        let mut cap = 64 * 1024usize;
+        const MAX_CAP: usize = 16 * 1024 * 1024;
+        loop {
+            let mut namebuf = vec![0i8; cap];
+            // SAFETY: buffers are valid for the call; the shim
+            // NUL-terminates both and catches every C++ exception.
+            let count = unsafe {
+                vance_ocio_list_colorspaces(
+                    cfg_ptr,
+                    namebuf.as_mut_ptr(),
+                    namebuf.len() as c_long,
+                    errbuf.as_mut_ptr(),
+                    errbuf.len() as c_long,
+                )
+            };
+            if count < 0 {
+                let msg = unsafe { CStr::from_ptr(errbuf.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned();
+                return Err(OcioError::Ocio(msg));
+            }
+            let names = unsafe { CStr::from_ptr(namebuf.as_ptr()) }
                 .to_string_lossy()
                 .into_owned();
-            return Err(OcioError::Ocio(msg));
+            let parsed: Vec<String> = if names.is_empty() {
+                Vec::new()
+            } else {
+                names.split('\n').map(|s| s.to_string()).collect()
+            };
+            // Buffer held the whole list → done.
+            if parsed.len() == count as usize {
+                return Ok(parsed);
+            }
+            // Truncated: grow and retry, unless we've hit the ceiling.
+            if cap >= MAX_CAP {
+                return Err(OcioError::Ocio(format!(
+                    "colorspace name list exceeds {MAX_CAP} bytes ({count} colorspaces)"
+                )));
+            }
+            cap = (cap * 2).min(MAX_CAP);
         }
-        let names = unsafe { CStr::from_ptr(namebuf.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
-        Ok(if names.is_empty() {
-            Vec::new()
-        } else {
-            names.split('\n').map(|s| s.to_string()).collect()
-        })
     }
 }

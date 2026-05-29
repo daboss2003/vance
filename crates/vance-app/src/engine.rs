@@ -1678,6 +1678,10 @@ impl Engine {
     /// discarded — a future "save before close" gate is up to the UI.
     pub fn load_project(&mut self, path: &str) -> Result<ProjectInfo, EngineError> {
         self.pause_for_edit();
+        // Drop the previous project's OCIO bake — the new project may
+        // reference the same (config, src, dst) spec while the .ocio file
+        // on disk differs, which would otherwise serve a stale LUT.
+        self.ocio_lut_cache = None;
         let project = vance_project::open(path).map_err(|e| EngineError::Project(e.to_string()))?;
         let mut info = ProjectInfo::from(&project);
         self.current_sequence_id = project.sequences.first().map(|s| s.id);
@@ -1706,6 +1710,7 @@ impl Engine {
     /// and A1 audio track. The user can rename / re-rate later.
     pub fn new_project(&mut self, name: String) -> Result<ProjectInfo, EngineError> {
         self.pause_for_edit();
+        self.ocio_lut_cache = None;
         let mut project = Project::new(name);
         let mut seq = Sequence::new("Sequence 01", vance_core::FrameRate::FPS_24);
         seq.tracks.push(Arc::new(Track::new(TrackKind::Video, "V1")));

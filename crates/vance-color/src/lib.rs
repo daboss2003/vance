@@ -20,9 +20,6 @@ pub mod space;
 pub mod transform;
 pub mod pipeline;
 
-#[cfg(feature = "ocio")]
-pub mod ocio;
-
 pub use lut::{load_from_path as load_lut, parse_3dl, parse_cube, Lut3d, LutError};
 pub use pipeline::{Pipeline, PipelineParams};
 pub use space::{ColorSpace, Primaries, Range, TransferFunction};

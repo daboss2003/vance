@@ -8,13 +8,6 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
-[features]
-default = []
-# `ocio` lights up the OpenColorIO FFI path (Phase 6.1b). The system
-# needs `libOpenColorIO` available to pkg-config — on macOS:
-#   brew install opencolorio
-ocio = []
-
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }

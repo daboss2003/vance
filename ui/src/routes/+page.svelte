@@ -250,7 +250,10 @@
         else stepFrame(1);
         return;
       case 'Escape':
-        if (selectionState.count > 0) {
+        if (ocioPanelOpen) {
+          e.preventDefault();
+          ocioPanelOpen = false;
+        } else if (selectionState.count > 0) {
           e.preventDefault();
           selectionState.clear();
         }
@@ -582,6 +585,9 @@
   // Seed the panel fields from the project's persisted OCIO transform
   // whenever it opens, so editing starts from the current state.
   function openOcioPanel() {
+    // Clear any stale error from a prior op so the panel's error line
+    // only reflects this session.
+    projectState.error = null;
     const v = projectState.info?.ocio_view;
     if (v) {
       ocioConfigPath = v.config_path ?? '';
@@ -627,6 +633,9 @@
 
   async function applyOcio() {
     if (!ocioSrc || !ocioDst) return;
+    // Clamp + reflect back so the engine never rejects on size and the
+    // field shows the value actually used (2..=129 matches the backend).
+    ocioSize = Math.max(2, Math.min(129, ocioSize || 33));
     await projectState.setOcioViewTransform(ocioConfigPath || null, ocioSrc, ocioDst, ocioSize);
     if (!projectState.error) ocioPanelOpen = false;
   }
@@ -1196,6 +1205,13 @@
             {/if}
           </button>
           {#if ocioPanelOpen}
+            <!-- Click-outside backdrop (mirrors the title modal pattern). -->
+            <button
+              type="button"
+              class="fixed inset-0 z-40 cursor-default"
+              aria-label="Dismiss OCIO panel"
+              onclick={() => (ocioPanelOpen = false)}
+            ></button>
             <div
               class="border-vance-border bg-vance-panel absolute left-0 top-full z-50 mt-1 flex w-72 flex-col gap-2 rounded border p-3 text-[11px] shadow-lg"
             >
@@ -1269,6 +1285,14 @@
                   Clear
                 </button>
               </div>
+              <!-- Surface OCIO errors (bad config, unknown colorspace,
+                   bake failure) inside the panel where the action was
+                   taken, not just the far-away global error line. -->
+              {#if projectState.error}
+                <p class="rounded border border-red-700 bg-red-950 p-1.5 text-[10px] text-red-200">
+                  {projectState.error}
+                </p>
+              {/if}
             </div>
           {/if}
         </div>
