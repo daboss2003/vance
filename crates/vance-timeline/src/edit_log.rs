@@ -177,6 +177,30 @@ pub enum EditOp {
         /// Transition to remove.
         transition_id: TransitionId,
     },
+    /// Move an effect to a new index in a clip's effects list
+    /// (re-sequences the serial chain — used by the color page to
+    /// reorder grade nodes).
+    MoveEffectOnClip {
+        /// Track holding the clip.
+        track_id: TrackId,
+        /// Clip holding the effect.
+        clip_id: ClipId,
+        /// Effect to move.
+        effect_id: EffectId,
+        /// Destination index (clamped into range).
+        new_index: usize,
+    },
+    /// Toggle an effect's `enabled` (bypass) flag.
+    SetEffectEnabled {
+        /// Track holding the clip.
+        track_id: TrackId,
+        /// Clip holding the effect.
+        clip_id: ClipId,
+        /// Effect to toggle.
+        effect_id: EffectId,
+        /// New enabled state.
+        enabled: bool,
+    },
 }
 
 /// Apply a single op to a sequence, returning the new sequence.
@@ -266,6 +290,18 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
             track_id,
             transition_id,
         } => ops::remove_transition(seq, *track_id, *transition_id),
+        EditOp::MoveEffectOnClip {
+            track_id,
+            clip_id,
+            effect_id,
+            new_index,
+        } => ops::move_effect_on_clip(seq, *track_id, *clip_id, *effect_id, *new_index),
+        EditOp::SetEffectEnabled {
+            track_id,
+            clip_id,
+            effect_id,
+            enabled,
+        } => ops::set_effect_enabled(seq, *track_id, *clip_id, *effect_id, *enabled),
     }
 }
 
@@ -482,5 +518,80 @@ mod tests {
         let mut log = EditLog::new(log_init);
         assert!(!log.can_undo());
         assert!(log.undo().is_none());
+    }
+
+    #[test]
+    fn grade_node_ops_undo_redo_round_trip() {
+        use crate::effect::Effect;
+        let (mut log, tid, media) = seed_log();
+        let clip = Clip::new(media, "c", t(0), t(0), t(5)).unwrap();
+        let cid = clip.id;
+        log.apply(EditOp::InsertClip { track_id: tid, clip }).unwrap();
+        // Two grade nodes with caller-allocated IDs (byte-identical replay).
+        let e0 = Effect::new("grade");
+        let e1 = Effect::new("grade");
+        let (id0, id1) = (e0.id, e1.id);
+        log.apply(EditOp::AddEffectToClip {
+            track_id: tid,
+            clip_id: cid,
+            effect: e0,
+        })
+        .unwrap();
+        log.apply(EditOp::AddEffectToClip {
+            track_id: tid,
+            clip_id: cid,
+            effect: e1,
+        })
+        .unwrap();
+        // Reorder: move id1 to front, then bypass id0.
+        log.apply(EditOp::MoveEffectOnClip {
+            track_id: tid,
+            clip_id: cid,
+            effect_id: id1,
+            new_index: 0,
+        })
+        .unwrap();
+        log.apply(EditOp::SetEffectEnabled {
+            track_id: tid,
+            clip_id: cid,
+            effect_id: id0,
+            enabled: false,
+        })
+        .unwrap();
+
+        let order = |log: &EditLog| -> Vec<crate::id::EffectId> {
+            log.current().tracks[0].clips[0]
+                .effects
+                .iter()
+                .map(|e| e.id)
+                .collect()
+        };
+        let enabled0 = |log: &EditLog| -> bool {
+            log.current().tracks[0].clips[0]
+                .effects
+                .iter()
+                .find(|e| e.id == id0)
+                .unwrap()
+                .enabled
+        };
+
+        // Final state: id1 first, id0 bypassed.
+        assert_eq!(order(&log), vec![id1, id0]);
+        assert!(!enabled0(&log));
+
+        // Undo the bypass → id0 enabled again, order unchanged.
+        log.undo().unwrap();
+        assert!(enabled0(&log));
+        assert_eq!(order(&log), vec![id1, id0]);
+
+        // Undo the reorder → original order.
+        log.undo().unwrap();
+        assert_eq!(order(&log), vec![id0, id1]);
+
+        // Redo both → back to final state.
+        log.redo().unwrap();
+        log.redo().unwrap();
+        assert_eq!(order(&log), vec![id1, id0]);
+        assert!(!enabled0(&log));
     }
 }

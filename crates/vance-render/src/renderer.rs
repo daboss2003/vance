@@ -159,6 +159,130 @@ struct RenderParams {
     /// is meant for display only (export bypasses it). Independent
     /// of the per-clip LUT effect.
     view_lut_params: [f32; 4],
+    /// Number of active color-grade nodes (Phase 6.6). The shader
+    /// loops `grades[0..grade_count]` in linear working space. Packed
+    /// into a vec4<u32> for std140 alignment; only `.x` is used.
+    grade_count: [u32; 4],
+    /// Serial chain of grade nodes. Applied in order, right where the
+    /// brightness/contrast block runs (linear working space). A node
+    /// is a no-op when its `flags.x` (enabled) is 0; `grade_count == 0`
+    /// makes the whole loop a no-op, preserving pre-6.6 output exactly.
+    grades: [GradeNode; MAX_GRADES],
+}
+
+/// Max grade nodes the single-pass renderer applies per frame. Mirror
+/// of `vance_timeline::grade::MAX_GRADE_NODES`.
+const MAX_GRADES: usize = 8;
+
+/// One color-grade node's GPU params. All `vec4` fields (no bare f32
+/// arrays) to dodge std140 stride traps — 6 × 16 = 96 bytes. The WGSL
+/// `GradeNode` struct must match this layout byte-for-byte.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct GradeNode {
+    /// Lift (shadows) `(r, g, b, master)`. Additive; default 0.
+    lift: [f32; 4],
+    /// Gamma (midtones) `(r, g, b, master)`. Power; default 1.
+    gamma: [f32; 4],
+    /// Gain (highlights) `(r, g, b, master)`. Multiplicative; default 1.
+    gain: [f32; 4],
+    /// Log offset + shadow balance, packed `(off_r-ish)` — see shader.
+    /// Layout: `(offset_r, offset_g, offset_b, _)`.
+    log_offset: [f32; 4],
+    /// Log shadow/mid/highlight balances, packed for the shader.
+    /// Layout: `(shadow_y, mid_y, highlight_y, _)` luma weights —
+    /// per-channel log balances ride `lift`/`gamma`/`gain` slots when
+    /// `mode == log` (documented in the shader's `apply_log`).
+    log_smh: [f32; 4],
+    /// `(enabled, mode, _, _)`. `enabled`: 1 = apply, 0 = bypass.
+    /// `mode`: 0 = primary (lift/gamma/gain), 1 = log.
+    flags: [f32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<GradeNode>() == 96);
+
+impl GradeNode {
+    /// Identity node: passthrough (disabled, primary mode, neutral
+    /// lift/gamma/gain).
+    fn identity() -> Self {
+        Self {
+            lift: [0.0, 0.0, 0.0, 0.0],
+            gamma: [1.0, 1.0, 1.0, 1.0],
+            gain: [1.0, 1.0, 1.0, 1.0],
+            log_offset: [0.0; 4],
+            log_smh: [0.0; 4],
+            flags: [0.0, 0.0, 0.0, 0.0],
+        }
+    }
+}
+
+/// Public, `vance-color`-free description of one grade node the engine
+/// hands to [`Renderer::set_grades`]. Mirror of the GPU `GradeNode`
+/// but with named fields the engine fills from evaluated effect params.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct GradeNodeParams {
+    /// Enabled (false = bypass).
+    pub enabled: bool,
+    /// True = log mode (offset/shadow/mid/highlight); false = primary.
+    pub log_mode: bool,
+    /// Lift `(r, g, b, master)`.
+    pub lift: [f32; 4],
+    /// Gamma `(r, g, b, master)`.
+    pub gamma: [f32; 4],
+    /// Gain `(r, g, b, master)`.
+    pub gain: [f32; 4],
+    /// Log offset `(r, g, b)`.
+    pub offset: [f32; 3],
+    /// Log shadow balance `(r, g, b)`.
+    pub shadow: [f32; 3],
+    /// Log midtone balance `(r, g, b)`.
+    pub midtone: [f32; 3],
+    /// Log highlight balance `(r, g, b)`.
+    pub highlight: [f32; 3],
+}
+
+impl Default for GradeNodeParams {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            log_mode: false,
+            lift: [0.0, 0.0, 0.0, 0.0],
+            gamma: [1.0, 1.0, 1.0, 1.0],
+            gain: [1.0, 1.0, 1.0, 1.0],
+            offset: [0.0; 3],
+            shadow: [0.0; 3],
+            midtone: [0.0; 3],
+            highlight: [0.0; 3],
+        }
+    }
+}
+
+impl GradeNodeParams {
+    fn to_gpu(self) -> GradeNode {
+        // In log mode the per-channel shadow/mid/highlight balances
+        // ride the lift/gamma/gain vec4 slots (r,g,b) — the shader's
+        // `apply_log` reads them from there; log_offset carries the
+        // offset, log_smh is reserved for future luma-window widths.
+        if self.log_mode {
+            GradeNode {
+                lift: [self.shadow[0], self.shadow[1], self.shadow[2], 0.0],
+                gamma: [self.midtone[0], self.midtone[1], self.midtone[2], 0.0],
+                gain: [self.highlight[0], self.highlight[1], self.highlight[2], 0.0],
+                log_offset: [self.offset[0], self.offset[1], self.offset[2], 0.0],
+                log_smh: [0.0; 4],
+                flags: [if self.enabled { 1.0 } else { 0.0 }, 1.0, 0.0, 0.0],
+            }
+        } else {
+            GradeNode {
+                lift: self.lift,
+                gamma: self.gamma,
+                gain: self.gain,
+                log_offset: [0.0; 4],
+                log_smh: [0.0; 4],
+                flags: [if self.enabled { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+            }
+        }
+    }
 }
 
 impl Default for RenderParams {
@@ -184,6 +308,8 @@ impl Default for RenderParams {
             pipeline_working_to_out: identity_row3(),
             lut_params: [0.0; 4],
             view_lut_params: [0.0; 4],
+            grade_count: [0; 4],
+            grades: [GradeNode::identity(); MAX_GRADES],
         }
     }
 }
@@ -231,6 +357,17 @@ fn f32_to_f16_bits(v: f32) -> u16 {
         return (sign << 15) | 0x7c00;
     }
     (sign << 15) | ((new_exp as u16) << 10) | ((mant >> 13) as u16)
+}
+
+#[inline]
+fn grade_nodes_eq(a: &GradeNode, b: &GradeNode) -> bool {
+    let eq4 = |x: &[f32; 4], y: &[f32; 4]| (0..4).all(|i| (x[i] - y[i]).abs() < 1e-6);
+    eq4(&a.lift, &b.lift)
+        && eq4(&a.gamma, &b.gamma)
+        && eq4(&a.gain, &b.gain)
+        && eq4(&a.log_offset, &b.log_offset)
+        && eq4(&a.log_smh, &b.log_smh)
+        && eq4(&a.flags, &b.flags)
 }
 
 #[inline]
@@ -670,6 +807,32 @@ impl Renderer {
                 height: size,
                 depth_or_array_layers: size,
             },
+        );
+    }
+
+    /// Set the serial color-grade node chain (Phase 6.6/6.7). Nodes
+    /// apply in order in linear working space, where the
+    /// brightness/contrast block already runs. Anything past
+    /// `MAX_GRADES` is dropped (the UI warns). Idempotency-gated: a
+    /// no-op call (same nodes + count) skips the buffer write.
+    pub fn set_grades(&mut self, nodes: &[GradeNodeParams]) {
+        let count = nodes.len().min(MAX_GRADES);
+        let mut next = [GradeNode::identity(); MAX_GRADES];
+        for (i, n) in nodes.iter().take(count).enumerate() {
+            next[i] = n.to_gpu();
+        }
+        let same_count = self.current_params.grade_count[0] as usize == count;
+        let same_nodes = same_count
+            && (0..count).all(|i| grade_nodes_eq(&self.current_params.grades[i], &next[i]));
+        if same_count && same_nodes {
+            return;
+        }
+        self.current_params.grade_count = [count as u32, 0, 0, 0];
+        self.current_params.grades = next;
+        self.queue.write_buffer(
+            &self.params_buffer,
+            0,
+            bytemuck::cast_slice(&[self.current_params]),
         );
     }
 
@@ -1256,4 +1419,57 @@ fn create_r8_texture(device: &wgpu::Device, w: u32, h: u32, label: &str) -> wgpu
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     })
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    // Build-gate: the WGSL `Params` struct must match `RenderParams`
+    // byte-for-byte (binding 4 is read as a single uniform). This
+    // size is hand-computed from the std140 layout; a mismatch means
+    // the shader will read grade/pipeline fields at the wrong offset
+    // and silently corrupt output.
+    #[test]
+    fn render_params_size_matches_std140() {
+        // Field offsets (bytes), all naturally 4/16-aligned under repr(C):
+        //  opacity 0, rotation 4, translate 8, scale 16, brightness 24,
+        //  contrast 28, crop_lrtb 32, mix_factor 48, _pad0 52,
+        //  chroma_key 64, chroma_params 80, luma_key 96,
+        //  pipeline_flags 112, in_to_working 128, working_to_out 176,
+        //  lut_params 224, view_lut_params 240, grade_count 256,
+        //  grades 272 (8 * 96 = 768) -> total 1040.
+        assert_eq!(std::mem::size_of::<RenderParams>(), 1040);
+        assert_eq!(std::mem::size_of::<GradeNode>(), 96);
+    }
+
+    #[test]
+    fn grade_params_default_is_identity_node() {
+        let n = GradeNodeParams::default().to_gpu();
+        // Disabled by default? No — GradeNodeParams default is enabled,
+        // primary, neutral lift/gamma/gain. Verify the GPU mapping.
+        assert_eq!(n.flags[0], 1.0); // enabled
+        assert_eq!(n.flags[1], 0.0); // primary mode
+        assert_eq!(n.lift, [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(n.gamma, [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(n.gain, [1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn log_mode_routes_balances_into_slots() {
+        let p = GradeNodeParams {
+            log_mode: true,
+            offset: [0.1, 0.2, 0.3],
+            shadow: [0.4, 0.0, 0.0],
+            midtone: [0.0, 0.5, 0.0],
+            highlight: [0.0, 0.0, 0.6],
+            ..GradeNodeParams::default()
+        };
+        let n = p.to_gpu();
+        assert_eq!(n.flags[1], 1.0); // log mode
+        assert_eq!(n.log_offset, [0.1, 0.2, 0.3, 0.0]);
+        assert_eq!(n.lift, [0.4, 0.0, 0.0, 0.0]); // shadow
+        assert_eq!(n.gamma, [0.0, 0.5, 0.0, 0.0]); // midtone
+        assert_eq!(n.gain, [0.0, 0.0, 0.6, 0.0]); // highlight
+    }
 }

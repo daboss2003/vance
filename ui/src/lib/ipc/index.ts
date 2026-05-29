@@ -377,6 +377,36 @@ export const removeEffectFromClip = (
 ): Promise<void> =>
   invoke('remove_effect_from_clip', { trackId, clipId, effectId });
 
+/** Move an effect to a new index in a clip's chain (color-page node
+ *  reorder). Undoable. */
+export const moveEffectOnClip = (
+  trackId: string,
+  clipId: string,
+  effectId: string,
+  newIndex: number
+): Promise<void> =>
+  invoke('move_effect_on_clip', { trackId, clipId, effectId, newIndex });
+
+/** Toggle an effect's enabled (bypass) flag. Undoable. */
+export const setEffectEnabled = (
+  trackId: string,
+  clipId: string,
+  effectId: string,
+  enabled: boolean
+): Promise<void> =>
+  invoke('set_effect_enabled', { trackId, clipId, effectId, enabled });
+
+/** Live, NON-undoable preview of one grade param mid-drag. Repaints
+ *  the Record viewport with the override; the caller commits one
+ *  `updateEffectParam` on pointer-up for a single undo step. */
+export const previewGradeParam = (
+  clipId: string,
+  effectId: string,
+  key: string,
+  value: EffectValue
+): Promise<void> =>
+  invoke('preview_grade_param', { clipId, effectId, key, value });
+
 /** Update one parameter on an effect attached to a clip. */
 export const updateEffectParam = (
   trackId: string,

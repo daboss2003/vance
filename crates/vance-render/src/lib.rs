@@ -19,6 +19,6 @@
 mod renderer;
 pub mod title;
 
-pub use renderer::{RenderError, Renderer, RendererConfig};
+pub use renderer::{GradeNodeParams, RenderError, Renderer, RendererConfig};
 pub use title::{render_title_yuv420, TitleError, TitleParams};
 pub use vance_decoder::{FrameData, PixelFormat};

@@ -423,6 +423,87 @@ fn remove_effect_from_clip(
 }
 
 #[tauri::command]
+fn move_effect_on_clip(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    clip_id: String,
+    effect_id: String,
+    new_index: usize,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let clip_uuid = clip_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid clip id: {e}"))?;
+    let effect_uuid = effect_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid effect id: {e}"))?;
+    state
+        .lock()
+        .move_effect_on_clip(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            vance_timeline::ClipId::from_uuid(clip_uuid),
+            vance_timeline::EffectId::from_uuid(effect_uuid),
+            new_index,
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_effect_enabled(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    clip_id: String,
+    effect_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let clip_uuid = clip_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid clip id: {e}"))?;
+    let effect_uuid = effect_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid effect id: {e}"))?;
+    state
+        .lock()
+        .set_effect_enabled(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            vance_timeline::ClipId::from_uuid(clip_uuid),
+            vance_timeline::EffectId::from_uuid(effect_uuid),
+            enabled,
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn preview_grade_param(
+    state: tauri::State<'_, EngineHandle>,
+    clip_id: String,
+    effect_id: String,
+    key: String,
+    value: vance_timeline::EffectValue,
+) -> Result<(), String> {
+    let clip_uuid = clip_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid clip id: {e}"))?;
+    let effect_uuid = effect_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid effect id: {e}"))?;
+    state
+        .lock()
+        .preview_grade_param(
+            vance_timeline::ClipId::from_uuid(clip_uuid),
+            vance_timeline::EffectId::from_uuid(effect_uuid),
+            key,
+            value,
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn set_media_input_color_space(
     state: tauri::State<'_, EngineHandle>,
     media_id: String,
@@ -696,6 +777,9 @@ fn main() {
             add_effect_to_clip,
             remove_effect_from_clip,
             update_effect_param,
+            move_effect_on_clip,
+            set_effect_enabled,
+            preview_grade_param,
             add_transition_at_cut,
             remove_transition,
             create_title_media,

@@ -652,6 +652,86 @@ pub fn remove_effect_from_clip(
     Ok(replace_track(seq, idx, new_track))
 }
 
+/// Move an effect to a new index in the clip's effects list. The list
+/// order is the serial render order (for color-grade nodes the first
+/// entry is applied first), so reordering re-sequences the chain.
+/// `new_index` is clamped into range. Errors if the effect isn't on
+/// the clip. A no-op move (same resolved index) still returns a fresh
+/// sequence so undo/redo stays uniform.
+pub fn move_effect_on_clip(
+    seq: &Sequence,
+    track_id: TrackId,
+    clip_id: ClipId,
+    effect_id: EffectId,
+    new_index: usize,
+) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    let (clip_idx, clip) = find_clip(&track, clip_id)?;
+
+    let mut updated = (*clip).clone();
+    let cur = updated
+        .effects
+        .iter()
+        .position(|e| e.id == effect_id)
+        .ok_or_else(|| TimelineError::invalid(format!("effect {effect_id} not on clip")))?;
+    let dest = new_index.min(updated.effects.len().saturating_sub(1));
+    if cur != dest {
+        let e = updated.effects.remove(cur);
+        updated.effects.insert(dest, e);
+    }
+
+    let mut clips = track.clips.clone();
+    clips[clip_idx] = Arc::new(updated);
+    let new_track = Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips,
+        transitions: track.transitions.clone(),
+    };
+    Ok(replace_track(seq, idx, new_track))
+}
+
+/// Set the `enabled` (bypass) flag on a clip's effect by ID. Used for
+/// per-node bypass on the color page — `enabled` is a struct field,
+/// not a params key, so it needs its own op rather than routing
+/// through `update_effect_param`. Errors if the effect isn't found.
+pub fn set_effect_enabled(
+    seq: &Sequence,
+    track_id: TrackId,
+    clip_id: ClipId,
+    effect_id: EffectId,
+    enabled: bool,
+) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    let (clip_idx, clip) = find_clip(&track, clip_id)?;
+
+    let mut updated = (*clip).clone();
+    let target = updated
+        .effects
+        .iter_mut()
+        .find(|e| e.id == effect_id)
+        .ok_or_else(|| TimelineError::invalid(format!("effect {effect_id} not on clip")))?;
+    target.enabled = enabled;
+
+    let mut clips = track.clips.clone();
+    clips[clip_idx] = Arc::new(updated);
+    let new_track = Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips,
+        transitions: track.transitions.clone(),
+    };
+    Ok(replace_track(seq, idx, new_track))
+}
+
 /// Split a clip at `at_timeline` into two clips that together cover the
 /// same range. The left half keeps the original ID; the right half gets
 /// a fresh ID. Errors if `at_timeline` isn't strictly inside the clip's
@@ -983,5 +1063,77 @@ mod tests {
 
         // V2 wasn't touched; it must be the *same Arc* (pointer equality).
         assert!(Arc::ptr_eq(&seq.tracks[1], &v2_arc_before));
+    }
+
+    // ---- Grade-node ops (Phase 6.6) ----------------------------------------
+
+    /// Seed a clip with three effects (a, b, c by kind) so we can test
+    /// reorder / enable by ID.
+    fn seed_clip_with_effects() -> (Sequence, TrackId, ClipId, [EffectId; 3]) {
+        let (seq, tid, media) = seed_seq();
+        let clip = Clip::new(media, "c", t(0), t(0), t(5)).unwrap();
+        let cid = clip.id;
+        let seq = insert_clip(&seq, tid, clip).unwrap();
+        let e0 = Effect::new("grade");
+        let e1 = Effect::new("grade");
+        let e2 = Effect::new("grade");
+        let ids = [e0.id, e1.id, e2.id];
+        let seq = add_effect_to_clip(&seq, tid, cid, e0).unwrap();
+        let seq = add_effect_to_clip(&seq, tid, cid, e1).unwrap();
+        let seq = add_effect_to_clip(&seq, tid, cid, e2).unwrap();
+        (seq, tid, cid, ids)
+    }
+
+    fn effect_ids(seq: &Sequence, tid: TrackId, cid: ClipId) -> Vec<EffectId> {
+        let track = seq.tracks.iter().find(|t| t.id == tid).unwrap();
+        let clip = track.clips.iter().find(|c| c.id == cid).unwrap();
+        clip.effects.iter().map(|e| e.id).collect()
+    }
+
+    #[test]
+    fn move_effect_reorders_chain() {
+        let (seq, tid, cid, ids) = seed_clip_with_effects();
+        // Move the last (ids[2]) to the front.
+        let seq = move_effect_on_clip(&seq, tid, cid, ids[2], 0).unwrap();
+        assert_eq!(effect_ids(&seq, tid, cid), vec![ids[2], ids[0], ids[1]]);
+    }
+
+    #[test]
+    fn move_effect_clamps_out_of_range_index() {
+        let (seq, tid, cid, ids) = seed_clip_with_effects();
+        // new_index way past the end → clamp to last slot.
+        let seq = move_effect_on_clip(&seq, tid, cid, ids[0], 99).unwrap();
+        assert_eq!(effect_ids(&seq, tid, cid), vec![ids[1], ids[2], ids[0]]);
+    }
+
+    #[test]
+    fn move_effect_same_index_is_noop_order() {
+        let (seq, tid, cid, ids) = seed_clip_with_effects();
+        let seq = move_effect_on_clip(&seq, tid, cid, ids[1], 1).unwrap();
+        assert_eq!(effect_ids(&seq, tid, cid), ids.to_vec());
+    }
+
+    #[test]
+    fn move_effect_unknown_id_errors() {
+        let (seq, tid, cid, _ids) = seed_clip_with_effects();
+        assert!(move_effect_on_clip(&seq, tid, cid, EffectId::new(), 0).is_err());
+    }
+
+    #[test]
+    fn set_effect_enabled_toggles() {
+        let (seq, tid, cid, ids) = seed_clip_with_effects();
+        let seq = set_effect_enabled(&seq, tid, cid, ids[1], false).unwrap();
+        let track = seq.tracks.iter().find(|t| t.id == tid).unwrap();
+        let clip = track.clips.iter().find(|c| c.id == cid).unwrap();
+        let e = clip.effects.iter().find(|e| e.id == ids[1]).unwrap();
+        assert!(!e.enabled);
+        // Other effects untouched.
+        assert!(clip.effects.iter().find(|e| e.id == ids[0]).unwrap().enabled);
+    }
+
+    #[test]
+    fn set_effect_enabled_unknown_id_errors() {
+        let (seq, tid, cid, _ids) = seed_clip_with_effects();
+        assert!(set_effect_enabled(&seq, tid, cid, EffectId::new(), false).is_err());
     }
 }

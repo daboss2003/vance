@@ -422,6 +422,93 @@ fn clip_brightness_contrast_at(
     (0.0, 1.0)
 }
 
+/// Evaluate the serial color-grade chain (Phase 6.6/6.7): every
+/// `kind == "grade"` effect, in `Vec` order, each read at clip-relative
+/// `t_seconds` so keyframed wheel values animate. Disabled nodes stay
+/// in the list (occupying their slot, bypassed in the shader) so the
+/// chain order is preserved. Capped at `MAX_GRADE_NODES`.
+fn eval_clip_grades(
+    effects: &[vance_timeline::Effect],
+    t_seconds: f64,
+) -> Vec<vance_render::GradeNodeParams> {
+    use vance_timeline::grade as gk;
+    let num = |ps: &std::collections::BTreeMap<String, EffectValue>, k: &str, default: f32| -> f32 {
+        ps.get(k)
+            .and_then(|p| p.eval_number(t_seconds))
+            .map(|v| v as f32)
+            .unwrap_or(default)
+    };
+    let mut out = Vec::new();
+    for e in effects {
+        if e.kind != gk::GRADE_KIND {
+            continue;
+        }
+        if out.len() >= gk::MAX_GRADE_NODES {
+            break;
+        }
+        let log_mode = matches!(
+            e.params.get(gk::KEY_MODE),
+            Some(EffectValue::String(s)) if s == gk::MODE_LOG
+        );
+        out.push(vance_render::GradeNodeParams {
+            enabled: e.enabled,
+            log_mode,
+            lift: [
+                num(&e.params, gk::KEY_LIFT_R, 0.0),
+                num(&e.params, gk::KEY_LIFT_G, 0.0),
+                num(&e.params, gk::KEY_LIFT_B, 0.0),
+                num(&e.params, gk::KEY_LIFT_Y, 0.0),
+            ],
+            gamma: [
+                num(&e.params, gk::KEY_GAMMA_R, 1.0),
+                num(&e.params, gk::KEY_GAMMA_G, 1.0),
+                num(&e.params, gk::KEY_GAMMA_B, 1.0),
+                num(&e.params, gk::KEY_GAMMA_Y, 1.0),
+            ],
+            gain: [
+                num(&e.params, gk::KEY_GAIN_R, 1.0),
+                num(&e.params, gk::KEY_GAIN_G, 1.0),
+                num(&e.params, gk::KEY_GAIN_B, 1.0),
+                num(&e.params, gk::KEY_GAIN_Y, 1.0),
+            ],
+            offset: [
+                num(&e.params, gk::KEY_OFFSET_R, 0.0),
+                num(&e.params, gk::KEY_OFFSET_G, 0.0),
+                num(&e.params, gk::KEY_OFFSET_B, 0.0),
+            ],
+            shadow: [
+                num(&e.params, gk::KEY_SHADOW_R, 0.0),
+                num(&e.params, gk::KEY_SHADOW_G, 0.0),
+                num(&e.params, gk::KEY_SHADOW_B, 0.0),
+            ],
+            midtone: [
+                num(&e.params, gk::KEY_MID_R, 0.0),
+                num(&e.params, gk::KEY_MID_G, 0.0),
+                num(&e.params, gk::KEY_MID_B, 0.0),
+            ],
+            highlight: [
+                num(&e.params, gk::KEY_HI_R, 0.0),
+                num(&e.params, gk::KEY_HI_G, 0.0),
+                num(&e.params, gk::KEY_HI_B, 0.0),
+            ],
+        });
+    }
+    out
+}
+
+fn clip_grades_at(
+    seq: &Sequence,
+    clip_id: vance_timeline::ClipId,
+    t_seconds: f64,
+) -> Vec<vance_render::GradeNodeParams> {
+    for track in seq.tracks.iter() {
+        if let Some(clip) = track.clips.iter().find(|c| c.id == clip_id) {
+            return eval_clip_grades(&clip.effects, t_seconds);
+        }
+    }
+    Vec::new()
+}
+
 /// First enabled "chroma_key" effect on the clip, evaluated at
 /// `t_seconds`. Returns `(key_rgb, tolerance, softness, enable)`;
 /// `enable = 0.0` means no chroma key effect is on (passthrough).
@@ -1157,6 +1244,7 @@ impl Engine {
             rs.renderer.set_chroma_key([0.0, 1.0, 0.0], 0.15, 0.05, 0.0);
             rs.renderer.set_luma_key(0.5, 1.0, 0.05, 0.0);
             rs.renderer.set_lut_enable(0.0);
+            rs.renderer.set_grades(&[]);
             if let Some(params) = source_pipeline {
                 rs.renderer.set_pipeline(params);
             }
@@ -1246,6 +1334,7 @@ impl Engine {
                 rs.renderer.set_mix_factor(0.0);
                 rs.renderer.set_chroma_key([0.0, 1.0, 0.0], 0.15, 0.05, 0.0);
                 rs.renderer.set_luma_key(0.5, 1.0, 0.05, 0.0);
+                rs.renderer.set_grades(&[]);
             }
         }
         let dec = self.decoder.as_mut().ok_or(EngineError::NoFileOpen)?;
@@ -1952,6 +2041,10 @@ impl Engine {
                 entry_luma.2,
                 entry_luma.3,
             );
+            rs.renderer.set_grades(&eval_clip_grades(
+                &clip_effects_snapshot,
+                source_pts_seconds - anchor_source_in,
+            ));
             if let Some(p) = entry_pipeline {
                 rs.renderer.set_pipeline(p);
             }
@@ -2137,6 +2230,7 @@ impl Engine {
             rs.renderer.set_crop(crop[0], crop[1], crop[2], crop[3]);
             rs.renderer.set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
             rs.renderer.set_luma_key(luma.0, luma.1, luma.2, luma.3);
+            rs.renderer.set_grades(&clip_grades_at(seq, from_clip_id, from_clip_t));
             rs.renderer.set_mix_factor(active_tr.mix);
             if let Some(p) = a_pipeline {
                 rs.renderer.set_pipeline(p);
@@ -2233,6 +2327,7 @@ impl Engine {
             rs.renderer.set_crop(crop[0], crop[1], crop[2], crop[3]);
             rs.renderer.set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
             rs.renderer.set_luma_key(luma.0, luma.1, luma.2, luma.3);
+            rs.renderer.set_grades(&eval_clip_grades(&effects, 0.0));
             rs.renderer.set_mix_factor(0.0);
             if let Some(p) = title_pipeline {
                 rs.renderer.set_pipeline(p);
@@ -2282,7 +2377,7 @@ impl Engine {
         // Effect chain (transform / crop / color / keys) evaluated at
         // the clip-relative time. Titles aren't usually animated but
         // we honor their effects for consistency.
-        let (xform, crop, color, chroma, luma) = {
+        let (xform, crop, color, chroma, luma, grades) = {
             let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
             let seq_id = self
                 .current_sequence_id
@@ -2297,6 +2392,7 @@ impl Engine {
                 clip_brightness_contrast_at(seq, clip_id, clip_t),
                 clip_chroma_key_at(seq, clip_id, clip_t),
                 clip_luma_key_at(seq, clip_id, clip_t),
+                clip_grades_at(seq, clip_id, clip_t),
             )
         };
         // Title media is tagged sRGB; route it through the project
@@ -2316,6 +2412,7 @@ impl Engine {
             rs.renderer.set_crop(crop[0], crop[1], crop[2], crop[3]);
             rs.renderer.set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
             rs.renderer.set_luma_key(luma.0, luma.1, luma.2, luma.3);
+            rs.renderer.set_grades(&grades);
             rs.renderer.set_mix_factor(0.0);
             if let Some(p) = title_pipeline {
                 rs.renderer.set_pipeline(p);
@@ -2584,7 +2681,7 @@ impl Engine {
             self.pipeline_for_media(media_id)
         };
         self.open_file(&media_path)?;
-        let (xform_for_decode, crop_for_decode, color_for_decode, chroma_for_decode, luma_for_decode) = {
+        let (xform_for_decode, crop_for_decode, color_for_decode, chroma_for_decode, luma_for_decode, grades_for_decode) = {
             let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
             let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
             let seq = project
@@ -2597,6 +2694,7 @@ impl Engine {
                 clip_brightness_contrast_at(seq, anchor_clip_id, entry_clip_t),
                 clip_chroma_key_at(seq, anchor_clip_id, entry_clip_t),
                 clip_luma_key_at(seq, anchor_clip_id, entry_clip_t),
+                clip_grades_at(seq, anchor_clip_id, entry_clip_t),
             )
         };
         if let Some(rs) = self.render_state.as_ref() {
@@ -2626,6 +2724,7 @@ impl Engine {
                 luma_for_decode.2,
                 luma_for_decode.3,
             );
+            rs.renderer.set_grades(&grades_for_decode);
             if let Some(p) = pipeline_params {
                 rs.renderer.set_pipeline(p);
             }
@@ -2749,6 +2848,96 @@ impl Engine {
             key,
             value,
         })
+    }
+
+    /// Reorder an effect within a clip's chain (color-page node
+    /// reorder). Undoable.
+    pub fn move_effect_on_clip(
+        &mut self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+        effect_id: EffectId,
+        new_index: usize,
+    ) -> Result<(), EngineError> {
+        self.pause_for_edit();
+        self.apply_edit_op(EditOp::MoveEffectOnClip {
+            track_id,
+            clip_id,
+            effect_id,
+            new_index,
+        })
+    }
+
+    /// Toggle an effect's `enabled` (bypass) flag. Undoable.
+    pub fn set_effect_enabled(
+        &mut self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+        effect_id: EffectId,
+        enabled: bool,
+    ) -> Result<(), EngineError> {
+        self.pause_for_edit();
+        self.apply_edit_op(EditOp::SetEffectEnabled {
+            track_id,
+            clip_id,
+            effect_id,
+            enabled,
+        })
+    }
+
+    /// Live, NON-undoable preview of one grade param mid-drag. Rebuilds
+    /// the clip's grade chain with `key` overridden to `value` on
+    /// `effect_id`, pushes it to the renderer, and repaints the Record
+    /// viewport from the textures already loaded — no decode, no edit
+    /// log entry. The UI commits exactly one `update_effect_param` on
+    /// pointer-up so the EditLog gets a single coalesced step. Silently
+    /// no-ops if no project/clip is loaded.
+    pub fn preview_grade_param(
+        &mut self,
+        clip_id: vance_timeline::ClipId,
+        effect_id: EffectId,
+        key: String,
+        value: EffectValue,
+    ) -> Result<(), EngineError> {
+        let grades = {
+            let project = match self.current_project.as_ref() {
+                Some(p) => p,
+                None => return Ok(()),
+            };
+            let seq_id = match self.current_sequence_id {
+                Some(id) => id,
+                None => return Ok(()),
+            };
+            let seq = match project.sequence(seq_id) {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+            // Find the clip, clone its effects, override the one param.
+            let mut effects = match seq
+                .tracks
+                .iter()
+                .find_map(|t| t.clips.iter().find(|c| c.id == clip_id))
+            {
+                Some(c) => c.effects.clone(),
+                None => return Ok(()),
+            };
+            if let Some(e) = effects.iter_mut().find(|e| e.id == effect_id) {
+                e.params.insert(key, value);
+            }
+            // Grade params aren't usually keyframed during a live drag;
+            // eval at t=0 is a fine preview. The pointer-up commit
+            // re-renders at the real playhead time.
+            eval_clip_grades(&effects, 0.0)
+        };
+        if let Some(rs) = self.render_state.as_ref() {
+            rs.lock().renderer.set_grades(&grades);
+        }
+        if let (Some(rs), Some(vp)) = (self.render_state.as_ref(), self.viewport.as_ref()) {
+            let rs = rs.clone();
+            let vp = vp.clone();
+            present_record_only(&rs, &vp)?;
+        }
+        Ok(())
     }
 
     /// Remove a clip from a track (leaves a gap on the timeline).
@@ -3578,6 +3767,7 @@ fn playback_loop(
             let (br, ct) = eval_clip_brightness_contrast(&clip_effects, clip_t);
             let chroma = eval_clip_chroma_key(&clip_effects, clip_t);
             let luma = eval_clip_luma_key(&clip_effects, clip_t);
+            let grades = eval_clip_grades(&clip_effects, clip_t);
             let mut rs = render_state.lock();
             rs.renderer.set_opacity(op);
             rs.renderer.set_transform(xf.translate, xf.scale, xf.rotation_radians);
@@ -3585,6 +3775,7 @@ fn playback_loop(
             rs.renderer.set_crop(crop[0], crop[1], crop[2], crop[3]);
             rs.renderer.set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
             rs.renderer.set_luma_key(luma.0, luma.1, luma.2, luma.3);
+            rs.renderer.set_grades(&grades);
         }
 
         // Transition handling — only relevant when this is sequence
@@ -3849,6 +4040,40 @@ fn upload_and_render(
             return Err(EngineError::SurfaceAcquire(
                 "surface timeout/occluded".into(),
             ));
+        }
+    };
+    let view = surface_tex
+        .texture
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    rs.renderer.render_to(&view)?;
+    surface_tex.present();
+    Ok(())
+}
+
+/// Re-present the Record viewport using whatever frame is already in
+/// the renderer's textures, with the current uniforms. Used by the
+/// live color-wheel preview fast-path: after `set_grades` updates the
+/// uniform we just need to redraw — no decode. Returns `Ok(())` if
+/// the surface isn't configured yet (nothing to repaint).
+fn present_record_only(
+    render_state: &Arc<Mutex<RenderState>>,
+    viewport: &Arc<Viewport>,
+) -> Result<(), EngineError> {
+    let mut rs = render_state.lock();
+    if rs.surface_config.is_none() {
+        return Ok(());
+    }
+    let surface = viewport.surface();
+    let surface_tex = match surface.get_current_texture() {
+        wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+        wgpu::CurrentSurfaceTexture::Outdated
+        | wgpu::CurrentSurfaceTexture::Lost
+        | wgpu::CurrentSurfaceTexture::Validation => {
+            rs.surface_config = None;
+            return Err(EngineError::SurfaceAcquire("surface outdated".into()));
+        }
+        wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+            return Err(EngineError::SurfaceAcquire("surface timeout/occluded".into()));
         }
     };
     let view = surface_tex

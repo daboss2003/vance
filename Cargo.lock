@@ -5263,6 +5263,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "vance-audio",
+ "vance-color",
  "vance-core",
  "vance-decoder",
  "vance-project",
@@ -5308,6 +5309,10 @@ version = "0.0.0"
 [[package]]
 name = "vance-color"
 version = "0.0.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "vance-core"
@@ -5403,6 +5408,7 @@ dependencies = [
  "pollster",
  "thiserror 2.0.18",
  "tracing",
+ "vance-color",
  "vance-core",
  "vance-decoder",
  "vance-timeline",
@@ -5425,6 +5431,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "uuid",
+ "vance-color",
  "vance-core",
 ]
 

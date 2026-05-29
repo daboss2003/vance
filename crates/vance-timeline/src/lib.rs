@@ -33,6 +33,7 @@ pub mod clip;
 pub mod edit_log;
 pub mod effect;
 pub mod error;
+pub mod grade;
 pub mod id;
 pub mod marker;
 pub mod media;

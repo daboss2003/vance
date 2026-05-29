@@ -31,6 +31,8 @@
   import { dragState } from '$lib/drag.svelte';
   import { selectionState } from '$lib/selection.svelte';
   import Timeline from '$lib/timeline/Timeline.svelte';
+  import ColorWheel from '$lib/color/ColorWheel.svelte';
+  import * as GK from '$lib/grade-keys';
 
   let backend = $state<string>('checking…');
   let info = $state<StreamInfo | null>(null);
@@ -62,6 +64,13 @@
   let titleDraftDuration = $state<number>(3);
   let titleDraftSize = $state<number>(96);
   let titleSubmitting = $state<boolean>(false);
+
+  // Edit ↔ Color page toggle (Phase 6.6). The center viewers + Record
+  // viewport stay mounted across the switch (only the side panels swap)
+  // so the native wgpu surface never rebinds.
+  let activePage = $state<'edit' | 'color'>('edit');
+  // Which grade node's wheels are shown on the Color page.
+  let selectedNodeId = $state<string | null>(null);
   $effect(() => {
     void projectState.info;
     void projectState.editTick;
@@ -568,6 +577,105 @@
     return 'L';
   }
 
+  // ---- Color page (Phase 6.6/6.7) ------------------------------------------
+
+  /** Grade nodes (effects of kind 'grade') on the selected clip, in
+   *  chain order. Empty when no single clip is selected. */
+  const gradeNodes = $derived.by<EffectInfo[]>(() => {
+    const d = selectedClipDetails;
+    if (!d) return [];
+    return d.clip.effects.filter((e) => e.kind === GK.GRADE_KIND);
+  });
+
+  /** The node whose wheels are shown — `selectedNodeId` if it still
+   *  exists, else the first node. */
+  const activeNode = $derived.by<EffectInfo | null>(() => {
+    const nodes = gradeNodes;
+    if (nodes.length === 0) return null;
+    return nodes.find((n) => n.id === selectedNodeId) ?? nodes[0];
+  });
+
+  function nodeLabel(node: EffectInfo, index: number): string {
+    const raw = node.params[GK.KEY_LABEL];
+    if (typeof raw === 'string' && raw.length > 0) return raw;
+    return `Node ${index + 1}`;
+  }
+
+  function nodeMode(node: EffectInfo): 'primary' | 'log' {
+    return node.params[GK.KEY_MODE] === GK.MODE_LOG ? 'log' : 'primary';
+  }
+
+  /** Read a numeric grade param's current value (static or evaluated). */
+  function gradeVal(node: EffectInfo, key: string): number {
+    const raw = node.params[key];
+    if (raw === undefined) return GK.gradeDefault(key);
+    return evalNumber(raw, 0, GK.gradeDefault(key));
+  }
+
+  /** Append a new primary grade node to the selected clip. */
+  async function addGradeNode(mode: 'primary' | 'log' = 'primary') {
+    const d = selectedClipDetails;
+    if (!d) return;
+    await projectState.addEffect(d.track.id, d.clip.id, GK.GRADE_KIND, {
+      [GK.KEY_MODE]: mode
+    });
+  }
+
+  /** Live-preview a wheel group's three channel values + master during
+   *  a drag (non-undoable), then nothing is committed until pointer-up
+   *  (`commitWheel`). `group` is e.g. 'lift' | 'gamma' | 'gain' (primary)
+   *  or 'offset' | 'shadow' | 'midtone' | 'highlight' (log). */
+  function wheelKeys(group: string): { rgb: [string, string, string]; master: string | null } {
+    const p = (GK.PRIMARY_KEYS as Record<string, readonly string[]>)[group];
+    if (p) return { rgb: [p[0], p[1], p[2]], master: p[3] };
+    const l = (GK.LOG_KEYS as Record<string, readonly string[]>)[group];
+    return { rgb: [l[0], l[1], l[2]], master: null };
+  }
+
+  function readWheel(node: EffectInfo, group: string): { rgb: [number, number, number]; master: number } {
+    const k = wheelKeys(group);
+    return {
+      rgb: [gradeVal(node, k.rgb[0]), gradeVal(node, k.rgb[1]), gradeVal(node, k.rgb[2])],
+      master: k.master ? gradeVal(node, k.master) : 0
+    };
+  }
+
+  /** Push a wheel change live to the engine preview (no undo step). */
+  function previewWheel(
+    node: EffectInfo,
+    group: string,
+    rgb: [number, number, number],
+    master: number
+  ) {
+    const d = selectedClipDetails;
+    if (!d) return;
+    const k = wheelKeys(group);
+    // Preview applies one key at a time; push all four (or three) keys
+    // by overriding them in sequence on the engine fast-path.
+    projectState.previewGradeParam(d.clip.id, node.id, k.rgb[0], rgb[0]);
+    projectState.previewGradeParam(d.clip.id, node.id, k.rgb[1], rgb[1]);
+    projectState.previewGradeParam(d.clip.id, node.id, k.rgb[2], rgb[2]);
+    if (k.master) projectState.previewGradeParam(d.clip.id, node.id, k.master, master);
+  }
+
+  /** Commit a wheel change as undoable edits (on pointer-up). */
+  async function commitWheel(
+    node: EffectInfo,
+    group: string,
+    rgb: [number, number, number],
+    master: number
+  ) {
+    const d = selectedClipDetails;
+    if (!d) return;
+    const k = wheelKeys(group);
+    await projectState.updateEffectParam(d.track.id, d.clip.id, node.id, k.rgb[0], rgb[0]);
+    await projectState.updateEffectParam(d.track.id, d.clip.id, node.id, k.rgb[1], rgb[1]);
+    await projectState.updateEffectParam(d.track.id, d.clip.id, node.id, k.rgb[2], rgb[2]);
+    if (k.master) {
+      await projectState.updateEffectParam(d.track.id, d.clip.id, node.id, k.master, master);
+    }
+  }
+
   /** First enabled video track on the active sequence, or null. */
   function firstVideoTrackId(): string | null {
     const seq = projectState.sequence;
@@ -809,7 +917,27 @@
     class="border-vance-border bg-vance-panel flex h-11 flex-shrink-0 items-center gap-3 border-b px-4"
   >
     <h1 class="text-sm font-semibold">Vance</h1>
-    <span class="text-vance-muted text-xs">Phase 4 · M4.2</span>
+    <span class="text-vance-muted text-xs">Phase 6 · Color</span>
+
+    <!-- Edit / Color page toggle (Phase 6.6) -->
+    <div class="ml-1 flex items-center rounded border border-vance-border overflow-hidden text-xs">
+      <button
+        class="px-2 py-0.5 {activePage === 'edit'
+          ? 'bg-[var(--color-vance-accent)] text-[#003040] font-semibold'
+          : 'bg-vance-bg hover:brightness-125'}"
+        onclick={() => (activePage = 'edit')}
+      >
+        Edit
+      </button>
+      <button
+        class="px-2 py-0.5 {activePage === 'color'
+          ? 'bg-[var(--color-vance-accent)] text-[#003040] font-semibold'
+          : 'bg-vance-bg hover:brightness-125'}"
+        onclick={() => (activePage = 'color')}
+      >
+        Color
+      </button>
+    </div>
 
     {#if projectState.info}
       <span class="ml-3 text-xs text-vance-muted flex items-center gap-1">
@@ -915,6 +1043,124 @@
 
   <!-- Main 3-pane area -->
   <div class="flex flex-1 min-h-0">
+    <!-- Left panel: Browser (Edit) or Node list (Color) -->
+    {#if activePage === 'color'}
+      <aside
+        class="border-vance-border bg-vance-panel w-60 flex-shrink-0 overflow-y-auto border-r p-4"
+      >
+        <div class="mb-3 flex items-center justify-between">
+          <h2 class="text-vance-muted text-xs uppercase tracking-wider">Nodes</h2>
+          <div class="flex gap-1">
+            <button
+              class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125 disabled:opacity-50"
+              onclick={() => addGradeNode('primary')}
+              disabled={!selectedClipDetails}
+              title="Add a primary (lift/gamma/gain) grade node"
+            >
+              + Primary
+            </button>
+            <button
+              class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125 disabled:opacity-50"
+              onclick={() => addGradeNode('log')}
+              disabled={!selectedClipDetails}
+              title="Add a log (offset/shadow/mid/highlight) grade node"
+            >
+              + Log
+            </button>
+          </div>
+        </div>
+        {#if !selectedClipDetails}
+          <p class="text-vance-muted text-xs italic">
+            Select a clip on the timeline to grade it.
+          </p>
+        {:else if gradeNodes.length === 0}
+          <p class="text-vance-muted text-xs italic">
+            No grade nodes. Add one above — nodes apply top-to-bottom.
+          </p>
+        {:else}
+          <ul class="flex flex-col gap-1 text-xs">
+            {#each gradeNodes as node, i (node.id)}
+              {@const isSel = activeNode?.id === node.id}
+              <li
+                class="flex items-center gap-1 rounded border px-2 py-1
+                  {isSel
+                    ? 'border-[var(--color-vance-accent)] bg-[#003040]'
+                    : 'bg-vance-bg border-vance-border'}"
+              >
+                <input
+                  type="checkbox"
+                  checked={node.enabled}
+                  onchange={() =>
+                    projectState.setNodeEnabled(
+                      selectedClipDetails!.track.id,
+                      selectedClipDetails!.clip.id,
+                      node.id,
+                      !node.enabled
+                    )}
+                  title="Bypass / enable this node"
+                />
+                <button
+                  class="flex-1 truncate text-left {node.enabled ? '' : 'opacity-40 line-through'}"
+                  onclick={() => (selectedNodeId = node.id)}
+                >
+                  {nodeLabel(node, i)} · {nodeMode(node)}
+                </button>
+                <button
+                  class="text-vance-muted hover:brightness-125 disabled:opacity-30"
+                  onclick={() =>
+                    projectState.moveGradeNode(
+                      selectedClipDetails!.track.id,
+                      selectedClipDetails!.clip.id,
+                      node.id,
+                      i - 1
+                    )}
+                  disabled={i === 0}
+                  title="Move up (earlier in chain)"
+                >
+                  ↑
+                </button>
+                <button
+                  class="text-vance-muted hover:brightness-125 disabled:opacity-30"
+                  onclick={() =>
+                    projectState.moveGradeNode(
+                      selectedClipDetails!.track.id,
+                      selectedClipDetails!.clip.id,
+                      node.id,
+                      i + 1
+                    )}
+                  disabled={i === gradeNodes.length - 1}
+                  title="Move down (later in chain)"
+                >
+                  ↓
+                </button>
+                <button
+                  class="text-vance-muted hover:text-red-400"
+                  onclick={() =>
+                    projectState.removeEffect(
+                      selectedClipDetails!.track.id,
+                      selectedClipDetails!.clip.id,
+                      node.id
+                    )}
+                  title="Delete node"
+                >
+                  ✕
+                </button>
+              </li>
+            {/each}
+          </ul>
+          {#if gradeNodes.length >= GK.MAX_GRADE_NODES}
+            <p class="mt-2 text-[10px] text-yellow-500">
+              Max {GK.MAX_GRADE_NODES} nodes render; extras are ignored.
+            </p>
+          {/if}
+        {/if}
+        {#if projectState.error}
+          <p class="mt-3 rounded border border-red-700 bg-red-950 p-2 text-xs text-red-200">
+            {projectState.error}
+          </p>
+        {/if}
+      </aside>
+    {:else}
     <!-- Browser -->
     <aside
       class="border-vance-border bg-vance-panel w-60 flex-shrink-0 overflow-y-auto border-r p-4"
@@ -1028,6 +1274,7 @@
         </p>
       {/if}
     </aside>
+    {/if}
 
     <!-- Center: Source + Record viewports + transport -->
     <main class="flex flex-1 flex-col min-w-0">
@@ -1307,6 +1554,62 @@
       </div>
     {/if}
 
+    <!-- Right panel: Wheels (Color) or Inspector (Edit) -->
+    {#if activePage === 'color'}
+      <aside
+        class="border-vance-border bg-vance-panel w-80 flex-shrink-0 overflow-y-auto overflow-x-hidden border-l p-4"
+      >
+        <h2 class="text-vance-muted mb-3 text-xs uppercase tracking-wider">
+          {activeNode ? nodeLabel(activeNode, gradeNodes.indexOf(activeNode)) : 'Wheels'}
+        </h2>
+        {#if !activeNode}
+          <p class="text-vance-muted text-xs italic">
+            {selectedClipDetails
+              ? 'Add a grade node to start.'
+              : 'Select a clip to grade.'}
+          </p>
+        {:else}
+          {@const node = activeNode}
+          {@const mode = nodeMode(node)}
+          {#if mode === 'primary'}
+            {#each ['lift', 'gamma', 'gain'] as group (group)}
+              {@const w = readWheel(node, group)}
+              <div class="mb-4">
+                <ColorWheel
+                  label={group}
+                  rgb={w.rgb}
+                  master={w.master}
+                  masterMin={group === 'lift' ? -0.5 : 0}
+                  masterMax={group === 'lift' ? 0.5 : 2}
+                  onInput={(rgb, m) => previewWheel(node, group, rgb, m)}
+                  onCommit={(rgb, m) => commitWheel(node, group, rgb, m)}
+                />
+              </div>
+            {/each}
+          {:else}
+            {#each ['offset', 'shadow', 'midtone', 'highlight'] as group (group)}
+              {@const w = readWheel(node, group)}
+              <div class="mb-4">
+                <ColorWheel
+                  label={group}
+                  rgb={w.rgb}
+                  master={w.master}
+                  masterMin={-0.5}
+                  masterMax={0.5}
+                  onInput={(rgb, m) => previewWheel(node, group, rgb, m)}
+                  onCommit={(rgb, m) => commitWheel(node, group, rgb, m)}
+                />
+              </div>
+            {/each}
+          {/if}
+        {/if}
+        {#if projectState.error}
+          <p class="mt-3 rounded border border-red-700 bg-red-950 p-2 text-xs text-red-200">
+            {projectState.error}
+          </p>
+        {/if}
+      </aside>
+    {:else}
     <!-- Inspector -->
     <aside
       class="border-vance-border bg-vance-panel w-72 flex-shrink-0 overflow-y-auto overflow-x-hidden border-l p-4"
@@ -1712,6 +2015,7 @@
         </p>
       {/if}
     </aside>
+    {/if}
   </div>
 
   <!-- Timeline panel -->
