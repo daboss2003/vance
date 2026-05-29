@@ -221,21 +221,30 @@ struct GradeNode {
     qual_a: [f32; 4],
     /// Qualifier `(luma_lo, luma_hi, hue_soft, sat_soft)` (6.9).
     qual_b: [f32; 4],
-    /// Qualifier `(luma_soft, show_mask, window_rsvd0, window_rsvd1)`.
-    /// `show_mask`: 1 = solo this node's matte to the viewport.
-    /// `window_rsvd*` reserved for the 6.10 power-window mask.
+    /// Qualifier `(luma_soft, show_mask, _, _)`. `show_mask`: 1 = solo
+    /// this node's matte to the viewport. The `.z/.w` lanes are now
+    /// PERMANENTLY-DEAD reserved padding — the 6.10 power window lives in
+    /// its own `win_a`/`win_b` lanes below (kept contiguous + trailing).
     qual_c: [f32; 4],
+    /// Power window `(shape, center_x, center_y, rotation_rad)` (6.10).
+    /// `shape`: 0 = off (mask = 1, exact passthrough), 1 = ellipse,
+    /// 2 = rectangle. Center is in source-UV `[0,1]`; rotation CCW.
+    win_a: [f32; 4],
+    /// Power window `(half_size_x, half_size_y, feather, invert)` (6.10).
+    /// Half-extents/radii in source-UV units; `feather` softness band;
+    /// `invert`: 1 = invert the window mask.
+    win_b: [f32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<GradeNode>() == 144);
+const _: () = assert!(std::mem::size_of::<GradeNode>() == 176);
 // Compile-time gate on the FULL uniform size so a field add/reorder
 // that diverges from the WGSL std140 `Params` layout fails the build,
-// not just `cargo test`. 272-byte header + 8 × 144-byte GradeNode.
-const _: () = assert!(std::mem::size_of::<RenderParams>() == 1424);
+// not just `cargo test`. 272-byte header + 8 × 176-byte GradeNode.
+const _: () = assert!(std::mem::size_of::<RenderParams>() == 1680);
 
 impl GradeNode {
     /// Identity node: passthrough (disabled, primary mode, neutral
-    /// lift/gamma/gain, qualifier off).
+    /// lift/gamma/gain, qualifier off, window off).
     fn identity() -> Self {
         Self {
             lift: [0.0, 0.0, 0.0, 0.0],
@@ -247,6 +256,9 @@ impl GradeNode {
             qual_a: [0.0; 4],
             qual_b: [0.0; 4],
             qual_c: [0.0; 4],
+            // shape 0 = window off; sane center/size/feather defaults.
+            win_a: [0.0, 0.5, 0.5, 0.0],
+            win_b: [0.25, 0.25, 0.1, 0.0],
         }
     }
 }
@@ -326,6 +338,42 @@ pub struct GradeNodeParams {
     /// luma range. Mode-INDEPENDENT (applies in primary/log/curves).
     /// Phase 6.9.
     pub qual: Qualifier,
+    /// Power window (shape mask) — intersected with the qualifier mask.
+    /// Phase 6.10.
+    pub window: Window,
+}
+
+/// Power-window / shape-mask params (Phase 6.10). Restricts the node's
+/// correction to an ellipse or rectangle in source-UV space, feathered
+/// and optionally inverted. `shape == Off` is an exact passthrough. The
+/// center is keyframe-animatable (the 6.11 point tracker drives it).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Window {
+    /// 0 = off (mask = 1), 1 = ellipse, 2 = rectangle.
+    pub shape: u8,
+    /// Center `(x, y)` in source-UV `[0, 1]`.
+    pub center: [f32; 2],
+    /// Half-extents / radii `(x, y)` in source-UV units.
+    pub size: [f32; 2],
+    /// Rotation in radians (CCW about the center).
+    pub rotation: f32,
+    /// Feather / softness band width.
+    pub feather: f32,
+    /// Invert the mask.
+    pub invert: bool,
+}
+
+impl Default for Window {
+    fn default() -> Self {
+        Self {
+            shape: 0,
+            center: [0.5, 0.5],
+            size: [0.25, 0.25],
+            rotation: 0.0,
+            feather: 0.1,
+            invert: false,
+        }
+    }
 }
 
 /// HSL qualifier / secondary-key params (Phase 6.9). When `enabled`, the
@@ -377,6 +425,7 @@ impl Default for GradeNodeParams {
             highlight: [0.0; 3],
             curves: None,
             qual: Qualifier::default(),
+            window: Window::default(),
         }
     }
 }
@@ -391,6 +440,16 @@ impl GradeNodeParams {
         n.qual_a = [q.hue[0], q.hue[1], q.sat[0], q.sat[1]];
         n.qual_b = [q.luma[0], q.luma[1], q.hue[2], q.sat[2]];
         n.qual_c = [q.luma[2], if q.show_mask { 1.0 } else { 0.0 }, 0.0, 0.0];
+        n
+    }
+
+    /// Stamp the power-window params into a GradeNode (mode-independent,
+    /// like `write_qual`). `shape` is clamped to `{0, 1, 2}`.
+    fn write_window(&self, mut n: GradeNode) -> GradeNode {
+        let w = &self.window;
+        let shape = w.shape.min(2) as f32;
+        n.win_a = [shape, w.center[0], w.center[1], w.rotation];
+        n.win_b = [w.size[0], w.size[1], w.feather, if w.invert { 1.0 } else { 0.0 }];
         n
     }
 
@@ -438,7 +497,7 @@ impl GradeNodeParams {
                 ..GradeNode::identity()
             },
         };
-        self.write_qual(base)
+        self.write_window(self.write_qual(base))
     }
 }
 
@@ -574,6 +633,10 @@ fn grade_nodes_eq(a: &GradeNode, b: &GradeNode) -> bool {
         && eq4(&a.qual_a, &b.qual_a)
         && eq4(&a.qual_b, &b.qual_b)
         && eq4(&a.qual_c, &b.qual_c)
+        // Power-window lanes (6.10) — MUST be compared or an animated /
+        // tracked window freezes on the GPU (same trap as the qualifier).
+        && eq4(&a.win_a, &b.win_a)
+        && eq4(&a.win_b, &b.win_b)
 }
 
 #[inline]
@@ -1831,11 +1894,12 @@ mod layout_tests {
         //  chroma_key 64, chroma_params 80, luma_key 96,
         //  pipeline_flags 112, in_to_working 128, working_to_out 176,
         //  lut_params 224, view_lut_params 240, grade_count 256,
-        //  grades 272 (8 * 144 = 1152) -> total 1424.
-        // GradeNode is 9 vec4 = 144: lift/gamma/gain/log_offset/log_smh/
-        // flags + qual_a (96) + qual_b (112) + qual_c (128) per node (6.9).
-        assert_eq!(std::mem::size_of::<RenderParams>(), 1424);
-        assert_eq!(std::mem::size_of::<GradeNode>(), 144);
+        //  grades 272 (8 * 176 = 1408) -> total 1680.
+        // GradeNode is 11 vec4 = 176: lift/gamma/gain/log_offset/log_smh/
+        // flags + qual_a (96) + qual_b (112) + qual_c (128) (6.9) +
+        // win_a (144) + win_b (160) per node (6.10).
+        assert_eq!(std::mem::size_of::<RenderParams>(), 1680);
+        assert_eq!(std::mem::size_of::<GradeNode>(), 176);
     }
 
     #[test]
@@ -2047,10 +2111,120 @@ mod layout_tests {
             |n: &mut GradeNode| n.qual_a[0] = 0.5, // hue center
             |n: &mut GradeNode| n.qual_b[2] = 0.2, // hue softness
             |n: &mut GradeNode| n.qual_c[0] = 0.3, // luma softness
+            |n: &mut GradeNode| n.win_a[1] = 0.7,  // window center x (6.10)
+            |n: &mut GradeNode| n.win_b[2] = 0.3,  // window feather (6.10)
         ] {
             let mut b = a;
             mutate(&mut b);
-            assert!(!grade_nodes_eq(&a, &b), "qualifier-lane change must register as different");
+            assert!(!grade_nodes_eq(&a, &b), "qualifier/window-lane change must register as different");
         }
+    }
+
+    #[test]
+    fn window_to_gpu_maps_lanes() {
+        let p = GradeNodeParams {
+            window: Window {
+                shape: 2,
+                center: [0.4, 0.6],
+                size: [0.3, 0.2],
+                rotation: 0.5,
+                feather: 0.15,
+                invert: true,
+            },
+            ..Default::default()
+        };
+        let n = p.to_gpu();
+        assert_eq!(n.win_a, [2.0, 0.4, 0.6, 0.5]); // shape, cx, cy, rot
+        assert_eq!(n.win_b, [0.3, 0.2, 0.15, 1.0]); // sx, sy, feather, invert
+        // Default window is off (shape 0) and identity-mapped.
+        let off = GradeNodeParams::default().to_gpu();
+        assert_eq!(off.win_a[0], 0.0, "window must default off");
+    }
+
+    // Pure-Rust mirror of the WGSL `window_mask` (shader.wgsl) so the SDF
+    // is unit-testable without a GPU. KEEP IN SYNC with the shader.
+    fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
+        let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+    fn window_mask_cpu(
+        uv: [f32; 2],
+        shape: f32,
+        center: [f32; 2],
+        size: [f32; 2],
+        rotation: f32,
+        feather: f32,
+        invert: bool,
+        aspect: f32,
+    ) -> f32 {
+        if shape < 0.5 {
+            return 1.0;
+        }
+        let half = [size[0].max(1e-4), size[1].max(1e-4)];
+        let feather = feather.max(1e-4);
+        let mut dx = uv[0] - center[0];
+        let dy = uv[1] - center[1];
+        dx *= aspect;
+        let c = (-rotation).cos();
+        let s = (-rotation).sin();
+        let lx = dx * c - dy * s;
+        let ly = dx * s + dy * c;
+        let rx = half[0] * aspect;
+        let ry = half[1];
+        let nd = if shape < 1.5 {
+            ((lx / rx).powi(2) + (ly / ry).powi(2)).sqrt()
+        } else {
+            (lx.abs() / rx).max(ly.abs() / ry)
+        };
+        let band = feather / (0.5 * (rx + ry)).max(1e-4);
+        let mut m = 1.0 - smoothstep(1.0, 1.0 + band, nd);
+        if invert {
+            m = 1.0 - m;
+        }
+        m.clamp(0.0, 1.0)
+    }
+
+    #[test]
+    fn window_mask_shape_off_is_identity() {
+        for uv in [[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]] {
+            assert_eq!(window_mask_cpu(uv, 0.0, [0.5, 0.5], [0.25, 0.25], 0.0, 0.1, false, 1.0), 1.0);
+        }
+    }
+
+    #[test]
+    fn window_mask_ellipse_center_in_corner_out() {
+        let m_center = window_mask_cpu([0.5, 0.5], 1.0, [0.5, 0.5], [0.25, 0.25], 0.0, 0.01, false, 1.0);
+        let m_corner = window_mask_cpu([0.0, 0.0], 1.0, [0.5, 0.5], [0.25, 0.25], 0.0, 0.01, false, 1.0);
+        assert!(m_center > 0.99, "center keyed: {m_center}");
+        assert!(m_corner < 0.01, "corner excluded: {m_corner}");
+    }
+
+    #[test]
+    fn window_mask_invert_flips() {
+        let m = window_mask_cpu([0.5, 0.5], 1.0, [0.5, 0.5], [0.25, 0.25], 0.0, 0.01, false, 1.0);
+        let mi = window_mask_cpu([0.5, 0.5], 1.0, [0.5, 0.5], [0.25, 0.25], 0.0, 0.01, true, 1.0);
+        assert!((m + mi - 1.0).abs() < 1e-5, "invert must be 1-m: {m} {mi}");
+    }
+
+    #[test]
+    fn window_mask_aspect_is_circular_in_pixels() {
+        // With aspect=16/9, equal radii: a pixel offset of (r/aspect, 0)
+        // and (0, r) must both land on the boundary (nd==1 -> m~0.5).
+        let aspect = 16.0 / 9.0;
+        let r = 0.25;
+        let mx = window_mask_cpu([0.5 + r / aspect, 0.5], 1.0, [0.5, 0.5], [r, r], 0.0, 0.01, false, aspect);
+        let my = window_mask_cpu([0.5, 0.5 + r], 1.0, [0.5, 0.5], [r, r], 0.0, 0.01, false, aspect);
+        assert!((mx - my).abs() < 0.05, "circle must be symmetric in pixels: {mx} {my}");
+    }
+
+    #[test]
+    fn window_mask_rect_vs_ellipse_corner() {
+        // The square's corner (just inside the box extents diagonally) is
+        // inside a rect but outside the inscribed ellipse.
+        let uv = [0.5 + 0.24, 0.5 + 0.24];
+        let rect = window_mask_cpu(uv, 2.0, [0.5, 0.5], [0.25, 0.25], 0.0, 0.01, false, 1.0);
+        let ellipse = window_mask_cpu(uv, 1.0, [0.5, 0.5], [0.25, 0.25], 0.0, 0.01, false, 1.0);
+        assert!(rect > 0.99, "rect includes its corner: {rect}");
+        assert!(ellipse < 0.5, "ellipse excludes the box corner: {ellipse}");
     }
 }

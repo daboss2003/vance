@@ -587,6 +587,23 @@ fn eval_clip_grades(
                     num(&e.params, gk::KEY_QUAL_LUMA_SOFT, 0.05),
                 ],
             },
+            // Power window (6.10) — keyframe-animatable; center is what
+            // the 6.11 tracker drives. shape rounded + clamped so a
+            // fractional interpolation can't read as off/garbage.
+            window: vance_render::Window {
+                shape: (num(&e.params, gk::KEY_WIN_SHAPE, 0.0).round() as i64).clamp(0, 2) as u8,
+                center: [
+                    num(&e.params, gk::KEY_WIN_CENTER_X, 0.5),
+                    num(&e.params, gk::KEY_WIN_CENTER_Y, 0.5),
+                ],
+                size: [
+                    num(&e.params, gk::KEY_WIN_SIZE_X, 0.25),
+                    num(&e.params, gk::KEY_WIN_SIZE_Y, 0.25),
+                ],
+                rotation: num(&e.params, gk::KEY_WIN_ROTATION, 0.0),
+                feather: num(&e.params, gk::KEY_WIN_FEATHER, 0.1),
+                invert: num(&e.params, gk::KEY_WIN_INVERT, 0.0) > 0.5,
+            },
         });
     }
     out

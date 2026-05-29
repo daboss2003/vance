@@ -557,3 +557,155 @@ fn qualifier_is_mode_agnostic() {
     );
     assert_eq!(base, log_off_key, "out-of-key LOG node must also bypass");
 }
+
+// ---- Power window / shape mask (Phase 6.10) ------------------------------
+
+use vance_render::Window;
+
+/// Sample an arbitrary pixel of a row-major RGBA8 buffer.
+fn sample_at(buf: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
+    let i = ((y * width + x) * 4) as usize;
+    [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+}
+
+/// A matte node that solos its (window-only) mask to the viewport.
+fn window_matte_node(window: Window) -> GradeNodeParams {
+    GradeNodeParams {
+        enabled: true,
+        qual: Qualifier { show_mask: true, ..Qualifier::default() },
+        window,
+        ..GradeNodeParams::default()
+    }
+}
+
+fn ellipse(cx: f32, cy: f32, rx: f32, ry: f32) -> Window {
+    Window { shape: 1, center: [cx, cy], size: [rx, ry], feather: 0.01, ..Window::default() }
+}
+
+// A centered ellipse window keys the center pixel and excludes the corner
+// (matte: center white, corner black).
+#[test]
+fn window_ellipse_matte_center_white_corner_black() {
+    let gray = solid_yuv420p(64, 64, 128, 128, 128);
+    let buf = {
+        let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
+        r.upload_frame(&gray).expect("upload");
+        r.set_grades(&[window_matte_node(ellipse(0.5, 0.5, 0.3, 0.3))]);
+        r.render_to_rgba_buffer(64, 64).expect("render")
+    };
+    let mid = center(&buf, 64, 64);
+    let corner = sample_at(&buf, 64, 2, 2);
+    assert!(mid[0] > 250, "center should be inside the window (white matte): {mid:?}");
+    assert!(corner[0] < 5, "corner should be outside (black matte): {corner:?}");
+}
+
+// A rectangle window includes a near-corner point that the inscribed
+// ellipse would exclude (sampled inside the box, off the ellipse).
+#[test]
+fn window_rect_matte_fills_box() {
+    let gray = solid_yuv420p(64, 64, 128, 128, 128);
+    let rect = Window { shape: 2, center: [0.5, 0.5], size: [0.4, 0.4], feather: 0.01, ..Window::default() };
+    let buf = {
+        let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
+        r.upload_frame(&gray).expect("upload");
+        r.set_grades(&[window_matte_node(rect)]);
+        r.render_to_rgba_buffer(64, 64).expect("render")
+    };
+    // (0.5+0.3, 0.5+0.3) in uv -> pixel ~ (51, 51): inside the 0.4 box,
+    // outside the inscribed ellipse.
+    let box_corner = sample_at(&buf, 64, 51, 51);
+    assert!(box_corner[0] > 200, "box corner should be keyed by a rect window: {box_corner:?}");
+}
+
+// Inverting the window flips inside/outside.
+#[test]
+fn window_invert_matte_flips() {
+    let gray = solid_yuv420p(64, 64, 128, 128, 128);
+    let mut win = ellipse(0.5, 0.5, 0.3, 0.3);
+    win.invert = true;
+    let buf = {
+        let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
+        r.upload_frame(&gray).expect("upload");
+        r.set_grades(&[window_matte_node(win)]);
+        r.render_to_rgba_buffer(64, 64).expect("render")
+    };
+    let mid = center(&buf, 64, 64);
+    let corner = sample_at(&buf, 64, 2, 2);
+    assert!(mid[0] < 5, "inverted: center now excluded: {mid:?}");
+    assert!(corner[0] > 250, "inverted: corner now keyed: {corner:?}");
+}
+
+// shape == 0 (window off) is a byte-for-byte passthrough even with
+// non-neutral window params present.
+#[test]
+fn window_off_is_bit_identical() {
+    let gray = solid_yuv420p(64, 64, 128, 128, 128);
+    let plain = render_center(&[gain_node(Qualifier::default())], &gray);
+    let with_off_window = render_center(
+        &[GradeNodeParams {
+            enabled: true,
+            gain: [1.0, 1.0, 1.0, 2.0],
+            window: Window { shape: 0, center: [0.2, 0.3], size: [0.1, 0.1], ..Window::default() },
+            ..GradeNodeParams::default()
+        }],
+        &gray,
+    );
+    assert_eq!(plain, with_off_window, "window shape 0 must be an exact passthrough");
+}
+
+// The node mask is qualifier_mask * window_mask: a red frame with the
+// qualifier keyed to CYAN (excludes red -> 0) makes the combined matte
+// black everywhere regardless of the window shape.
+#[test]
+fn window_times_qualifier_intersection() {
+    let red = solid_yuv420p(64, 64, 63, 102, 240);
+    // qualifier keyed to red (passes) + ellipse window -> center white.
+    let pass = {
+        let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
+        r.upload_frame(&red).expect("upload");
+        r.set_grades(&[GradeNodeParams {
+            enabled: true,
+            qual: Qualifier { enabled: true, show_mask: true, hue: [0.0, 0.2, 0.02], ..Qualifier::default() },
+            window: ellipse(0.5, 0.5, 0.3, 0.3),
+            ..GradeNodeParams::default()
+        }]);
+        center(&r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64)
+    };
+    // qualifier keyed to cyan (excludes red) -> combined mask 0 -> black.
+    let excluded = {
+        let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
+        r.upload_frame(&red).expect("upload");
+        r.set_grades(&[GradeNodeParams {
+            enabled: true,
+            qual: Qualifier { enabled: true, show_mask: true, hue: [0.5, 0.2, 0.02], ..Qualifier::default() },
+            window: ellipse(0.5, 0.5, 0.3, 0.3),
+            ..GradeNodeParams::default()
+        }]);
+        center(&r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64)
+    };
+    assert!(pass[0] > 240, "in-hue + inside window -> keyed: {pass:?}");
+    assert!(excluded[0] < 15, "off-hue zeroes the combined mask: {excluded:?}");
+}
+
+// Aspect: on a non-square (96x54, 16:9) frame, an equal-radii ellipse is
+// circular in PIXELS, so a horizontal offset scaled by 1/aspect and the
+// matching vertical offset land at the same mask value.
+#[test]
+fn window_aspect_circular_on_wide_frame() {
+    let frame = solid_yuv420p(96, 54, 128, 128, 128);
+    let buf = {
+        let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
+        r.upload_frame(&frame).expect("upload");
+        r.set_grades(&[window_matte_node(ellipse(0.5, 0.5, 0.3, 0.3))]);
+        r.render_to_rgba_buffer(96, 54).expect("render")
+    };
+    let aspect = 96.0 / 54.0;
+    // uv offset 0.25 in x (scaled by 1/aspect) vs 0.25 in y from center.
+    let px = ((0.5 + 0.25 / aspect) * 96.0) as u32;
+    let x_pt = sample_at(&buf, 96, px, 27);
+    let y_pt = sample_at(&buf, 96, 48, ((0.5 + 0.25) * 54.0) as u32);
+    assert!(
+        (x_pt[0] as i32 - y_pt[0] as i32).abs() < 24,
+        "circle must be symmetric in pixels: x={x_pt:?} y={y_pt:?}"
+    );
+}

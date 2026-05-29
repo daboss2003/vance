@@ -20,7 +20,7 @@ mod renderer;
 pub mod title;
 
 pub use renderer::{
-    CurveSet, GradeMode, GradeNodeParams, Qualifier, RenderError, Renderer, RendererConfig,
+    CurveSet, GradeMode, GradeNodeParams, Qualifier, RenderError, Renderer, RendererConfig, Window,
 };
 pub use title::{render_title_yuv420, TitleError, TitleParams};
 pub use vance_decoder::{FrameData, PixelFormat};

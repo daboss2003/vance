@@ -79,4 +79,26 @@ export function qualifierDefault(key: string): number {
   return 0;
 }
 
+// Power window / shape mask (Phase 6.10). Mirror of grade.rs — keep in
+// sync. shape 0 = off, 1 = ellipse, 2 = rectangle.
+export const WINDOW_KEYS = {
+  shape: 'win_shape',
+  centerX: 'win_cx',
+  centerY: 'win_cy',
+  sizeX: 'win_sx',
+  sizeY: 'win_sy',
+  rotation: 'win_rot',
+  feather: 'win_feather',
+  invert: 'win_invert'
+} as const;
+
+/** Default for a window param: center → 0.5, size → 0.25, feather → 0.1,
+ *  else (shape/rotation/invert) → 0. */
+export function windowDefault(key: string): number {
+  if (key === 'win_cx' || key === 'win_cy') return 0.5;
+  if (key === 'win_sx' || key === 'win_sy') return 0.25;
+  if (key === 'win_feather') return 0.1;
+  return 0;
+}
+
 export const MAX_GRADE_NODES = 8;

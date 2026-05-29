@@ -150,6 +150,28 @@ pub const KEY_QUAL_INVERT: &str = "qual_invert";
 // It's a transient viewer state driven by the engine's `set_matte_node`
 // (Phase 6.9) so a saved project never reopens stuck in matte view.
 
+// ---- Power window / shape mask (Phase 6.10) ---------------------------
+//
+// A geometric mask intersected with the qualifier mask. All keys are
+// keyframe-animatable numbers (the 6.11 point tracker animates the
+// center). `win_shape` 0 = OFF (mask = 1, exact passthrough).
+/// Window shape: 0 off, 1 ellipse, 2 rectangle. Default 0.
+pub const KEY_WIN_SHAPE: &str = "win_shape";
+/// Center X in source-UV [0,1]. Default 0.5.
+pub const KEY_WIN_CENTER_X: &str = "win_cx";
+/// Center Y in source-UV [0,1]. Default 0.5.
+pub const KEY_WIN_CENTER_Y: &str = "win_cy";
+/// Half-width (radius x) in source-UV units. Default 0.25.
+pub const KEY_WIN_SIZE_X: &str = "win_sx";
+/// Half-height (radius y) in source-UV units. Default 0.25.
+pub const KEY_WIN_SIZE_Y: &str = "win_sy";
+/// Rotation in radians (CCW). Default 0.
+pub const KEY_WIN_ROTATION: &str = "win_rot";
+/// Feather / softness band width. Default 0.1.
+pub const KEY_WIN_FEATHER: &str = "win_feather";
+/// Invert the window mask. 0/1, default 0.
+pub const KEY_WIN_INVERT: &str = "win_invert";
+
 /// Max grade nodes the single-pass renderer evaluates per clip. Nodes
 /// beyond this are ignored (the UI should warn). Matches the GPU
 /// uniform array size in `vance-render`.

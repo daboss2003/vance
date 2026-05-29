@@ -922,6 +922,26 @@
   function qualOn(node: EffectInfo): boolean {
     return readQual(node, GK.QUALIFIER_KEYS.enable) > 0.5;
   }
+
+  // Power window (6.10) — reuses the generic single-param preview/commit
+  // plumbing (previewQual/commitQual write any key, keyframe-animatable).
+  function readWin(node: EffectInfo, key: string): number {
+    const raw = node.params[key];
+    if (raw === undefined) return GK.windowDefault(key);
+    return evalNumber(raw, 0, GK.windowDefault(key));
+  }
+  function winShape(node: EffectInfo): number {
+    return Math.round(readWin(node, GK.WINDOW_KEYS.shape));
+  }
+  function winOn(node: EffectInfo): boolean {
+    return winShape(node) >= 1;
+  }
+  const RAD_PER_DEG = Math.PI / 180;
+  const WIN_GROUPS: { label: string; keys: string[]; labels: string[] }[] = [
+    { label: 'Center', keys: [GK.WINDOW_KEYS.centerX, GK.WINDOW_KEYS.centerY], labels: ['x', 'y'] },
+    { label: 'Size', keys: [GK.WINDOW_KEYS.sizeX, GK.WINDOW_KEYS.sizeY], labels: ['w', 'h'] },
+    { label: 'Feather', keys: [GK.WINDOW_KEYS.feather], labels: ['soft'] }
+  ];
   /** Live-preview a qualifier param during a slider drag (non-undoable). */
   function previewQual(node: EffectInfo, key: string, value: number) {
     const d = selectedClipDetails;
@@ -2027,9 +2047,9 @@
                   class="rounded border px-1 py-0.5 {matteNodeId === node.id
                     ? 'border-yellow-400 bg-[#3a3320] text-yellow-200'
                     : 'bg-vance-bg border-vance-border'} disabled:opacity-40"
-                  disabled={!qOn}
+                  disabled={!qOn && !winOn(node)}
                   onclick={() => toggleMatte(node)}
-                  title="Solo the matte (B/W) to the viewport"
+                  title="Solo the combined matte (qualifier ∩ window) to the viewport"
                 >
                   ◧ mask
                 </button>
@@ -2059,6 +2079,73 @@
                     </div>
                   </div>
                 {/each}
+              </div>
+            {/if}
+          </div>
+
+          <!-- Power window / shape mask (Phase 6.10). Numeric controls;
+               on-viewport drag handles arrive in 6.10b. Combined with the
+               qualifier via the shared matte toggle above. -->
+          {@const wShape = winShape(node)}
+          <div class="mb-4 rounded border border-vance-border p-2">
+            <div class="mb-2 flex items-center justify-between">
+              <span class="text-vance-muted text-[11px] uppercase tracking-wider">Power Window</span>
+              <select
+                class="bg-vance-bg border-vance-border rounded border px-1 py-0.5 text-[10px]"
+                value={wShape}
+                onchange={(e) => commitQual(node, GK.WINDOW_KEYS.shape, parseInt((e.currentTarget as HTMLSelectElement).value, 10))}
+              >
+                <option value={0}>Off</option>
+                <option value={1}>Ellipse</option>
+                <option value={2}>Rectangle</option>
+              </select>
+            </div>
+            {#if wShape >= 1}
+              <div class="flex flex-col gap-2 text-[10px]">
+                {#each WIN_GROUPS as g (g.label)}
+                  <div>
+                    <div class="text-vance-muted mb-0.5">{g.label}</div>
+                    <div class="grid grid-cols-2 gap-1">
+                      {#each g.keys as k, i (k)}
+                        <label class="flex flex-col">
+                          <span class="text-vance-muted text-[9px]">{g.labels[i]}</span>
+                          <input
+                            type="range"
+                            min="0"
+                            max="1"
+                            step="0.001"
+                            value={readWin(node, k)}
+                            oninput={(e) => previewQual(node, k, parseFloat((e.currentTarget as HTMLInputElement).value))}
+                            onchange={(e) => commitQual(node, k, parseFloat((e.currentTarget as HTMLInputElement).value))}
+                          />
+                        </label>
+                      {/each}
+                    </div>
+                  </div>
+                {/each}
+                <div class="flex items-center justify-between">
+                  <label class="flex flex-1 flex-col">
+                    <span class="text-vance-muted text-[9px]">rotation</span>
+                    <input
+                      type="range"
+                      min="-180"
+                      max="180"
+                      step="1"
+                      value={readWin(node, GK.WINDOW_KEYS.rotation) / RAD_PER_DEG}
+                      oninput={(e) => previewQual(node, GK.WINDOW_KEYS.rotation, parseFloat((e.currentTarget as HTMLInputElement).value) * RAD_PER_DEG)}
+                      onchange={(e) => commitQual(node, GK.WINDOW_KEYS.rotation, parseFloat((e.currentTarget as HTMLInputElement).value) * RAD_PER_DEG)}
+                    />
+                  </label>
+                  <button
+                    class="ml-2 self-end rounded border px-1 py-0.5 {readWin(node, GK.WINDOW_KEYS.invert) > 0.5
+                      ? 'border-[var(--color-vance-accent)] bg-[#003040]'
+                      : 'bg-vance-bg border-vance-border'}"
+                    onclick={() => commitQual(node, GK.WINDOW_KEYS.invert, readWin(node, GK.WINDOW_KEYS.invert) > 0.5 ? 0 : 1)}
+                  >
+                    invert
+                  </button>
+                </div>
+                <p class="text-vance-muted text-[9px] italic">Drag handles on the viewport arrive in 6.10b.</p>
               </div>
             {/if}
           </div>

@@ -72,8 +72,8 @@ struct Params {
     view_lut_params: vec4<f32>,
     // Number of active grade nodes; only .x is read.
     grade_count: vec4<u32>,
-    // Serial color-grade chain (Phase 6.6/6.7/6.9). Must match the Rust
-    // GradeNode layout (9 vec4 = 144 bytes) byte-for-byte.
+    // Serial color-grade chain (Phase 6.6/6.7/6.9/6.10). Must match the
+    // Rust GradeNode layout (11 vec4 = 176 bytes) byte-for-byte.
     grades: array<GradeNode, 8>,
 };
 
@@ -87,7 +87,9 @@ struct GradeNode {
     flags: vec4<f32>,       // (enabled, mode 0=primary/1=log/2=curves, qual_enable, qual_invert)
     qual_a: vec4<f32>,      // (hue_center, hue_range, sat_lo, sat_hi)
     qual_b: vec4<f32>,      // (luma_lo, luma_hi, hue_soft, sat_soft)
-    qual_c: vec4<f32>,      // (luma_soft, show_mask, window_rsvd0, window_rsvd1)
+    qual_c: vec4<f32>,      // (luma_soft, show_mask, _, _)
+    win_a: vec4<f32>,       // (shape 0=off/1=ellipse/2=rect, center_x, center_y, rotation_rad)
+    win_b: vec4<f32>,       // (half_size_x, half_size_y, feather, invert)
 };
 @group(0) @binding(4) var<uniform> params: Params;
 
@@ -223,18 +225,60 @@ fn qualifier_mask(rgb_lin: vec3<f32>, n: GradeNode) -> f32 {
     return clamp(m, 0.0, 1.0);
 }
 
+// ---- Power window (shape mask), Phase 6.10 --------------------------------
+//
+// A geometric mask on the node's correction, computed in SOURCE-UV space
+// (image content) so it stays locked to the subject under clip
+// transform/crop and so the 6.11 point tracker (which tracks image
+// content) can animate the center directly. `aspect = width/height` makes
+// equal half-sizes draw a circle in pixels rather than an ellipse.
+fn window_mask(uv: vec2<f32>, n: GradeNode, aspect: f32) -> f32 {
+    let shape = n.win_a.x;
+    if (shape < 0.5) { return 1.0; }   // 0 = off -> no restriction
+    let center = n.win_a.yz;
+    let rot = n.win_a.w;
+    let half = max(n.win_b.xy, vec2<f32>(1e-4));
+    let feather = max(n.win_b.z, 1e-4);
+    let invert = n.win_b.w;
+    // Aspect-correct BOTH the delta and the x radius so the ratio is
+    // preserved (a one-sided multiply makes egg shapes).
+    var d = uv - center;
+    d.x = d.x * aspect;
+    let c = cos(-rot);
+    let s = sin(-rot);
+    let local = vec2<f32>(d.x * c - d.y * s, d.x * s + d.y * c);
+    let r = vec2<f32>(half.x * aspect, half.y);
+    var nd: f32;
+    if (shape < 1.5) {
+        nd = length(local / r);                          // ellipse: 1.0 on boundary
+    } else {
+        let q = abs(local) / r;
+        nd = max(q.x, q.y);                              // rect: Chebyshev box
+    }
+    // Convert the uv-space feather to the nd metric via the mean radius.
+    let band = feather / max(0.5 * (r.x + r.y), 1e-4);
+    var m = 1.0 - smoothstep(1.0, 1.0 + band, nd);
+    if (invert > 0.5) { m = 1.0 - m; }
+    return clamp(m, 0.0, 1.0);
+}
+
 // Apply the serial grade chain in linear working space. Intermediate
 // values are NOT clamped to [0,1] (only floored at 0) so nodes compose
 // like a real grade graph; the downstream brightness/contrast block
 // (and the output stage) bound the final SDR result.
 //
-// Each node's correction is masked by its HSL qualifier (when enabled):
-// out = mix(input, graded, mask), with the mask computed on the node's
-// INPUT pixel (standard secondary behavior). A disabled qualifier yields
-// mask=1 (exact passthrough of the pre-6.9 behavior).
-fn apply_grades(rgb_in: vec3<f32>) -> vec3<f32> {
+// Each node's correction is masked by `qualifier_mask * window_mask`,
+// computed on the node's INPUT pixel + the source UV (standard secondary
+// behavior). Both masks are 1.0 when their feature is off, so a node with
+// neither is an exact passthrough of pre-6.9/6.10 behavior.
+fn apply_grades(rgb_in: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
     var rgb = rgb_in;
     let count = params.grade_count.x;
+    // Frame aspect for circular windows — tex_y_a is always bound when
+    // the shader runs (render errors NoFrame otherwise). Hoisted out of
+    // the loop.
+    let dims = textureDimensions(tex_y_a);
+    let aspect = f32(dims.x) / max(f32(dims.y), 1.0);
     for (var i = 0u; i < count; i = i + 1u) {
         let n = params.grades[i];
         if (n.flags.x < 0.5) { continue; }      // bypassed node
@@ -251,14 +295,16 @@ fn apply_grades(rgb_in: vec3<f32>) -> vec3<f32> {
                 graded = apply_curve(src, i);
             }
         }
+        // Combined node mask: qualifier (hue/sat/luma) ∩ power window.
         var mask = 1.0;
         if (n.flags.z > 0.5) {                  // qualifier enabled
             mask = qualifier_mask(src, n);
         }
+        mask = mask * window_mask(uv, n, aspect);
         rgb = mix(src, graded, mask);
-        // Matte solo: show this node's mask as grayscale and stop. The
-        // first matte-enabled node wins (UI keeps it mutually exclusive).
-        if (n.flags.z > 0.5 && n.qual_c.y > 0.5) {
+        // Matte solo: show this node's COMBINED mask as grayscale and
+        // stop. Gated on show_mask alone so a window-only node can solo.
+        if (n.qual_c.y > 0.5) {
             g_matte_hit = true;
             rgb = vec3<f32>(mask);
             break;
@@ -413,7 +459,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     //     grade_count == 0, so pre-6.6 frames render bit-identically.
     //     Pipeline contract: grade chain -> brightness/contrast ->
     //     keys -> working->output -> view-LUT.
-    rgb_lin_working = apply_grades(rgb_lin_working);
+    rgb_lin_working = apply_grades(rgb_lin_working, source_uv);
     // Qualifier matte solo (6.9): a grade node requested "show mask", so
     // return the raw grayscale matte BEFORE contrast / keys / output
     // matrix / view-LUT (any of which would tint a mid-gray matte).
