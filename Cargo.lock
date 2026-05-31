@@ -5272,6 +5272,7 @@ dependencies = [
  "vance-scopes",
  "vance-time",
  "vance-timeline",
+ "vance-tracker",
  "vance-viewport",
  "wgpu",
 ]
@@ -5455,6 +5456,14 @@ dependencies = [
  "uuid",
  "vance-color",
  "vance-core",
+]
+
+[[package]]
+name = "vance-tracker"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -21,6 +21,7 @@
     label,
     points,
     color = '#e6ebf5',
+    identityY = null,
     onInput,
     onCommit
   }: {
@@ -28,6 +29,10 @@
     /** Control points in [0,1]×[0,1], sorted by x. Empty = identity. */
     points: Pt[];
     color?: string;
+    /** Identity baseline for multiplier-style curves (6.8b hs/hl use
+     *  `0.5` so the empty-curve display is a flat no-op line, not the
+     *  diagonal). Null/undefined keeps the classic y=x baseline. */
+    identityY?: number | null;
     onInput: (points: Pt[]) => void;
     onCommit: (points: Pt[]) => void;
   } = $props();
@@ -35,11 +40,17 @@
   const SIZE = 200;
   const HIT_PX = 9; // click-to-grab radius
 
-  // An empty/short list means "identity ramp"; show it as the diagonal
-  // with two draggable endpoints so the user can start editing.
+  // An empty/short list means "identity"; default baseline is y=x, but
+  // multiplier curves pass identityY to get a flat horizontal baseline.
   function normalize(p: Pt[]): Pt[] {
     if (p.length >= 2) {
       return p.map((q) => ({ x: q.x, y: q.y })).sort((a, b) => a.x - b.x);
+    }
+    if (identityY !== null && identityY !== undefined) {
+      return [
+        { x: 0, y: identityY },
+        { x: 1, y: identityY }
+      ];
     }
     return [
       { x: 0, y: 0 },
@@ -59,7 +70,11 @@
   // the first paint (no identity flash).
   let syncedKey = '';
   $effect.pre(() => {
-    const key = JSON.stringify(points);
+    // Include identityY in the key so switching from a multiplier
+    // channel (identityY=0.5) to a remap channel (identityY=null) on a
+    // STILL-EMPTY curve re-normalizes the baseline (else the editor
+    // keeps showing the old horizontal line instead of the diagonal).
+    const key = JSON.stringify(points) + '|' + String(identityY);
     untrack(() => {
       if (key !== syncedKey) {
         syncedKey = key;
@@ -168,9 +183,13 @@
 
   // Reset to identity (clears all interior points). Bound to the button.
   function reset() {
+    // Reset to the per-channel identity baseline so a multiplier-curve
+    // reset doesn't accidentally encode a diagonal as the new identity.
+    const y0 = identityY ?? 0;
+    const y1 = identityY ?? 1;
     pts = [
-      { x: 0, y: 0 },
-      { x: 1, y: 1 }
+      { x: 0, y: y0 },
+      { x: 1, y: y1 }
     ];
     dragIdx = null;
     onCommit(pts.map((p) => ({ ...p })));

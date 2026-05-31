@@ -709,3 +709,81 @@ fn window_aspect_circular_on_wide_frame() {
         "circle must be symmetric in pixels: x={x_pt:?} y={y_pt:?}"
     );
 }
+
+// ---- HSL hue-wheel curves (Phase 6.8b) -----------------------------------
+
+use vance_render::CurveSet;
+use vance_timeline::{Keyframe, KeyframeInterp};
+
+fn lkf(x: f64, y: f64) -> Keyframe {
+    Keyframe { time_seconds: x, value: y, interp: KeyframeInterp::Linear }
+}
+fn const_curve(y: f64) -> Vec<Keyframe> {
+    // Same y for x=0 and x=1 -> a constant remap independent of input.
+    vec![lkf(0.0, y), lkf(1.0, y)]
+}
+
+// hh = constant 1/3 -> every pixel's hue is remapped to green; a red
+// frame should render GREEN-dominant.
+#[test]
+fn curves_hsl_hue_rotate_red_to_green() {
+    let red = solid_yuv420p(64, 64, 63, 102, 240);
+    let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
+    r.upload_frame(&red).expect("upload");
+    r.set_grades(&[GradeNodeParams {
+        enabled: true,
+        mode: GradeMode::Curves,
+        curves: Some(CurveSet {
+            hh: const_curve(1.0 / 3.0),
+            ..CurveSet::default()
+        }),
+        ..GradeNodeParams::default()
+    }]);
+    let g = center(&r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64);
+    assert!(g[1] > g[0] + 30 && g[1] > g[2] + 30, "expected green-dominant, got {g:?}");
+}
+
+// hs = constant 0 -> hue-driven sat multiplier = 0 -> saturation killed.
+// A red frame should render NEAR-GRAY (R ≈ G ≈ B).
+#[test]
+fn curves_hsl_sat_kill_makes_red_gray() {
+    let red = solid_yuv420p(64, 64, 63, 102, 240);
+    let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
+    r.upload_frame(&red).expect("upload");
+    r.set_grades(&[GradeNodeParams {
+        enabled: true,
+        mode: GradeMode::Curves,
+        curves: Some(CurveSet {
+            hs: const_curve(0.0),
+            ..CurveSet::default()
+        }),
+        ..GradeNodeParams::default()
+    }]);
+    let g = center(&r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64);
+    let max = g[0].max(g[1]).max(g[2]);
+    let min = g[0].min(g[1]).min(g[2]);
+    assert!(
+        (max as i32 - min as i32) < 20,
+        "sat-kill should be near-gray (RGB equal), got {g:?}"
+    );
+}
+
+// An ALL-EMPTY HSL CurveSet (the default) must be bit-for-bit identical
+// to no HSL curves at all — the log_smh.y flag stays 0 and the shader's
+// HSL block never runs. This is the regression gate that protects every
+// pre-6.8b golden.
+#[test]
+fn curves_hsl_identity_is_bit_identical() {
+    let frame = solid_yuv420p(64, 64, 128, 128, 128);
+    let plain = render_center(&[], &frame);
+    let with_empty_hsl = render_center(
+        &[GradeNodeParams {
+            enabled: true,
+            mode: GradeMode::Curves,
+            curves: Some(CurveSet::default()), // tone + HSL all empty
+            ..GradeNodeParams::default()
+        }],
+        &frame,
+    );
+    assert_eq!(plain, with_empty_hsl, "all-empty curves node must be a passthrough");
+}

@@ -21,6 +21,8 @@ import {
   computeScopes,
   setScopesEnabled as ipcSetScopesEnabled,
   setMatteNode as ipcSetMatteNode,
+  trackWindow as ipcTrackWindow,
+  type TrackSummary,
   insertClipAt,
   loadProject,
   addEffectToClip as ipcAddEffect,
@@ -397,6 +399,35 @@ class ProjectState {
       await ipcSetScopesEnabled(on);
     } catch (e) {
       console.debug('setScopesEnabled', e);
+    }
+  }
+
+  /** Track a power window's center forward N frames via ZNCC and write
+   *  the result as keyframes on win_cx/win_cy (one undoable edit).
+   *  Synchronous: blocks while the engine decodes and tracks. Phase 6.11. */
+  async trackWindow(
+    trackId: string,
+    clipId: string,
+    effectId: string,
+    startSourceSeconds: number,
+    nFrames: number,
+    patchHalf: number,
+    searchRadius: number
+  ): Promise<TrackSummary | null> {
+    this.error = null;
+    try {
+      return await ipcTrackWindow(
+        trackId,
+        clipId,
+        effectId,
+        startSourceSeconds,
+        nFrames,
+        patchHalf,
+        searchRadius
+      );
+    } catch (e) {
+      this.error = String(e);
+      return null;
     }
   }
 

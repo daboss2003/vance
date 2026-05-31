@@ -153,16 +153,84 @@ fn apply_log(rgb: vec3<f32>, n: GradeNode) -> vec3<f32> {
 // upper-clamped — same serial-chain convention as apply_primary. Uses
 // textureSampleLevel because we're in the (non-uniform) grade loop where
 // implicit-derivative sampling is illegal in WGSL.
-fn apply_curve(rgb: vec3<f32>, i: u32) -> vec3<f32> {
-    let rowv = (f32(i) + 0.5) / 8.0;
-    let cr = textureSampleLevel(tex_curve_atlas, samp, vec2<f32>(clamp(rgb.r, 0.0, 1.0), rowv), 0.0).r;
-    let cg = textureSampleLevel(tex_curve_atlas, samp, vec2<f32>(clamp(rgb.g, 0.0, 1.0), rowv), 0.0).g;
-    let cb = textureSampleLevel(tex_curve_atlas, samp, vec2<f32>(clamp(rgb.b, 0.0, 1.0), rowv), 0.0).b;
-    var out = vec3<f32>(cr, cg, cb);
-    let l = dot(max(rgb, vec3<f32>(0.0)), vec3<f32>(0.2126, 0.7152, 0.0722));
-    let cl = textureSampleLevel(tex_curve_atlas, samp, vec2<f32>(clamp(l, 0.0, 1.0), rowv), 0.0).a;
-    // Scale by curve(input_luma)/input_luma to keep hue; guard near black.
-    out = select(out, out * (cl / max(l, 1e-4)), l > 1e-4);
+// ---- HSL hue-wheel curves (Phase 6.8b) ------------------------------------
+//
+// Five secondary curves operating in the SAME perceptual-encode HSL space
+// the 6.9 qualifier uses (encode = pow(linear, 1/2.2)):
+//   hh: hue -> hue REMAP, cyclic input. y = sampled (direct remap).
+//   hs: hue -> sat MULTIPLIER. scale = 2*sampled (y=0.5 is no-op).
+//   hl: hue -> lum MULTIPLIER. scale = 2*sampled (y=0.5 is no-op).
+//   ss: sat -> sat REMAP. y = sampled.
+//   ll: lum -> lum REMAP. y = sampled.
+// Stored in atlas rows 3*i+1 (lanes r,g,b,a = hh,hs,hl,ss) and 3*i+2
+// (lane r = ll). Hue domain is CYCLIC; we wrap the sample coordinate
+// via fract() in-shader so the existing clamp sampler suffices.
+
+fn hsl_to_rgb_enc(h: f32, s: f32, l: f32) -> vec3<f32> {
+    // Standard HSL -> encoded RGB (in [0,1]); returns the gamma-encoded
+    // RGB that, when run through pow(_, 2.2), gives back linear RGB.
+    let c = (1.0 - abs(2.0 * l - 1.0)) * s;
+    let hp = fract(h) * 6.0;
+    let x = c * (1.0 - abs((hp - 2.0 * floor(hp / 2.0)) - 1.0));
+    var rgb = vec3<f32>(0.0);
+    if (hp < 1.0)      { rgb = vec3<f32>(c, x, 0.0); }
+    else if (hp < 2.0) { rgb = vec3<f32>(x, c, 0.0); }
+    else if (hp < 3.0) { rgb = vec3<f32>(0.0, c, x); }
+    else if (hp < 4.0) { rgb = vec3<f32>(0.0, x, c); }
+    else if (hp < 5.0) { rgb = vec3<f32>(x, 0.0, c); }
+    else               { rgb = vec3<f32>(c, 0.0, x); }
+    let m = l - 0.5 * c;
+    return rgb + vec3<f32>(m);
+}
+
+fn apply_hsl_curves(rgb_lin: vec3<f32>, i: u32) -> vec3<f32> {
+    let row1 = (3.0 * f32(i) + 1.5) / 24.0;     // HSL-1: hh, hs, hl, ss
+    let row2 = (3.0 * f32(i) + 2.5) / 24.0;     // HSL-2: ll, _, _, _
+    let hsl = rgb_to_hsl(rgb_lin);
+    let h = hsl.x;
+    let s = hsl.y;
+    let l = hsl.z;
+    // Hue is cyclic — wrap via fract() before the clamp sample. (The
+    // 0/1 seam can produce a tiny filter blip for curves with very
+    // different endpoints; cheaper than a separate Repeat sampler.)
+    let by_hue = textureSampleLevel(tex_curve_atlas, samp, vec2<f32>(fract(h), row1), 0.0);
+    // hh = REMAP (direct, cyclic).
+    let new_h = fract(by_hue.r);
+    // hs / hl = MULTIPLIERS keyed by hue. Stored 0..1 with 0.5 == no-op;
+    // decoded as 2*y so the range is [0, 2].
+    let s1 = clamp(s * (2.0 * by_hue.g), 0.0, 1.0);
+    let l1 = clamp(l * (2.0 * by_hue.b), 0.0, 1.0);
+    // ss = REMAP keyed by the intermediate saturation (row1, alpha lane).
+    let by_sat = textureSampleLevel(tex_curve_atlas, samp, vec2<f32>(s1, row1), 0.0);
+    let new_s = clamp(by_sat.a, 0.0, 1.0);
+    // ll = REMAP keyed by the intermediate luminance (row2, r lane).
+    let by_lum = textureSampleLevel(tex_curve_atlas, samp, vec2<f32>(l1, row2), 0.0);
+    let new_l = clamp(by_lum.r, 0.0, 1.0);
+    // Back to linear RGB via HSL -> encoded RGB -> pow(_, 2.2).
+    let out_enc = hsl_to_rgb_enc(new_h, new_s, new_l);
+    return pow(out_enc, vec3<f32>(2.2));
+}
+
+fn apply_curve(rgb: vec3<f32>, i: u32, n: GradeNode) -> vec3<f32> {
+    // Atlas is MAX_GRADES × 3 rows tall (6.8b). For node i:
+    //   row 3*i     = tone (R/G/B + luma)
+    //   row 3*i+1   = HSL-1 (hh, hs, hl, ss)
+    //   row 3*i+2   = HSL-2 (ll, _, _, _)
+    let row_tone = (3.0 * f32(i) + 0.5) / 24.0;
+    var out = rgb;
+    if (n.log_smh.x > 0.5) {                              // tone block
+        let cr = textureSampleLevel(tex_curve_atlas, samp, vec2<f32>(clamp(rgb.r, 0.0, 1.0), row_tone), 0.0).r;
+        let cg = textureSampleLevel(tex_curve_atlas, samp, vec2<f32>(clamp(rgb.g, 0.0, 1.0), row_tone), 0.0).g;
+        let cb = textureSampleLevel(tex_curve_atlas, samp, vec2<f32>(clamp(rgb.b, 0.0, 1.0), row_tone), 0.0).b;
+        out = vec3<f32>(cr, cg, cb);
+        let l = dot(max(rgb, vec3<f32>(0.0)), vec3<f32>(0.2126, 0.7152, 0.0722));
+        let cl = textureSampleLevel(tex_curve_atlas, samp, vec2<f32>(clamp(l, 0.0, 1.0), row_tone), 0.0).a;
+        // Scale by curve(input_luma)/input_luma to keep hue; guard near black.
+        out = select(out, out * (cl / max(l, 1e-4)), l > 1e-4);
+    }
+    if (n.log_smh.y > 0.5) {                              // HSL block (6.8b)
+        out = apply_hsl_curves(out, i);
+    }
     return out;
 }
 
@@ -289,10 +357,11 @@ fn apply_grades(rgb_in: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
         } else if (n.flags.y < 1.5) {
             graded = apply_log(src, n);
         } else {
-            // mode 2 = curves; skip the 4 samples for identity nodes
-            // (log_smh.x == 0 means every curve is the identity ramp).
-            if (n.log_smh.x > 0.5) {
-                graded = apply_curve(src, i);
+            // mode 2 = curves; run apply_curve when EITHER the tone
+            // (log_smh.x) or the HSL (log_smh.y, 6.8b) block is active —
+            // each block self-gates inside.
+            if (n.log_smh.x > 0.5 || n.log_smh.y > 0.5) {
+                graded = apply_curve(src, i, n);
             }
         }
         // Combined node mask: qualifier (hue/sat/luma) ∩ power window.

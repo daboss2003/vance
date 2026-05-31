@@ -847,25 +847,37 @@
 
   // ---- Curves (Phase 6.8) --------------------------------------------------
 
-  type CurveChannel = 'master' | 'r' | 'g' | 'b' | 'luma';
+  type CurveChannel = 'master' | 'r' | 'g' | 'b' | 'luma' | 'hh' | 'hs' | 'hl' | 'ss' | 'll';
   type CurvePt = { x: number; y: number };
 
   /** Which channel's curve is shown in the editor. */
   let curveChannel = $state<CurveChannel>('master');
 
-  const CURVE_CHANNELS: { key: CurveChannel; label: string; color: string }[] = [
+  // hh/ss/ll are REMAPS (identity y=x, like tone). hs/hl are MULTIPLIERS
+  // (identity y=0.5 — the shader decodes 2*y so 0.5 == no-op scale 1).
+  // The editor receives identityY so a fresh tab opens at the correct
+  // baseline instead of always at the diagonal.
+  const CURVE_CHANNELS: {
+    key: CurveChannel; label: string; color: string; identityY?: number;
+  }[] = [
     { key: 'master', label: 'Master', color: '#e6ebf5' },
     { key: 'r', label: 'Red', color: '#e0524d' },
     { key: 'g', label: 'Green', color: '#5fb86b' },
     { key: 'b', label: 'Blue', color: '#5b8def' },
-    { key: 'luma', label: 'Luma', color: '#d8b24a' }
+    { key: 'luma', label: 'Luma', color: '#d8b24a' },
+    { key: 'hh', label: 'Hue/Hue', color: '#c98ad9' },
+    { key: 'hs', label: 'Hue/Sat', color: '#c98ad9', identityY: 0.5 },
+    { key: 'hl', label: 'Hue/Lum', color: '#c98ad9', identityY: 0.5 },
+    { key: 'ss', label: 'Sat/Sat', color: '#9bb4c8' },
+    { key: 'll', label: 'Lum/Lum', color: '#d8b24a' }
   ];
 
-  // HSL hue-wheel curve tabs are defined in the data model (6.8b) but
-  // not yet rendered — greyed out here so the layout is forward-looking.
-  const HSL_CURVE_TABS = ['Hue/Hue', 'Hue/Sat', 'Hue/Lum', 'Sat/Sat', 'Lum/Lum'];
-
+  // Maps a CurveChannel to its grade.rs param key (tone vs HSL).
   function curveKeyFor(ch: CurveChannel): string {
+    if (ch === 'hh' || ch === 'hs' || ch === 'hl' || ch === 'ss' || ch === 'll') {
+      const map = { hh: 'hueHue', hs: 'hueSat', hl: 'hueLum', ss: 'satSat', ll: 'lumLum' } as const;
+      return GK.HSL_CURVE_KEYS[map[ch]];
+    }
     return GK.CURVE_KEYS[ch];
   }
 
@@ -881,12 +893,21 @@
    *  exact identity ramp (and `is_identity` skips sampling). Linear
    *  interp keeps the editor WYSIWYG with the baked LUT. */
   function curveParam(ch: CurveChannel, points: CurvePt[]): [string, EffectValue][] {
+    // REMAP channels (tone, hh, ss, ll) identity = y=x; MULTIPLIER
+    // channels (hs, hl) identity = y=0.5. Either way an exact-identity
+    // 2-point curve is sent as an EMPTY list so the engine bakes the
+    // type-specific identity and the non-identity flag stays off.
+    const idY = ch === 'hs' || ch === 'hl' ? 0.5 : null; // null => y=x
+    const matchesIdentity = (i: number) => {
+      if (idY === null) return Math.abs(points[i].y - points[i].x) < 1e-6;
+      return Math.abs(points[i].y - idY) < 1e-6;
+    };
     const isIdentity =
       points.length === 2 &&
       Math.abs(points[0].x) < 1e-6 &&
-      Math.abs(points[0].y) < 1e-6 &&
       Math.abs(points[1].x - 1) < 1e-6 &&
-      Math.abs(points[1].y - 1) < 1e-6;
+      matchesIdentity(0) &&
+      matchesIdentity(1);
     const value: EffectValue = isIdentity
       ? []
       : points.map((p) => ({ time_seconds: p.x, value: p.y, interp: 'Linear' as const }));
@@ -976,6 +997,39 @@
     if (matteNodeId && matteClipId) projectState.setMatteNode(matteClipId, null);
     matteNodeId = null;
     matteClipId = null;
+  }
+
+  // ---- Point tracker (Phase 6.11) ----------------------------------------
+  let trackFrames = $state(60);
+  let trackPatchHalf = $state(15);
+  let trackSearchRadius = $state(16);
+  let trackBusy = $state(false);
+  let trackSummary = $state<{
+    frames_tracked: number;
+    mean_score: number;
+    start_clip_seconds: number;
+    end_clip_seconds: number;
+  } | null>(null);
+
+  async function runTracker(node: EffectInfo) {
+    const d = selectedClipDetails;
+    if (!d) return;
+    trackBusy = true;
+    trackSummary = null;
+    try {
+      const r = await projectState.trackWindow(
+        d.track.id,
+        d.clip.id,
+        node.id,
+        d.clip.source_in_seconds,
+        Math.min(240, Math.max(2, Math.round(trackFrames))),
+        Math.max(2, Math.round(trackPatchHalf)),
+        Math.max(1, Math.round(trackSearchRadius))
+      );
+      if (r) trackSummary = r;
+    } finally {
+      trackBusy = false;
+    }
   }
 
   // If the soloed node is deleted (or otherwise vanishes from the chain),
@@ -2146,6 +2200,68 @@
                   </button>
                 </div>
                 <p class="text-vance-muted text-[9px] italic">Drag handles on the viewport arrive in 6.10b.</p>
+
+                <!-- Point tracker (Phase 6.11). Tracks the window center
+                     forward from the clip start by ZNCC on the Y plane;
+                     writes win_cx/win_cy keyframes in ONE undoable edit.
+                     Synchronous v1 — the UI is blocked while tracking. -->
+                <div class="mt-2 border-t border-vance-border pt-2">
+                  <div class="text-vance-muted mb-1 text-[10px] uppercase tracking-wider">Tracker</div>
+                  <div class="grid grid-cols-3 gap-1 text-[10px]">
+                    <label class="flex flex-col">
+                      <span class="text-vance-muted text-[9px]">frames</span>
+                      <input
+                        type="number"
+                        min="2"
+                        max="240"
+                        step="1"
+                        class="bg-vance-bg border-vance-border rounded border px-1 py-0.5"
+                        bind:value={trackFrames}
+                      />
+                    </label>
+                    <label class="flex flex-col">
+                      <span class="text-vance-muted text-[9px]">patch ½</span>
+                      <input
+                        type="number"
+                        min="2"
+                        max="64"
+                        step="1"
+                        class="bg-vance-bg border-vance-border rounded border px-1 py-0.5"
+                        bind:value={trackPatchHalf}
+                      />
+                    </label>
+                    <label class="flex flex-col">
+                      <span class="text-vance-muted text-[9px]">search ±</span>
+                      <input
+                        type="number"
+                        min="1"
+                        max="128"
+                        step="1"
+                        class="bg-vance-bg border-vance-border rounded border px-1 py-0.5"
+                        bind:value={trackSearchRadius}
+                      />
+                    </label>
+                  </div>
+                  <button
+                    class="mt-1 w-full rounded border border-[var(--color-vance-accent)] bg-[#003040] px-2 py-0.5 text-[11px] disabled:opacity-40"
+                    onclick={() => runTracker(node)}
+                    disabled={trackBusy}
+                  >
+                    {trackBusy ? 'Tracking…' : 'Track from clip start →'}
+                  </button>
+                  {#if trackSummary}
+                    <p class="text-vance-muted mt-1 text-[9px]">
+                      Tracked {trackSummary.frames_tracked} frames
+                      ({trackSummary.start_clip_seconds.toFixed(2)}s →
+                      {trackSummary.end_clip_seconds.toFixed(2)}s) ·
+                      mean score {trackSummary.mean_score.toFixed(2)}
+                    </p>
+                  {/if}
+                  <p class="text-vance-muted text-[9px] italic">
+                    Replaces win_cx/win_cy keyframes from the clip start through the tracked
+                    range. Decoder must be open on this clip (play/seek it once first).
+                  </p>
+                </div>
               </div>
             {/if}
           </div>
@@ -2195,19 +2311,11 @@
                 </button>
               {/each}
             </div>
-            <div class="mb-3 flex flex-wrap gap-1 opacity-40">
-              {#each HSL_CURVE_TABS as t (t)}
-                <span
-                  class="bg-vance-bg border-vance-border cursor-not-allowed rounded border px-1.5 py-0.5 text-[10px]"
-                  title="HSL hue-wheel curves arrive in 6.8b"
-                >
-                  {t}
-                </span>
-              {/each}
-            </div>
+            <!-- (HSL hue-wheel tabs are now full members of CURVE_CHANNELS above — 6.8b shipped.) -->
             <CurveEditor
               label={chMeta.label}
               color={chMeta.color}
+              identityY={chMeta.identityY ?? null}
               points={readCurve(node, curveChannel)}
               onInput={(pts) => previewCurve(node, curveChannel, pts)}
               onCommit={(pts) => commitCurve(node, curveChannel, pts)}

@@ -188,6 +188,11 @@ struct RenderParams {
 /// of `vance_timeline::grade::MAX_GRADE_NODES`.
 const MAX_GRADES: usize = 8;
 
+/// Curve-atlas rows per grade node (Phase 6.8 + 6.8b). Row 0 = tone
+/// curves (R/G/B/luma packed in RGBA); rows 1+2 = the five HSL hue-wheel
+/// curves (hh/hs/hl/ss/ll). Atlas height = MAX_GRADES × this.
+const CURVE_ROWS_PER_NODE: usize = 3;
+
 /// One color-grade node's GPU params. All `vec4` fields (no bare f32
 /// arrays) to dodge std140 stride traps — 9 × 16 = 144 bytes. The WGSL
 /// `GradeNode` struct must match this layout byte-for-byte.
@@ -291,12 +296,28 @@ pub struct CurveSet {
     pub b: Vec<vance_timeline::Keyframe>,
     /// Luma curve (applied as a hue-preserving ratio).
     pub luma: Vec<vance_timeline::Keyframe>,
+    // ---- HSL hue-wheel curves (Phase 6.8b) -------------------------------
+    //
+    // Five secondary curves operating in perceptual HSL. Empty = identity
+    // (no-op). The bake interprets remap curves (hh/ss/ll) with empty=y=x
+    // and multiplier curves (hs/hl) with empty=constant 0.5 (scale=1 in
+    // the shader's `2*y` decoding).
+    /// Hue→hue REMAP (cyclic input). y=x is identity.
+    pub hh: Vec<vance_timeline::Keyframe>,
+    /// Hue→saturation MULTIPLIER (cyclic input). y=0.5 is no-op (scale=1).
+    pub hs: Vec<vance_timeline::Keyframe>,
+    /// Hue→luminance MULTIPLIER (cyclic input). y=0.5 is no-op.
+    pub hl: Vec<vance_timeline::Keyframe>,
+    /// Saturation→saturation REMAP. y=x is identity.
+    pub ss: Vec<vance_timeline::Keyframe>,
+    /// Luminance→luminance REMAP. y=x is identity.
+    pub ll: Vec<vance_timeline::Keyframe>,
 }
 
 impl CurveSet {
-    /// True when every curve is empty (or trivially identity) — the
-    /// shader can skip sampling the atlas for such a node.
-    fn is_identity(&self) -> bool {
+    /// True when the TONE curves (master/R/G/B/luma) are all empty or
+    /// trivially the diagonal — the shader can skip the tone block.
+    fn is_tone_identity(&self) -> bool {
         let id = |p: &[vance_timeline::Keyframe]| {
             p.is_empty()
                 || (p.len() == 2
@@ -306,6 +327,20 @@ impl CurveSet {
                     && (p[1].time_seconds - 1.0).abs() < 1e-6)
         };
         id(&self.master) && id(&self.r) && id(&self.g) && id(&self.b) && id(&self.luma)
+    }
+    /// True when all 5 HSL curves are empty (the only cheap identity
+    /// check — non-empty fields trigger the shader's HSL block even if
+    /// they happen to be a diagonal).
+    fn is_hsl_identity(&self) -> bool {
+        self.hh.is_empty()
+            && self.hs.is_empty()
+            && self.hl.is_empty()
+            && self.ss.is_empty()
+            && self.ll.is_empty()
+    }
+    /// True when both the tone and HSL halves are identity.
+    fn is_identity(&self) -> bool {
+        self.is_tone_identity() && self.is_hsl_identity()
     }
 }
 
@@ -469,20 +504,27 @@ impl GradeNodeParams {
                 ..GradeNode::identity()
             },
             GradeMode::Curves => {
-                // Curve data lives in the atlas (row = node index); the
-                // GPU node only flags the mode + whether it's identity
-                // (so the shader can skip the atlas sample).
-                let non_identity = self
+                // Curve data lives in the atlas (row-block per node); the
+                // GPU node only flags the mode + which CURVE FAMILIES are
+                // non-identity so the shader can skip an idle block:
+                //   log_smh.x = tone (R/G/B/luma) non-identity
+                //   log_smh.y = HSL  (hh/hs/hl/ss/ll) non-identity (6.8b)
+                let (tone_active, hsl_active) = self
                     .curves
                     .as_ref()
-                    .map(|c| if c.is_identity() { 0.0 } else { 1.0 })
-                    .unwrap_or(0.0);
+                    .map(|c| (!c.is_tone_identity(), !c.is_hsl_identity()))
+                    .unwrap_or((false, false));
                 GradeNode {
                     lift: [0.0; 4],
                     gamma: [1.0, 1.0, 1.0, 1.0],
                     gain: [1.0, 1.0, 1.0, 1.0],
                     log_offset: [0.0; 4],
-                    log_smh: [non_identity, 0.0, 0.0, 0.0],
+                    log_smh: [
+                        if tone_active { 1.0 } else { 0.0 },
+                        if hsl_active { 1.0 } else { 0.0 },
+                        0.0,
+                        0.0,
+                    ],
                     flags: [enabled, 2.0, 0.0, 0.0],
                     ..GradeNode::identity()
                 }
@@ -580,6 +622,19 @@ fn f32_to_f16_bits(v: f32) -> u16 {
 /// 0.0 for an empty list (the keyframe convention), which would crush
 /// the channel to black. Output is clamped to the LUT's `[0, 1]`
 /// domain.
+/// Evaluate a curve at `x`, returning a per-curve-type IDENTITY value
+/// when the list is empty: pass `default = x` for REMAP curves
+/// (y = x is identity, e.g. hh / ss / ll / tone) and `default = 0.5` for
+/// MULTIPLIER curves (the shader decodes as `2*y` so 0.5 = scale 1,
+/// e.g. hs / hl). Phase 6.8b.
+#[inline]
+fn eval_curve_or_const(points: &[vance_timeline::Keyframe], x: f64, default: f64) -> f64 {
+    if points.is_empty() {
+        return default.clamp(0.0, 1.0);
+    }
+    vance_timeline::eval_curve(points, x).clamp(0.0, 1.0)
+}
+
 #[inline]
 fn eval_curve_or_identity(points: &[vance_timeline::Keyframe], x: f64) -> f64 {
     if points.is_empty() {
@@ -1147,17 +1202,45 @@ impl Renderer {
     /// single sample per channel.
     fn bake_and_upload_curve_atlas(&mut self, curve_inputs: &[(usize, CurveSet)]) {
         let w = vance_timeline::grade::CURVE_LUT_WIDTH; // 256
-        // Atlas: MAX_GRADES rows × w cols × 4 channels (f32, packed → f16).
-        let mut atlas = vec![0.0_f32; MAX_GRADES * w * 4];
-        // Default every row to identity (y = x on all four lanes).
-        for row in 0..MAX_GRADES {
+        // Atlas grew in 6.8b to host the HSL hue-wheel curves: now
+        // MAX_GRADES × CURVE_ROWS_PER_NODE rows × w cols × 4 channels.
+        // Per node:
+        //   row 3*i     = tone curves   (r=R, g=G, b=B, a=luma) — 6.8.
+        //   row 3*i+1   = HSL-1         (r=hh, g=hs, b=hl, a=ss) — 6.8b.
+        //   row 3*i+2   = HSL-2         (r=ll, g=_, b=_, a=_)    — 6.8b.
+        let h = MAX_GRADES * CURVE_ROWS_PER_NODE;
+        let mut atlas = vec![0.0_f32; h * w * 4];
+        // Default-fill identity per row TYPE: tone + remap curves are
+        // identity y=x; HSL multipliers (hs, hl) are stored y=0.5 (the
+        // shader decodes as 2*y, so 0.5 == scale 1.0 == no-op).
+        for row in 0..h {
+            let kind = row % CURVE_ROWS_PER_NODE;
             for u in 0..w {
                 let x = u as f32 / (w as f32 - 1.0);
                 let off = (row * w + u) * 4;
-                atlas[off] = x;
-                atlas[off + 1] = x;
-                atlas[off + 2] = x;
-                atlas[off + 3] = x;
+                match kind {
+                    0 => {
+                        // Tone row: r/g/b/luma all y=x.
+                        atlas[off] = x;
+                        atlas[off + 1] = x;
+                        atlas[off + 2] = x;
+                        atlas[off + 3] = x;
+                    }
+                    1 => {
+                        // HSL-1 identity: hh=y=x (remap), hs=hl=0.5 (the
+                        // shader decodes multipliers as 2*y, so 0.5 == no-op
+                        // scale 1.0; 1.0 here would silently double them),
+                        // ss=y=x (remap).
+                        atlas[off] = x;
+                        atlas[off + 1] = 0.5;
+                        atlas[off + 2] = 0.5;
+                        atlas[off + 3] = x;
+                    }
+                    _ => {
+                        // HSL-2: ll=y=x, rest unused (left 0).
+                        atlas[off] = x;
+                    }
+                }
             }
         }
         // Bake each curves node's row.
@@ -1176,6 +1259,12 @@ impl Renderer {
             let g_pts = sanitize_curve(&cs.g);
             let b_pts = sanitize_curve(&cs.b);
             let l_pts = sanitize_curve(&cs.luma);
+            // HSL curves (6.8b). Each Vec can be empty (identity).
+            let hh_pts = sanitize_curve(&cs.hh);
+            let hs_pts = sanitize_curve(&cs.hs);
+            let hl_pts = sanitize_curve(&cs.hl);
+            let ss_pts = sanitize_curve(&cs.ss);
+            let ll_pts = sanitize_curve(&cs.ll);
             for u in 0..w {
                 let x = u as f64 / (w as f64 - 1.0);
                 let m = eval_curve_or_identity(&m_pts, x);
@@ -1183,22 +1272,42 @@ impl Renderer {
                 let g = eval_curve_or_identity(&g_pts, m);
                 let b = eval_curve_or_identity(&b_pts, m);
                 let l = eval_curve_or_identity(&l_pts, x);
-                let off = (*row * w + u) * 4;
-                atlas[off] = r as f32;
-                atlas[off + 1] = g as f32;
-                atlas[off + 2] = b as f32;
-                atlas[off + 3] = l as f32;
+                // Tone row (3*i) = R/G/B/luma packed into RGBA.
+                let row_tone = ((*row * CURVE_ROWS_PER_NODE) * w + u) * 4;
+                atlas[row_tone] = r as f32;
+                atlas[row_tone + 1] = g as f32;
+                atlas[row_tone + 2] = b as f32;
+                atlas[row_tone + 3] = l as f32;
+                // HSL-1 row (3*i+1) = (hh, hs, hl, ss). Empty curves bake
+                // to their type's identity (remap → x, multiplier → 0.5,
+                // decoded as 2*y in the shader so 0.5 → scale 1).
+                let hh = eval_curve_or_const(&hh_pts, x, x);
+                let hs = eval_curve_or_const(&hs_pts, x, 0.5);
+                let hl = eval_curve_or_const(&hl_pts, x, 0.5);
+                let ss = eval_curve_or_const(&ss_pts, x, x);
+                let row_hsl1 = ((*row * CURVE_ROWS_PER_NODE + 1) * w + u) * 4;
+                atlas[row_hsl1] = hh as f32;
+                atlas[row_hsl1 + 1] = hs as f32;
+                atlas[row_hsl1 + 2] = hl as f32;
+                atlas[row_hsl1 + 3] = ss as f32;
+                // HSL-2 row (3*i+2) = (ll, _, _, _). Unused lanes 0.
+                let ll = eval_curve_or_const(&ll_pts, x, x);
+                let row_hsl2 = ((*row * CURVE_ROWS_PER_NODE + 2) * w + u) * 4;
+                atlas[row_hsl2] = ll as f32;
+                atlas[row_hsl2 + 1] = 0.0;
+                atlas[row_hsl2 + 2] = 0.0;
+                atlas[row_hsl2 + 3] = 0.0;
             }
         }
         self.upload_curve_atlas(&atlas, w as u32);
     }
 
-    /// Upload the baked curve atlas (`rows = MAX_GRADES`, `width`
+    /// Upload the baked curve atlas (`rows = MAX_GRADES × CURVE_ROWS_PER_NODE`, `width`
     /// columns, 4 f32 channels) to the GPU as an Rgba16Float 2D
     /// texture. Lazily allocates on first call (then rebuilds the bind
     /// group). Mirrors the `upload_lut` packing path.
     fn upload_curve_atlas(&mut self, atlas: &[f32], width: u32) {
-        let height = MAX_GRADES as u32;
+        let height = (MAX_GRADES * CURVE_ROWS_PER_NODE) as u32;
         // Replace the texture when absent OR still the 1×1 dummy (or any
         // stale width) — otherwise write_texture would overrun it.
         if self.tex_curve_atlas.is_none() || self.curve_atlas_width != width {
@@ -1969,6 +2078,7 @@ mod layout_tests {
             g: diag.clone(),
             b: diag.clone(),
             luma: diag,
+            ..CurveSet::default()
         };
         assert!(cs.is_identity());
         // A lifted master breaks identity.

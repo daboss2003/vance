@@ -454,6 +454,39 @@ export const setScopesEnabled = (on: boolean): Promise<void> =>
 export const setMatteNode = (clipId: string, effectId: string | null): Promise<void> =>
   invoke('set_matte_node', { clipId, effectId });
 
+/** Summary returned by `trackWindow`. Phase 6.11. */
+export type TrackSummary = {
+  frames_tracked: number;
+  mean_score: number;
+  /** Clip-relative seconds of the first/last keyframes written — the
+   *  bounds of the destructive "replaces keyframes in range" effect. */
+  start_clip_seconds: number;
+  end_clip_seconds: number;
+};
+
+/** Track a power-window center across `nFrames` frames forward by ZNCC
+ *  on the Y plane, writing the result as keyframes on the effect's
+ *  win_cx / win_cy (one undoable edit). Synchronous v1 — the IPC call
+ *  blocks while the engine decodes and tracks. Phase 6.11. */
+export const trackWindow = (
+  trackId: string,
+  clipId: string,
+  effectId: string,
+  startSourceSeconds: number,
+  nFrames: number,
+  patchHalf: number,
+  searchRadius: number
+): Promise<TrackSummary> =>
+  invoke('track_window', {
+    trackId,
+    clipId,
+    effectId,
+    startSourceSeconds,
+    nFrames,
+    patchHalf,
+    searchRadius
+  });
+
 /** Compute the current frame's scope data. Returns `null` when there's
  *  no update (scopes disabled, playing, or no cached frame). */
 export async function computeScopes(

@@ -1,0 +1,18 @@
+[package]
+name = "vance-tracker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# Pure CV — no wgpu/tauri/decoder. Frame-to-frame point tracking by
+# zero-mean normalized cross-correlation (ZNCC) on the Y plane. The
+# entire per-frame loop is exposed as pure functions over borrowed
+# slices so it's unit-testable without IPC.
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }

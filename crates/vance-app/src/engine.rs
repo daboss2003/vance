@@ -142,6 +142,24 @@ pub struct OcioViewInfo {
     pub size: u32,
 }
 
+/// Summary returned from a `track_window` invocation (Phase 6.11).
+#[derive(serde::Serialize, Clone, Copy, Debug)]
+pub struct TrackSummary {
+    /// Number of keyframes written (incl. the anchor at `start_pts`).
+    pub frames_tracked: u32,
+    /// Mean ZNCC score in `[-1, 1]` (1.0 = perfect match), averaged
+    /// over EVERY frame in `frames_tracked` (the anchor's self-match
+    /// counts as 1.0, so the metric covers all written keyframes).
+    /// Low values mean the tracker probably drifted.
+    pub mean_score: f32,
+    /// Clip-relative time of the anchor (and first keyframe written).
+    pub start_clip_seconds: f64,
+    /// Clip-relative time of the last keyframe written. The destructive
+    /// "replace keyframes in range" effect bounds are
+    /// `[start_clip_seconds, end_clip_seconds]`.
+    pub end_clip_seconds: f64,
+}
+
 /// One row in `ProjectInfo.sequences`.
 #[derive(serde::Serialize, Clone, Debug)]
 pub struct SequenceInfo {
@@ -453,6 +471,39 @@ fn clip_brightness_contrast_at(
 /// `t_seconds` so keyframed wheel values animate. Disabled nodes stay
 /// in the list (occupying their slot, bypassed in the shader) so the
 /// chain order is preserved. Capped at `MAX_GRADE_NODES`.
+/// Read the raw keyframe vector for a param key. A plain `Number(n)` is
+/// returned as a single `t=0` keyframe so a constant value survives the
+/// "merge with tracked keyframes" path (Phase 6.11). Anything else
+/// (Bool/String/absent) returns an empty Vec.
+fn read_keyframes(
+    params: &std::collections::BTreeMap<String, EffectValue>,
+    key: &str,
+) -> Vec<vance_timeline::Keyframe> {
+    match params.get(key) {
+        Some(EffectValue::Keyframes(v)) => v.clone(),
+        Some(EffectValue::Number(n)) => vec![vance_timeline::Keyframe {
+            time_seconds: 0.0,
+            value: *n,
+            interp: vance_timeline::KeyframeInterp::Linear,
+        }],
+        _ => Vec::new(),
+    }
+}
+
+/// Evaluate a keyframe list at clip-relative time `t`, returning
+/// `default` when the list is empty (so the tracker has a fallback
+/// anchor when no win_cx/cy keyframe has been authored yet).
+fn eval_keyframes_or(kfs: &[vance_timeline::Keyframe], t: f64, default: f64) -> f64 {
+    if kfs.is_empty() {
+        return default;
+    }
+    // Reuse the existing linear-interp evaluator by wrapping in an
+    // EffectValue::Keyframes (cheap clone of small Vec).
+    EffectValue::Keyframes(kfs.to_vec())
+        .eval_number(t)
+        .unwrap_or(default)
+}
+
 fn eval_clip_grades(
     effects: &[vance_timeline::Effect],
     t_seconds: f64,
@@ -517,6 +568,12 @@ fn eval_clip_grades(
                 g: curve(&e.params, gk::KEY_CURVE_G),
                 b: curve(&e.params, gk::KEY_CURVE_B),
                 luma: curve(&e.params, gk::KEY_CURVE_LUMA),
+                // HSL hue-wheel curves (6.8b). Empty = identity.
+                hh: curve(&e.params, gk::KEY_CURVE_HUE_HUE),
+                hs: curve(&e.params, gk::KEY_CURVE_HUE_SAT),
+                hl: curve(&e.params, gk::KEY_CURVE_HUE_LUM),
+                ss: curve(&e.params, gk::KEY_CURVE_SAT_SAT),
+                ll: curve(&e.params, gk::KEY_CURVE_LUM_LUM),
             })
         } else {
             None
@@ -3213,6 +3270,257 @@ impl Engine {
             clip_id,
             effect_id,
             params,
+        })
+    }
+
+    /// Track a power-window center across `n_frames` frames forward by
+    /// zero-mean normalized cross-correlation on the Y plane, then write
+    /// the (time, win_cx) and (time, win_cy) trail as a single batched
+    /// `update_effect_params` edit (one undo step). Phase 6.11.
+    ///
+    /// v1 limitations (deliberate, separable as 6.11b):
+    /// * synchronous — blocks the engine for ~`n_frames` decode RTTs;
+    ///   capped at `TRACK_FRAMES_MAX` so the UI can't hang too long;
+    /// * integer-pixel precision (no sub-pixel refinement);
+    /// * single-scale (no pyramid — fast motion needs a bigger search
+    ///   radius rather than coarser tracking);
+    /// * no template update (drift on long shots);
+    /// * existing win_cx / win_cy keyframes INSIDE the tracked range are
+    ///   replaced; keyframes outside the range are preserved.
+    pub fn track_window(
+        &mut self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+        effect_id: EffectId,
+        start_source_seconds: f64,
+        n_frames: u32,
+        patch_half: u32,
+        search_radius: u32,
+    ) -> Result<TrackSummary, EngineError> {
+        /// Hard cap on the synchronous tracker — keeps the engine from
+        /// blocking the command queue for too long. 6.11b's async path
+        /// removes this.
+        const TRACK_FRAMES_MAX: u32 = 240;
+        use vance_timeline::grade as gk;
+
+        self.pause_for_edit();
+        let n_frames = n_frames.clamp(2, TRACK_FRAMES_MAX);
+        let patch_half_i = patch_half as i32;
+        let search_radius_i = search_radius as i32;
+
+        // ---- Snapshot all immutable state BEFORE borrowing the decoder.
+        let info = self
+            .stream_info
+            .as_ref()
+            .ok_or(EngineError::NoFileOpen)?
+            .clone();
+        let tb_num = info.time_base.0;
+        let tb_den = info.time_base.1;
+        let fr_num = info.frame_rate.0;
+        let fr_den = info.frame_rate.1;
+        if tb_num == 0 || tb_den == 0 || fr_num == 0 || fr_den == 0 {
+            return Err(EngineError::Project(
+                "tracker: invalid time_base or frame_rate (zero component)".into(),
+            ));
+        }
+        // step_pts = (fr_den / fr_num) sec/frame  /  (tb_num / tb_den) sec/tick
+        //          = fr_den * tb_den / (fr_num * tb_num)
+        let step_pts = ((fr_den as i128 * tb_den as i128)
+            / (fr_num as i128 * tb_num as i128))
+            .max(1) as i64;
+        // start_seconds (source-time) -> stream PTS in tb units.
+        let start_pts = (start_source_seconds * tb_den as f64 / tb_num as f64).round() as i64;
+
+        // Clip lookup (source_in for clip-relative time conversion).
+        // Also resolves the clip's source-file path so we can confirm
+        // the decoder is actually open on that file — otherwise a stale
+        // decoder (e.g. the user opened a different file in the Source
+        // monitor) would silently track frames from the wrong media.
+        let (source_in_seconds, expected_path, mut cx_kfs, mut cy_kfs) = {
+            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
+            let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+            let seq = project.sequence(seq_id).ok_or(EngineError::SequenceNotFound)?;
+            let clip = seq
+                .tracks
+                .iter()
+                .find_map(|t| t.clips.iter().find(|c| c.id == clip_id))
+                .ok_or(EngineError::Project("tracker: clip not found".into()))?;
+            let effect = clip
+                .effects
+                .iter()
+                .find(|e| e.id == effect_id)
+                .ok_or(EngineError::Project("tracker: effect not found".into()))?;
+            let media = project
+                .media
+                .get(&clip.media)
+                .ok_or(EngineError::MediaNotFound)?;
+            (
+                rt_to_seconds(clip.source_in),
+                media.path.to_string_lossy().into_owned(),
+                read_keyframes(&effect.params, gk::KEY_WIN_CENTER_X),
+                read_keyframes(&effect.params, gk::KEY_WIN_CENTER_Y),
+            )
+        };
+        // Refuse to track if the decoder isn't on this clip's source —
+        // silently sampling the wrong file is the worst possible failure.
+        match self.current_media_path.as_deref() {
+            Some(p) if p == expected_path => {}
+            _ => {
+                return Err(EngineError::Project(format!(
+                    "tracker: decoder is not open on the clip's source ({expected_path}) — \
+                     open / play this clip first, then re-run the tracker"
+                )));
+            }
+        }
+        // Anchor (clip-relative) time + position from the current
+        // keyframes (or defaults).
+        let pts_to_clip_t = |pts: i64| -> f64 {
+            (pts as f64) * (tb_num as f64) / (tb_den as f64) - source_in_seconds
+        };
+        let start_t = pts_to_clip_t(start_pts);
+        let anchor_cx_uv = eval_keyframes_or(&cx_kfs, start_t, 0.5);
+        let anchor_cy_uv = eval_keyframes_or(&cy_kfs, start_t, 0.5);
+
+        // ---- Decode anchor frame, extract template.
+        // Capture the anchor frame's ACTUAL dimensions for the seed
+        // pixel — using `info.width/height` here would silently desync
+        // if the decoder ever returned a rescaled / cropped frame.
+        let (template, anchor_w, anchor_h) = {
+            let dec = self.decoder.as_mut().ok_or(EngineError::NoFileOpen)?;
+            let frame = dec
+                .decode_at(start_pts)
+                .map_err(|e| EngineError::Project(format!("tracker decode: {e}")))?;
+            let stride = frame.strides[0];
+            let bytes_end = (frame.height * stride) as usize;
+            let view = vance_tracker::LumaView {
+                bytes: &frame.bytes[..bytes_end],
+                stride,
+                w: frame.width,
+                h: frame.height,
+            };
+            let anchor_px = vance_tracker::uv_to_px(
+                (anchor_cx_uv as f32, anchor_cy_uv as f32),
+                frame.width,
+                frame.height,
+            );
+            let template = vance_tracker::extract_patch(&view, anchor_px, patch_half_i)
+                .map_err(|e| EngineError::Project(format!("tracker patch: {e}")))?;
+            (template, frame.width, frame.height)
+        };
+        let mut prev_px = vance_tracker::uv_to_px(
+            (anchor_cx_uv as f32, anchor_cy_uv as f32),
+            anchor_w,
+            anchor_h,
+        );
+
+        // ---- Per-frame loop. Frame 0 is the anchor (already used);
+        // results[0..n_frames-1] correspond to pts = start_pts + i*step.
+        let mut tracked: Vec<(f64, (f32, f32))> = Vec::with_capacity(n_frames as usize);
+        // Include the anchor itself so seek-to-start is bit-exact.
+        tracked.push((start_t, (anchor_cx_uv as f32, anchor_cy_uv as f32)));
+        // Seed `sum_score` with the anchor's self-correlation (exactly
+        // 1.0 by construction — the template equals its own source patch)
+        // so `mean_score = sum / scored` covers EVERY frame in
+        // `frames_tracked`, not just the N-1 tracked frames. Without this
+        // a user seeing frames_tracked=N + mean_score=M can't tell
+        // whether M covers N or N-1 samples.
+        let mut sum_score = 1.0_f32;
+        let mut scored = 1u32;
+        // Run the per-frame loop in an inner closure so a decode/track
+        // failure mid-track doesn't discard the keyframes that already
+        // succeeded — we commit the partial trail below before
+        // propagating the error.
+        let loop_err: Option<EngineError> = (|| -> Result<(), EngineError> {
+            for i in 1..n_frames {
+                let pts = start_pts + (i as i64) * step_pts;
+                let dec = self.decoder.as_mut().ok_or(EngineError::NoFileOpen)?;
+                let frame = dec
+                    .decode_at(pts)
+                    .map_err(|e| EngineError::Project(format!("tracker decode @ pts {pts}: {e}")))?;
+                let stride = frame.strides[0];
+                let bytes_end = (frame.height * stride) as usize;
+                let view = vance_tracker::LumaView {
+                    bytes: &frame.bytes[..bytes_end],
+                    stride,
+                    w: frame.width,
+                    h: frame.height,
+                };
+                let r = vance_tracker::track_ncc(
+                    &template,
+                    &view,
+                    prev_px,
+                    search_radius_i,
+                    patch_half_i,
+                )
+                .map_err(|e| EngineError::Project(format!("tracker step @ pts {pts}: {e}")))?;
+                prev_px = r.center_px;
+                sum_score += r.score;
+                scored += 1;
+                let t = pts_to_clip_t(pts);
+                let uv = vance_tracker::px_to_uv(r.center_px, frame.width, frame.height);
+                tracked.push((t, uv));
+            }
+            Ok(())
+        })()
+        .err();
+
+        // ---- Merge: drop any existing keyframes in the tracked range
+        // (inclusive on both ends), then append the new trail and sort.
+        let end_t = tracked.last().map(|(t, _)| *t).unwrap_or(start_t);
+        cx_kfs.retain(|k| k.time_seconds < start_t || k.time_seconds > end_t);
+        cy_kfs.retain(|k| k.time_seconds < start_t || k.time_seconds > end_t);
+        for (t, (u, v)) in &tracked {
+            cx_kfs.push(vance_timeline::Keyframe {
+                time_seconds: *t,
+                value: *u as f64,
+                interp: vance_timeline::KeyframeInterp::Linear,
+            });
+            cy_kfs.push(vance_timeline::Keyframe {
+                time_seconds: *t,
+                value: *v as f64,
+                interp: vance_timeline::KeyframeInterp::Linear,
+            });
+        }
+        let cmp = |a: &vance_timeline::Keyframe, b: &vance_timeline::Keyframe| {
+            a.time_seconds
+                .partial_cmp(&b.time_seconds)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        };
+        cx_kfs.sort_by(cmp);
+        cy_kfs.sort_by(cmp);
+
+        // ---- One batched, undoable update — committed BEFORE
+        // propagating any loop error so partial progress is preserved.
+        self.update_effect_params(
+            track_id,
+            clip_id,
+            effect_id,
+            vec![
+                (
+                    gk::KEY_WIN_CENTER_X.to_string(),
+                    EffectValue::Keyframes(cx_kfs),
+                ),
+                (
+                    gk::KEY_WIN_CENTER_Y.to_string(),
+                    EffectValue::Keyframes(cy_kfs),
+                ),
+            ],
+        )?;
+        if let Some(e) = loop_err {
+            return Err(e);
+        }
+
+        let mean_score = if scored > 0 {
+            sum_score / scored as f32
+        } else {
+            1.0
+        };
+        let end_clip_seconds = tracked.last().map(|(t, _)| *t).unwrap_or(start_t);
+        Ok(TrackSummary {
+            frames_tracked: tracked.len() as u32,
+            mean_score,
+            start_clip_seconds: start_t,
+            end_clip_seconds,
         })
     }
 

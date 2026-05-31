@@ -11,7 +11,7 @@
 
 mod engine;
 
-use engine::{EngineHandle, MediaItemInfo, ProjectInfo, SequenceContents, SourceState};
+use engine::{EngineHandle, MediaItemInfo, ProjectInfo, SequenceContents, SourceState, TrackSummary};
 use serde::Serialize;
 use tauri::Manager;
 use vance_decoder::StreamInfo;
@@ -626,6 +626,43 @@ fn set_matte_node(
         .map_err(|e| e.to_string())
 }
 
+/// Track a power-window center across `n_frames` frames forward by ZNCC
+/// on the Y plane, writing the result as a single batched keyframe
+/// update on the effect's win_cx / win_cy. Phase 6.11.
+#[tauri::command]
+fn track_window(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    clip_id: String,
+    effect_id: String,
+    start_source_seconds: f64,
+    n_frames: u32,
+    patch_half: u32,
+    search_radius: u32,
+) -> Result<TrackSummary, String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let clip_uuid = clip_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid clip id: {e}"))?;
+    let effect_uuid = effect_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid effect id: {e}"))?;
+    state
+        .lock()
+        .track_window(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            vance_timeline::ClipId::from_uuid(clip_uuid),
+            vance_timeline::EffectId::from_uuid(effect_uuid),
+            start_source_seconds,
+            n_frames,
+            patch_half,
+            search_radius,
+        )
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn set_scopes_enabled(state: tauri::State<'_, EngineHandle>, on: bool) -> Result<(), String> {
     state.lock().set_scopes_enabled(on);
@@ -903,6 +940,7 @@ fn main() {
             set_scopes_enabled,
             compute_scopes,
             set_matte_node,
+            track_window,
             trim_clip_in,
             trim_clip_out,
             play_sequence,
