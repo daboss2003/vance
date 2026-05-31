@@ -9,6 +9,7 @@ members = [
     "crates/vance-scopes",
     "crates/vance-tracker",
     "crates/vance-grading-cmd",
+    "crates/vance-peaks",
     "crates/vance-media",
     "crates/vance-ffmpeg-sys",
     "crates/vance-decoder",
@@ -50,6 +51,7 @@ vance-ocio = { path = "crates/vance-ocio" }
 vance-scopes = { path = "crates/vance-scopes" }
 vance-tracker = { path = "crates/vance-tracker" }
 vance-grading-cmd = { path = "crates/vance-grading-cmd" }
+vance-peaks = { path = "crates/vance-peaks" }
 vance-media = { path = "crates/vance-media" }
 vance-ffmpeg-sys = { path = "crates/vance-ffmpeg-sys" }
 vance-decoder = { path = "crates/vance-decoder" }

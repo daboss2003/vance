@@ -55,6 +55,12 @@ export function gradeDefault(key: string): number {
 // HSL qualifier / secondary key (Phase 6.9). Mirror of grade.rs. The
 // range/hi defaults are WIDE-OPEN (1.0) so enabling the qualifier and
 // setting only a hue doesn't key to nothing.
+//
+// 6.9b: eyedropper "pick-from-pixel" (set hue_c / sat_lo,hi / luma_lo,hi
+// by clicking a viewport pixel) is a separable follow-up — it needs a
+// new viewport->pixel readback IPC (the on-viewport overlay path that
+// 6.10b is also blocked on; see ui/src/routes/+page.svelte). The
+// numeric sliders below are the complete v1 surface.
 export const QUALIFIER_KEYS = {
   enable: 'qual_enable',
   hueC: 'qual_hue_c',

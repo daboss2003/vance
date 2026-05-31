@@ -1,0 +1,22 @@
+[package]
+name = "vance-peaks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# Audio peak (waveform) cache: byte-exact on-disk format, pure-Rust
+# builder/reader, no IPC or filesystem orchestration. Phase 7.1 M1.
+# Consumers: the PeaksService in vance-app (Phase 7.1 M2) feeds PCM
+# chunks into a `PeakBuilder` and writes the result via `write_atomic`.
+# IPC handlers read level slices via `read_slice` and ship them to the
+# UI verbatim.
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

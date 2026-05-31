@@ -2206,6 +2206,11 @@ impl Engine {
     ///   contended, returns the cache rather than blocking the scheduler.
     /// The GPU readback runs while holding the render lock; the (pure)
     /// accumulation runs AFTER the lock is released.
+    ///
+    /// 6.12b: live-during-playback scopes would require the playback
+    /// scheduler to emit a downsampled copy on a background channel and
+    /// ship it without ever blocking frame pacing — a separable feature,
+    /// not a gap in this paused-workflow tool.
     pub fn compute_scopes(
         &mut self,
         cfg: vance_scopes::ScopeConfig,

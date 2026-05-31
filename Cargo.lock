@@ -5406,6 +5406,14 @@ name = "vance-otio"
 version = "0.0.0"
 
 [[package]]
+name = "vance-peaks"
+version = "0.0.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "vance-plugin-host"
 version = "0.0.0"
 
