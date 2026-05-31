@@ -5266,6 +5266,7 @@ dependencies = [
  "vance-color",
  "vance-core",
  "vance-decoder",
+ "vance-grading-cmd",
  "vance-ocio",
  "vance-project",
  "vance-render",
@@ -5358,6 +5359,19 @@ name = "vance-ffmpeg-sys"
 version = "0.0.0"
 dependencies = [
  "ffmpeg-the-third",
+]
+
+[[package]]
+name = "vance-grading-cmd"
+version = "0.0.0"
+dependencies = [
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+ "vance-core",
+ "vance-timeline",
 ]
 
 [[package]]

@@ -629,6 +629,45 @@ fn set_matte_node(
 /// Track a power-window center across `n_frames` frames forward by ZNCC
 /// on the Y plane, writing the result as a single batched keyframe
 /// update on the effect's win_cx / win_cy. Phase 6.11.
+/// Apply ONE typed grading command (Phase 6.13). Convenience wrapper
+/// around `apply_grading_commands` with a single-element batch; produces
+/// one undo step on success.
+#[tauri::command]
+fn apply_grading_command(
+    state: tauri::State<'_, EngineHandle>,
+    cmd: vance_grading_cmd::GradingCommand,
+) -> Result<vance_grading_cmd::GradingCommandOutcome, String> {
+    let mut outcomes = state
+        .lock()
+        .apply_grading_batch(&[cmd], None)
+        .map_err(|e| e.to_string())?;
+    Ok(outcomes.pop().unwrap_or(vance_grading_cmd::GradingCommandOutcome::None))
+}
+
+/// Apply a BATCH of typed grading commands as a single AI assistant
+/// turn. Sequence-affecting commands collapse into one `EditOp::Compound`
+/// (one undo step labeled `label`). Project-level / tracker commands run
+/// outside the compound and add their own entries.
+#[tauri::command]
+fn apply_grading_commands(
+    state: tauri::State<'_, EngineHandle>,
+    cmds: Vec<vance_grading_cmd::GradingCommand>,
+    label: Option<String>,
+) -> Result<Vec<vance_grading_cmd::GradingCommandOutcome>, String> {
+    state
+        .lock()
+        .apply_grading_batch(&cmds, label)
+        .map_err(|e| e.to_string())
+}
+
+/// JSON Schema for `GradingCommand`, for the AI runtime's tool-use spec.
+/// Single source of truth — derived from the Rust enum via `schemars`.
+#[tauri::command]
+fn grading_command_schema() -> serde_json::Value {
+    serde_json::to_value(vance_grading_cmd::grading_command_schema())
+        .unwrap_or(serde_json::Value::Null)
+}
+
 #[tauri::command]
 fn track_window(
     state: tauri::State<'_, EngineHandle>,
@@ -941,6 +980,9 @@ fn main() {
             compute_scopes,
             set_matte_node,
             track_window,
+            apply_grading_command,
+            apply_grading_commands,
+            grading_command_schema,
             trim_clip_in,
             trim_clip_out,
             play_sequence,

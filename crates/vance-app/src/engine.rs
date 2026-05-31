@@ -3524,6 +3524,349 @@ impl Engine {
         })
     }
 
+    /// Dispatch a batch of typed grading commands (Phase 6.13 — the AI
+    /// assistant's entry point). Sequence-affecting commands collapse
+    /// into ONE `EditOp::Compound` so the whole turn appears as a single
+    /// undo step labeled `label`. Project-level commands (OCIO, view
+    /// LUT, working space) and the tracker run inline against the
+    /// existing engine methods — they are NOT inside the compound (they
+    /// don't go through the sequence EditLog), so a batch that
+    /// interleaves them will produce additional undo entries. Returns
+    /// one `GradingCommandOutcome` per command, in order.
+    pub fn apply_grading_batch(
+        &mut self,
+        cmds: &[vance_grading_cmd::GradingCommand],
+        label: Option<String>,
+    ) -> Result<Vec<vance_grading_cmd::GradingCommandOutcome>, EngineError> {
+        use vance_grading_cmd as gc;
+        use vance_timeline::grade as gk;
+        use vance_timeline::{Effect, EffectId as EId, EffectValue, Keyframe, KeyframeInterp};
+        self.pause_for_edit();
+        let label = label.unwrap_or_else(|| "grading batch".to_string());
+
+        let parse_uuid = |s: &str, what: &str| -> Result<uuid::Uuid, EngineError> {
+            s.parse::<uuid::Uuid>()
+                .map_err(|e| EngineError::Project(format!("invalid {what} uuid: {e}")))
+        };
+        let parse_track = |s: &str| -> Result<TrackId, EngineError> {
+            Ok(TrackId::from_uuid(parse_uuid(s, "track_id")?))
+        };
+        let parse_clip = |s: &str| -> Result<vance_timeline::ClipId, EngineError> {
+            Ok(vance_timeline::ClipId::from_uuid(parse_uuid(s, "clip_id")?))
+        };
+        let parse_effect = |s: &str| -> Result<EId, EngineError> {
+            Ok(EId::from_uuid(parse_uuid(s, "effect_id")?))
+        };
+        let mode_str = |m: gc::GradeMode| match m {
+            gc::GradeMode::Primary => gk::MODE_PRIMARY,
+            gc::GradeMode::Log => gk::MODE_LOG,
+            gc::GradeMode::Curves => gk::MODE_CURVES,
+        };
+        // Convert curve points -> animatable Keyframes (linear interp,
+        // matching the editor's WYSIWYG model).
+        let curve_kfs = |pts: &[gc::CurvePoint]| -> EffectValue {
+            EffectValue::Keyframes(
+                pts.iter()
+                    .map(|p| Keyframe {
+                        time_seconds: p.x as f64,
+                        value: p.y as f64,
+                        interp: KeyframeInterp::Linear,
+                    })
+                    .collect(),
+            )
+        };
+        // Wheel-group → (rgb-key triple, master-key option). Primary
+        // groups carry a master lane; log groups don't.
+        let wheel_keys = |g: gc::WheelGroup| -> ([&'static str; 3], Option<&'static str>) {
+            match g {
+                gc::WheelGroup::Lift => ([gk::KEY_LIFT_R, gk::KEY_LIFT_G, gk::KEY_LIFT_B], Some(gk::KEY_LIFT_Y)),
+                gc::WheelGroup::Gamma => ([gk::KEY_GAMMA_R, gk::KEY_GAMMA_G, gk::KEY_GAMMA_B], Some(gk::KEY_GAMMA_Y)),
+                gc::WheelGroup::Gain => ([gk::KEY_GAIN_R, gk::KEY_GAIN_G, gk::KEY_GAIN_B], Some(gk::KEY_GAIN_Y)),
+                gc::WheelGroup::Offset => ([gk::KEY_OFFSET_R, gk::KEY_OFFSET_G, gk::KEY_OFFSET_B], None),
+                gc::WheelGroup::Shadow => ([gk::KEY_SHADOW_R, gk::KEY_SHADOW_G, gk::KEY_SHADOW_B], None),
+                gc::WheelGroup::Mid => ([gk::KEY_MID_R, gk::KEY_MID_G, gk::KEY_MID_B], None),
+                gc::WheelGroup::Highlight => ([gk::KEY_HI_R, gk::KEY_HI_G, gk::KEY_HI_B], None),
+            }
+        };
+        // Reset value for a wheel — gamma/gain are y=1 identity;
+        // everything else (lift/log balances/offset) is 0.
+        let reset_rgb_master = |g: gc::WheelGroup| -> ([f32; 3], f32) {
+            match g {
+                gc::WheelGroup::Gamma | gc::WheelGroup::Gain => ([1.0, 1.0, 1.0], 1.0),
+                _ => ([0.0, 0.0, 0.0], 0.0),
+            }
+        };
+
+        let mut outcomes: Vec<gc::GradingCommandOutcome> = Vec::with_capacity(cmds.len());
+        let mut pending: Vec<EditOp> = Vec::new();
+        // Flush the accumulated sequence-EditOps as one Compound (or a
+        // single op if exactly one is pending). Called between
+        // "project-level" / tracker commands and at the end.
+        let flush =
+            |this: &mut Self, pending: &mut Vec<EditOp>, label: &str| -> Result<(), EngineError> {
+                if pending.is_empty() {
+                    return Ok(());
+                }
+                let op = if pending.len() == 1 {
+                    pending.remove(0)
+                } else {
+                    EditOp::Compound {
+                        ops: std::mem::take(pending),
+                        label: label.to_string(),
+                    }
+                };
+                this.apply_edit_op(op)
+            };
+
+        for cmd in cmds {
+            match cmd {
+                gc::GradingCommand::AddGradeNode { track_id, clip_id, mode, label: lbl } => {
+                    let mut params = std::collections::BTreeMap::new();
+                    params.insert(gk::KEY_MODE.to_string(), EffectValue::String(mode_str(*mode).to_string()));
+                    if let Some(l) = lbl {
+                        params.insert(gk::KEY_LABEL.to_string(), EffectValue::String(l.clone()));
+                    }
+                    let new_id = EId::new();
+                    let effect = Effect {
+                        id: new_id,
+                        kind: gk::GRADE_KIND.to_string(),
+                        enabled: true,
+                        params,
+                    };
+                    pending.push(EditOp::AddEffectToClip {
+                        track_id: parse_track(track_id)?,
+                        clip_id: parse_clip(clip_id)?,
+                        effect,
+                    });
+                    outcomes.push(gc::GradingCommandOutcome::NodeAdded {
+                        effect_id: new_id.to_string(),
+                    });
+                }
+                gc::GradingCommand::RemoveGradeNode { track_id, clip_id, effect_id } => {
+                    pending.push(EditOp::RemoveEffectFromClip {
+                        track_id: parse_track(track_id)?,
+                        clip_id: parse_clip(clip_id)?,
+                        effect_id: parse_effect(effect_id)?,
+                    });
+                    outcomes.push(gc::GradingCommandOutcome::None);
+                }
+                gc::GradingCommand::ReorderGradeNode { track_id, clip_id, effect_id, new_index } => {
+                    pending.push(EditOp::MoveEffectOnClip {
+                        track_id: parse_track(track_id)?,
+                        clip_id: parse_clip(clip_id)?,
+                        effect_id: parse_effect(effect_id)?,
+                        new_index: *new_index as usize,
+                    });
+                    outcomes.push(gc::GradingCommandOutcome::None);
+                }
+                gc::GradingCommand::SetGradeNodeEnabled { track_id, clip_id, effect_id, enabled } => {
+                    pending.push(EditOp::SetEffectEnabled {
+                        track_id: parse_track(track_id)?,
+                        clip_id: parse_clip(clip_id)?,
+                        effect_id: parse_effect(effect_id)?,
+                        enabled: *enabled,
+                    });
+                    outcomes.push(gc::GradingCommandOutcome::None);
+                }
+                gc::GradingCommand::SetGradeNodeLabel { track_id, clip_id, effect_id, label: lbl } => {
+                    pending.push(EditOp::UpdateEffectParams {
+                        track_id: parse_track(track_id)?,
+                        clip_id: parse_clip(clip_id)?,
+                        effect_id: parse_effect(effect_id)?,
+                        params: vec![(gk::KEY_LABEL.to_string(), EffectValue::String(lbl.clone()))],
+                    });
+                    outcomes.push(gc::GradingCommandOutcome::None);
+                }
+                gc::GradingCommand::SetNodeMode { track_id, clip_id, effect_id, mode } => {
+                    pending.push(EditOp::UpdateEffectParams {
+                        track_id: parse_track(track_id)?,
+                        clip_id: parse_clip(clip_id)?,
+                        effect_id: parse_effect(effect_id)?,
+                        params: vec![(gk::KEY_MODE.to_string(), EffectValue::String(mode_str(*mode).to_string()))],
+                    });
+                    outcomes.push(gc::GradingCommandOutcome::None);
+                }
+                gc::GradingCommand::SetWheel { track_id, clip_id, effect_id, group, rgb, master, reset } => {
+                    let (rgb_keys, master_key) = wheel_keys(*group);
+                    let mut params: Vec<(String, EffectValue)> = Vec::new();
+                    if reset.unwrap_or(false) {
+                        let (rrgb, rmaster) = reset_rgb_master(*group);
+                        for (k, v) in rgb_keys.iter().zip(rrgb.iter()) {
+                            params.push((k.to_string(), EffectValue::Number(*v as f64)));
+                        }
+                        if let Some(mk) = master_key {
+                            params.push((mk.to_string(), EffectValue::Number(rmaster as f64)));
+                        }
+                    } else {
+                        if let Some(rgb) = rgb {
+                            for (k, v) in rgb_keys.iter().zip(rgb.iter()) {
+                                params.push((k.to_string(), EffectValue::Number(*v as f64)));
+                            }
+                        }
+                        if let (Some(mk), Some(m)) = (master_key, master) {
+                            params.push((mk.to_string(), EffectValue::Number(*m as f64)));
+                        }
+                    }
+                    if !params.is_empty() {
+                        pending.push(EditOp::UpdateEffectParams {
+                            track_id: parse_track(track_id)?,
+                            clip_id: parse_clip(clip_id)?,
+                            effect_id: parse_effect(effect_id)?,
+                            params,
+                        });
+                    }
+                    outcomes.push(gc::GradingCommandOutcome::None);
+                }
+                gc::GradingCommand::SetToneCurve { track_id, clip_id, effect_id, channel, points } => {
+                    let key = match channel {
+                        gc::ToneChannel::Master => gk::KEY_CURVE_MASTER,
+                        gc::ToneChannel::R => gk::KEY_CURVE_R,
+                        gc::ToneChannel::G => gk::KEY_CURVE_G,
+                        gc::ToneChannel::B => gk::KEY_CURVE_B,
+                        gc::ToneChannel::Luma => gk::KEY_CURVE_LUMA,
+                    };
+                    pending.push(EditOp::UpdateEffectParams {
+                        track_id: parse_track(track_id)?,
+                        clip_id: parse_clip(clip_id)?,
+                        effect_id: parse_effect(effect_id)?,
+                        params: vec![(key.to_string(), curve_kfs(points))],
+                    });
+                    outcomes.push(gc::GradingCommandOutcome::None);
+                }
+                gc::GradingCommand::SetHslCurve { track_id, clip_id, effect_id, curve, points } => {
+                    let key = match curve {
+                        gc::HslCurve::HueHue => gk::KEY_CURVE_HUE_HUE,
+                        gc::HslCurve::HueSat => gk::KEY_CURVE_HUE_SAT,
+                        gc::HslCurve::HueLum => gk::KEY_CURVE_HUE_LUM,
+                        gc::HslCurve::SatSat => gk::KEY_CURVE_SAT_SAT,
+                        gc::HslCurve::LumLum => gk::KEY_CURVE_LUM_LUM,
+                    };
+                    pending.push(EditOp::UpdateEffectParams {
+                        track_id: parse_track(track_id)?,
+                        clip_id: parse_clip(clip_id)?,
+                        effect_id: parse_effect(effect_id)?,
+                        params: vec![(key.to_string(), curve_kfs(points))],
+                    });
+                    outcomes.push(gc::GradingCommandOutcome::None);
+                }
+                gc::GradingCommand::SetQualifier { track_id, clip_id, effect_id, enabled, invert, hue, sat, luma } => {
+                    let mut params: Vec<(String, EffectValue)> = Vec::new();
+                    let mut push_bool = |k: &str, b: Option<bool>| {
+                        if let Some(b) = b {
+                            params.push((k.to_string(), EffectValue::Number(if b { 1.0 } else { 0.0 })));
+                        }
+                    };
+                    push_bool(gk::KEY_QUAL_ENABLE, *enabled);
+                    push_bool(gk::KEY_QUAL_INVERT, *invert);
+                    let mut push_num = |k: &str, v: Option<f32>| {
+                        if let Some(v) = v {
+                            params.push((k.to_string(), EffectValue::Number(v as f64)));
+                        }
+                    };
+                    if let Some(h) = hue {
+                        push_num(gk::KEY_QUAL_HUE_C, h.center);
+                        push_num(gk::KEY_QUAL_HUE_RANGE, h.range);
+                        push_num(gk::KEY_QUAL_HUE_SOFT, h.soft);
+                    }
+                    if let Some(s) = sat {
+                        push_num(gk::KEY_QUAL_SAT_LO, s.lo);
+                        push_num(gk::KEY_QUAL_SAT_HI, s.hi);
+                        push_num(gk::KEY_QUAL_SAT_SOFT, s.soft);
+                    }
+                    if let Some(l) = luma {
+                        push_num(gk::KEY_QUAL_LUMA_LO, l.lo);
+                        push_num(gk::KEY_QUAL_LUMA_HI, l.hi);
+                        push_num(gk::KEY_QUAL_LUMA_SOFT, l.soft);
+                    }
+                    if !params.is_empty() {
+                        pending.push(EditOp::UpdateEffectParams {
+                            track_id: parse_track(track_id)?,
+                            clip_id: parse_clip(clip_id)?,
+                            effect_id: parse_effect(effect_id)?,
+                            params,
+                        });
+                    }
+                    outcomes.push(gc::GradingCommandOutcome::None);
+                }
+                gc::GradingCommand::SetWindow { track_id, clip_id, effect_id, shape, center, size, rotation, feather, invert } => {
+                    let mut params: Vec<(String, EffectValue)> = Vec::new();
+                    if let Some(s) = shape {
+                        let v = match s {
+                            gc::WindowShape::Off => 0.0,
+                            gc::WindowShape::Ellipse => 1.0,
+                            gc::WindowShape::Rectangle => 2.0,
+                        };
+                        params.push((gk::KEY_WIN_SHAPE.to_string(), EffectValue::Number(v)));
+                    }
+                    if let Some(c) = center {
+                        params.push((gk::KEY_WIN_CENTER_X.to_string(), EffectValue::Number(c[0] as f64)));
+                        params.push((gk::KEY_WIN_CENTER_Y.to_string(), EffectValue::Number(c[1] as f64)));
+                    }
+                    if let Some(s) = size {
+                        params.push((gk::KEY_WIN_SIZE_X.to_string(), EffectValue::Number(s[0] as f64)));
+                        params.push((gk::KEY_WIN_SIZE_Y.to_string(), EffectValue::Number(s[1] as f64)));
+                    }
+                    if let Some(r) = rotation {
+                        params.push((gk::KEY_WIN_ROTATION.to_string(), EffectValue::Number(*r as f64)));
+                    }
+                    if let Some(f) = feather {
+                        params.push((gk::KEY_WIN_FEATHER.to_string(), EffectValue::Number(*f as f64)));
+                    }
+                    if let Some(i) = invert {
+                        params.push((gk::KEY_WIN_INVERT.to_string(), EffectValue::Number(if *i { 1.0 } else { 0.0 })));
+                    }
+                    if !params.is_empty() {
+                        pending.push(EditOp::UpdateEffectParams {
+                            track_id: parse_track(track_id)?,
+                            clip_id: parse_clip(clip_id)?,
+                            effect_id: parse_effect(effect_id)?,
+                            params,
+                        });
+                    }
+                    outcomes.push(gc::GradingCommandOutcome::None);
+                }
+                // ---- Project-level + tracker: flush the pending compound
+                // first (preserves command order), then call inline.
+                gc::GradingCommand::TrackWindow { track_id, clip_id, effect_id, start_source_seconds, n_frames, patch_half, search_radius } => {
+                    flush(self, &mut pending, &label)?;
+                    let summary = self.track_window(
+                        parse_track(track_id)?,
+                        parse_clip(clip_id)?,
+                        parse_effect(effect_id)?,
+                        *start_source_seconds,
+                        *n_frames,
+                        *patch_half,
+                        *search_radius,
+                    )?;
+                    outcomes.push(gc::GradingCommandOutcome::Tracked {
+                        frames_tracked: summary.frames_tracked,
+                        mean_score: summary.mean_score,
+                        start_clip_seconds: summary.start_clip_seconds,
+                        end_clip_seconds: summary.end_clip_seconds,
+                    });
+                }
+                gc::GradingCommand::SetOcioViewTransform { config, src, dst, size } => {
+                    flush(self, &mut pending, &label)?;
+                    self.set_ocio_view_transform(config.as_deref(), src, dst, *size)?;
+                    outcomes.push(gc::GradingCommandOutcome::None);
+                }
+                gc::GradingCommand::SetProjectViewLut { path } => {
+                    flush(self, &mut pending, &label)?;
+                    self.set_project_view_lut(path.as_deref())?;
+                    outcomes.push(gc::GradingCommandOutcome::None);
+                }
+                gc::GradingCommand::SetProjectWorkingColorSpace { color_space } => {
+                    flush(self, &mut pending, &label)?;
+                    self.set_project_working_color_space(color_space)?;
+                    outcomes.push(gc::GradingCommandOutcome::None);
+                }
+            }
+        }
+        // Final flush for any trailing sequence ops.
+        flush(self, &mut pending, &label)?;
+        Ok(outcomes)
+    }
+
     /// Reorder an effect within a clip's chain (color-page node
     /// reorder). Undoable.
     pub fn move_effect_on_clip(

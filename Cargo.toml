@@ -8,6 +8,7 @@ members = [
     "crates/vance-ocio",
     "crates/vance-scopes",
     "crates/vance-tracker",
+    "crates/vance-grading-cmd",
     "crates/vance-media",
     "crates/vance-ffmpeg-sys",
     "crates/vance-decoder",
@@ -48,6 +49,7 @@ vance-color = { path = "crates/vance-color" }
 vance-ocio = { path = "crates/vance-ocio" }
 vance-scopes = { path = "crates/vance-scopes" }
 vance-tracker = { path = "crates/vance-tracker" }
+vance-grading-cmd = { path = "crates/vance-grading-cmd" }
 vance-media = { path = "crates/vance-media" }
 vance-ffmpeg-sys = { path = "crates/vance-ffmpeg-sys" }
 vance-decoder = { path = "crates/vance-decoder" }
@@ -71,6 +73,7 @@ vance-viewport = { path = "crates/vance-viewport" }
 # External
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+schemars = "0.8"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"

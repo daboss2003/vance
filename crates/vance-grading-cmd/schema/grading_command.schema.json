@@ -1,0 +1,958 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GradingCommand",
+  "description": "One typed grading operation. Internally-tagged so the JSON carries a stable `\"op\"` field (no shape-collision routing hazards) and every variant uses struct fields with descriptive names suitable for an LLM tool-use schema.\n\n`track_id` / `clip_id` / `effect_id` are stringified UUIDs to match the existing Tauri command convention.",
+  "oneOf": [
+    {
+      "description": "Append a new grade node to a clip.",
+      "type": "object",
+      "required": [
+        "clip_id",
+        "mode",
+        "op",
+        "track_id"
+      ],
+      "properties": {
+        "clip_id": {
+          "description": "Clip UUID.",
+          "type": "string"
+        },
+        "label": {
+          "description": "Optional human-readable label.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "description": "Initial mode (primary / log / curves).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/GradeMode"
+            }
+          ]
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "add_grade_node"
+          ]
+        },
+        "track_id": {
+          "description": "Track UUID.",
+          "type": "string"
+        }
+      }
+    },
+    {
+      "description": "Remove a grade node from a clip.",
+      "type": "object",
+      "required": [
+        "clip_id",
+        "effect_id",
+        "op",
+        "track_id"
+      ],
+      "properties": {
+        "clip_id": {
+          "description": "Clip UUID.",
+          "type": "string"
+        },
+        "effect_id": {
+          "description": "Effect UUID of the node.",
+          "type": "string"
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "remove_grade_node"
+          ]
+        },
+        "track_id": {
+          "description": "Track UUID.",
+          "type": "string"
+        }
+      }
+    },
+    {
+      "description": "Move a grade node to a new index in the chain (top-of-list = first applied; indices clamped to the chain length).",
+      "type": "object",
+      "required": [
+        "clip_id",
+        "effect_id",
+        "new_index",
+        "op",
+        "track_id"
+      ],
+      "properties": {
+        "clip_id": {
+          "description": "Clip UUID.",
+          "type": "string"
+        },
+        "effect_id": {
+          "description": "Effect UUID of the node to move.",
+          "type": "string"
+        },
+        "new_index": {
+          "description": "New 0-based index in the chain.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "reorder_grade_node"
+          ]
+        },
+        "track_id": {
+          "description": "Track UUID.",
+          "type": "string"
+        }
+      }
+    },
+    {
+      "description": "Enable / bypass a grade node.",
+      "type": "object",
+      "required": [
+        "clip_id",
+        "effect_id",
+        "enabled",
+        "op",
+        "track_id"
+      ],
+      "properties": {
+        "clip_id": {
+          "description": "Clip UUID.",
+          "type": "string"
+        },
+        "effect_id": {
+          "description": "Effect UUID.",
+          "type": "string"
+        },
+        "enabled": {
+          "description": "1 = apply, 0 = bypass.",
+          "type": "boolean"
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "set_grade_node_enabled"
+          ]
+        },
+        "track_id": {
+          "description": "Track UUID.",
+          "type": "string"
+        }
+      }
+    },
+    {
+      "description": "Set the node's display label (UI-only; does not affect rendering).",
+      "type": "object",
+      "required": [
+        "clip_id",
+        "effect_id",
+        "label",
+        "op",
+        "track_id"
+      ],
+      "properties": {
+        "clip_id": {
+          "description": "Clip UUID.",
+          "type": "string"
+        },
+        "effect_id": {
+          "description": "Effect UUID.",
+          "type": "string"
+        },
+        "label": {
+          "description": "New label string.",
+          "type": "string"
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "set_grade_node_label"
+          ]
+        },
+        "track_id": {
+          "description": "Track UUID.",
+          "type": "string"
+        }
+      }
+    },
+    {
+      "description": "Switch an existing node between primary / log / curves modes.",
+      "type": "object",
+      "required": [
+        "clip_id",
+        "effect_id",
+        "mode",
+        "op",
+        "track_id"
+      ],
+      "properties": {
+        "clip_id": {
+          "description": "Clip UUID.",
+          "type": "string"
+        },
+        "effect_id": {
+          "description": "Effect UUID.",
+          "type": "string"
+        },
+        "mode": {
+          "description": "New mode.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/GradeMode"
+            }
+          ]
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "set_node_mode"
+          ]
+        },
+        "track_id": {
+          "description": "Track UUID.",
+          "type": "string"
+        }
+      }
+    },
+    {
+      "description": "Set a primary or log wheel's RGB balance (and optional master, primary mode only). `reset = true` snaps the wheel back to its neutral (RGB 0, master 1 for gamma/gain; master 0 for lift).",
+      "type": "object",
+      "required": [
+        "clip_id",
+        "effect_id",
+        "group",
+        "op",
+        "track_id"
+      ],
+      "properties": {
+        "clip_id": {
+          "description": "Clip UUID.",
+          "type": "string"
+        },
+        "effect_id": {
+          "description": "Effect UUID.",
+          "type": "string"
+        },
+        "group": {
+          "description": "Which wheel.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/WheelGroup"
+            }
+          ]
+        },
+        "master": {
+          "description": "Master scalar (primary mode only; ignored on log wheels).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "set_wheel"
+          ]
+        },
+        "reset": {
+          "description": "Snap this wheel back to neutral and ignore `rgb` / `master`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "rgb": {
+          "description": "`[r, g, b]` in the wheel's natural range (omit to leave RGB unchanged).",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "number",
+            "format": "float"
+          },
+          "maxItems": 3,
+          "minItems": 3
+        },
+        "track_id": {
+          "description": "Track UUID.",
+          "type": "string"
+        }
+      }
+    },
+    {
+      "description": "Replace one tone curve's control points (Master / R / G / B / Luma). Pass an empty `points` list to reset to identity.",
+      "type": "object",
+      "required": [
+        "channel",
+        "clip_id",
+        "effect_id",
+        "op",
+        "points",
+        "track_id"
+      ],
+      "properties": {
+        "channel": {
+          "description": "Which tone channel.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ToneChannel"
+            }
+          ]
+        },
+        "clip_id": {
+          "description": "Clip UUID.",
+          "type": "string"
+        },
+        "effect_id": {
+          "description": "Effect UUID (must be a curves-mode node).",
+          "type": "string"
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "set_tone_curve"
+          ]
+        },
+        "points": {
+          "description": "Control points; empty = identity (y = x for master/R/G/B, hue-preserving ratio = 1 for luma).",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CurvePoint"
+          }
+        },
+        "track_id": {
+          "description": "Track UUID.",
+          "type": "string"
+        }
+      }
+    },
+    {
+      "description": "Replace one HSL hue-wheel curve's control points (HueHue / HueSat / HueLum / SatSat / LumLum). Pass an empty `points` list to reset to identity (y = x for remap curves; constant 0.5 for the hs/hl multiplier curves).",
+      "type": "object",
+      "required": [
+        "clip_id",
+        "curve",
+        "effect_id",
+        "op",
+        "points",
+        "track_id"
+      ],
+      "properties": {
+        "clip_id": {
+          "description": "Clip UUID.",
+          "type": "string"
+        },
+        "curve": {
+          "description": "Which HSL curve.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/HslCurve"
+            }
+          ]
+        },
+        "effect_id": {
+          "description": "Effect UUID (must be a curves-mode node).",
+          "type": "string"
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "set_hsl_curve"
+          ]
+        },
+        "points": {
+          "description": "Control points; empty = identity.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CurvePoint"
+          }
+        },
+        "track_id": {
+          "description": "Track UUID.",
+          "type": "string"
+        }
+      }
+    },
+    {
+      "description": "Partial update of a node's HSL qualifier (secondary key). Any omitted sub-field is left unchanged. Setting `enabled = false` keeps the band/hue settings but stops applying them.",
+      "type": "object",
+      "required": [
+        "clip_id",
+        "effect_id",
+        "op",
+        "track_id"
+      ],
+      "properties": {
+        "clip_id": {
+          "description": "Clip UUID.",
+          "type": "string"
+        },
+        "effect_id": {
+          "description": "Effect UUID.",
+          "type": "string"
+        },
+        "enabled": {
+          "description": "On / off (omit to leave unchanged).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "hue": {
+          "description": "Hue band partial update.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/HueRange"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "invert": {
+          "description": "Invert the mask (omit to leave unchanged).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "luma": {
+          "description": "Luma band partial update.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BandRange"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "set_qualifier"
+          ]
+        },
+        "sat": {
+          "description": "Saturation band partial update.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BandRange"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "track_id": {
+          "description": "Track UUID.",
+          "type": "string"
+        }
+      }
+    },
+    {
+      "description": "Partial update of a node's power window. `shape = Off` disables the window (mask = 1, exact passthrough). Any omitted field is left unchanged.",
+      "type": "object",
+      "required": [
+        "clip_id",
+        "effect_id",
+        "op",
+        "track_id"
+      ],
+      "properties": {
+        "center": {
+          "description": "Center `(x, y)` in source-UV `[0, 1]`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "number",
+            "format": "float"
+          },
+          "maxItems": 2,
+          "minItems": 2
+        },
+        "clip_id": {
+          "description": "Clip UUID.",
+          "type": "string"
+        },
+        "effect_id": {
+          "description": "Effect UUID.",
+          "type": "string"
+        },
+        "feather": {
+          "description": "Feather / softness band width.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "invert": {
+          "description": "Invert the mask.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "set_window"
+          ]
+        },
+        "rotation": {
+          "description": "Rotation in radians (CCW about center).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "shape": {
+          "description": "Shape (off / ellipse / rectangle).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/WindowShape"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "size": {
+          "description": "Half-extents `(x, y)` in source-UV units.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "number",
+            "format": "float"
+          },
+          "maxItems": 2,
+          "minItems": 2
+        },
+        "track_id": {
+          "description": "Track UUID.",
+          "type": "string"
+        }
+      }
+    },
+    {
+      "description": "Run the point tracker over a power window's center forward N frames, writing keyframes to win_cx / win_cy. Synchronous — blocks the engine for ~N decode round-trips; capped at 240 frames per call by the engine. The decoder must already be open on this clip's source file.",
+      "type": "object",
+      "required": [
+        "clip_id",
+        "effect_id",
+        "n_frames",
+        "op",
+        "patch_half",
+        "search_radius",
+        "start_source_seconds",
+        "track_id"
+      ],
+      "properties": {
+        "clip_id": {
+          "description": "Clip UUID.",
+          "type": "string"
+        },
+        "effect_id": {
+          "description": "Effect UUID (the power-window node).",
+          "type": "string"
+        },
+        "n_frames": {
+          "description": "Number of frames to track (anchor + N-1 forward). Clamped engine-side to `[2, 240]`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "track_window"
+          ]
+        },
+        "patch_half": {
+          "description": "Half-side of the template patch in pixels (e.g. 15 → 31×31).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "search_radius": {
+          "description": "Per-frame max search radius in pixels.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "start_source_seconds": {
+          "description": "Source-time start (seconds in the clip's source media).",
+          "type": "number",
+          "format": "double"
+        },
+        "track_id": {
+          "description": "Track UUID.",
+          "type": "string"
+        }
+      }
+    },
+    {
+      "description": "Apply an OpenColorIO display transform to the viewport. `config` may be `None` to use the `$OCIO` env config. Phase 6.1b.",
+      "type": "object",
+      "required": [
+        "dst",
+        "op",
+        "size",
+        "src"
+      ],
+      "properties": {
+        "config": {
+          "description": "Path to the `.ocio` config (omit for `$OCIO` env config).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dst": {
+          "description": "Destination (display) colorspace / role name.",
+          "type": "string"
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "set_ocio_view_transform"
+          ]
+        },
+        "size": {
+          "description": "Baked cube side length (typical: 33).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "src": {
+          "description": "Source colorspace / role name.",
+          "type": "string"
+        }
+      }
+    },
+    {
+      "description": "Set (or clear) the project's display LUT. `path = None` clears.",
+      "type": "object",
+      "required": [
+        "op"
+      ],
+      "properties": {
+        "op": {
+          "type": "string",
+          "enum": [
+            "set_project_view_lut"
+          ]
+        },
+        "path": {
+          "description": "Filesystem path to a `.cube` / `.3dl`. `None` clears.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Replace the project's working color space.",
+      "type": "object",
+      "required": [
+        "color_space",
+        "op"
+      ],
+      "properties": {
+        "color_space": {
+          "description": "Color-space label (matches the engine's `color_space_to_str` values: e.g. `\"linear_rec709\"`, `\"linear_rec2020\"`, ...).",
+          "type": "string"
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "set_project_working_color_space"
+          ]
+        }
+      }
+    }
+  ],
+  "definitions": {
+    "BandRange": {
+      "description": "HSL qualifier sat/luma band — lo / hi / softness, all `[0, 1]`. Any omitted field is left unchanged.",
+      "type": "object",
+      "properties": {
+        "hi": {
+          "description": "Upper bound.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "lo": {
+          "description": "Lower bound.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "soft": {
+          "description": "Edge softness.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        }
+      }
+    },
+    "CurvePoint": {
+      "description": "One control point of a curve, in `[0, 1]` on both axes.",
+      "type": "object",
+      "required": [
+        "x",
+        "y"
+      ],
+      "properties": {
+        "x": {
+          "description": "Input level (x). For hue curves x is cyclic.",
+          "type": "number",
+          "format": "float"
+        },
+        "y": {
+          "description": "Output level (y).",
+          "type": "number",
+          "format": "float"
+        }
+      }
+    },
+    "GradeMode": {
+      "description": "Family of color operations for a grade node.",
+      "oneOf": [
+        {
+          "description": "Primary wheels: lift / gamma / gain (per-channel + master).",
+          "type": "string",
+          "enum": [
+            "primary"
+          ]
+        },
+        {
+          "description": "Log wheels: offset + shadow / mid / highlight balances.",
+          "type": "string",
+          "enum": [
+            "log"
+          ]
+        },
+        {
+          "description": "Per-channel tone curves (+ HSL hue-wheel curves).",
+          "type": "string",
+          "enum": [
+            "curves"
+          ]
+        }
+      ]
+    },
+    "HslCurve": {
+      "description": "Which HSL hue-wheel curve a `SetHslCurve` command targets. `hh`/`ss`/ `ll` are REMAPS (identity y=x); `hs`/`hl` are MULTIPLIERS keyed by hue (identity y=0.5; shader decodes as `2*y`).",
+      "oneOf": [
+        {
+          "description": "Hue → hue REMAP, cyclic input.",
+          "type": "string",
+          "enum": [
+            "hue_hue"
+          ]
+        },
+        {
+          "description": "Hue → saturation MULTIPLIER.",
+          "type": "string",
+          "enum": [
+            "hue_sat"
+          ]
+        },
+        {
+          "description": "Hue → luminance MULTIPLIER.",
+          "type": "string",
+          "enum": [
+            "hue_lum"
+          ]
+        },
+        {
+          "description": "Saturation → saturation REMAP.",
+          "type": "string",
+          "enum": [
+            "sat_sat"
+          ]
+        },
+        {
+          "description": "Luminance → luminance REMAP.",
+          "type": "string",
+          "enum": [
+            "lum_lum"
+          ]
+        }
+      ]
+    },
+    "HueRange": {
+      "description": "HSL qualifier hue band — center / range / softness, all `[0, 1]`. Any omitted field is left unchanged.",
+      "type": "object",
+      "properties": {
+        "center": {
+          "description": "Cyclic hue center.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "range": {
+          "description": "Full hue-wedge width (1.0 = no restriction).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "soft": {
+          "description": "Edge softness.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        }
+      }
+    },
+    "ToneChannel": {
+      "description": "Which tone-curve channel a `SetToneCurve` command targets.",
+      "oneOf": [
+        {
+          "description": "Master tone curve, folded into R/G/B at bake time.",
+          "type": "string",
+          "enum": [
+            "master"
+          ]
+        },
+        {
+          "description": "Red channel tone curve.",
+          "type": "string",
+          "enum": [
+            "r"
+          ]
+        },
+        {
+          "description": "Green channel tone curve.",
+          "type": "string",
+          "enum": [
+            "g"
+          ]
+        },
+        {
+          "description": "Blue channel tone curve.",
+          "type": "string",
+          "enum": [
+            "b"
+          ]
+        },
+        {
+          "description": "Luma curve (hue-preserving ratio).",
+          "type": "string",
+          "enum": [
+            "luma"
+          ]
+        }
+      ]
+    },
+    "WheelGroup": {
+      "description": "Which wheel within a node a `SetWheel` command targets. Primary mode uses `Lift` / `Gamma` / `Gain`; log mode uses `Offset` / `Shadow` / `Mid` / `Highlight`. The dispatcher rejects mismatches.",
+      "oneOf": [
+        {
+          "description": "Primary mode: shadows lift (additive).",
+          "type": "string",
+          "enum": [
+            "lift"
+          ]
+        },
+        {
+          "description": "Primary mode: midtone gamma (power).",
+          "type": "string",
+          "enum": [
+            "gamma"
+          ]
+        },
+        {
+          "description": "Primary mode: highlight gain (multiplicative).",
+          "type": "string",
+          "enum": [
+            "gain"
+          ]
+        },
+        {
+          "description": "Log mode: overall offset (RGB only, no master).",
+          "type": "string",
+          "enum": [
+            "offset"
+          ]
+        },
+        {
+          "description": "Log mode: shadow balance.",
+          "type": "string",
+          "enum": [
+            "shadow"
+          ]
+        },
+        {
+          "description": "Log mode: midtone balance.",
+          "type": "string",
+          "enum": [
+            "mid"
+          ]
+        },
+        {
+          "description": "Log mode: highlight balance.",
+          "type": "string",
+          "enum": [
+            "highlight"
+          ]
+        }
+      ]
+    },
+    "WindowShape": {
+      "description": "Geometric shape of a power window.",
+      "oneOf": [
+        {
+          "description": "Window disabled (mask = 1, exact passthrough).",
+          "type": "string",
+          "enum": [
+            "off"
+          ]
+        },
+        {
+          "description": "Ellipse / circle (when half_x == half_y).",
+          "type": "string",
+          "enum": [
+            "ellipse"
+          ]
+        },
+        {
+          "description": "Axis-aligned rectangle.",
+          "type": "string",
+          "enum": [
+            "rectangle"
+          ]
+        }
+      ]
+    }
+  }
+}

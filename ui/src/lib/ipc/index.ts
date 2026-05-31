@@ -468,6 +468,25 @@ export type TrackSummary = {
  *  on the Y plane, writing the result as keyframes on the effect's
  *  win_cx / win_cy (one undoable edit). Synchronous v1 — the IPC call
  *  blocks while the engine decodes and tracks. Phase 6.11. */
+// ---- Typed grading commands (Phase 6.13, AI-assistant hook) -------------
+// `GradingCommand` and `GradingCommandOutcome` use schemars-derived JSON
+// schemas in the Rust side — fetch the live schema via grading_command_schema()
+// at prompt-build time rather than mirroring the variants by hand here.
+
+/** Apply ONE typed grading command (one undo step). */
+export const applyGradingCommand = (cmd: unknown): Promise<unknown> =>
+  invoke('apply_grading_command', { cmd });
+
+/** Apply a BATCH of typed grading commands as one labeled compound undo
+ *  step (sequence ops collapse into `EditOp::Compound`; tracker /
+ *  project-level commands run inline and add their own entries). */
+export const applyGradingCommands = (cmds: unknown[], label: string | null): Promise<unknown[]> =>
+  invoke('apply_grading_commands', { cmds, label });
+
+/** JSON Schema for `GradingCommand` — single source of truth for the
+ *  AI's tool-use spec. */
+export const gradingCommandSchema = (): Promise<unknown> => invoke('grading_command_schema');
+
 export const trackWindow = (
   trackId: string,
   clipId: string,

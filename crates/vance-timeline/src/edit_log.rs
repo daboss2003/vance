@@ -213,6 +213,18 @@ pub enum EditOp {
         /// `(key, value)` pairs applied together.
         params: Vec<(String, EffectValue)>,
     },
+    /// Apply a batch of sub-ops atomically as a SINGLE undo step.
+    /// Apply folds left over `ops`; if any child fails the whole
+    /// compound returns Err and is NEVER recorded in the log, so the
+    /// snapshot-based undo gives atomic rollback for free. The `label`
+    /// flows through to the UI's undo entry (e.g. an AI tool-call
+    /// turn shows as one labeled step). Phase 6.13.
+    Compound {
+        /// Sub-ops in apply order. Empty is a no-op.
+        ops: Vec<EditOp>,
+        /// Human-readable label shown in undo history.
+        label: String,
+    },
 }
 
 /// Apply a single op to a sequence, returning the new sequence.
@@ -320,6 +332,16 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
             effect_id,
             params,
         } => ops::update_effect_params(seq, *track_id, *clip_id, *effect_id, params),
+        EditOp::Compound { ops: children, .. } => {
+            // Fold-left over children. If any child fails the whole
+            // compound returns Err; the EditLog never records it, so
+            // the original snapshot remains current = atomic rollback.
+            let mut cur = seq.clone();
+            for child in children {
+                cur = apply(&cur, child)?;
+            }
+            Ok(cur)
+        }
     }
 }
 
@@ -611,5 +633,62 @@ mod tests {
         log.redo().unwrap();
         assert_eq!(order(&log), vec![id1, id0]);
         assert!(!enabled0(&log));
+    }
+
+    #[test]
+    fn compound_applies_as_one_undo_step() {
+        // Two child inserts via a single Compound -> one EditLog entry,
+        // one undo reverts the whole batch.
+        let (mut log, tid, media) = seed_log();
+        assert_eq!(log.len(), 1);
+        let c0 = Clip::new(media, "c0", t(0), t(0), t(5)).unwrap();
+        let c1 = Clip::new(media, "c1", t(10), t(0), t(5)).unwrap();
+        log.apply(EditOp::Compound {
+            label: "ai: insert two clips".into(),
+            ops: vec![
+                EditOp::InsertClip { track_id: tid, clip: c0 },
+                EditOp::InsertClip { track_id: tid, clip: c1 },
+            ],
+        })
+        .unwrap();
+        // ONE new entry (not two).
+        assert_eq!(log.len(), 2);
+        assert_eq!(log.current().tracks[0].clips.len(), 2);
+        log.undo().unwrap();
+        assert_eq!(log.current().tracks[0].clips.len(), 0);
+        log.redo().unwrap();
+        assert_eq!(log.current().tracks[0].clips.len(), 2);
+    }
+
+    #[test]
+    fn compound_failure_rolls_back_atomically() {
+        // First child succeeds, second fails (bad track id). Compound
+        // returns Err and is NEVER recorded — the snapshot stays at
+        // pre-compound state.
+        let (mut log, tid, media) = seed_log();
+        let before_len = log.len();
+        let before_clip_count = log.current().tracks[0].clips.len();
+        let c0 = Clip::new(media, "c0", t(0), t(0), t(5)).unwrap();
+        let bogus_tid = TrackId::new();
+        let result = log.apply(EditOp::Compound {
+            label: "should rollback".into(),
+            ops: vec![
+                EditOp::InsertClip { track_id: tid, clip: c0 },
+                // This one fails: track doesn't exist.
+                EditOp::RemoveTrack { track_id: bogus_tid },
+            ],
+        });
+        assert!(result.is_err(), "compound with failing child must error");
+        assert_eq!(log.len(), before_len, "no entry recorded on failure");
+        assert_eq!(log.current().tracks[0].clips.len(), before_clip_count, "state unchanged");
+    }
+
+    #[test]
+    fn empty_compound_is_a_noop() {
+        let (mut log, _tid, _media) = seed_log();
+        let before = log.current().clone();
+        log.apply(EditOp::Compound { label: "empty".into(), ops: Vec::new() })
+            .unwrap();
+        assert_eq!(log.current(), &before, "empty compound must not change state");
     }
 }

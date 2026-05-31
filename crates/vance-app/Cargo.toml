@@ -42,6 +42,7 @@ vance-color = { workspace = true }
 vance-ocio = { workspace = true }
 vance-scopes = { workspace = true }
 vance-tracker = { workspace = true }
+vance-grading-cmd = { workspace = true }
 vance-time = { workspace = true }
 vance-decoder = { workspace = true }
 vance-render = { workspace = true }

@@ -1,0 +1,24 @@
+[package]
+name = "vance-grading-cmd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# Typed grading commands — the AI-facing API surface (Phase 6.13). Pure
+# data + schema generation; no engine deps. Consumers (vance-app +
+# vance-ai-runtime + vance-cli) translate `GradingCommand` into engine
+# method calls. Defining it here (not in vance-app) lets vance-ai-runtime
+# load the schema without pulling in Tauri / wgpu.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+vance-core = { workspace = true }
+vance-timeline = { workspace = true }
