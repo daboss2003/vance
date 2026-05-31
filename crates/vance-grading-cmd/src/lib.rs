@@ -16,6 +16,65 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+// ---- ID newtype -----------------------------------------------------------
+
+/// A stringified UUID — `8-4-4-4-12` hyphenated lowercase hex (same form
+/// the Tauri command layer accepts). `#[serde(transparent)]` keeps the
+/// JSON wire format identical to a bare string; the manual `JsonSchema`
+/// impl pins a regex pattern so the AI assistant's tool-use validator
+/// catches malformed ids upfront instead of waiting for the engine to
+/// reject them at runtime.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(transparent)]
+pub struct Uuid(pub String);
+
+impl From<String> for Uuid {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+impl From<&str> for Uuid {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+impl std::ops::Deref for Uuid {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl AsRef<str> for Uuid {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+impl JsonSchema for Uuid {
+    fn schema_name() -> String {
+        "Uuid".into()
+    }
+    fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        let mut obj = schemars::schema::SchemaObject {
+            instance_type: Some(schemars::schema::InstanceType::String.into()),
+            ..Default::default()
+        };
+        obj.string = Some(Box::new(schemars::schema::StringValidation {
+            pattern: Some(
+                r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$".into(),
+            ),
+            ..Default::default()
+        }));
+        obj.metadata = Some(Box::new(schemars::schema::Metadata {
+            description: Some(
+                "Hyphenated lowercase UUID, e.g. \"00000000-0000-0000-0000-000000000000\"."
+                    .into(),
+            ),
+            ..Default::default()
+        }));
+        schemars::schema::Schema::Object(obj)
+    }
+}
+
 // ---- Enumerations ---------------------------------------------------------
 
 /// Family of color operations for a grade node.
@@ -148,9 +207,9 @@ pub enum GradingCommand {
     /// Append a new grade node to a clip.
     AddGradeNode {
         /// Track UUID.
-        track_id: String,
+        track_id: Uuid,
         /// Clip UUID.
-        clip_id: String,
+        clip_id: Uuid,
         /// Initial mode (primary / log / curves).
         mode: GradeMode,
         /// Optional human-readable label.
@@ -159,54 +218,54 @@ pub enum GradingCommand {
     /// Remove a grade node from a clip.
     RemoveGradeNode {
         /// Track UUID.
-        track_id: String,
+        track_id: Uuid,
         /// Clip UUID.
-        clip_id: String,
+        clip_id: Uuid,
         /// Effect UUID of the node.
-        effect_id: String,
+        effect_id: Uuid,
     },
     /// Move a grade node to a new index in the chain (top-of-list = first
     /// applied; indices clamped to the chain length).
     ReorderGradeNode {
         /// Track UUID.
-        track_id: String,
+        track_id: Uuid,
         /// Clip UUID.
-        clip_id: String,
+        clip_id: Uuid,
         /// Effect UUID of the node to move.
-        effect_id: String,
+        effect_id: Uuid,
         /// New 0-based index in the chain.
         new_index: u32,
     },
     /// Enable / bypass a grade node.
     SetGradeNodeEnabled {
         /// Track UUID.
-        track_id: String,
+        track_id: Uuid,
         /// Clip UUID.
-        clip_id: String,
+        clip_id: Uuid,
         /// Effect UUID.
-        effect_id: String,
+        effect_id: Uuid,
         /// 1 = apply, 0 = bypass.
         enabled: bool,
     },
     /// Set the node's display label (UI-only; does not affect rendering).
     SetGradeNodeLabel {
         /// Track UUID.
-        track_id: String,
+        track_id: Uuid,
         /// Clip UUID.
-        clip_id: String,
+        clip_id: Uuid,
         /// Effect UUID.
-        effect_id: String,
+        effect_id: Uuid,
         /// New label string.
         label: String,
     },
     /// Switch an existing node between primary / log / curves modes.
     SetNodeMode {
         /// Track UUID.
-        track_id: String,
+        track_id: Uuid,
         /// Clip UUID.
-        clip_id: String,
+        clip_id: Uuid,
         /// Effect UUID.
-        effect_id: String,
+        effect_id: Uuid,
         /// New mode.
         mode: GradeMode,
     },
@@ -215,11 +274,11 @@ pub enum GradingCommand {
     /// neutral (RGB 0, master 1 for gamma/gain; master 0 for lift).
     SetWheel {
         /// Track UUID.
-        track_id: String,
+        track_id: Uuid,
         /// Clip UUID.
-        clip_id: String,
+        clip_id: Uuid,
         /// Effect UUID.
-        effect_id: String,
+        effect_id: Uuid,
         /// Which wheel.
         group: WheelGroup,
         /// `[r, g, b]` in the wheel's natural range (omit to leave RGB
@@ -234,11 +293,11 @@ pub enum GradingCommand {
     /// Pass an empty `points` list to reset to identity.
     SetToneCurve {
         /// Track UUID.
-        track_id: String,
+        track_id: Uuid,
         /// Clip UUID.
-        clip_id: String,
+        clip_id: Uuid,
         /// Effect UUID (must be a curves-mode node).
-        effect_id: String,
+        effect_id: Uuid,
         /// Which tone channel.
         channel: ToneChannel,
         /// Control points; empty = identity (y = x for master/R/G/B,
@@ -251,11 +310,11 @@ pub enum GradingCommand {
     /// constant 0.5 for the hs/hl multiplier curves).
     SetHslCurve {
         /// Track UUID.
-        track_id: String,
+        track_id: Uuid,
         /// Clip UUID.
-        clip_id: String,
+        clip_id: Uuid,
         /// Effect UUID (must be a curves-mode node).
-        effect_id: String,
+        effect_id: Uuid,
         /// Which HSL curve.
         curve: HslCurve,
         /// Control points; empty = identity.
@@ -266,11 +325,11 @@ pub enum GradingCommand {
     /// keeps the band/hue settings but stops applying them.
     SetQualifier {
         /// Track UUID.
-        track_id: String,
+        track_id: Uuid,
         /// Clip UUID.
-        clip_id: String,
+        clip_id: Uuid,
         /// Effect UUID.
-        effect_id: String,
+        effect_id: Uuid,
         /// On / off (omit to leave unchanged).
         enabled: Option<bool>,
         /// Invert the mask (omit to leave unchanged).
@@ -287,11 +346,11 @@ pub enum GradingCommand {
     /// left unchanged.
     SetWindow {
         /// Track UUID.
-        track_id: String,
+        track_id: Uuid,
         /// Clip UUID.
-        clip_id: String,
+        clip_id: Uuid,
         /// Effect UUID.
-        effect_id: String,
+        effect_id: Uuid,
         /// Shape (off / ellipse / rectangle).
         shape: Option<WindowShape>,
         /// Center `(x, y)` in source-UV `[0, 1]`.
@@ -312,11 +371,11 @@ pub enum GradingCommand {
     /// clip's source file.
     TrackWindow {
         /// Track UUID.
-        track_id: String,
+        track_id: Uuid,
         /// Clip UUID.
-        clip_id: String,
+        clip_id: Uuid,
         /// Effect UUID (the power-window node).
-        effect_id: String,
+        effect_id: Uuid,
         /// Source-time start (seconds in the clip's source media).
         start_source_seconds: f64,
         /// Number of frames to track (anchor + N-1 forward). Clamped
@@ -362,7 +421,7 @@ pub enum GradingCommandOutcome {
     /// `AddGradeNode` succeeded; the new effect's UUID.
     NodeAdded {
         /// New effect UUID (stringified).
-        effect_id: String,
+        effect_id: Uuid,
     },
     /// `TrackWindow` succeeded; the tracker summary.
     Tracked {

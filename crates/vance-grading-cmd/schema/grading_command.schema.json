@@ -15,7 +15,11 @@
       "properties": {
         "clip_id": {
           "description": "Clip UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "label": {
           "description": "Optional human-readable label.",
@@ -40,7 +44,11 @@
         },
         "track_id": {
           "description": "Track UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         }
       }
     },
@@ -56,11 +64,19 @@
       "properties": {
         "clip_id": {
           "description": "Clip UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "effect_id": {
           "description": "Effect UUID of the node.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "op": {
           "type": "string",
@@ -70,7 +86,11 @@
         },
         "track_id": {
           "description": "Track UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         }
       }
     },
@@ -87,11 +107,19 @@
       "properties": {
         "clip_id": {
           "description": "Clip UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "effect_id": {
           "description": "Effect UUID of the node to move.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "new_index": {
           "description": "New 0-based index in the chain.",
@@ -107,7 +135,11 @@
         },
         "track_id": {
           "description": "Track UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         }
       }
     },
@@ -124,11 +156,19 @@
       "properties": {
         "clip_id": {
           "description": "Clip UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "effect_id": {
           "description": "Effect UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "enabled": {
           "description": "1 = apply, 0 = bypass.",
@@ -142,7 +182,11 @@
         },
         "track_id": {
           "description": "Track UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         }
       }
     },
@@ -159,11 +203,19 @@
       "properties": {
         "clip_id": {
           "description": "Clip UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "effect_id": {
           "description": "Effect UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "label": {
           "description": "New label string.",
@@ -177,7 +229,11 @@
         },
         "track_id": {
           "description": "Track UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         }
       }
     },
@@ -194,11 +250,19 @@
       "properties": {
         "clip_id": {
           "description": "Clip UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "effect_id": {
           "description": "Effect UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "mode": {
           "description": "New mode.",
@@ -216,7 +280,11 @@
         },
         "track_id": {
           "description": "Track UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         }
       }
     },
@@ -233,11 +301,19 @@
       "properties": {
         "clip_id": {
           "description": "Clip UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "effect_id": {
           "description": "Effect UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "group": {
           "description": "Which wheel.",
@@ -283,7 +359,11 @@
         },
         "track_id": {
           "description": "Track UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         }
       }
     },
@@ -309,11 +389,19 @@
         },
         "clip_id": {
           "description": "Clip UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "effect_id": {
           "description": "Effect UUID (must be a curves-mode node).",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "op": {
           "type": "string",
@@ -330,7 +418,11 @@
         },
         "track_id": {
           "description": "Track UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         }
       }
     },
@@ -348,7 +440,11 @@
       "properties": {
         "clip_id": {
           "description": "Clip UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "curve": {
           "description": "Which HSL curve.",
@@ -360,7 +456,11 @@
         },
         "effect_id": {
           "description": "Effect UUID (must be a curves-mode node).",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "op": {
           "type": "string",
@@ -377,7 +477,11 @@
         },
         "track_id": {
           "description": "Track UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         }
       }
     },
@@ -393,11 +497,19 @@
       "properties": {
         "clip_id": {
           "description": "Clip UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "effect_id": {
           "description": "Effect UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "enabled": {
           "description": "On / off (omit to leave unchanged).",
@@ -454,7 +566,11 @@
         },
         "track_id": {
           "description": "Track UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         }
       }
     },
@@ -483,11 +599,19 @@
         },
         "clip_id": {
           "description": "Clip UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "effect_id": {
           "description": "Effect UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "feather": {
           "description": "Feather / softness band width.",
@@ -544,7 +668,11 @@
         },
         "track_id": {
           "description": "Track UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         }
       }
     },
@@ -564,11 +692,19 @@
       "properties": {
         "clip_id": {
           "description": "Clip UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "effect_id": {
           "description": "Effect UUID (the power-window node).",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         },
         "n_frames": {
           "description": "Number of frames to track (anchor + N-1 forward). Clamped engine-side to `[2, 240]`.",
@@ -601,7 +737,11 @@
         },
         "track_id": {
           "description": "Track UUID.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            }
+          ]
         }
       }
     },
@@ -873,6 +1013,11 @@
           ]
         }
       ]
+    },
+    "Uuid": {
+      "description": "Hyphenated lowercase UUID, e.g. \"00000000-0000-0000-0000-000000000000\".",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
     },
     "WheelGroup": {
       "description": "Which wheel within a node a `SetWheel` command targets. Primary mode uses `Lift` / `Gamma` / `Gain`; log mode uses `Offset` / `Shadow` / `Mid` / `Highlight`. The dispatcher rejects mismatches.",

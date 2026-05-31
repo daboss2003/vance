@@ -29,6 +29,11 @@ SUBCOMMANDS:
                 after changing files under ui/.
     app-run     Same as app-build, then launch ./target/debug/vance-app.
     check-deps  Verify the internal crate dependency graph stays a DAG (PLAN.md §6.1).
+    verify-grading-schema
+                Run the GradingCommand JSON Schema snapshot test (Phase 6.13).
+                Fails on any drift between the Rust enum and the committed
+                schema/grading_command.schema.json so the AI tool-use spec
+                and the engine contract can't silently desync.
     help        Print this message.
 "#;
 
@@ -67,6 +72,19 @@ fn main() {
             cargo(&["run", "--package", "vance-app"], &rest)
         }),
         "check-deps" => check_deps(),
+        "verify-grading-schema" => cargo(
+            &[
+                "test",
+                "--package",
+                "vance-grading-cmd",
+                "--test",
+                "schema_snapshot",
+                "--",
+                "--exact",
+                "schema_matches_committed_snapshot",
+            ],
+            &rest,
+        ),
         "help" | "--help" | "-h" => {
             print!("{HELP}");
             return;

@@ -362,6 +362,13 @@ struct Entry {
 /// `current` is the sequence the caller is editing. `entries[..cursor]`
 /// have been applied; `entries[cursor..]` are available for redo until
 /// a fresh `apply` truncates them.
+///
+/// NOT PERSISTED: the log is session-only — `vance-project::save` only
+/// writes the current `Project` (which contains the current `Sequence`),
+/// and `Engine::load_project` reseeds a fresh `EditLog` from that
+/// baseline. Users cannot undo across a project reload. Persisting the
+/// history (with a Compound-aware serialization) is a separable Phase
+/// 3.5 / migrations follow-up.
 #[derive(Clone, Debug)]
 pub struct EditLog {
     current: Sequence,

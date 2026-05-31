@@ -3525,14 +3525,62 @@ impl Engine {
     }
 
     /// Dispatch a batch of typed grading commands (Phase 6.13 — the AI
-    /// assistant's entry point). Sequence-affecting commands collapse
-    /// into ONE `EditOp::Compound` so the whole turn appears as a single
-    /// undo step labeled `label`. Project-level commands (OCIO, view
-    /// LUT, working space) and the tracker run inline against the
-    /// existing engine methods — they are NOT inside the compound (they
-    /// don't go through the sequence EditLog), so a batch that
-    /// interleaves them will produce additional undo entries. Returns
-    /// one `GradingCommandOutcome` per command, in order.
+    /// assistant's entry point). Returns one `GradingCommandOutcome`
+    /// per command, in order.
+    ///
+    /// UNDO semantics: pure sequence-affecting commands accumulate into
+    /// a single `EditOp::Compound` labeled `label` (one undo step per
+    /// run, atomic rollback on partial failure). Other commands run
+    /// inline and add their own entries — flushed BEFORE so order is
+    /// preserved relative to the compound:
+    /// * `SetOcioViewTransform`, `SetProjectViewLut`,
+    ///   `SetProjectWorkingColorSpace` — mutate project state directly;
+    ///   NOT recorded in the sequence EditLog at all.
+    /// * `TrackWindow` — internally calls `update_effect_params`, which
+    ///   IS recorded as its own `EditOp::UpdateEffectParams` entry. So
+    ///   a batch containing one tracker yields two entries (the prior
+    ///   compound + the tracker write); a batch with N trackers yields
+    ///   N+1 entries. Folding the tracker into the compound is a
+    ///   6.13b refinement.
+    ///
+    /// Mode-validation: `SetWheel`, `SetToneCurve`, and `SetHslCurve`
+    /// reject mismatched modes upfront with a clear error rather than
+    /// silently writing params the renderer would never sample.
+    /// Look up the current `mode` param of a grade node ("primary" /
+    /// "log" / "curves"). Returns "primary" (the schema's implicit
+    /// default) when the node exists but has no mode key. Errors when
+    /// the project / sequence / clip / effect can't be found.
+    fn lookup_grade_mode(
+        &self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+        effect_id: EffectId,
+    ) -> Result<String, EngineError> {
+        let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
+        let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+        let seq = project.sequence(seq_id).ok_or(EngineError::SequenceNotFound)?;
+        let track = seq
+            .tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .ok_or(EngineError::Project("grading: track not found".into()))?;
+        let clip = track
+            .clips
+            .iter()
+            .find(|c| c.id == clip_id)
+            .ok_or(EngineError::Project("grading: clip not found".into()))?;
+        let effect = clip
+            .effects
+            .iter()
+            .find(|e| e.id == effect_id)
+            .ok_or(EngineError::Project("grading: effect not found".into()))?;
+        let mode = match effect.params.get(vance_timeline::grade::KEY_MODE) {
+            Some(EffectValue::String(s)) => s.clone(),
+            _ => vance_timeline::grade::MODE_PRIMARY.to_string(),
+        };
+        Ok(mode)
+    }
+
     pub fn apply_grading_batch(
         &mut self,
         cmds: &[vance_grading_cmd::GradingCommand],
@@ -3639,7 +3687,7 @@ impl Engine {
                         effect,
                     });
                     outcomes.push(gc::GradingCommandOutcome::NodeAdded {
-                        effect_id: new_id.to_string(),
+                        effect_id: vance_grading_cmd::Uuid::from(new_id.to_string()),
                     });
                 }
                 gc::GradingCommand::RemoveGradeNode { track_id, clip_id, effect_id } => {
@@ -3687,6 +3735,28 @@ impl Engine {
                     outcomes.push(gc::GradingCommandOutcome::None);
                 }
                 gc::GradingCommand::SetWheel { track_id, clip_id, effect_id, group, rgb, master, reset } => {
+                    // Reject mismatched mode (primary wheels on a log
+                    // node, log wheels on a primary node) — otherwise
+                    // the params write succeeds but the renderer's
+                    // mode-arm silently drops them, giving the AI a
+                    // confusing "success that did nothing".
+                    let tid = parse_track(track_id)?;
+                    let cid = parse_clip(clip_id)?;
+                    let eid = parse_effect(effect_id)?;
+                    let mode = self.lookup_grade_mode(tid, cid, eid)?;
+                    let want_primary = matches!(
+                        group,
+                        gc::WheelGroup::Lift | gc::WheelGroup::Gamma | gc::WheelGroup::Gain
+                    );
+                    let is_primary = mode == gk::MODE_PRIMARY;
+                    if want_primary != is_primary {
+                        return Err(EngineError::Project(format!(
+                            "grading: SetWheel {:?} requires {} mode, but node is {}",
+                            group,
+                            if want_primary { "primary" } else { "log" },
+                            mode
+                        )));
+                    }
                     let (rgb_keys, master_key) = wheel_keys(*group);
                     let mut params: Vec<(String, EffectValue)> = Vec::new();
                     if reset.unwrap_or(false) {
@@ -3709,15 +3779,27 @@ impl Engine {
                     }
                     if !params.is_empty() {
                         pending.push(EditOp::UpdateEffectParams {
-                            track_id: parse_track(track_id)?,
-                            clip_id: parse_clip(clip_id)?,
-                            effect_id: parse_effect(effect_id)?,
+                            track_id: tid,
+                            clip_id: cid,
+                            effect_id: eid,
                             params,
                         });
                     }
                     outcomes.push(gc::GradingCommandOutcome::None);
                 }
                 gc::GradingCommand::SetToneCurve { track_id, clip_id, effect_id, channel, points } => {
+                    let tid = parse_track(track_id)?;
+                    let cid = parse_clip(clip_id)?;
+                    let eid = parse_effect(effect_id)?;
+                    // Curve params on a non-curves node would write into
+                    // params that the renderer never samples — reject
+                    // upfront so the AI gets a clear error, not silence.
+                    let mode = self.lookup_grade_mode(tid, cid, eid)?;
+                    if mode != gk::MODE_CURVES {
+                        return Err(EngineError::Project(format!(
+                            "grading: SetToneCurve requires a curves-mode node (this node is {mode})"
+                        )));
+                    }
                     let key = match channel {
                         gc::ToneChannel::Master => gk::KEY_CURVE_MASTER,
                         gc::ToneChannel::R => gk::KEY_CURVE_R,
@@ -3726,14 +3808,23 @@ impl Engine {
                         gc::ToneChannel::Luma => gk::KEY_CURVE_LUMA,
                     };
                     pending.push(EditOp::UpdateEffectParams {
-                        track_id: parse_track(track_id)?,
-                        clip_id: parse_clip(clip_id)?,
-                        effect_id: parse_effect(effect_id)?,
+                        track_id: tid,
+                        clip_id: cid,
+                        effect_id: eid,
                         params: vec![(key.to_string(), curve_kfs(points))],
                     });
                     outcomes.push(gc::GradingCommandOutcome::None);
                 }
                 gc::GradingCommand::SetHslCurve { track_id, clip_id, effect_id, curve, points } => {
+                    let tid = parse_track(track_id)?;
+                    let cid = parse_clip(clip_id)?;
+                    let eid = parse_effect(effect_id)?;
+                    let mode = self.lookup_grade_mode(tid, cid, eid)?;
+                    if mode != gk::MODE_CURVES {
+                        return Err(EngineError::Project(format!(
+                            "grading: SetHslCurve requires a curves-mode node (this node is {mode})"
+                        )));
+                    }
                     let key = match curve {
                         gc::HslCurve::HueHue => gk::KEY_CURVE_HUE_HUE,
                         gc::HslCurve::HueSat => gk::KEY_CURVE_HUE_SAT,
@@ -3742,9 +3833,9 @@ impl Engine {
                         gc::HslCurve::LumLum => gk::KEY_CURVE_LUM_LUM,
                     };
                     pending.push(EditOp::UpdateEffectParams {
-                        track_id: parse_track(track_id)?,
-                        clip_id: parse_clip(clip_id)?,
-                        effect_id: parse_effect(effect_id)?,
+                        track_id: tid,
+                        clip_id: cid,
+                        effect_id: eid,
                         params: vec![(key.to_string(), curve_kfs(points))],
                     });
                     outcomes.push(gc::GradingCommandOutcome::None);
