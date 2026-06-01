@@ -5411,6 +5411,7 @@ version = "0.0.0"
 dependencies = [
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

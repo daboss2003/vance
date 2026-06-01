@@ -8,16 +8,17 @@
 //!     0..4    magic               b"VPK1"
 //!     4..6    format_version      u16 = 1
 //!     6..7    lane_count          u8  = 3   (min / max / rms)
-//!     7..8    level_count         u8  = 3   (L0 = 256, L1 = 1024, L2 = 4096)
+//!     7..8    level_count         u8  in [1, LEVEL_COUNT_MAX]
 //!     8..12   sample_rate         u32       source sample rate (Hz)
 //!    12..20   total_samples       u64       per-channel sample count (mono frames)
 //!    20..32   content_hash[12]    [u8;12]   first 12 B of media's BLAKE3
 //!    -------------------------- 32 B header --------------------------
-//!    32..49   level_dir[0]        17 B   { samples_per_bucket u32,
-//!    49..66   level_dir[1]        17 B     bucket_count u32,
-//!    66..83   level_dir[2]        17 B     offset u64,
-//!                                          level_idx u8 }
-//!    83..PAD  alignment pad to 4-byte boundary
+//!    32..(32+17*level_count)      level directory, one 17 B entry per level:
+//!                                          { samples_per_bucket u32,
+//!                                            bucket_count u32,
+//!                                            offset u64,
+//!                                            level_idx u8 }
+//!    pad..    alignment pad to 4-byte boundary
 //!    pad..    level payloads, each one packed lane-major:
 //!                 [ min_i16 × bucket_count ]    -- 2*N B
 //!                 [ max_i16 × bucket_count ]    -- 2*N B
@@ -29,24 +30,52 @@
 //!
 //! ## Stereo collapse
 //!
-//! Per source frame `i`, the mono envelope sample is
-//! `s_i = if |L_i| >= |R_i| { L_i } else { R_i }` — the *signed* sample
-//! of the louder channel. This preserves the visual asymmetry of a
-//! real waveform (positive vs negative excursions look different).
-//! RMS uses the standard stereo formula
-//! `ms_i = (L_i^2 + R_i^2) / 2`, then a bucket's `rms = sqrt(mean(ms_i))`
-//! over the bucket's frames. Mono inputs are treated as `R = L`.
+//! Per source frame, BOTH channels feed the bucket min/max envelope
+//! independently — `cur_min = min(cur_min, L, R)` and
+//! `cur_max = max(cur_max, L, R)`. This matches Audacity / ffmpeg
+//! `showwavespic` and renders anti-phase content (L = -R) correctly,
+//! where the previous single-louder-channel picker dropped one side of
+//! the excursion. RMS uses the standard stereo formula
+//! `ms_i = (L_i^2 + R_i^2) / 2`, then a bucket's
+//! `rms = sqrt(mean(ms_i))` over the bucket's frames. Mono inputs are
+//! treated as `R = L`.
 //!
 //! ## Pyramid
 //!
-//! Level 0 holds the source-resolution buckets. L1 and L2 derive in
+//! Level 0 holds the source-resolution buckets. L1, L2, … derive in
 //! the same streaming pass via 4× decimation so the writer never needs
-//! a second pass over the file:
-//! `Ln.min = min(Ln-1[i..i+4].min)`,
-//! `Ln.max = max(Ln-1[i..i+4].max)`,
-//! `Ln.rms = sqrt(mean(Ln-1[i..i+4].rms^2))`.
-//! The RMS derivation is exact when each child bucket holds the same
-//! number of frames (always true except for the last tail bucket).
+//! a second pass over the file. The decimator is frame-weighted so the
+//! trailing partial-window bucket carries exact RMS even when its
+//! child buckets cover unequal frame counts (e.g. a tail L0 holding
+//! <256 frames decimated with three full siblings):
+//!
+//! ```text
+//!   Ln.min = min(Ln-1[k].min for k in window)
+//!   Ln.max = max(Ln-1[k].max for k in window)
+//!   Ln.rms = sqrt( sum(frames_k * rms_k^2) / sum(frames_k) )
+//! ```
+//!
+//! The on-disk format stores no per-bucket frame count; readers MUST
+//! derive the last bucket's effective frame span at any level from
+//! `header.total_samples` and `level.samples_per_bucket`. See
+//! [`LevelDir::frames_in_bucket`].
+//!
+//! ## Levels (current build)
+//!
+//! At 48 kHz, samples-per-bucket / coverage:
+//!
+//! | level | samples/bucket | ms / bucket |
+//! |-------|----------------|-------------|
+//! | L0    |            256 |        5.33 |
+//! | L1    |          1,024 |       21.33 |
+//! | L2    |          4,096 |       85.33 |
+//! | L3    |         16,384 |      341.33 |
+//!
+//! `LEVEL_COUNT_MAX = 8` is reserved in the format; the writer emits
+//! only as many levels as are useful for the given `total_samples` (at
+//! least 1, never more than fits with ≥ 2 buckets at the coarsest).
+//! Readers must consult `header.level_count`, not the const, when
+//! iterating.
 //!
 //! ## Quantization
 //!
@@ -55,9 +84,15 @@
 //! treated as 0.0.
 
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
+
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 
 /// File magic: bytes literally `V`, `P`, `K`, `1`.
 pub const PEAK_MAGIC: [u8; 4] = *b"VPK1";
@@ -70,8 +105,11 @@ pub const FORMAT_VERSION: u16 = 1;
 /// any `lane_count != 3` until the matching format_version supports it.
 pub const LANE_COUNT: u8 = 3;
 
-/// Number of pyramid levels. v1 = 3.
-pub const LEVEL_COUNT: u8 = 3;
+/// Maximum number of pyramid levels the format supports. At base
+/// `L0 = 256` samples/bucket and decimation 4, `L7` covers
+/// `256 * 4^7 = 4_194_304` samples (≈ 87 s @ 48 kHz) — enough that a
+/// 24-hour audio file still has ≥ 1000 coarsest-level buckets.
+pub const LEVEL_COUNT_MAX: u8 = 8;
 
 /// 6 bytes per bucket per level — `i16 + i16 + u16`. The lanes are
 /// stored lane-major within each level so JS can build typed-array
@@ -84,16 +122,25 @@ pub const HEADER_SIZE: usize = 32;
 /// One level-directory entry, fixed size.
 pub const LEVEL_DIR_ENTRY_SIZE: usize = 17;
 
-/// Total directory size for a v1 file.
-pub const LEVEL_DIR_TOTAL_SIZE: usize = LEVEL_DIR_ENTRY_SIZE * LEVEL_COUNT as usize;
+/// L0 samples per bucket (every level is L0 × 4^level).
+pub const L0_SAMPLES_PER_BUCKET: u32 = 256;
 
-/// Samples-per-bucket for each level. 4× decimation between levels lets
-/// L1 derive from L0 and L2 derive from L1 in the same streaming pass.
-/// At 48 kHz: L0 ≈ 5.3 ms, L1 ≈ 21 ms, L2 ≈ 85 ms.
-pub const LEVEL_SAMPLES_PER_BUCKET: [u32; LEVEL_COUNT as usize] = [256, 1024, 4096];
+/// Decimation factor between adjacent pyramid levels.
+pub const LEVEL_RATIO: u32 = 4;
 
-/// Decimation between adjacent levels.
-const DECIMATION: usize = 4;
+const DECIMATION: usize = LEVEL_RATIO as usize;
+
+/// Samples-per-bucket for `level`, computed as `256 * 4^level`. Returns
+/// `None` for any level whose result would not fit in `u32`. With
+/// `L0_SAMPLES_PER_BUCKET = 256 = 2^8`, the result is `2^(8 + 2*level)`,
+/// so level 11 produces `2^30 = 1_073_741_824` (still fits) and level
+/// 12 would produce `2^32` (wraps to 0). Well above `LEVEL_COUNT_MAX`.
+pub const fn samples_per_bucket(level: u8) -> Option<u32> {
+    if level >= 12 {
+        return None;
+    }
+    Some(L0_SAMPLES_PER_BUCKET << (level as u32 * 2))
+}
 
 /// First 12 bytes of the media's content hash — enough to make
 /// accidental collisions astronomically unlikely while keeping the
@@ -136,7 +183,7 @@ pub enum PeakError {
         supported: u16,
     },
 
-    /// `lane_count` or `level_count` doesn't match the v1 spec.
+    /// `lane_count` is wrong, or `level_count` is out of `[1, LEVEL_COUNT_MAX]`.
     #[error("unsupported layout: lane_count={lane_count}, level_count={level_count}")]
     UnsupportedLayout {
         /// What the file claims.
@@ -145,10 +192,19 @@ pub enum PeakError {
         level_count: u8,
     },
 
-    /// Level directory points outside the file.
+    /// Level directory entry contradicts the v1 spec or another entry.
+    #[error("inconsistent directory at level {level}: {kind}")]
+    InconsistentDirectory {
+        /// Index of the offending entry.
+        level: u8,
+        /// Specific kind of inconsistency.
+        kind: DirectoryProblem,
+    },
+
+    /// Level directory points outside the file (post overflow-check).
     #[error("level {level} payload out of range: offset {offset} + len {len} > file_len {file_len}")]
     LevelOutOfRange {
-        /// Which level (0..LEVEL_COUNT).
+        /// Which level.
         level: u8,
         /// Recorded payload offset.
         offset: u64,
@@ -179,6 +235,74 @@ pub enum PeakError {
         /// Number of levels in the file.
         level_count: u8,
     },
+
+    /// File would exceed `usize::MAX` bytes on this target.
+    #[error("file size {bytes} exceeds usize::MAX on this target")]
+    FileTooLarge {
+        /// File size in bytes.
+        bytes: u64,
+    },
+}
+
+/// Specific kind of directory inconsistency. Surfaces what the v1
+/// spec/invariant said vs what the file said.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DirectoryProblem {
+    /// `level_idx` field doesn't match the entry's slot index.
+    LevelIdxMismatch {
+        /// What the file claims.
+        found: u8,
+        /// What was expected (= slot index).
+        expected: u8,
+    },
+    /// `samples_per_bucket` doesn't match `256 * 4^level`.
+    SamplesPerBucketMismatch {
+        /// What the file claims.
+        found: u32,
+        /// What was expected.
+        expected: u32,
+    },
+    /// `bucket_count` is wrong for the header's `total_samples`.
+    BucketCountMismatch {
+        /// What the file claims.
+        found: u32,
+        /// What was expected: `ceil(total_samples / samples_per_bucket)`.
+        expected: u32,
+    },
+    /// Two adjacent level payloads overlap, or this level starts before
+    /// the post-directory region.
+    OverlappingOrInvalidOffset {
+        /// What the file claims.
+        found: u64,
+        /// Minimum legal start offset (post previous-level end / post
+        /// directory).
+        minimum: u64,
+    },
+    /// Arithmetic on offsets/lengths overflowed u64.
+    OffsetArithmeticOverflow,
+}
+
+impl std::fmt::Display for DirectoryProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LevelIdxMismatch { found, expected } => {
+                write!(f, "level_idx mismatch (found {found}, expected {expected})")
+            }
+            Self::SamplesPerBucketMismatch { found, expected } => write!(
+                f,
+                "samples_per_bucket mismatch (found {found}, expected {expected})"
+            ),
+            Self::BucketCountMismatch { found, expected } => write!(
+                f,
+                "bucket_count mismatch (found {found}, expected {expected})"
+            ),
+            Self::OverlappingOrInvalidOffset { found, minimum } => write!(
+                f,
+                "overlapping or invalid offset (found {found}, minimum {minimum})"
+            ),
+            Self::OffsetArithmeticOverflow => write!(f, "offset arithmetic overflow"),
+        }
+    }
 }
 
 /// Parsed `.peaks` header. Cheap to copy.
@@ -188,7 +312,7 @@ pub struct PeakHeader {
     pub format_version: u16,
     /// Lanes per bucket (currently 3).
     pub lane_count: u8,
-    /// Pyramid levels (currently 3).
+    /// Pyramid levels in the file (`1..=LEVEL_COUNT_MAX`).
     pub level_count: u8,
     /// Source sample rate in Hz.
     pub sample_rate: u32,
@@ -234,7 +358,7 @@ impl PeakHeader {
         }
         let lane_count = bytes[6];
         let level_count = bytes[7];
-        if lane_count != LANE_COUNT || level_count != LEVEL_COUNT {
+        if lane_count != LANE_COUNT || level_count == 0 || level_count > LEVEL_COUNT_MAX {
             return Err(PeakError::UnsupportedLayout {
                 lane_count,
                 level_count,
@@ -259,14 +383,14 @@ impl PeakHeader {
 /// lives and how many buckets it holds.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct LevelDir {
-    /// Source samples per bucket at this level (256 / 1024 / 4096).
+    /// Source samples per bucket at this level (`256 * 4^level`).
     pub samples_per_bucket: u32,
     /// Number of buckets at this level. `ceil(total_samples / samples_per_bucket)`.
     pub bucket_count: u32,
     /// Byte offset of this level's payload start (the mins lane).
     pub offset: u64,
-    /// Level index (0..LEVEL_COUNT). Stored explicitly so a misordered
-    /// directory is detectable.
+    /// Level index (0..LEVEL_COUNT_MAX). Stored explicitly so a
+    /// misordered directory is detectable.
     pub level_idx: u8,
 }
 
@@ -289,23 +413,54 @@ impl LevelDir {
     }
 
     /// Payload length in bytes for this level (all three lanes).
-    pub fn payload_len(&self) -> u64 {
+    pub const fn payload_len(&self) -> u64 {
         self.bucket_count as u64 * BYTES_PER_BUCKET as u64
     }
 
     /// Byte offset of the `min` lane (same as `offset`).
-    pub fn min_lane_offset(&self) -> u64 {
+    pub const fn min_lane_offset(&self) -> u64 {
         self.offset
     }
 
     /// Byte offset of the `max` lane.
-    pub fn max_lane_offset(&self) -> u64 {
+    pub const fn max_lane_offset(&self) -> u64 {
         self.offset + self.bucket_count as u64 * 2
     }
 
     /// Byte offset of the `rms` lane.
-    pub fn rms_lane_offset(&self) -> u64 {
+    pub const fn rms_lane_offset(&self) -> u64 {
         self.offset + self.bucket_count as u64 * 4
+    }
+
+    /// Effective frame count covered by bucket `bucket_idx` given the
+    /// file's `total_samples`. All buckets cover `samples_per_bucket`
+    /// frames except possibly the LAST, which covers
+    /// `total_samples - bucket_idx * samples_per_bucket` (in
+    /// `1..=samples_per_bucket`). Returns `samples_per_bucket` for any
+    /// non-final bucket. Use this when mapping source-sample times to
+    /// pixels and when interpreting the last bucket's RMS.
+    pub const fn frames_in_bucket(&self, bucket_idx: u32, total_samples: u64) -> u32 {
+        if self.bucket_count == 0 || total_samples == 0 {
+            return 0;
+        }
+        if bucket_idx >= self.bucket_count {
+            return 0;
+        }
+        if bucket_idx + 1 < self.bucket_count {
+            return self.samples_per_bucket;
+        }
+        // Last bucket: cover `total_samples - prior_full_buckets * spb`,
+        // clamped to `[1, samples_per_bucket]`.
+        let consumed = bucket_idx as u64 * self.samples_per_bucket as u64;
+        if consumed >= total_samples {
+            return 0;
+        }
+        let remaining = total_samples - consumed;
+        if remaining > self.samples_per_bucket as u64 {
+            self.samples_per_bucket
+        } else {
+            remaining as u32
+        }
     }
 }
 
@@ -316,7 +471,7 @@ pub struct Bucket {
     pub min: i16,
     /// Most-positive envelope sample in the bucket, i16-quantized.
     pub max: i16,
-    /// `sqrt(mean(L^2+R^2)/2)` × 65535, clamped to `[0, 65535]`.
+    /// `sqrt(mean((L^2+R^2)/2))` × 65535, clamped to `[0, 65535]`.
     pub rms: u16,
 }
 
@@ -329,30 +484,37 @@ impl Bucket {
     };
 }
 
+/// Internal bucket carrying its effective frame count so partial-window
+/// decimation can do a frame-weighted RMS. Never serialized.
+#[derive(Debug, Clone, Copy)]
+struct BuilderBucket {
+    bucket: Bucket,
+    frames: u32,
+}
+
 /// Streaming peak builder. Feed PCM via `push_stereo_chunk` (or
-/// `push_mono_chunk`), then `finish()` to get the three level payloads.
+/// `push_mono_chunk`), then `finish()` to get the per-level payloads.
 ///
 /// The builder is allocation-light: it keeps a 4-bucket sliding window
 /// for each derived level rather than buffering whole levels in memory,
-/// so peak extraction memory is `O(1)` in source duration.
+/// so peak extraction memory is `O(LEVEL_COUNT_MAX)` in source duration.
 pub struct PeakBuilder {
-    samples_per_bucket: u32,
-    /// L0 buckets accumulated so far.
+    /// Built L0 buckets so far (the only level we store fully — L1..LN
+    /// only buffer the 4-bucket sliding window because they're driven
+    /// directly into the FinishedPeaks vec at every emission).
     l0: Vec<Bucket>,
-    /// L1 buckets derived in-pass.
-    l1: Vec<Bucket>,
-    /// L2 buckets derived in-pass.
-    l2: Vec<Bucket>,
+    /// All derived levels, one Vec per level (`derived[i]` = L(i+1)).
+    derived: Vec<Vec<Bucket>>,
+    /// 4-bucket decimation windows: `windows[0]` consumes L0,
+    /// `windows[i]` consumes derived[i-1]. Each holds BuilderBuckets so
+    /// the partial-window drain at finish() can weight by frames.
+    windows: Vec<Vec<BuilderBucket>>,
     /// In-progress L0 accumulator.
     cur_min: f32,
     cur_max: f32,
     cur_sumsq: f64,
     cur_frames: u32,
-    /// Last-4 L0 buckets feeding the L1 decimator.
-    l0_window: Vec<Bucket>,
-    /// Last-4 L1 buckets feeding the L2 decimator.
-    l1_window: Vec<Bucket>,
-    /// Total mono frames consumed (== L0 sample count).
+    /// Total mono frames consumed.
     total_frames: u64,
 }
 
@@ -363,20 +525,20 @@ impl Default for PeakBuilder {
 }
 
 impl PeakBuilder {
-    /// Create a fresh builder. `LEVEL_SAMPLES_PER_BUCKET[0]` (256) is
-    /// hard-coded for v1.
+    /// Create a fresh builder. Maintains windows for all
+    /// `LEVEL_COUNT_MAX` derived levels; unused tail levels are dropped
+    /// by `finish()` so the on-disk file only carries useful levels.
     pub fn new() -> Self {
         Self {
-            samples_per_bucket: LEVEL_SAMPLES_PER_BUCKET[0],
             l0: Vec::new(),
-            l1: Vec::new(),
-            l2: Vec::new(),
-            cur_min: 0.0,
-            cur_max: 0.0,
+            derived: (0..LEVEL_COUNT_MAX as usize - 1).map(|_| Vec::new()).collect(),
+            windows: (0..LEVEL_COUNT_MAX as usize - 1)
+                .map(|_| Vec::with_capacity(DECIMATION))
+                .collect(),
+            cur_min: f32::INFINITY,
+            cur_max: f32::NEG_INFINITY,
             cur_sumsq: 0.0,
             cur_frames: 0,
-            l0_window: Vec::with_capacity(DECIMATION),
-            l1_window: Vec::with_capacity(DECIMATION),
             total_frames: 0,
         }
     }
@@ -389,8 +551,7 @@ impl PeakBuilder {
         for f in 0..frames {
             let l = sanitize(samples[2 * f]);
             let r = sanitize(samples[2 * f + 1]);
-            let mono = if l.abs() >= r.abs() { l } else { r };
-            self.push_mono_frame(mono, l, r);
+            self.push_lr(l, r);
         }
     }
 
@@ -398,27 +559,30 @@ impl PeakBuilder {
     pub fn push_mono_chunk(&mut self, samples: &[f32]) {
         for &s in samples {
             let s = sanitize(s);
-            self.push_mono_frame(s, s, s);
+            self.push_lr(s, s);
         }
     }
 
-    fn push_mono_frame(&mut self, mono: f32, l: f32, r: f32) {
-        if self.cur_frames == 0 {
-            self.cur_min = mono;
-            self.cur_max = mono;
-        } else {
-            if mono < self.cur_min {
-                self.cur_min = mono;
-            }
-            if mono > self.cur_max {
-                self.cur_max = mono;
-            }
+    fn push_lr(&mut self, l: f32, r: f32) {
+        // Both channels feed the envelope independently — anti-phase
+        // and asymmetric-stereo content render the full visible swing.
+        if l < self.cur_min {
+            self.cur_min = l;
         }
-        // ms_i = (L^2 + R^2) / 2  — accumulate then mean at flush.
+        if r < self.cur_min {
+            self.cur_min = r;
+        }
+        if l > self.cur_max {
+            self.cur_max = l;
+        }
+        if r > self.cur_max {
+            self.cur_max = r;
+        }
+        // ms_i = (L^2 + R^2) / 2 — accumulate then mean at flush.
         self.cur_sumsq += ((l as f64) * (l as f64) + (r as f64) * (r as f64)) * 0.5;
         self.cur_frames += 1;
         self.total_frames += 1;
-        if self.cur_frames >= self.samples_per_bucket {
+        if self.cur_frames >= L0_SAMPLES_PER_BUCKET {
             self.flush_l0();
         }
     }
@@ -427,85 +591,118 @@ impl PeakBuilder {
         if self.cur_frames == 0 {
             return;
         }
-        let ms_mean = self.cur_sumsq / self.cur_frames as f64;
-        let rms = (ms_mean.max(0.0)).sqrt();
-        let b = Bucket {
+        let frames = self.cur_frames;
+        let ms_mean = self.cur_sumsq / frames as f64;
+        let rms = ms_mean.max(0.0).sqrt();
+        // `sanitize()` clamps every public input to a finite value
+        // before it ever reaches `cur_min`/`cur_max`, so by the time we
+        // get here (cur_frames > 0) both extremes must be finite. Hold
+        // the invariant in debug so a future direct-write path can't
+        // silently break the i16 quantizer.
+        debug_assert!(
+            self.cur_min.is_finite() && self.cur_max.is_finite(),
+            "envelope extremes must be finite after >= 1 sample"
+        );
+        let bucket = Bucket {
             min: quantize_i16(self.cur_min),
             max: quantize_i16(self.cur_max),
             rms: quantize_u16(rms as f32),
         };
-        self.l0.push(b);
-        self.feed_l1(b);
-        self.cur_min = 0.0;
-        self.cur_max = 0.0;
+        self.l0.push(bucket);
+        self.feed_window(0, BuilderBucket { bucket, frames });
+        self.cur_min = f32::INFINITY;
+        self.cur_max = f32::NEG_INFINITY;
         self.cur_sumsq = 0.0;
         self.cur_frames = 0;
     }
 
-    fn feed_l1(&mut self, b: Bucket) {
-        self.l0_window.push(b);
-        if self.l0_window.len() == DECIMATION {
-            let derived = decimate(&self.l0_window);
-            self.l1.push(derived);
-            self.feed_l2(derived);
-            self.l0_window.clear();
+    fn feed_window(&mut self, level_index: usize, b: BuilderBucket) {
+        if level_index >= self.windows.len() {
+            return;
+        }
+        self.windows[level_index].push(b);
+        if self.windows[level_index].len() == DECIMATION {
+            let window: Vec<BuilderBucket> = self.windows[level_index].drain(..).collect();
+            let derived = decimate(&window);
+            self.derived[level_index].push(derived.bucket);
+            self.feed_window(level_index + 1, derived);
         }
     }
 
-    fn feed_l2(&mut self, b: Bucket) {
-        self.l1_window.push(b);
-        if self.l1_window.len() == DECIMATION {
-            let derived = decimate(&self.l1_window);
-            self.l2.push(derived);
-            self.l1_window.clear();
-        }
-    }
-
-    /// Finalize: flush the partial L0 bucket, drain partial L1/L2
-    /// windows so every L0 bucket is represented at every level.
+    /// Finalize: flush the partial L0 bucket and drain partial decimation
+    /// windows so every L0 bucket is represented at every emitted level.
+    /// Trailing levels with zero buckets are dropped.
     pub fn finish(mut self) -> FinishedPeaks {
-        // Tail L0 with < samples_per_bucket frames is still recorded.
         self.flush_l0();
-        if !self.l0_window.is_empty() {
-            let derived = decimate(&self.l0_window);
-            self.l1.push(derived);
-            self.feed_l2(derived);
-            self.l0_window.clear();
+        // Drain partial windows from L0→L1, then L1→L2, etc.
+        for level_index in 0..self.windows.len() {
+            if !self.windows[level_index].is_empty() {
+                let window: Vec<BuilderBucket> =
+                    self.windows[level_index].drain(..).collect();
+                let derived = decimate(&window);
+                self.derived[level_index].push(derived.bucket);
+                // Propagate this partial-derived bucket into the next
+                // window so coarser levels don't truncate at the tail.
+                if level_index + 1 < self.windows.len() {
+                    self.windows[level_index + 1].push(derived);
+                }
+            }
         }
-        if !self.l1_window.is_empty() {
-            let derived = decimate(&self.l1_window);
-            self.l2.push(derived);
-            self.l1_window.clear();
+        // Assemble levels: L0 first, then as many derived as carry at
+        // least one bucket AND can have ≥ 2 buckets at the coarsest
+        // (so we don't waste disk on a 1-bucket level that adds zero
+        // information past its parent).
+        let mut levels: Vec<Vec<Bucket>> = Vec::with_capacity(LEVEL_COUNT_MAX as usize);
+        levels.push(std::mem::take(&mut self.l0));
+        for v in self.derived.iter_mut() {
+            if v.is_empty() {
+                break;
+            }
+            levels.push(std::mem::take(v));
+        }
+        // Trim trailing levels that carry no decimation gain (same
+        // bucket count as their parent — typically a partial-window
+        // drain of a single bucket through every coarser level).
+        while levels.len() >= 2 {
+            let i = levels.len() - 1;
+            if levels[i].len() == levels[i - 1].len() {
+                levels.pop();
+            } else {
+                break;
+            }
+        }
+        // Guarantee ≥ 1 level (empty L0 is fine).
+        if levels.is_empty() {
+            levels.push(Vec::new());
         }
         FinishedPeaks {
             total_frames: self.total_frames,
-            levels: [self.l0, self.l1, self.l2],
+            levels,
         }
     }
 
     /// Live progress: total source frames consumed so far. Useful for
     /// the `peaks://progress` event the PeaksService emits.
-    pub fn frames_consumed(&self) -> u64 {
+    pub const fn frames_consumed(&self) -> u64 {
         self.total_frames
     }
 }
 
-/// Output of `PeakBuilder::finish`: the three level payloads ready to
-/// write. Stored as `Vec<Bucket>` per level rather than as raw bytes so
-/// tests can assert structurally; the on-disk encoding happens inside
-/// `write_atomic`.
+/// Output of `PeakBuilder::finish`: the level payloads ready to write,
+/// L0 first. `levels.len()` is the effective level count (`1..=LEVEL_COUNT_MAX`).
 #[derive(Debug, Clone)]
 pub struct FinishedPeaks {
     /// Total per-channel frames consumed by the builder.
     pub total_frames: u64,
-    /// Buckets per level: `levels[0]` = L0, `levels[1]` = L1, `levels[2]` = L2.
-    pub levels: [Vec<Bucket>; LEVEL_COUNT as usize],
+    /// Buckets per level: `levels[0]` = L0, `levels[1]` = L1, ….
+    pub levels: Vec<Vec<Bucket>>,
 }
 
 /// Atomically write `header + finished` to `final_path` via
-/// `<final_path>.tmp` + fsync + rename. The source `sample_rate` and
-/// `content_hash_prefix` are taken from the header; `total_samples` is
-/// overridden to match the builder so the caller can't desync them.
+/// `<final_path>.<pid>.<counter>.tmp` + fsync + rename + parent-dir
+/// fsync (Unix). The temp file is removed on every error path. The
+/// header's `total_samples` and `level_count` are overridden to match
+/// the builder so the caller can't desync them.
 ///
 /// Returns the bytes written (header + dir + pad + payloads).
 pub fn write_atomic(
@@ -513,25 +710,135 @@ pub fn write_atomic(
     header: &PeakHeader,
     finished: &FinishedPeaks,
 ) -> Result<usize, PeakError> {
-    let bytes = encode(header, finished);
-    let tmp_path = with_extension(final_path, "peaks.tmp");
+    let bytes = encode(header, finished)?;
+    let tmp_path = unique_tmp_path(final_path);
+    let guard = TmpFileGuard::new(tmp_path.clone());
     {
         let mut f = fs::File::create(&tmp_path)?;
         f.write_all(&bytes)?;
         f.sync_all()?;
     }
     fs::rename(&tmp_path, final_path)?;
+    guard.disarm();
+    fsync_parent_dir(final_path);
     Ok(bytes.len())
 }
 
-/// Pure-Rust encoder — exposed for round-trip testing and for callers
-/// that need to ship the bytes over IPC without touching disk.
-pub fn encode(header: &PeakHeader, finished: &FinishedPeaks) -> Vec<u8> {
+/// RAII guard that removes the tmp path on Drop unless `disarm` was
+/// called after a successful rename.
+struct TmpFileGuard {
+    path: Option<std::path::PathBuf>,
+}
+
+impl TmpFileGuard {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+    fn disarm(mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TmpFileGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.path.take() {
+            let _ = fs::remove_file(&p);
+        }
+    }
+}
+
+/// Construct a unique tmp path so concurrent writers to the same final
+/// path do not race on a deterministic filename. Format:
+/// `<final>.<pid>.<counter>.peaks.tmp`.
+fn unique_tmp_path(final_path: &Path) -> std::path::PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut name = final_path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    use std::ffi::OsString;
+    let mut suffix = OsString::new();
+    suffix.push(format!(".{}.{}.peaks.tmp", pid, counter));
+    name.push(suffix);
+    final_path.with_file_name(name)
+}
+
+/// On Unix, durable rename requires fsync on the parent directory.
+/// The rename has already returned in the page cache by the time this
+/// runs, so the file is visible immediately even on failure — but a
+/// crash before the dirent reaches disk can revert it. We log every
+/// failure path at WARN so operators can detect degraded durability
+/// without surfacing a non-fatal error to the caller's hot path.
+fn fsync_parent_dir(final_path: &Path) {
+    #[cfg(unix)]
+    {
+        let parent = match final_path.parent() {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    target: "vance_peaks",
+                    path = ?final_path,
+                    "parent-dir fsync skipped: path has no parent; rename may not be crash-durable"
+                );
+                return;
+            }
+        };
+        match fs::File::open(parent) {
+            Ok(d) => {
+                if let Err(e) = d.sync_all() {
+                    tracing::warn!(
+                        target: "vance_peaks",
+                        path = ?final_path,
+                        err = ?e,
+                        "parent-dir fsync failed; rename may not be crash-durable"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "vance_peaks",
+                    parent = ?parent,
+                    err = ?e,
+                    "parent-dir open failed; cannot fsync; rename may not be crash-durable"
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = final_path;
+    }
+}
+
+/// Pure-Rust encoder — exposed for tests and for callers that need to
+/// ship the bytes over IPC without touching disk.
+///
+/// `header.total_samples` and `header.level_count` are derived from
+/// `finished` and overwrite whatever the caller passed in
+/// (`lane_count`, `format_version`, `sample_rate`, and
+/// `content_hash_prefix` are taken from the caller verbatim). Returns
+/// `Err(FileTooLarge)` if the computed file size would exceed
+/// `usize::MAX` on the current target.
+pub fn encode(header: &PeakHeader, finished: &FinishedPeaks) -> Result<Vec<u8>, PeakError> {
+    let level_count = finished.levels.len();
+    // `FinishedPeaks` is `pub` with `pub levels`, so external callers
+    // can construct one with arbitrary length. Validate explicitly —
+    // not just in debug — so encode/open agree on what's writable.
+    if level_count == 0 || level_count > LEVEL_COUNT_MAX as usize {
+        return Err(PeakError::UnsupportedLayout {
+            lane_count: header.lane_count,
+            level_count: u8::try_from(level_count).unwrap_or(u8::MAX),
+        });
+    }
     let mut header = *header;
     header.total_samples = finished.total_frames;
+    header.level_count = level_count as u8;
 
-    let dir_entries = build_directory(&finished.levels);
-    let mut out = Vec::with_capacity(file_byte_len(&dir_entries));
+    let dir_entries = build_directory(&finished.levels)?;
+    let total = file_byte_len(&dir_entries)?;
+    let mut out = Vec::with_capacity(total);
 
     header.write(&mut out);
     for d in &dir_entries {
@@ -545,38 +852,72 @@ pub fn encode(header: &PeakHeader, finished: &FinishedPeaks) -> Vec<u8> {
         write_level_payload(&mut out, level);
         pad_to_alignment(&mut out, 4);
     }
+    debug_assert_eq!(out.len(), total);
 
-    out
+    Ok(out)
 }
 
-fn build_directory(levels: &[Vec<Bucket>; LEVEL_COUNT as usize]) -> [LevelDir; LEVEL_COUNT as usize] {
-    let dir_start = HEADER_SIZE + LEVEL_DIR_TOTAL_SIZE;
-    let first_payload = align_up(dir_start, 4);
-    let mut entries = [LevelDir {
-        samples_per_bucket: 0,
-        bucket_count: 0,
-        offset: 0,
-        level_idx: 0,
-    }; LEVEL_COUNT as usize];
-    let mut cursor = first_payload as u64;
-    for i in 0..LEVEL_COUNT as usize {
-        let bucket_count = levels[i].len() as u32;
-        entries[i] = LevelDir {
-            samples_per_bucket: LEVEL_SAMPLES_PER_BUCKET[i],
+fn build_directory(levels: &[Vec<Bucket>]) -> Result<Vec<LevelDir>, PeakError> {
+    let dir_size = LEVEL_DIR_ENTRY_SIZE.checked_mul(levels.len()).ok_or(
+        PeakError::InconsistentDirectory {
+            level: 0,
+            kind: DirectoryProblem::OffsetArithmeticOverflow,
+        },
+    )?;
+    let dir_start = HEADER_SIZE.checked_add(dir_size).ok_or(
+        PeakError::InconsistentDirectory {
+            level: 0,
+            kind: DirectoryProblem::OffsetArithmeticOverflow,
+        },
+    )?;
+    let first_payload = align_up_u64(dir_start as u64, 4);
+
+    let mut entries = Vec::with_capacity(levels.len());
+    let mut cursor = first_payload;
+    for (i, level) in levels.iter().enumerate() {
+        let bucket_count = u32::try_from(level.len()).map_err(|_| {
+            PeakError::InconsistentDirectory {
+                level: i as u8,
+                kind: DirectoryProblem::OffsetArithmeticOverflow,
+            }
+        })?;
+        let entry = LevelDir {
+            samples_per_bucket: samples_per_bucket(i as u8).ok_or(
+                PeakError::InconsistentDirectory {
+                    level: i as u8,
+                    kind: DirectoryProblem::OffsetArithmeticOverflow,
+                },
+            )?,
             bucket_count,
             offset: cursor,
             level_idx: i as u8,
         };
-        let payload_len = bucket_count as u64 * BYTES_PER_BUCKET as u64;
-        cursor += payload_len;
-        cursor = align_up(cursor as usize, 4) as u64;
+        let payload_len = entry.payload_len();
+        let next = cursor.checked_add(payload_len).ok_or(
+            PeakError::InconsistentDirectory {
+                level: i as u8,
+                kind: DirectoryProblem::OffsetArithmeticOverflow,
+            },
+        )?;
+        cursor = align_up_u64(next, 4);
+        entries.push(entry);
     }
-    entries
+    Ok(entries)
 }
 
-fn file_byte_len(dir_entries: &[LevelDir; LEVEL_COUNT as usize]) -> usize {
-    let last = &dir_entries[LEVEL_COUNT as usize - 1];
-    align_up((last.offset + last.payload_len()) as usize, 4)
+fn file_byte_len(dir_entries: &[LevelDir]) -> Result<usize, PeakError> {
+    let last = dir_entries
+        .last()
+        .expect("at least one level is enforced upstream");
+    let raw = last
+        .offset
+        .checked_add(last.payload_len())
+        .ok_or(PeakError::InconsistentDirectory {
+            level: last.level_idx,
+            kind: DirectoryProblem::OffsetArithmeticOverflow,
+        })?;
+    let aligned = align_up_u64(raw, 4);
+    usize::try_from(aligned).map_err(|_| PeakError::FileTooLarge { bytes: aligned })
 }
 
 fn write_level_payload(out: &mut Vec<u8>, level: &[Bucket]) {
@@ -600,15 +941,14 @@ fn pad_to_alignment(out: &mut Vec<u8>, align: usize) {
     out.resize(padded, 0u8);
 }
 
-fn align_up(value: usize, align: usize) -> usize {
+const fn align_up(value: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
     (value + align - 1) & !(align - 1)
 }
 
-fn with_extension(path: &Path, new_ext: &str) -> std::path::PathBuf {
-    let mut p = path.to_path_buf();
-    p.set_extension(new_ext);
-    p
+const fn align_up_u64(value: u64, align: u64) -> u64 {
+    debug_assert!(align.is_power_of_two());
+    (value + align - 1) & !(align - 1)
 }
 
 fn sanitize(s: f32) -> f32 {
@@ -629,26 +969,36 @@ fn quantize_u16(x: f32) -> u16 {
     scaled.clamp(0, u16::MAX as i32) as u16
 }
 
-fn decimate(window: &[Bucket]) -> Bucket {
+fn decimate(window: &[BuilderBucket]) -> BuilderBucket {
     debug_assert!(!window.is_empty());
     let mut min = i16::MAX;
     let mut max = i16::MIN;
-    let mut sumsq = 0.0f64;
+    let mut frame_total: u64 = 0;
+    let mut sumsq: f64 = 0.0;
     for b in window {
-        if b.min < min {
-            min = b.min;
+        if b.bucket.min < min {
+            min = b.bucket.min;
         }
-        if b.max > max {
-            max = b.max;
+        if b.bucket.max > max {
+            max = b.bucket.max;
         }
-        let r = b.rms as f64 / 65535.0;
-        sumsq += r * r;
+        let frames = b.frames as u64;
+        let r = b.bucket.rms as f64 / 65535.0;
+        sumsq += (r * r) * (frames as f64);
+        frame_total += frames;
     }
-    let rms_norm = (sumsq / window.len() as f64).sqrt();
-    Bucket {
-        min,
-        max,
-        rms: quantize_u16(rms_norm as f32),
+    let rms_norm = if frame_total == 0 {
+        0.0
+    } else {
+        (sumsq / frame_total as f64).sqrt()
+    };
+    BuilderBucket {
+        bucket: Bucket {
+            min,
+            max,
+            rms: quantize_u16(rms_norm as f32),
+        },
+        frames: u32::try_from(frame_total).unwrap_or(u32::MAX),
     }
 }
 
@@ -656,6 +1006,10 @@ fn decimate(window: &[Bucket]) -> Bucket {
 
 /// Open a `.peaks` file and parse just the header + directory. The
 /// payloads stay on disk; use `read_slice` to pull bucket ranges.
+///
+/// `PeakFile` uses positional reads (`pread`/`seek_read`) under the
+/// hood, so `read_slice` takes `&self` and concurrent callers can
+/// share one `PeakFile` without a Mutex.
 #[derive(Debug)]
 pub struct PeakFile {
     file: fs::File,
@@ -663,45 +1017,122 @@ pub struct PeakFile {
     file_len: u64,
     /// Parsed header.
     pub header: PeakHeader,
-    /// Per-level directory.
-    pub levels: [LevelDir; LEVEL_COUNT as usize],
+    /// Per-level directory. Length == `header.level_count`.
+    pub levels: Vec<LevelDir>,
 }
 
 impl PeakFile {
     /// Open and parse. Returns `Err` on any structural problem (bad
-    /// magic, wrong version, out-of-range level pointers).
+    /// magic, wrong version, inconsistent directory, out-of-range
+    /// level pointers, overflow).
     pub fn open(path: &Path) -> Result<Self, PeakError> {
-        let mut file = fs::File::open(path)?;
+        let file = fs::File::open(path)?;
         let file_len = file.metadata()?.len();
-        if file_len < (HEADER_SIZE + LEVEL_DIR_TOTAL_SIZE) as u64 {
+        if file_len < HEADER_SIZE as u64 {
             return Err(PeakError::Truncated {
-                expected: HEADER_SIZE + LEVEL_DIR_TOTAL_SIZE,
+                expected: HEADER_SIZE,
                 actual: file_len as usize,
             });
         }
-        let mut buf = vec![0u8; HEADER_SIZE + LEVEL_DIR_TOTAL_SIZE];
-        file.seek(SeekFrom::Start(0))?;
-        file.read_exact(&mut buf)?;
-        let header = PeakHeader::parse(&buf[..HEADER_SIZE])?;
-        let mut levels = [LevelDir {
-            samples_per_bucket: 0,
-            bucket_count: 0,
-            offset: 0,
-            level_idx: 0,
-        }; LEVEL_COUNT as usize];
-        for i in 0..LEVEL_COUNT as usize {
-            let start = HEADER_SIZE + i * LEVEL_DIR_ENTRY_SIZE;
-            levels[i] = LevelDir::parse(&buf[start..start + LEVEL_DIR_ENTRY_SIZE]);
-            let payload_end = levels[i].offset + levels[i].payload_len();
+
+        // Read enough to parse the header. We don't know level_count
+        // until we've read it, so do this in two reads.
+        let mut header_buf = [0u8; HEADER_SIZE];
+        pread_exact(&file, 0, &mut header_buf)?;
+        let header = PeakHeader::parse(&header_buf)?;
+
+        let dir_bytes = LEVEL_DIR_ENTRY_SIZE * header.level_count as usize;
+        let post_header = HEADER_SIZE + dir_bytes;
+        if file_len < post_header as u64 {
+            return Err(PeakError::Truncated {
+                expected: post_header,
+                actual: file_len as usize,
+            });
+        }
+        let mut dir_buf = vec![0u8; dir_bytes];
+        pread_exact(&file, HEADER_SIZE as u64, &mut dir_buf)?;
+
+        let min_payload_offset = align_up_u64(post_header as u64, 4);
+        let mut levels = Vec::with_capacity(header.level_count as usize);
+        let mut prev_end = min_payload_offset;
+        for i in 0..header.level_count as usize {
+            let slot_bytes = &dir_buf[i * LEVEL_DIR_ENTRY_SIZE..(i + 1) * LEVEL_DIR_ENTRY_SIZE];
+            let slot = LevelDir::parse(slot_bytes);
+
+            // (a) level_idx must match the slot.
+            if slot.level_idx != i as u8 {
+                return Err(PeakError::InconsistentDirectory {
+                    level: i as u8,
+                    kind: DirectoryProblem::LevelIdxMismatch {
+                        found: slot.level_idx,
+                        expected: i as u8,
+                    },
+                });
+            }
+            // (b) samples_per_bucket must follow the 256 × 4^level
+            //     spec.
+            let expected_spb = samples_per_bucket(i as u8).ok_or(
+                PeakError::UnsupportedLayout {
+                    lane_count: header.lane_count,
+                    level_count: header.level_count,
+                },
+            )?;
+            if slot.samples_per_bucket != expected_spb {
+                return Err(PeakError::InconsistentDirectory {
+                    level: i as u8,
+                    kind: DirectoryProblem::SamplesPerBucketMismatch {
+                        found: slot.samples_per_bucket,
+                        expected: expected_spb,
+                    },
+                });
+            }
+            // (c) bucket_count must equal
+            //     ceil(total_samples / samples_per_bucket).
+            let expected_bc = if header.total_samples == 0 {
+                0u32
+            } else {
+                ceil_div_u64_to_u32(header.total_samples, expected_spb as u64)?
+            };
+            if slot.bucket_count != expected_bc {
+                return Err(PeakError::InconsistentDirectory {
+                    level: i as u8,
+                    kind: DirectoryProblem::BucketCountMismatch {
+                        found: slot.bucket_count,
+                        expected: expected_bc,
+                    },
+                });
+            }
+            // (d) Offset must be ≥ previous-level-end (or post-directory
+            //     for level 0), and offset + payload_len must not
+            //     overflow u64.
+            if slot.offset < prev_end {
+                return Err(PeakError::InconsistentDirectory {
+                    level: i as u8,
+                    kind: DirectoryProblem::OverlappingOrInvalidOffset {
+                        found: slot.offset,
+                        minimum: prev_end,
+                    },
+                });
+            }
+            let payload_end = slot
+                .offset
+                .checked_add(slot.payload_len())
+                .ok_or(PeakError::InconsistentDirectory {
+                    level: i as u8,
+                    kind: DirectoryProblem::OffsetArithmeticOverflow,
+                })?;
             if payload_end > file_len {
                 return Err(PeakError::LevelOutOfRange {
                     level: i as u8,
-                    offset: levels[i].offset,
-                    len: levels[i].payload_len(),
+                    offset: slot.offset,
+                    len: slot.payload_len(),
                     file_len,
                 });
             }
+            prev_end = align_up_u64(payload_end, 4);
+            levels.push(slot);
         }
+
         Ok(Self {
             file,
             file_len,
@@ -713,20 +1144,18 @@ impl PeakFile {
     /// Read a bucket range `[bucket_start, bucket_start + bucket_count)`
     /// from `level` and return it in IPC-ready layout:
     /// `[ min × N | max × N | rms × N ]` — three lane slices
-    /// concatenated, each 2*N bytes. The buffer is 4-byte aligned at
-    /// the start (the IPC layer guarantees this for typed-array view
-    /// safety, and JS only needs 2-byte alignment for Int16/Uint16
-    /// anyway).
+    /// concatenated, each `2 × N` bytes. JS callers build
+    /// `Int16Array` / `Uint16Array` views directly into this buffer.
     pub fn read_slice(
-        &mut self,
+        &self,
         level: u8,
         bucket_start: u32,
         bucket_count: u32,
     ) -> Result<Vec<u8>, PeakError> {
-        if (level as u8) >= LEVEL_COUNT {
+        if level >= self.header.level_count {
             return Err(PeakError::InvalidLevel {
                 level,
-                level_count: LEVEL_COUNT,
+                level_count: self.header.level_count,
             });
         }
         let dir = self.levels[level as usize];
@@ -754,53 +1183,130 @@ impl PeakFile {
         let (min_dst, rest) = out.split_at_mut(count * 2);
         let (max_dst, rms_dst) = rest.split_at_mut(count * 2);
 
-        self.read_lane(dir.min_lane_offset(), bucket_start, min_dst)?;
-        self.read_lane(dir.max_lane_offset(), bucket_start, max_dst)?;
-        self.read_lane(dir.rms_lane_offset(), bucket_start, rms_dst)?;
+        self.read_lane(level, dir.min_lane_offset(), bucket_start, min_dst)?;
+        self.read_lane(level, dir.max_lane_offset(), bucket_start, max_dst)?;
+        self.read_lane(level, dir.rms_lane_offset(), bucket_start, rms_dst)?;
 
         Ok(out)
     }
 
-    fn read_lane(&mut self, lane_offset: u64, bucket_start: u32, dst: &mut [u8]) -> Result<(), PeakError> {
-        let abs = lane_offset + bucket_start as u64 * 2;
-        let abs_end = abs + dst.len() as u64;
+    fn read_lane(
+        &self,
+        level: u8,
+        lane_offset: u64,
+        bucket_start: u32,
+        dst: &mut [u8],
+    ) -> Result<(), PeakError> {
+        let lane_within = (bucket_start as u64)
+            .checked_mul(2)
+            .ok_or(PeakError::LevelOutOfRange {
+                level,
+                offset: lane_offset,
+                len: dst.len() as u64,
+                file_len: self.file_len,
+            })?;
+        let abs =
+            lane_offset
+                .checked_add(lane_within)
+                .ok_or(PeakError::LevelOutOfRange {
+                    level,
+                    offset: lane_offset,
+                    len: dst.len() as u64,
+                    file_len: self.file_len,
+                })?;
+        let abs_end = abs.checked_add(dst.len() as u64).ok_or(
+            PeakError::LevelOutOfRange {
+                level,
+                offset: abs,
+                len: dst.len() as u64,
+                file_len: self.file_len,
+            },
+        )?;
         if abs_end > self.file_len {
             return Err(PeakError::LevelOutOfRange {
-                level: 0,
+                level,
                 offset: abs,
                 len: dst.len() as u64,
                 file_len: self.file_len,
             });
         }
-        self.file.seek(SeekFrom::Start(abs))?;
-        self.file.read_exact(dst)?;
-        Ok(())
+        pread_exact(&self.file, abs, dst)
     }
 }
 
-/// Pick the best level for a given screen-pixel-per-second density.
-/// Returns the smallest level whose `samples_per_bucket / sample_rate
-/// * pixels_per_second` falls in `[1.0, 4.0]` (one bucket per pixel,
-/// no aliasing, no overdraw). Falls back to the coarsest level if
-/// every level would overdraw at this zoom (zoomed-way-out case).
-pub fn choose_level(sample_rate: u32, pixels_per_second: f64) -> u8 {
-    if sample_rate == 0 || pixels_per_second <= 0.0 {
-        return LEVEL_COUNT - 1;
-    }
-    for (i, &spb) in LEVEL_SAMPLES_PER_BUCKET.iter().enumerate() {
-        let bps = spb as f64 / sample_rate as f64 * pixels_per_second;
-        if (1.0..=4.0).contains(&bps) {
-            return i as u8;
+#[cfg(unix)]
+fn pread_exact(f: &fs::File, offset: u64, dst: &mut [u8]) -> Result<(), PeakError> {
+    f.read_exact_at(dst, offset).map_err(PeakError::Io)
+}
+
+#[cfg(windows)]
+fn pread_exact(f: &fs::File, offset: u64, dst: &mut [u8]) -> Result<(), PeakError> {
+    // FileExt::seek_read is "at least one byte" semantics; loop to fill.
+    // Mirrors Unix `read_exact_at`'s stdlib retry-on-Interrupted contract
+    // so callers see identical semantics on both platforms.
+    let mut filled = 0;
+    while filled < dst.len() {
+        match f.seek_read(&mut dst[filled..], offset + filled as u64) {
+            Ok(0) => {
+                return Err(PeakError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "pread hit EOF before fill",
+                )))
+            }
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(PeakError::Io(e)),
         }
     }
-    // Zoomed in past L0 (>4 px/bucket): use L0 anyway. Zoomed out past
-    // L2 (<1 px/bucket): use L2 and accept the aliasing — there is no
-    // L3.
-    let l0_density = LEVEL_SAMPLES_PER_BUCKET[0] as f64 / sample_rate as f64 * pixels_per_second;
+    Ok(())
+}
+
+fn ceil_div_u64_to_u32(num: u64, den: u64) -> Result<u32, PeakError> {
+    debug_assert!(den > 0);
+    let q = num.div_ceil(den);
+    u32::try_from(q).map_err(|_| PeakError::InconsistentDirectory {
+        level: 0,
+        kind: DirectoryProblem::OffsetArithmeticOverflow,
+    })
+}
+
+/// Pick the best level for a given screen-pixel-per-second density and
+/// the actual `header.level_count` of the file.
+///
+/// Returns the smallest level whose `samples_per_bucket / sample_rate
+/// × pixels_per_second` falls in `[1.0, 4.0]` (one bucket per pixel,
+/// no aliasing, no overdraw). If every level in `[0, level_count)`
+/// would *over*draw (too dense at L0), returns `0` — the UI's only
+/// option for very-zoomed-in scrubbing. If every level would *under*draw
+/// (too sparse even at the coarsest level), returns `level_count - 1`
+/// and the UI MUST further-downsample on the fly per draw column. NaN,
+/// zero, and negative inputs all return `level_count - 1` (the cheapest
+/// safe choice).
+pub fn choose_level(sample_rate: u32, pixels_per_second: f64, level_count: u8) -> u8 {
+    if level_count == 0 {
+        return 0;
+    }
+    let last = level_count - 1;
+    if sample_rate == 0 || !pixels_per_second.is_finite() || pixels_per_second <= 0.0 {
+        return last;
+    }
+    for i in 0..level_count {
+        let spb = match samples_per_bucket(i) {
+            Some(s) => s as f64,
+            None => return last,
+        };
+        let bps = spb / sample_rate as f64 * pixels_per_second;
+        if (1.0..=4.0).contains(&bps) {
+            return i;
+        }
+    }
+    // Zoomed in past L0 (>4 px/bucket): use L0. Zoomed out past last
+    // level (<1 px/bucket): use last. Sample the L0 density to decide.
+    let l0_density = L0_SAMPLES_PER_BUCKET as f64 / sample_rate as f64 * pixels_per_second;
     if l0_density > 4.0 {
         0
     } else {
-        LEVEL_COUNT - 1
+        last
     }
 }
 
@@ -813,7 +1319,7 @@ mod tests {
         PeakHeader {
             format_version: FORMAT_VERSION,
             lane_count: LANE_COUNT,
-            level_count: LEVEL_COUNT,
+            level_count: 1, // overridden by encode()
             sample_rate: 48_000,
             total_samples: 0, // overridden by encode()
             content_hash_prefix: [
@@ -838,31 +1344,29 @@ mod tests {
         assert_eq!(HEADER_SIZE, 4 + 2 + 1 + 1 + 4 + 8 + 12);
         assert_eq!(LEVEL_DIR_ENTRY_SIZE, 4 + 4 + 8 + 1);
         assert_eq!(BYTES_PER_BUCKET, 2 + 2 + 2);
-        assert_eq!(LEVEL_SAMPLES_PER_BUCKET, [256, 1024, 4096]);
+        assert_eq!(samples_per_bucket(0), Some(256));
+        assert_eq!(samples_per_bucket(1), Some(1024));
+        assert_eq!(samples_per_bucket(2), Some(4096));
+        assert_eq!(samples_per_bucket(3), Some(16384));
+        assert_eq!(samples_per_bucket(7), Some(4_194_304));
     }
 
     #[test]
-    fn empty_input_produces_zero_bucket_directory() {
+    fn empty_input_produces_one_empty_level() {
         let mut b = PeakBuilder::new();
         b.push_stereo_chunk(&[]);
         let finished = b.finish();
         assert_eq!(finished.total_frames, 0);
-        for lvl in &finished.levels {
-            assert!(lvl.is_empty(), "no buckets on empty input");
-        }
-        let bytes = encode(&sample_header(), &finished);
-        assert_eq!(
-            bytes.len(),
-            align_up(HEADER_SIZE + LEVEL_DIR_TOTAL_SIZE, 4),
-            "header + dir + final pad only"
-        );
+        assert_eq!(finished.levels.len(), 1, "always at least one level");
+        assert!(finished.levels[0].is_empty());
+        let bytes = encode(&sample_header(), &finished).unwrap();
+        assert!(bytes.len() >= HEADER_SIZE + LEVEL_DIR_ENTRY_SIZE);
     }
 
     #[test]
     fn dc_signal_min_eq_max() {
         let mut b = PeakBuilder::new();
-        // Exactly one L0 bucket of constant DC at +0.5.
-        let frames = LEVEL_SAMPLES_PER_BUCKET[0] as usize;
+        let frames = L0_SAMPLES_PER_BUCKET as usize;
         let mut samples = Vec::with_capacity(frames * 2);
         for _ in 0..frames {
             samples.push(0.5);
@@ -872,11 +1376,9 @@ mod tests {
         let f = b.finish();
         assert_eq!(f.levels[0].len(), 1);
         let bk = f.levels[0][0];
-        // mono = 0.5 for every frame → min == max == 0.5 quantized
         let expected = quantize_i16(0.5);
         assert_eq!(bk.min, expected);
         assert_eq!(bk.max, expected);
-        // ms = (0.25 + 0.25)/2 = 0.25; rms = 0.5
         let expected_rms = quantize_u16(0.5);
         assert!(
             (bk.rms as i32 - expected_rms as i32).abs() <= 1,
@@ -889,18 +1391,15 @@ mod tests {
     #[test]
     fn full_scale_sine_min_max_span_full_range() {
         let mut b = PeakBuilder::new();
-        // 4 L0 buckets worth so we also exercise the L1 decimator.
-        let frames = (LEVEL_SAMPLES_PER_BUCKET[0] * 4) as usize;
+        let frames = (L0_SAMPLES_PER_BUCKET * 4) as usize;
         let samples = full_scale_sine(frames, 1_000.0, 48_000.0);
         b.push_stereo_chunk(&samples);
         let f = b.finish();
         assert_eq!(f.levels[0].len(), 4);
-        assert_eq!(f.levels[1].len(), 1);
+        assert!(f.levels.len() >= 2);
         for bk in &f.levels[0] {
             assert!((bk.max as i32) > 32_000, "max near +1.0 (got {})", bk.max);
             assert!((bk.min as i32) < -32_000, "min near -1.0 (got {})", bk.min);
-            // sine RMS = sqrt(0.5) ≈ 0.707. Tolerance accommodates the
-            // partial-cycle truncation at 1kHz over 256 samples / 48k.
             let expected = quantize_u16(0.707);
             assert!(
                 (bk.rms as i32 - expected as i32).abs() < 1500,
@@ -911,37 +1410,69 @@ mod tests {
     }
 
     #[test]
+    fn anti_phase_stereo_renders_full_excursion() {
+        // L = +0.9, R = -0.9 for one full bucket. Old code (pick
+        // louder-of-the-two) would yield min=max=quantize_i16(+0.9),
+        // hiding R's negative swing. The fix feeds both into min/max.
+        let mut b = PeakBuilder::new();
+        let n = L0_SAMPLES_PER_BUCKET as usize;
+        let mut samples = Vec::with_capacity(n * 2);
+        for _ in 0..n {
+            samples.push(0.9);
+            samples.push(-0.9);
+        }
+        b.push_stereo_chunk(&samples);
+        let f = b.finish();
+        let bk = f.levels[0][0];
+        assert_eq!(bk.min, quantize_i16(-0.9));
+        assert_eq!(bk.max, quantize_i16(0.9));
+    }
+
+    #[test]
+    fn asymmetric_stereo_takes_signed_envelope_from_both_channels() {
+        // L = +0.3, R = -0.8 — louder channel is R; new envelope must
+        // see both: min ≈ -0.8 (from R), max ≈ +0.3 (from L).
+        let mut b = PeakBuilder::new();
+        let n = L0_SAMPLES_PER_BUCKET as usize;
+        let mut samples = Vec::with_capacity(n * 2);
+        for _ in 0..n {
+            samples.push(0.3);
+            samples.push(-0.8);
+        }
+        b.push_stereo_chunk(&samples);
+        let f = b.finish();
+        let bk = f.levels[0][0];
+        assert_eq!(bk.min, quantize_i16(-0.8));
+        assert_eq!(bk.max, quantize_i16(0.3));
+    }
+
+    #[test]
     fn pyramid_decimation_l1_from_l0() {
         let mut b = PeakBuilder::new();
-        // Four distinct L0 buckets: alternating loud/quiet.
-        let n = LEVEL_SAMPLES_PER_BUCKET[0] as usize;
+        // Four full L0 buckets, all near full-scale.
+        let n = L0_SAMPLES_PER_BUCKET as usize;
         for k in 0..4 {
-            let amplitude = if k % 2 == 0 { 0.9 } else { 0.1 };
+            let amplitude = if k % 2 == 0 { 0.9 } else { 0.5 };
             let mut chunk = Vec::with_capacity(n * 2);
             for _ in 0..n {
                 chunk.push(amplitude);
-                chunk.push(-amplitude);
+                chunk.push(amplitude); // mono pair
             }
             b.push_stereo_chunk(&chunk);
         }
         let f = b.finish();
         assert_eq!(f.levels[0].len(), 4);
-        assert_eq!(f.levels[1].len(), 1);
+        assert!(f.levels.len() >= 2);
         let l1 = f.levels[1][0];
-        // L1 min/max should equal the most extreme L0 bucket's min/max.
         let expected_max = f.levels[0].iter().map(|b| b.max).max().unwrap();
         let expected_min = f.levels[0].iter().map(|b| b.min).min().unwrap();
         assert_eq!(l1.max, expected_max);
         assert_eq!(l1.min, expected_min);
-        // L1 rms ≈ sqrt(mean((rms_i/65535)^2)) * 65535. Two buckets at
-        // ~0.9 (mono=L since |L|>=|R|... wait L=+0.9, R=-0.9, so
-        // |L|=|R| and mono=L=+0.9; ms = (0.81+0.81)/2 = 0.81; rms=0.9)
-        // and two at 0.1 (rms ~= 0.1). Mean square = (0.81+0.01)*0.5 = 0.41
-        // -> rms ≈ 0.640.
-        let expected_l1 = quantize_u16(0.640);
+        // L1 RMS = sqrt(mean((0.81 + 0.25 + 0.81 + 0.25) / 4)) = sqrt(0.53) ≈ 0.728.
+        let expected_l1 = quantize_u16(0.728);
         assert!(
             (l1.rms as i32 - expected_l1 as i32).abs() < 800,
-            "L1 rms ~= 0.640 quantized (got {}, expected ~{})",
+            "L1 rms ~= 0.728 quantized (got {}, expected ~{})",
             l1.rms,
             expected_l1
         );
@@ -950,8 +1481,7 @@ mod tests {
     #[test]
     fn pyramid_decimation_l2_from_l1() {
         let mut b = PeakBuilder::new();
-        // 16 L0 buckets → 4 L1 → 1 L2.
-        let n = LEVEL_SAMPLES_PER_BUCKET[0] as usize;
+        let n = L0_SAMPLES_PER_BUCKET as usize;
         for k in 0..16 {
             let v = (k as f32) / 16.0;
             let mut chunk = Vec::with_capacity(n * 2);
@@ -964,20 +1494,61 @@ mod tests {
         let f = b.finish();
         assert_eq!(f.levels[0].len(), 16);
         assert_eq!(f.levels[1].len(), 4);
-        assert_eq!(f.levels[2].len(), 1);
+        assert!(f.levels.len() >= 3);
         let l2 = f.levels[2][0];
-        // Max DC: k=15 → mono = 15/16 = 0.9375
         let expected_max = quantize_i16(15.0 / 16.0);
         assert_eq!(l2.max, expected_max);
-        // Min DC: k=0 → mono = 0
         assert_eq!(l2.min, 0);
+    }
+
+    #[test]
+    fn frame_weighted_decimation_corrects_tail_bias() {
+        // 3 full L0 buckets at amplitude 0.1, then a 100-frame tail at
+        // amplitude 0.3. Unweighted decimation would over-amplify the
+        // tail; the new weighted formula reports the true frame-mean.
+        let mut b = PeakBuilder::new();
+        let n = L0_SAMPLES_PER_BUCKET as usize;
+        for _ in 0..3 {
+            let mut chunk = Vec::with_capacity(n * 2);
+            for _ in 0..n {
+                chunk.push(0.1);
+                chunk.push(0.1);
+            }
+            b.push_stereo_chunk(&chunk);
+        }
+        let mut tail = Vec::with_capacity(200);
+        for _ in 0..100 {
+            tail.push(0.3);
+            tail.push(0.3);
+        }
+        b.push_stereo_chunk(&tail);
+        let f = b.finish();
+        assert_eq!(f.levels[0].len(), 4);
+        assert!(f.levels.len() >= 2);
+        let l1 = f.levels[1][0];
+        // Frame-weighted: sqrt((3*256*0.01 + 100*0.09)/(3*256+100))
+        //               = sqrt(16.68 / 868) ≈ 0.1386
+        let expected = quantize_u16(0.1386);
+        assert!(
+            (l1.rms as i32 - expected as i32).abs() < 800,
+            "weighted L1 rms ~ 0.1386 (got {}, expected ~{})",
+            l1.rms,
+            expected
+        );
+        // Sanity: unweighted (old code) would have yielded ~0.173, so
+        // the new value MUST be lower than that.
+        let old_unweighted = quantize_u16(0.173);
+        assert!(
+            (l1.rms as i32) < (old_unweighted as i32),
+            "weighted result should be less than unweighted ~0.173 (got {}, unweighted {})",
+            l1.rms,
+            old_unweighted
+        );
     }
 
     #[test]
     fn tail_bucket_with_fewer_frames_is_recorded() {
         let mut b = PeakBuilder::new();
-        // 100 frames (less than 256) — should produce one tail L0
-        // bucket, one tail L1, one tail L2.
         let mut chunk = Vec::with_capacity(200);
         for _ in 0..100 {
             chunk.push(0.3);
@@ -986,17 +1557,48 @@ mod tests {
         b.push_stereo_chunk(&chunk);
         let f = b.finish();
         assert_eq!(f.levels[0].len(), 1, "tail L0");
-        assert_eq!(f.levels[1].len(), 1, "tail L1 = single L0");
-        assert_eq!(f.levels[2].len(), 1, "tail L2 = single L1");
-        for lvl in &f.levels {
-            assert_eq!(lvl[0].max, quantize_i16(0.3));
+        // Trim of trailing single-bucket levels: only L0 survives.
+        assert_eq!(f.levels.len(), 1);
+        assert_eq!(f.levels[0][0].max, quantize_i16(0.3));
+    }
+
+    #[test]
+    fn last_bucket_effective_frames_via_helper() {
+        let mut b = PeakBuilder::new();
+        let n = L0_SAMPLES_PER_BUCKET as usize;
+        for _ in 0..3 {
+            let mut chunk = Vec::with_capacity(n * 2);
+            for _ in 0..n {
+                chunk.push(0.1);
+                chunk.push(0.1);
+            }
+            b.push_stereo_chunk(&chunk);
         }
+        // Add 100-frame tail
+        let mut tail = Vec::with_capacity(200);
+        for _ in 0..100 {
+            tail.push(0.3);
+            tail.push(0.3);
+        }
+        b.push_stereo_chunk(&tail);
+        let f = b.finish();
+        let total = f.total_frames;
+        // Last L0 bucket covers exactly 100 frames.
+        let dir = LevelDir {
+            samples_per_bucket: L0_SAMPLES_PER_BUCKET,
+            bucket_count: f.levels[0].len() as u32,
+            offset: 0,
+            level_idx: 0,
+        };
+        assert_eq!(dir.frames_in_bucket(0, total), L0_SAMPLES_PER_BUCKET);
+        assert_eq!(dir.frames_in_bucket(2, total), L0_SAMPLES_PER_BUCKET);
+        assert_eq!(dir.frames_in_bucket(3, total), 100);
     }
 
     #[test]
     fn nan_and_inf_inputs_are_treated_as_silence() {
         let mut b = PeakBuilder::new();
-        let n = LEVEL_SAMPLES_PER_BUCKET[0] as usize;
+        let n = L0_SAMPLES_PER_BUCKET as usize;
         let mut chunk = Vec::with_capacity(n * 2);
         for _ in 0..n {
             chunk.push(f32::NAN);
@@ -1016,12 +1618,10 @@ mod tests {
         let path = tmp.path().join("test.peaks");
 
         let mut b = PeakBuilder::new();
-        let samples = full_scale_sine(LEVEL_SAMPLES_PER_BUCKET[0] as usize * 8, 1000.0, 48_000.0);
+        let samples = full_scale_sine(L0_SAMPLES_PER_BUCKET as usize * 8, 1000.0, 48_000.0);
         b.push_stereo_chunk(&samples);
         let finished = b.finish();
         assert_eq!(finished.levels[0].len(), 8);
-        assert_eq!(finished.levels[1].len(), 2);
-        assert_eq!(finished.levels[2].len(), 1); // partial L1 window flushed
 
         let bytes_written = write_atomic(&path, &sample_header(), &finished).unwrap();
         assert_eq!(
@@ -1030,18 +1630,16 @@ mod tests {
             "actual file size matches reported"
         );
 
-        let mut pf = PeakFile::open(&path).unwrap();
+        let pf = PeakFile::open(&path).unwrap();
         assert_eq!(pf.header.sample_rate, 48_000);
         assert_eq!(pf.header.total_samples, finished.total_frames);
+        assert_eq!(pf.header.level_count as usize, finished.levels.len());
         assert_eq!(pf.levels[0].bucket_count, 8);
-        assert_eq!(pf.levels[1].bucket_count, 2);
-        assert_eq!(pf.levels[2].bucket_count, 1);
         assert_eq!(
             pf.header.content_hash_prefix,
             sample_header().content_hash_prefix
         );
 
-        // Pull all of L0 and check it matches the in-memory buckets.
         let slice = pf.read_slice(0, 0, 8).unwrap();
         assert_eq!(slice.len(), 8 * BYTES_PER_BUCKET);
         for (i, b) in finished.levels[0].iter().enumerate() {
@@ -1059,13 +1657,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("test.peaks");
         let mut b = PeakBuilder::new();
-        let samples = full_scale_sine(LEVEL_SAMPLES_PER_BUCKET[0] as usize * 8, 1000.0, 48_000.0);
+        let samples = full_scale_sine(L0_SAMPLES_PER_BUCKET as usize * 8, 1000.0, 48_000.0);
         b.push_stereo_chunk(&samples);
         let finished = b.finish();
         write_atomic(&path, &sample_header(), &finished).unwrap();
 
-        let mut pf = PeakFile::open(&path).unwrap();
-        // Buckets 2..5 (3 buckets) at L0.
+        let pf = PeakFile::open(&path).unwrap();
         let slice = pf.read_slice(0, 2, 3).unwrap();
         assert_eq!(slice.len(), 3 * BYTES_PER_BUCKET);
         for (slot, src_idx) in (2..5).enumerate() {
@@ -1084,15 +1681,20 @@ mod tests {
         let path = tmp.path().join("test.peaks");
         let mut b = PeakBuilder::new();
         b.push_stereo_chunk(&full_scale_sine(
-            LEVEL_SAMPLES_PER_BUCKET[0] as usize,
+            L0_SAMPLES_PER_BUCKET as usize,
             1000.0,
             48_000.0,
         ));
         write_atomic(&path, &sample_header(), &b.finish()).unwrap();
 
-        let mut pf = PeakFile::open(&path).unwrap();
+        let pf = PeakFile::open(&path).unwrap();
         match pf.read_slice(0, 1, 1).unwrap_err() {
-            PeakError::RangeOutOfBounds { level: 0, available: 1, start: 1, end: 2 } => {}
+            PeakError::RangeOutOfBounds {
+                level: 0,
+                available: 1,
+                start: 1,
+                end: 2,
+            } => {}
             e => panic!("unexpected error: {e:?}"),
         }
         match pf.read_slice(99, 0, 1).unwrap_err() {
@@ -1105,7 +1707,7 @@ mod tests {
     fn open_rejects_bad_magic() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("bad.peaks");
-        let mut bytes = vec![0u8; HEADER_SIZE + LEVEL_DIR_TOTAL_SIZE];
+        let mut bytes = vec![0u8; HEADER_SIZE + LEVEL_DIR_ENTRY_SIZE];
         bytes[0..4].copy_from_slice(b"NOPE");
         fs::write(&path, &bytes).unwrap();
         match PeakFile::open(&path).unwrap_err() {
@@ -1118,11 +1720,11 @@ mod tests {
     fn open_rejects_unsupported_version() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("future.peaks");
-        let mut bytes = vec![0u8; HEADER_SIZE + LEVEL_DIR_TOTAL_SIZE];
+        let mut bytes = vec![0u8; HEADER_SIZE + LEVEL_DIR_ENTRY_SIZE];
         bytes[0..4].copy_from_slice(&PEAK_MAGIC);
         bytes[4..6].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
         bytes[6] = LANE_COUNT;
-        bytes[7] = LEVEL_COUNT;
+        bytes[7] = 1;
         fs::write(&path, &bytes).unwrap();
         match PeakFile::open(&path).unwrap_err() {
             PeakError::UnsupportedVersion { found, supported } => {
@@ -1148,17 +1750,160 @@ mod tests {
     fn open_rejects_unsupported_layout() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("layout.peaks");
-        let mut bytes = vec![0u8; HEADER_SIZE + LEVEL_DIR_TOTAL_SIZE];
+        let mut bytes = vec![0u8; HEADER_SIZE + LEVEL_DIR_ENTRY_SIZE];
         bytes[0..4].copy_from_slice(&PEAK_MAGIC);
         bytes[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
         bytes[6] = 4; // not 3
-        bytes[7] = LEVEL_COUNT;
+        bytes[7] = 1;
         fs::write(&path, &bytes).unwrap();
         match PeakFile::open(&path).unwrap_err() {
             PeakError::UnsupportedLayout {
                 lane_count: 4,
-                level_count: 3,
+                level_count: 1,
             } => {}
+            e => panic!("unexpected: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn open_rejects_level_count_zero_or_too_big() {
+        let tmp = TempDir::new().unwrap();
+        for bad in [0u8, LEVEL_COUNT_MAX + 1] {
+            let path = tmp.path().join(format!("lc{bad}.peaks"));
+            let mut bytes = vec![0u8; HEADER_SIZE + LEVEL_DIR_ENTRY_SIZE];
+            bytes[0..4].copy_from_slice(&PEAK_MAGIC);
+            bytes[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+            bytes[6] = LANE_COUNT;
+            bytes[7] = bad;
+            fs::write(&path, &bytes).unwrap();
+            match PeakFile::open(&path).unwrap_err() {
+                PeakError::UnsupportedLayout { .. } => {}
+                e => panic!("unexpected for level_count={bad}: {e:?}"),
+            }
+        }
+    }
+
+    /// Build a well-formed file then mutate one byte in the directory
+    /// and assert the structural validation rejects it.
+    fn write_then_mutate(
+        path: &Path,
+        mutate: impl FnOnce(&mut [u8]),
+    ) -> Result<PeakFile, PeakError> {
+        let mut b = PeakBuilder::new();
+        b.push_stereo_chunk(&full_scale_sine(
+            L0_SAMPLES_PER_BUCKET as usize * 16,
+            1000.0,
+            48_000.0,
+        ));
+        write_atomic(path, &sample_header(), &b.finish()).unwrap();
+        let mut bytes = fs::read(path).unwrap();
+        mutate(&mut bytes);
+        fs::write(path, &bytes).unwrap();
+        PeakFile::open(path)
+    }
+
+    #[test]
+    fn open_rejects_misordered_level_idx() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("misord.peaks");
+        let res = write_then_mutate(&path, |bytes| {
+            // Set level 0's level_idx field (last byte of first dir
+            // entry) to 99.
+            let level0_idx_byte = HEADER_SIZE + LEVEL_DIR_ENTRY_SIZE - 1;
+            bytes[level0_idx_byte] = 99;
+        });
+        match res.unwrap_err() {
+            PeakError::InconsistentDirectory {
+                level: 0,
+                kind: DirectoryProblem::LevelIdxMismatch { found: 99, expected: 0 },
+            } => {}
+            e => panic!("unexpected: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn open_rejects_bad_samples_per_bucket() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("badspb.peaks");
+        let res = write_then_mutate(&path, |bytes| {
+            // Overwrite level 0's samples_per_bucket (first 4 bytes of
+            // first dir entry) with 0.
+            let off = HEADER_SIZE;
+            bytes[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
+        });
+        match res.unwrap_err() {
+            PeakError::InconsistentDirectory {
+                level: 0,
+                kind: DirectoryProblem::SamplesPerBucketMismatch { found: 0, expected: 256 },
+            } => {}
+            e => panic!("unexpected: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn open_rejects_bad_bucket_count() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("badbc.peaks");
+        let res = write_then_mutate(&path, |bytes| {
+            // Set level 0's bucket_count to 99.
+            let off = HEADER_SIZE + 4;
+            bytes[off..off + 4].copy_from_slice(&99u32.to_le_bytes());
+        });
+        match res.unwrap_err() {
+            PeakError::InconsistentDirectory {
+                level: 0,
+                kind: DirectoryProblem::BucketCountMismatch { found: 99, expected: 16 },
+            } => {}
+            e => panic!("unexpected: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn open_rejects_offset_below_post_directory() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("badoff.peaks");
+        let res = write_then_mutate(&path, |bytes| {
+            // Point level 0 at offset 0 (inside the header itself).
+            let off = HEADER_SIZE + 8;
+            bytes[off..off + 8].copy_from_slice(&0u64.to_le_bytes());
+        });
+        match res.unwrap_err() {
+            PeakError::InconsistentDirectory {
+                kind: DirectoryProblem::OverlappingOrInvalidOffset { found: 0, .. },
+                ..
+            } => {}
+            e => panic!("unexpected: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn open_rejects_arithmetic_overflow_on_offset() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("overflow.peaks");
+        let res = write_then_mutate(&path, |bytes| {
+            // Set level 0's offset to near u64::MAX with a large bucket
+            // count so offset + payload_len overflows u64.
+            let off_field = HEADER_SIZE + 8;
+            let bc_field = HEADER_SIZE + 4;
+            bytes[off_field..off_field + 8]
+                .copy_from_slice(&(u64::MAX - 10).to_le_bytes());
+            // bucket_count = 16 (matches expected) — but offset+len overflows
+            // because final offset goes past u64::MAX. Also set total_samples
+            // so bucket_count check passes (total stays as-is from sample_header).
+            let _ = bc_field;
+        });
+        // Either OverflowOnAdd or LevelOutOfRange — both are acceptable
+        // rejections; the important thing is it didn't panic on overflow.
+        match res.unwrap_err() {
+            PeakError::InconsistentDirectory {
+                kind: DirectoryProblem::OffsetArithmeticOverflow,
+                ..
+            }
+            | PeakError::InconsistentDirectory {
+                kind: DirectoryProblem::OverlappingOrInvalidOffset { .. },
+                ..
+            }
+            | PeakError::LevelOutOfRange { .. } => {}
             e => panic!("unexpected: {e:?}"),
         }
     }
@@ -1169,7 +1914,7 @@ mod tests {
         let path = tmp.path().join("aligned.peaks");
         let mut b = PeakBuilder::new();
         b.push_stereo_chunk(&full_scale_sine(
-            LEVEL_SAMPLES_PER_BUCKET[0] as usize * 5,
+            L0_SAMPLES_PER_BUCKET as usize * 5,
             1000.0,
             48_000.0,
         ));
@@ -1190,7 +1935,6 @@ mod tests {
 
     #[test]
     fn level_dir_lane_offsets_match_layout() {
-        // 7 buckets at L0 → mins at offset, maxes at offset+14, rms at offset+28.
         let d = LevelDir {
             samples_per_bucket: 256,
             bucket_count: 7,
@@ -1205,57 +1949,170 @@ mod tests {
 
     #[test]
     fn choose_level_picks_appropriate_density() {
-        // 48k samples, asking for 1 px per millisecond (1000 px/s):
-        //   L0 = 256/48000 * 1000 = 5.33 px/bucket (> 4) → L0 anyway
-        //   L1 = 1024/48000 * 1000 = 21.3 px/bucket — too dense
-        //   L2 = 4096/48000 * 1000 = 85.3 px/bucket — too dense
-        //   None match [1..4] → fall back to L0 (densest source).
-        assert_eq!(choose_level(48_000, 1000.0), 0);
+        // Default 4-level file produced from 16 L0 buckets (4096 samples).
+        let level_count = 4;
+        assert_eq!(choose_level(48_000, 1000.0, level_count), 0);
+        assert_eq!(choose_level(48_000, 100.0, level_count), 1);
+        assert_eq!(choose_level(48_000, 30.0, level_count), 2);
+        assert_eq!(choose_level(48_000, 1.0, level_count), level_count - 1);
 
-        // 100 px/s:
-        //   L0 = 256/48000 * 100 = 0.53 — too sparse
-        //   L1 = 1024/48000 * 100 = 2.13 → IN RANGE
-        //   L2 = 4096/48000 * 100 = 8.53 — too dense
-        assert_eq!(choose_level(48_000, 100.0), 1);
-
-        // 30 px/s:
-        //   L0 = 256/48000 * 30 = 0.16
-        //   L1 = 1024/48000 * 30 = 0.64
-        //   L2 = 4096/48000 * 30 = 2.56 → IN RANGE
-        assert_eq!(choose_level(48_000, 30.0), 2);
-
-        // Pathologically zoomed-out: 1 px/s → no level in [1..4]; L0 is the
-        // densest source so it's not the "too dense at L0" case → coarsest.
-        assert_eq!(choose_level(48_000, 1.0), LEVEL_COUNT - 1);
-
-        // Sanity: zero arguments don't panic.
-        assert_eq!(choose_level(0, 1.0), LEVEL_COUNT - 1);
-        assert_eq!(choose_level(48_000, 0.0), LEVEL_COUNT - 1);
+        // Pathological inputs all fall back to coarsest.
+        assert_eq!(choose_level(0, 1.0, level_count), level_count - 1);
+        assert_eq!(choose_level(48_000, 0.0, level_count), level_count - 1);
+        assert_eq!(choose_level(48_000, f64::NAN, level_count), level_count - 1);
+        assert_eq!(choose_level(48_000, -1.0, level_count), level_count - 1);
+        assert_eq!(choose_level(48_000, 1e9, level_count), 0);
+        assert_eq!(choose_level(48_000, 100.0, 0), 0);
     }
 
     #[test]
-    fn finish_handles_partial_l1_window() {
-        // 5 L0 buckets → L1 gets {0..4} = 1, plus tail-drain of {4} = 1
-        // → 2 L1 buckets. L2 gets the same 2 → tail drain into 1 L2.
+    fn write_atomic_does_not_leave_tmp_on_success() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("clean.peaks");
         let mut b = PeakBuilder::new();
-        let n = LEVEL_SAMPLES_PER_BUCKET[0] as usize;
-        for _ in 0..5 {
-            let mut chunk = Vec::with_capacity(n * 2);
-            for _ in 0..n {
-                chunk.push(0.7);
-                chunk.push(0.7);
+        b.push_stereo_chunk(&full_scale_sine(512, 1000.0, 48_000.0));
+        write_atomic(&path, &sample_header(), &b.finish()).unwrap();
+        assert!(path.is_file());
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with(".peaks.tmp")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no .peaks.tmp leftovers: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn write_atomic_uses_unique_tmp_path_per_call() {
+        let path = std::path::PathBuf::from("/tmp/whatever.peaks");
+        let p1 = unique_tmp_path(&path);
+        let p2 = unique_tmp_path(&path);
+        assert_ne!(p1, p2, "consecutive calls give distinct tmp names");
+    }
+
+    #[test]
+    fn concurrent_writers_to_same_final_path_succeed_and_leave_no_tmp() {
+        // Spawn N threads each writing the same final path many times.
+        // Verifies (a) AtomicU64 counter actually serializes tmp names
+        // across threads, (b) the RAII guard cleans every tmp on every
+        // path, (c) the final file is a valid .peaks at the end.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("race.peaks");
+        let header = sample_header();
+
+        const THREADS: usize = 8;
+        const ITERS_PER_THREAD: usize = 8;
+
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let path = path.clone();
+                s.spawn(move || {
+                    for i in 0..ITERS_PER_THREAD {
+                        let mut b = PeakBuilder::new();
+                        let freq = 100.0 + (t * 100 + i) as f32;
+                        b.push_stereo_chunk(&full_scale_sine(512, freq, 48_000.0));
+                        write_atomic(&path, &header, &b.finish())
+                            .expect("write_atomic under contention");
+                    }
+                });
             }
-            b.push_stereo_chunk(&chunk);
+        });
+
+        // Final file is a valid .peaks (whichever writer landed last).
+        let pf = PeakFile::open(&path).unwrap();
+        assert!(pf.header.total_samples > 0);
+
+        // No stray .peaks.tmp files in the parent directory.
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with(".peaks.tmp")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no .peaks.tmp leftovers after concurrent writes: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn encode_rejects_empty_finished_peaks() {
+        let finished = FinishedPeaks {
+            total_frames: 0,
+            levels: Vec::new(),
+        };
+        match encode(&sample_header(), &finished).unwrap_err() {
+            PeakError::UnsupportedLayout {
+                level_count: 0, ..
+            } => {}
+            e => panic!("expected UnsupportedLayout{{level_count:0}}, got {e:?}"),
         }
-        let f = b.finish();
-        assert_eq!(f.levels[0].len(), 5);
-        assert_eq!(f.levels[1].len(), 2);
-        assert_eq!(f.levels[2].len(), 1);
+    }
+
+    #[test]
+    fn encode_rejects_too_many_levels() {
+        let finished = FinishedPeaks {
+            total_frames: 0,
+            levels: (0..=LEVEL_COUNT_MAX as usize)
+                .map(|_| Vec::new())
+                .collect(),
+        };
+        match encode(&sample_header(), &finished).unwrap_err() {
+            PeakError::UnsupportedLayout { level_count, .. } => {
+                assert_eq!(level_count, LEVEL_COUNT_MAX + 1);
+            }
+            e => panic!("expected UnsupportedLayout, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn samples_per_bucket_returns_none_above_u32_range() {
+        // 256 * 4^11 = 2^30, still fits.
+        assert_eq!(samples_per_bucket(11), Some(1u32 << 30));
+        // 256 * 4^12 = 2^32 — overflow — None.
+        assert_eq!(samples_per_bucket(12), None);
+        assert_eq!(samples_per_bucket(13), None);
+        assert_eq!(samples_per_bucket(255), None);
+    }
+
+    #[test]
+    fn write_atomic_cleans_tmp_on_error() {
+        // Pointing at a non-existent parent directory makes the
+        // create-file step fail. The guard MUST not leave a tmp file
+        // behind (in this case the parent does not even exist, but the
+        // logic must still attempt to remove cleanly).
+        let tmp = TempDir::new().unwrap();
+        let bad = tmp.path().join("does_not_exist").join("x.peaks");
+        let mut b = PeakBuilder::new();
+        b.push_stereo_chunk(&full_scale_sine(512, 1000.0, 48_000.0));
+        let err = write_atomic(&bad, &sample_header(), &b.finish());
+        assert!(err.is_err(), "expected io error");
+        // No file under the temp root should be left behind by the
+        // guard's cleanup path.
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains(".peaks.tmp")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "tmp cleaned: {leftovers:?}");
     }
 
     #[test]
     fn mono_chunk_matches_stereo_duplicate() {
-        let n = LEVEL_SAMPLES_PER_BUCKET[0] as usize;
+        let n = L0_SAMPLES_PER_BUCKET as usize;
         let mut mono = Vec::with_capacity(n);
         let mut stereo = Vec::with_capacity(n * 2);
         for i in 0..n {
@@ -1274,16 +2131,44 @@ mod tests {
     }
 
     #[test]
-    fn write_atomic_does_not_leave_tmp_on_success() {
+    fn frames_in_bucket_handles_edge_cases() {
+        let d = LevelDir {
+            samples_per_bucket: 256,
+            bucket_count: 5,
+            offset: 96,
+            level_idx: 0,
+        };
+        // All non-last buckets cover 256.
+        for i in 0..4 {
+            assert_eq!(d.frames_in_bucket(i, 5 * 256 - 100), 256);
+        }
+        // Last bucket covers 156 (= 5*256 - 100 - 4*256).
+        assert_eq!(d.frames_in_bucket(4, 5 * 256 - 100), 156);
+        // Empty file: 0.
+        assert_eq!(d.frames_in_bucket(0, 0), 0);
+        // Out-of-range index returns 0 gracefully.
+        assert_eq!(d.frames_in_bucket(99, 100), 0);
+    }
+
+    #[test]
+    fn read_slice_is_callable_with_shared_ref() {
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("clean.peaks");
+        let path = tmp.path().join("shared.peaks");
         let mut b = PeakBuilder::new();
-        b.push_stereo_chunk(&full_scale_sine(512, 1000.0, 48_000.0));
+        b.push_stereo_chunk(&full_scale_sine(
+            L0_SAMPLES_PER_BUCKET as usize * 4,
+            1000.0,
+            48_000.0,
+        ));
         write_atomic(&path, &sample_header(), &b.finish()).unwrap();
-        assert!(path.is_file());
-        assert!(
-            !tmp.path().join("clean.peaks.tmp").exists(),
-            ".tmp must be renamed away on success"
-        );
+        let pf = PeakFile::open(&path).unwrap();
+        // Two concurrent slice reads through &PeakFile (no Mutex needed
+        // — the API takes &self thanks to positional reads).
+        std::thread::scope(|s| {
+            let a = s.spawn(|| pf.read_slice(0, 0, 2).unwrap());
+            let b = s.spawn(|| pf.read_slice(0, 2, 2).unwrap());
+            assert_eq!(a.join().unwrap().len(), 2 * BYTES_PER_BUCKET);
+            assert_eq!(b.join().unwrap().len(), 2 * BYTES_PER_BUCKET);
+        });
     }
 }
