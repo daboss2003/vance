@@ -81,6 +81,16 @@ impl AudioClient {
         &self.decoder_label
     }
 
+    /// OS PID of the underlying sidecar process. Use this when you
+    /// need to signal the sidecar from another thread (the
+    /// [`PeaksService`] cancel path uses it to unstick a worker
+    /// blocked inside `next_chunk`).
+    ///
+    /// [`PeaksService`]: ../../vance-app/peaks/struct.PeaksService.html
+    pub fn pid(&self) -> Option<u32> {
+        self.sidecar.pid()
+    }
+
     /// Open a media file's audio stream.
     pub fn open(&mut self, path: impl Into<String>) -> Result<AudioStreamInfo, AudioClientError> {
         match self

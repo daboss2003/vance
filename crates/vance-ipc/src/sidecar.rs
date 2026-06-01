@@ -147,6 +147,14 @@ impl<Req: Serialize, Resp: DeserializeOwned> Sidecar<Req, Resp> {
         Ok(child.wait()?)
     }
 
+    /// The OS PID of the running child (if it hasn't already been
+    /// shut down). Use this when you need to signal the process from
+    /// a different thread than the one that owns the `Sidecar` —
+    /// `kill` requires `&mut self`, but signalling via PID does not.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(|c| c.id())
+    }
+
     /// Force-kill the child immediately. Use only if `shutdown` is not viable.
     pub fn kill(&mut self) -> Result<()> {
         if let Some(child) = self.child.as_mut() {

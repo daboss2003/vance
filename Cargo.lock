@@ -5251,6 +5251,7 @@ version = "0.0.0"
 name = "vance-app"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "parking_lot",
  "pollster",
  "serde",
@@ -5258,6 +5259,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
@@ -5268,6 +5270,7 @@ dependencies = [
  "vance-decoder",
  "vance-grading-cmd",
  "vance-ocio",
+ "vance-peaks",
  "vance-project",
  "vance-render",
  "vance-scopes",

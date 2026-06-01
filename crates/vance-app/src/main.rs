@@ -10,6 +10,7 @@
 )]
 
 mod engine;
+mod peaks;
 
 use engine::{EngineHandle, MediaItemInfo, ProjectInfo, SequenceContents, SourceState, TrackSummary};
 use serde::Serialize;

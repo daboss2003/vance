@@ -50,4 +50,11 @@ vance-viewport = { workspace = true }
 vance-audio = { workspace = true }
 vance-timeline = { workspace = true }
 vance-project = { workspace = true }
+vance-peaks = { workspace = true }
 uuid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
