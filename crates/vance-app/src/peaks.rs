@@ -1,9 +1,3 @@
-// M3 wires PeaksService into the Tauri command handler; until then
-// the module's public surface looks dead to the compiler even though
-// every method is covered by the in-module tests. Cleared when M3
-// imports `peaks::PeaksService` in main.rs.
-#![allow(dead_code)]
-
 //! `PeaksService` — background extractor for audio waveform caches.
 //!
 //! Phase 7.1 M2. One worker thread pulls `PeakJob`s off a FIFO,
@@ -419,14 +413,17 @@ impl PeaksService {
         slot_path(&self.inner.cache_dir, prefix)
     }
 
-    /// Resolve the failure-marker sibling path for a slot.
+    /// Resolve the failure-marker sibling path for a slot. M6 uses
+    /// this for diagnostics + cache-eviction.
+    #[allow(dead_code)]
     pub fn err_path(&self, prefix: &HashPrefix) -> PathBuf {
         err_path(&self.inner.cache_dir, prefix)
     }
 
     /// Delete any `*.peaks.tmp` left over in `cache_dir`. Already called
     /// once by `start`; re-exposed so callers can sweep again before a
-    /// long idle period.
+    /// long idle period (used by M6's project-load hook).
+    #[allow(dead_code)]
     pub fn cleanup_orphan_tmp(&self) -> Result<usize, PeaksServiceError> {
         clean_orphan_tmp(&self.inner.cache_dir).map_err(PeaksServiceError::Io)
     }
@@ -434,7 +431,9 @@ impl PeaksService {
     /// Stop accepting new jobs, signal the worker to abort, and join.
     /// Idempotent. Uses a 5-second join timeout: if the worker is
     /// blocked inside an unkillable IPC read we log a warning and
-    /// detach rather than hanging the host process forever.
+    /// detach rather than hanging the host process forever. M6 calls
+    /// this from the app-shutdown hook.
+    #[allow(dead_code)]
     pub fn shutdown(mut self) {
         self.do_shutdown();
     }
@@ -882,12 +881,15 @@ fn hex_lower(b: &HashPrefix) -> String {
 /// Derive a stable, non-cryptographic 12-byte hash prefix from a media
 /// path's metadata. Used when the project hasn't computed a BLAKE3 yet
 /// — same path + mtime + length always yields the same prefix, so
-/// repeated imports of the same file hit the same cache slot.
+/// repeated imports of the same file hit the same cache slot. M6
+/// chooses between this fallback and `MediaItem.content_hash` when
+/// computing the prefix for an enqueue.
 ///
 /// Two FNV-1a passes use DISTINCT 64-bit offset bases so the two halves
 /// produce independent values; the 12 bytes are filled as 8 from the
 /// first pass + 4 from the second pass shifted right (so we use the
 /// MSBs, not just the low 32 bits).
+#[allow(dead_code)]
 pub fn hash_prefix_from_path(path: &Path, mtime_nanos: i128, len_bytes: u64) -> HashPrefix {
     let mut out = [0u8; 12];
     let bytes = path.as_os_str().to_string_lossy();
@@ -900,8 +902,10 @@ pub fn hash_prefix_from_path(path: &Path, mtime_nanos: i128, len_bytes: u64) -> 
     out
 }
 
+#[allow(dead_code)]
 const FNV_PRIME: u64 = 0x100000001b3;
 
+#[allow(dead_code)]
 fn fnv1a(bytes: &[u8], mtime: i128, len: u64, seed: u64) -> u64 {
     let mut h: u64 = seed;
     for &b in bytes {

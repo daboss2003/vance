@@ -13,11 +13,401 @@ mod engine;
 mod peaks;
 
 use engine::{EngineHandle, MediaItemInfo, ProjectInfo, SequenceContents, SourceState, TrackSummary};
+use parking_lot::Mutex as PMutex;
+use peaks::{JobState, PeakJob, PeaksService, PeaksServiceError, ProgressSink};
 use serde::Serialize;
-use tauri::Manager;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tauri::{Emitter, Manager};
 use vance_decoder::StreamInfo;
+use vance_peaks::{PeakError, PeakFile};
 use vance_timeline::SequenceId;
 use vance_viewport::{HostWindowHandle, ViewportBounds};
+
+/// Tauri-managed handle around the optional `PeaksService` (None until
+/// `setup` has constructed it; `Some` for the rest of the app's life).
+/// Wrapped in a `Mutex<Option<…>>` rather than directly behind an Arc
+/// so M6 can swap the service when the active project bundle changes.
+type PeaksHandle = Arc<PMutex<Option<Arc<PeaksService>>>>;
+
+#[derive(Serialize)]
+struct PeaksStatusResponse {
+    /// Lowercase tag: "queued" | "running" | "done" | "failed" |
+    /// "cancelled" | "unknown".
+    state: &'static str,
+    samples_done: Option<u64>,
+    samples_total: Option<u64>,
+    reason: Option<String>,
+}
+
+impl From<Option<JobState>> for PeaksStatusResponse {
+    fn from(opt: Option<JobState>) -> Self {
+        match opt {
+            None => Self {
+                state: "unknown",
+                samples_done: None,
+                samples_total: None,
+                reason: None,
+            },
+            Some(JobState::Queued) => Self {
+                state: "queued",
+                samples_done: None,
+                samples_total: None,
+                reason: None,
+            },
+            Some(JobState::Running {
+                samples_done,
+                samples_total,
+            }) => Self {
+                state: "running",
+                samples_done: Some(samples_done),
+                samples_total,
+                reason: None,
+            },
+            Some(JobState::Done { samples_total }) => Self {
+                state: "done",
+                samples_done: Some(samples_total),
+                samples_total: Some(samples_total),
+                reason: None,
+            },
+            Some(JobState::Failed(r)) => Self {
+                state: "failed",
+                samples_done: None,
+                samples_total: None,
+                reason: Some(r),
+            },
+            Some(JobState::Cancelled) => Self {
+                state: "cancelled",
+                samples_done: None,
+                samples_total: None,
+                reason: None,
+            },
+        }
+    }
+}
+
+#[derive(Serialize, Clone)]
+struct PeaksProgressEvent {
+    media_id: String,
+    state: &'static str,
+    samples_done: Option<u64>,
+    samples_total: Option<u64>,
+    reason: Option<String>,
+}
+
+fn job_state_tag(s: &JobState) -> &'static str {
+    match s {
+        JobState::Queued => "queued",
+        JobState::Running { .. } => "running",
+        JobState::Done { .. } => "done",
+        JobState::Failed(_) => "failed",
+        JobState::Cancelled => "cancelled",
+    }
+}
+
+/// 4-byte LE sentinel returned by `peaks_for_clip` when the slot isn't
+/// ready (queued, running, missing on disk, or hash-mismatched). UI
+/// checks the first 4 bytes; any other value means real payload.
+const PEAKS_NOT_READY_SENTINEL: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
+
+/// Locate the bundled `vance-audio-decoder` sidecar binary. Mirrors
+/// `engine.rs::locate_audio_binary` but returns a plain `String` error
+/// for the non-engine context. Returns the path relative to
+/// `current_exe`'s directory, where Tauri ships sidecars on every OS.
+fn locate_audio_binary() -> Result<PathBuf, String> {
+    let exe_name = if cfg!(windows) {
+        "vance-audio-decoder.exe"
+    } else {
+        "vance-audio-decoder"
+    };
+    let self_exe =
+        std::env::current_exe().map_err(|e| format!("current_exe(): {e}"))?;
+    let dir = self_exe
+        .parent()
+        .ok_or_else(|| "current_exe has no parent".to_string())?;
+    let cand = dir.join(exe_name);
+    if cand.exists() {
+        Ok(cand)
+    } else {
+        Err(format!("audio sidecar not found at {}", cand.display()))
+    }
+}
+
+/// Default initial cache dir until M6 swaps it for the active bundle's
+/// `<bundle>/cache/peaks/`. Lives under the OS temp dir so it's clearly
+/// disposable.
+fn default_peaks_cache_dir() -> PathBuf {
+    std::env::temp_dir().join("vance-app-peaks-cache")
+}
+
+/// Clone the inner `Arc<PeaksService>` out of the handle and release
+/// the lock before doing any real work. Every peaks_* command MUST go
+/// through this helper — holding the PMutex across disk I/O or the 5s
+/// shutdown latency would serialize every other peaks request.
+fn checkout_peaks(state: &PeaksHandle) -> Result<Arc<PeaksService>, String> {
+    state
+        .lock()
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "peaks service not initialized".to_string())
+}
+
+#[tauri::command]
+fn peaks_status(
+    state: tauri::State<'_, PeaksHandle>,
+    media_id: String,
+) -> Result<PeaksStatusResponse, String> {
+    let uuid = media_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid media id: {e}"))?;
+    let id = vance_timeline::MediaItemId::from_uuid(uuid);
+    let svc = checkout_peaks(&state)?;
+    Ok(svc.status(id).into())
+}
+
+#[tauri::command]
+fn peaks_prioritize(
+    state: tauri::State<'_, PeaksHandle>,
+    media_id: String,
+) -> Result<(), String> {
+    let uuid = media_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid media id: {e}"))?;
+    let id = vance_timeline::MediaItemId::from_uuid(uuid);
+    let svc = checkout_peaks(&state)?;
+    svc.prioritize(id);
+    Ok(())
+}
+
+#[tauri::command]
+fn peaks_cancel(
+    state: tauri::State<'_, PeaksHandle>,
+    media_id: String,
+) -> Result<(), String> {
+    let uuid = media_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid media id: {e}"))?;
+    let id = vance_timeline::MediaItemId::from_uuid(uuid);
+    let svc = checkout_peaks(&state)?;
+    svc.cancel(id);
+    Ok(())
+}
+
+/// Returns whether the peaks subsystem is available, plus a short
+/// reason string when it isn't. UI calls this once on mount so a
+/// missing sidecar or failed cache-dir create surfaces as a clear
+/// "audio waveforms unavailable" banner instead of every peaks_*
+/// command throwing the same opaque string.
+#[tauri::command]
+fn peaks_service_status(
+    state: tauri::State<'_, PeaksHandle>,
+) -> PeaksServiceAvailability {
+    let available = state.lock().is_some();
+    PeaksServiceAvailability {
+        available,
+        reason: if available {
+            None
+        } else {
+            Some(
+                "PeaksService failed to initialize: likely the audio sidecar binary is \
+                 missing or the cache directory is unwritable. See logs."
+                    .to_string(),
+            )
+        },
+    }
+}
+
+#[derive(Serialize)]
+struct PeaksServiceAvailability {
+    available: bool,
+    reason: Option<String>,
+}
+
+/// Return raw `[mins|maxes|rms]` lane bytes for the requested bucket
+/// range, or a 4-byte not-ready sentinel if the slot isn't on disk
+/// yet, isn't on disk ever (hash-mismatched / never extracted), or
+/// the slot file's content-hash header doesn't match the requested
+/// prefix (stale cache).
+///
+/// JS contract: response length is either 4 (sentinel — peaks aren't
+/// ready) or `bucket_count * 6` (real payload). `bucket_count == 0` is
+/// rejected as an error to keep the discrimination unambiguous.
+#[tauri::command]
+fn peaks_for_clip(
+    state: tauri::State<'_, PeaksHandle>,
+    content_hash_prefix_hex: String,
+    level: u8,
+    bucket_start: u32,
+    bucket_count: u32,
+) -> Result<tauri::ipc::Response, String> {
+    if bucket_count == 0 {
+        return Err("bucket_count must be > 0".to_string());
+    }
+    let prefix = parse_hash_prefix_hex(&content_hash_prefix_hex)?;
+    let svc = checkout_peaks(&state)?;
+    let slot = svc.slot_path(&prefix);
+    match PeakFile::open(&slot) {
+        Ok(pf) => {
+            // Hash-prefix guard: a stale slot from before a re-import
+            // could have a header that decodes fine but represents a
+            // different file. Return the sentinel so the UI re-fetches
+            // peaks via peaks_enqueue instead of rendering garbage.
+            if pf.header.content_hash_prefix != prefix {
+                return Ok(tauri::ipc::Response::new(
+                    PEAKS_NOT_READY_SENTINEL.to_vec(),
+                ));
+            }
+            let bytes = pf
+                .read_slice(level, bucket_start, bucket_count)
+                .map_err(|e| e.to_string())?;
+            Ok(tauri::ipc::Response::new(bytes))
+        }
+        Err(PeakError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(tauri::ipc::Response::new(PEAKS_NOT_READY_SENTINEL.to_vec()))
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Convert the 24-char content-hash prefix hex into 12 bytes.
+/// Accepts both upper and lower case (the on-disk filenames use
+/// lowercase via [`hex_lower`], but tolerating both removes a class
+/// of UI-side bugs). Operates byte-by-byte on the ASCII representation
+/// so non-ASCII input is rejected with a clear error instead of
+/// panicking in the underlying str-indexing.
+fn parse_hash_prefix_hex(s: &str) -> Result<[u8; 12], String> {
+    let bytes = s.as_bytes();
+    if bytes.len() != 24 {
+        return Err(format!(
+            "content_hash_prefix_hex must be 24 chars, got {}",
+            bytes.len()
+        ));
+    }
+    let mut out = [0u8; 12];
+    for i in 0..12 {
+        let hi = hex_digit(bytes[i * 2])
+            .ok_or_else(|| format!("byte {i} hi: not an ascii hex digit"))?;
+        let lo = hex_digit(bytes[i * 2 + 1])
+            .ok_or_else(|| format!("byte {i} lo: not an ascii hex digit"))?;
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(10 + b - b'a'),
+        b'A'..=b'F' => Some(10 + b - b'A'),
+        _ => None,
+    }
+}
+
+/// Build the `ProgressSink` that forwards every state transition to
+/// the webview as a `peaks://progress` event. Throttling is already
+/// applied inside `PeaksService` at ≤ 10 Hz; this sink does no further
+/// coalescing.
+fn build_progress_sink(app: tauri::AppHandle) -> ProgressSink {
+    Arc::new(move |id: &vance_timeline::MediaItemId, state: &JobState| {
+        let payload = PeaksProgressEvent {
+            media_id: id.to_string(),
+            state: job_state_tag(state),
+            samples_done: match state {
+                JobState::Running { samples_done, .. } => Some(*samples_done),
+                JobState::Done { samples_total } => Some(*samples_total),
+                _ => None,
+            },
+            samples_total: match state {
+                JobState::Running { samples_total, .. } => *samples_total,
+                JobState::Done { samples_total } => Some(*samples_total),
+                _ => None,
+            },
+            reason: match state {
+                JobState::Failed(r) => Some(r.clone()),
+                _ => None,
+            },
+        };
+        if let Err(e) = app.emit("peaks://progress", payload) {
+            tracing::warn!(
+                target: "vance_app.peaks",
+                err = ?e,
+                "peaks://progress emit failed"
+            );
+        }
+    })
+}
+
+/// M6 will call this from the project-load Tauri command (`load_project`)
+/// once it knows the active bundle's `<bundle>/cache/peaks` path. Until
+/// then the service points at the OS temp dir.
+///
+/// Swaps the service atomically: the old worker is shut down (with the
+/// 5-second join timeout), then a fresh one is started. Any in-flight
+/// extraction is lost; M6 should enqueue everything the project needs
+/// immediately after the swap.
+#[tauri::command]
+fn peaks_set_cache_dir(
+    state: tauri::State<'_, PeaksHandle>,
+    app: tauri::AppHandle,
+    cache_dir: String,
+) -> Result<(), String> {
+    let new_dir = PathBuf::from(cache_dir);
+    let binary = locate_audio_binary()?;
+    let sink = build_progress_sink(app);
+    let new_svc = PeaksService::start(binary, new_dir, sink).map_err(stringify_peaks_err)?;
+    // Install the new service first, take the old one out, RELEASE the
+    // lock, then drop the old. Drop runs PeaksService::do_shutdown
+    // which can take up to 5 seconds — we must NOT hold the global
+    // PeaksHandle lock across that or every concurrent peaks_*
+    // command stalls.
+    let old = {
+        let mut slot = state.lock();
+        let prev = slot.take();
+        *slot = Some(Arc::new(new_svc));
+        prev
+    };
+    drop(old);
+    Ok(())
+}
+
+fn stringify_peaks_err(e: PeaksServiceError) -> String {
+    e.to_string()
+}
+
+/// Enqueue peaks extraction for a media item. The UI hands back the
+/// path + content-hash-prefix-hex; the service either skips work (fresh
+/// cache) or schedules extraction. Idempotent: a duplicate call while
+/// the same media id is Queued/Running is a no-op.
+#[tauri::command]
+fn peaks_enqueue(
+    state: tauri::State<'_, PeaksHandle>,
+    media_id: String,
+    path: String,
+    content_hash_prefix_hex: String,
+    expected_duration_seconds: Option<f64>,
+) -> Result<(), String> {
+    let uuid = media_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid media id: {e}"))?;
+    let prefix = parse_hash_prefix_hex(&content_hash_prefix_hex)?;
+    // Sanitize: NaN/infinity/negative durations would feed garbage
+    // into the staleness check and cause permanent re-extraction.
+    let expected_duration_seconds = expected_duration_seconds.and_then(|d| {
+        if d.is_finite() && (0.0..=24.0 * 3600.0).contains(&d) {
+            Some(d)
+        } else {
+            None
+        }
+    });
+    let job = PeakJob {
+        media_id: vance_timeline::MediaItemId::from_uuid(uuid),
+        path: PathBuf::from(path),
+        content_hash_prefix: prefix,
+        expected_duration_seconds,
+    };
+    let svc = checkout_peaks(&state)?;
+    svc.enqueue(job).map_err(stringify_peaks_err)
+}
 
 #[derive(Serialize)]
 struct OpenResponse {
@@ -902,10 +1292,12 @@ fn main() {
         .try_init();
 
     let engine = EngineHandle::new();
+    let peaks_handle: PeaksHandle = Arc::new(PMutex::new(None));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(engine.clone())
+        .manage(peaks_handle.clone())
         .setup(move |app| {
             let window = app
                 .get_webview_window("main")
@@ -927,6 +1319,38 @@ fn main() {
                 tracing::warn!(
                     "viewport install skipped: only macOS implemented at this checkpoint"
                 );
+            }
+
+            // Spawn the PeaksService with a temp cache dir. M6 swaps
+            // the cache_dir to <bundle>/cache/peaks via the
+            // `peaks_set_cache_dir` command once a project is loaded.
+            match locate_audio_binary() {
+                Ok(binary) => {
+                    let sink = build_progress_sink(app.handle().clone());
+                    match PeaksService::start(binary, default_peaks_cache_dir(), sink) {
+                        Ok(svc) => {
+                            *peaks_handle.lock() = Some(Arc::new(svc));
+                            tracing::info!(
+                                target: "vance_app.peaks",
+                                "PeaksService started with default temp cache_dir"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "vance_app.peaks",
+                                err = ?e,
+                                "PeaksService failed to start; waveforms unavailable"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "vance_app.peaks",
+                        err = ?e,
+                        "audio sidecar missing; PeaksService not started"
+                    );
+                }
             }
 
             Ok(())
@@ -993,7 +1417,38 @@ fn main() {
             redo,
             can_undo,
             can_redo,
+            peaks_enqueue,
+            peaks_status,
+            peaks_prioritize,
+            peaks_cancel,
+            peaks_for_clip,
+            peaks_set_cache_dir,
+            peaks_service_status,
         ])
-        .run(tauri::generate_context!())
-        .expect("tauri failed to start");
+        .build(tauri::generate_context!())
+        .expect("tauri failed to start")
+        // The build()+run() form gives us a RunEvent stream so the
+        // PeaksService worker + its audio sidecar can be drained
+        // deterministically at app exit. Otherwise managed-state Drop
+        // races process teardown and child processes can be orphaned.
+        .run(|app_handle, event| {
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                if let Some(handle) = app_handle.try_state::<PeaksHandle>() {
+                    // Pull the Arc out under a scoped lock, then drop
+                    // it AFTER releasing both the lock and the State
+                    // borrow. PeaksService::Drop can wait up to 5
+                    // seconds on the worker join.
+                    let taken = {
+                        let mut slot = handle.lock();
+                        slot.take()
+                    };
+                    if let Some(svc) = taken {
+                        drop(svc);
+                    }
+                }
+            }
+        });
 }
