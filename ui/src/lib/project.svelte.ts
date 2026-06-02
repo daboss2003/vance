@@ -58,8 +58,13 @@ import {
   type ScopeData,
   type SequenceContents,
   type SourceState,
-  type StreamInfo
+  type StreamInfo,
+  peaksEnqueue,
+  peaksSetCacheDir,
+  peaksServiceStatus,
+  peaksUseUntitledCacheDir
 } from './ipc';
+import { peaksCache } from './peaks-cache.svelte';
 
 class ProjectState {
   /** Current project as the engine sees it; `null` until something is loaded. */
@@ -93,6 +98,17 @@ class ProjectState {
   sourceName = $state<string>('');
   /** Live source state — stream info + playhead in source PTS. */
   source = $state<SourceState | null>(null);
+
+  /** Last advisory message from the peaks subsystem (sidecar missing,
+   *  cache dir un-writable, etc.). UI shows this once as a banner so
+   *  the user knows waveforms won't appear; clears on next success. */
+  peaksWarning = $state<string | null>(null);
+
+  /** Per-project ephemeral cache-dir identifier. For an unsaved
+   *  project we use a stable name derived from a counter so peaks
+   *  never spill into the previous bundle. Bumped on every newProject. */
+  private untitledCounter = 0;
+  private untitledCacheDir: string | null = null;
 
   private async refreshUndoState() {
     try {
@@ -129,6 +145,15 @@ class ProjectState {
       this.info = await ipcNew(name);
       this.path = null;
       this.media = [];
+      // Dispose the UI cache AND retarget the backend service to a
+      // per-Untitled-N OS-temp slot so peaks for the new project
+      // never bleed into whatever bundle was previously loaded.
+      await peaksCache.dispose();
+      this.untitledCounter++;
+      this.untitledCacheDir = await this.retargetCacheDir(
+        () => peaksUseUntitledCacheDir(`untitled-${this.untitledCounter}`),
+        `untitled-${this.untitledCounter}`
+      );
       await this.commitEdit();
     } catch (e) {
       this.error = String(e);
@@ -142,9 +167,95 @@ class ProjectState {
       this.info = await loadProject(path);
       this.path = path;
       this.media = await mediaList();
+      // Reset the UI peaks cache (drops listener + entries) before
+      // pointing the backend service at the new bundle's cache dir.
+      // syncPeaksLifecycle then registers every media item + enqueues
+      // audio extractions so the timeline can paint waveforms as soon
+      // as the user scrolls to them.
+      await peaksCache.dispose();
+      this.untitledCacheDir = null;
+      await this.syncPeaksLifecycle();
       await this.commitEdit();
     } catch (e) {
       this.error = String(e);
+    }
+  }
+
+  /** Centralized backend cache-dir swap. Captures the attempted path
+   *  in any error message so the warning is operator-actionable. */
+  private async retargetCacheDir(
+    swap: () => Promise<string | void>,
+    attemptedLabel: string
+  ): Promise<string | null> {
+    try {
+      const result = await swap();
+      this.peaksWarning = null;
+      return typeof result === 'string' ? result : null;
+    } catch (e) {
+      const msg = `peaksSetCacheDir(${attemptedLabel}) failed: ${e}`;
+      // eslint-disable-next-line no-console
+      console.warn(msg);
+      this.peaksWarning = msg;
+      return null;
+    }
+  }
+
+  /** Point the backend PeaksService at `<bundle>/cache/peaks/`, then
+   *  register every media item with the UI cache and enqueue audio
+   *  items for background extraction. Idempotent — safe to call on
+   *  re-mount, project refresh, etc.
+   *
+   *  Registration is unconditional: even if the backend swap fails,
+   *  the UI cache still learns about every media so a later
+   *  peaks://progress 'done' (e.g. from a sidecar that recovers) can
+   *  surface fresh waveforms without a project reload. Enqueues are
+   *  parallelized via Promise.allSettled so a 50-clip project doesn't
+   *  block project-open on 50 sequential IPC round-trips. */
+  private async syncPeaksLifecycle() {
+    if (this.path) {
+      await this.retargetCacheDir(
+        () => peaksSetCacheDir(`${this.path}/cache/peaks`),
+        `${this.path}/cache/peaks`
+      );
+    }
+    // Always register, regardless of cache-dir-swap outcome.
+    for (const m of this.media) {
+      peaksCache.registerMedia(m.id, m.content_hash_prefix_hex);
+    }
+    // Parallel enqueue — fire-and-forget per item; aggregate via
+    // Promise.allSettled so individual failures don't reject the lot.
+    const audio = this.media.filter((m) => isExtractableAudio(m));
+    if (audio.length === 0) return;
+    const results = await Promise.allSettled(
+      audio.map((m) =>
+        peaksEnqueue(
+          m.id,
+          m.path,
+          m.content_hash_prefix_hex,
+          Number.isFinite(m.duration_seconds) ? m.duration_seconds : null
+        )
+      )
+    );
+    const failed = results
+      .map((r, i) => (r.status === 'rejected' ? audio[i].id : null))
+      .filter((x): x is string => x !== null);
+    if (failed.length > 0) {
+      // eslint-disable-next-line no-console
+      console.warn(`peaksEnqueue failed for ${failed.length} media items:`, failed);
+    }
+  }
+
+  /** One-shot probe of the backend peaks subsystem. Sets
+   *  `peaksWarning` so the chrome can surface a banner. Call once at
+   *  app startup. */
+  async checkPeaksService(): Promise<void> {
+    try {
+      const s = await peaksServiceStatus();
+      if (!s.available) {
+        this.peaksWarning = s.reason ?? 'peaks service unavailable (no reason reported)';
+      }
+    } catch (e) {
+      this.peaksWarning = `peaks_service_status failed: ${e}`;
     }
   }
 
@@ -153,12 +264,53 @@ class ProjectState {
   async save(path: string | null = null) {
     this.error = null;
     try {
+      const previousPath = this.path;
       await ipcSave(path);
       // Keep the local `path` mirror in sync for the title bar.
       if (path) this.path = path;
       else this.path = await currentProjectPath();
+      // Save As / first-time save: retarget the backend peaks cache
+      // dir to the new bundle so subsequent extractions land in the
+      // right place. Any peaks already extracted into the untitled
+      // temp slot remain there until evicted; the next request will
+      // see the slot missing and re-enqueue.
+      if (this.path && this.path !== previousPath) {
+        await this.retargetCacheDir(
+          () => peaksSetCacheDir(`${this.path}/cache/peaks`),
+          `${this.path}/cache/peaks`
+        );
+        this.untitledCacheDir = null;
+        // Re-enqueue any audio media so the new bundle gets its own
+        // .peaks slots (untitled-temp slots stay in /tmp but aren't
+        // authoritative for the saved project any more).
+        await this.enqueueAllAudio();
+      }
     } catch (e) {
       this.error = String(e);
+    }
+  }
+
+  /** Re-enqueue extraction for every audio item in `this.media`.
+   *  Parallel via Promise.allSettled — see `syncPeaksLifecycle`. */
+  private async enqueueAllAudio() {
+    const audio = this.media.filter((m) => isExtractableAudio(m));
+    if (audio.length === 0) return;
+    const results = await Promise.allSettled(
+      audio.map((m) =>
+        peaksEnqueue(
+          m.id,
+          m.path,
+          m.content_hash_prefix_hex,
+          Number.isFinite(m.duration_seconds) ? m.duration_seconds : null
+        )
+      )
+    );
+    const failed = results
+      .map((r, i) => (r.status === 'rejected' ? audio[i].id : null))
+      .filter((x): x is string => x !== null);
+    if (failed.length > 0) {
+      // eslint-disable-next-line no-console
+      console.warn(`peaksEnqueue failed for ${failed.length} media items:`, failed);
     }
   }
 
@@ -259,6 +411,22 @@ class ProjectState {
     try {
       const item = await importMediaFile(path);
       this.media = [...this.media, item];
+      peaksCache.registerMedia(item.id, item.content_hash_prefix_hex);
+      if (isExtractableAudio(item)) {
+        // Fire-and-forget — don't block the user's next interaction on
+        // an IPC round-trip. Failure logs to console; the peaks://
+        // progress event will surface Failed states when M7+ wires
+        // them to the chrome.
+        void peaksEnqueue(
+          item.id,
+          item.path,
+          item.content_hash_prefix_hex,
+          Number.isFinite(item.duration_seconds) ? item.duration_seconds : null
+        ).catch((e) => {
+          // eslint-disable-next-line no-console
+          console.warn('peaksEnqueue failed for', item.id, e);
+        });
+      }
     } catch (e) {
       this.error = String(e);
     }
@@ -287,7 +455,7 @@ class ProjectState {
         fgRgb: args.fgRgb ?? [1, 1, 1],
         bgRgb: args.bgRgb ?? [0, 0, 0],
         width: args.width ?? 1280,
-        height: args.height ?? 720,
+        height: args.height ?? 720
       });
       this.media = [...this.media, item];
       return item.id;
@@ -300,10 +468,7 @@ class ProjectState {
   /** Drop a clip on the timeline. */
   /** Override the input color space tag on a media library item.
    *  `null` clears the override (engine falls back to default). */
-  async setMediaInputColorSpace(
-    mediaId: string,
-    space: ColorSpaceLabel | null
-  ) {
+  async setMediaInputColorSpace(mediaId: string, space: ColorSpaceLabel | null) {
     this.error = null;
     try {
       await setMediaInputColorSpace(mediaId, space);
@@ -587,11 +752,7 @@ class ProjectState {
    *  drag. Does NOT commitEdit — the caller commits once via
    *  `updateEffectParams` on pointer-up so the undo history gets a
    *  single step. */
-  async previewGradeParams(
-    clipId: string,
-    effectId: string,
-    params: [string, EffectValue][]
-  ) {
+  async previewGradeParams(clipId: string, effectId: string, params: [string, EffectValue][]) {
     try {
       await ipcPreviewGradeParams(clipId, effectId, params);
     } catch (e) {
@@ -602,11 +763,7 @@ class ProjectState {
 
   /** Drop a cross-dissolve at the cut after `afterClipId`. Default
    *  duration: 1 second. */
-  async addDissolveAtCut(
-    trackId: string,
-    afterClipId: string,
-    durationSeconds = 1
-  ) {
+  async addDissolveAtCut(trackId: string, afterClipId: string, durationSeconds = 1) {
     this.error = null;
     try {
       await ipcAddTransition(trackId, afterClipId, 'dissolve', durationSeconds);
@@ -680,6 +837,20 @@ class ProjectState {
       this.error = String(e);
     }
   }
+}
+
+/** Does this media item warrant peak extraction? `audio` items
+ *  always do; `video` items with embedded audio will too once
+ *  Phase 7.2 plumbs audio-track detection through MediaItemInfo
+ *  (the embedded-audio path is deliberately out of scope here —
+ *  enqueueing every video file before the extractor knows it has
+ *  an audio track would just produce a flood of Failed events).
+ *
+ *  Zero-duration media are skipped — the freshness check would
+ *  always fail (the cache compares duration ±100ms), causing a
+ *  re-extract on every project open. */
+function isExtractableAudio(m: MediaItemInfo): boolean {
+  return m.kind === 'audio' && m.duration_seconds > 0;
 }
 
 /** Singleton — modules import `projectState` and bind to its runes. */

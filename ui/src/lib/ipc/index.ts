@@ -293,6 +293,11 @@ export type MediaItemInfo = {
   /** User-overridable input color space (Phase 6.2). `null` means
    *  "use engine default" (Rec.709 limited today). */
   input_color_space: ColorSpaceLabel | null;
+  /** 24-char lowercase hex of the first 12 bytes of the media's
+   *  content hash. Stable per `(path, mtime, length)` even before
+   *  BLAKE3 is computed, so the UI can name `.peaks` slots on the
+   *  client side without an extra round-trip. */
+  content_hash_prefix_hex: string;
 };
 
 /** Pull metadata from a media file via the decoder and register it
@@ -708,6 +713,12 @@ export const peaksCancel = (mediaId: string): Promise<void> => invoke('peaks_can
 export const peaksSetCacheDir = (cacheDir: string): Promise<void> =>
   invoke('peaks_set_cache_dir', { cacheDir });
 
+/** Swap the backend cache dir to a per-untitled-project OS-temp slot.
+ *  Returns the absolute path of the chosen directory so the UI can
+ *  surface it if needed. */
+export const peaksUseUntitledCacheDir = (label: string): Promise<string> =>
+  invoke('peaks_use_untitled_cache_dir', { label });
+
 export type PeaksServiceAvailability = {
   available: boolean;
   reason: string | null;
@@ -795,9 +806,7 @@ export type PeaksMetaResponse = {
  *  `null` when the slot isn't on disk yet / is hash-mismatched. UI
  *  uses this to pick the right level for the current zoom and to
  *  bound the bucket range it requests via `peaksForClip`. */
-export const peaksMeta = (
-  contentHashPrefixHex: string
-): Promise<PeaksMetaResponse | null> =>
+export const peaksMeta = (contentHashPrefixHex: string): Promise<PeaksMetaResponse | null> =>
   invoke('peaks_meta', { contentHashPrefixHex });
 
 // ---- Peaks progress events ----------------------------------------------

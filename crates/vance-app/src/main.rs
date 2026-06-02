@@ -399,6 +399,34 @@ fn build_progress_sink(app: tauri::AppHandle) -> ProgressSink {
 /// 5-second join timeout), then a fresh one is started. Any in-flight
 /// extraction is lost; M6 should enqueue everything the project needs
 /// immediately after the swap.
+/// Point the backend service at a fresh OS-temp-scoped cache dir for
+/// an unsaved (Untitled-N) project. UI uses this between newProject
+/// and the first Save so peaks for the new project don't write back
+/// into whatever bundle was previously loaded. Same swap semantics as
+/// [`peaks_set_cache_dir`].
+#[tauri::command]
+fn peaks_use_untitled_cache_dir(
+    state: tauri::State<'_, PeaksHandle>,
+    app: tauri::AppHandle,
+    label: String,
+) -> Result<String, String> {
+    // Sanitize label so a UI bug can't traverse out of the temp root.
+    let safe: String = label
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(64)
+        .collect();
+    if safe.is_empty() {
+        return Err("untitled label must contain at least one [A-Za-z0-9_-] char".into());
+    }
+    let dir = std::env::temp_dir()
+        .join("vance-app-peaks-untitled")
+        .join(&safe);
+    let dir_str = dir.to_string_lossy().into_owned();
+    peaks_set_cache_dir(state, app, dir_str.clone())?;
+    Ok(dir_str)
+}
+
 #[tauri::command]
 fn peaks_set_cache_dir(
     state: tauri::State<'_, PeaksHandle>,
@@ -1478,6 +1506,7 @@ fn main() {
             peaks_for_clip,
             peaks_meta,
             peaks_set_cache_dir,
+            peaks_use_untitled_cache_dir,
             peaks_service_status,
         ])
         .build(tauri::generate_context!())

@@ -855,6 +855,12 @@ pub struct MediaItemInfo {
     /// Stringified input color space (Phase 6.2). `None` when the
     /// user hasn't picked one (engine uses Rec.709 Limited fallback).
     pub input_color_space: Option<String>,
+    /// 24-char lowercase hex of the first 12 bytes of the media's
+    /// content hash. Used by the peaks subsystem (Phase 7.1) to
+    /// name the on-disk `.peaks` slot. Falls back to a stable
+    /// path+mtime+length hash when no real content hash is recorded
+    /// yet — same media always yields the same prefix.
+    pub content_hash_prefix_hex: String,
 }
 
 impl From<&MediaItem> for MediaItemInfo {
@@ -877,8 +883,45 @@ impl From<&MediaItem> for MediaItemInfo {
             frame_rate_num: fr_n,
             frame_rate_den: fr_d,
             input_color_space: m.input_color_space.map(color_space_to_str),
+            content_hash_prefix_hex: media_item_hash_prefix_hex(m),
         }
     }
+}
+
+/// Resolve the 24-char content-hash prefix the peaks subsystem uses to
+/// name `.peaks` slots. Prefers the media item's recorded
+/// `content_hash` (BLAKE3) when present; falls back to a stable
+/// path+mtime+length FNV-1a hash via `vance_app::peaks::hash_prefix_from_path`
+/// when the indexer hasn't computed a real one yet.
+fn media_item_hash_prefix_hex(m: &MediaItem) -> String {
+    let prefix = if let Some(ch) = m.content_hash {
+        let mut p = [0u8; 12];
+        p.copy_from_slice(&ch[..12]);
+        p
+    } else {
+        // Single metadata call — split into mtime + length together so
+        // a race between two reads of the same file can't conjure a
+        // prefix that mixes pre- and post-write state.
+        let (mtime_nanos, len_bytes) = match std::fs::metadata(&m.path) {
+            Ok(md) => {
+                let mtime = md
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as i128)
+                    .unwrap_or(0);
+                (mtime, md.len())
+            }
+            Err(_) => (0i128, 0u64),
+        };
+        crate::peaks::hash_prefix_from_path(&m.path, mtime_nanos, len_bytes)
+    };
+    let mut s = String::with_capacity(24);
+    for byte in &prefix {
+        s.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap());
+    }
+    s
 }
 
 impl From<&Project> for ProjectInfo {
