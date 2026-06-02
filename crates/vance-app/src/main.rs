@@ -223,6 +223,60 @@ struct PeaksServiceAvailability {
     reason: Option<String>,
 }
 
+#[derive(Serialize)]
+struct PeaksLevelMeta {
+    level_idx: u8,
+    samples_per_bucket: u32,
+    bucket_count: u32,
+}
+
+#[derive(Serialize)]
+struct PeaksMetaResponse {
+    sample_rate: u32,
+    total_samples: u64,
+    level_count: u8,
+    levels: Vec<PeaksLevelMeta>,
+}
+
+/// Inspect a `.peaks` slot's header + directory so the UI can compute
+/// `choose_level` and bucket ranges without re-opening the file on
+/// every draw. Returns `None` (serialized as `null`) when the slot
+/// isn't on disk or is hash-mismatched — the UI treats both the same
+/// as "wait for peaks://progress done".
+#[tauri::command]
+fn peaks_meta(
+    state: tauri::State<'_, PeaksHandle>,
+    content_hash_prefix_hex: String,
+) -> Result<Option<PeaksMetaResponse>, String> {
+    let prefix = parse_hash_prefix_hex(&content_hash_prefix_hex)?;
+    let svc = checkout_peaks(&state)?;
+    let slot = svc.slot_path(&prefix);
+    match PeakFile::open(&slot) {
+        Ok(pf) => {
+            if pf.header.content_hash_prefix != prefix {
+                return Ok(None);
+            }
+            let levels = pf
+                .levels
+                .iter()
+                .map(|d| PeaksLevelMeta {
+                    level_idx: d.level_idx,
+                    samples_per_bucket: d.samples_per_bucket,
+                    bucket_count: d.bucket_count,
+                })
+                .collect();
+            Ok(Some(PeaksMetaResponse {
+                sample_rate: pf.header.sample_rate,
+                total_samples: pf.header.total_samples,
+                level_count: pf.header.level_count,
+                levels,
+            }))
+        }
+        Err(PeakError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Return raw `[mins|maxes|rms]` lane bytes for the requested bucket
 /// range, or a 4-byte not-ready sentinel if the slot isn't on disk
 /// yet, isn't on disk ever (hash-mismatched / never extracted), or
@@ -1422,6 +1476,7 @@ fn main() {
             peaks_prioritize,
             peaks_cancel,
             peaks_for_clip,
+            peaks_meta,
             peaks_set_cache_dir,
             peaks_service_status,
         ])

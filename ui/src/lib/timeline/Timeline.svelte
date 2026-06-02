@@ -22,6 +22,7 @@
   import { projectState } from '$lib/project.svelte';
   import { dragState } from '$lib/drag.svelte';
   import { selectionState } from '$lib/selection.svelte';
+  import { peaksCache, chooseLevel } from '$lib/peaks-cache.svelte';
 
   let { refreshTick = 0 }: { refreshTick?: number } = $props();
 
@@ -79,6 +80,15 @@
   // (e.g. Inspector later, keyboard shortcuts) update the canvas.
   $effect(() => {
     void selectionState.ids;
+    scheduleDraw();
+  });
+
+  // Redraw whenever the peaks cache mutates (a fetch landed or an
+  // invalidate fired). Reading .version inside this $effect is what
+  // makes the redraw reactive — the cache's request() calls inside
+  // drawWaveform read but don't subscribe Svelte effects.
+  $effect(() => {
+    void peaksCache.version;
     scheduleDraw();
   });
 
@@ -204,9 +214,7 @@
   function chooseTickInterval(): number {
     // Aim for a tick every ~80px.
     const target = 80 / pixelsPerSecond;
-    const candidates = [
-      0.04, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600
-    ];
+    const candidates = [0.04, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
     for (const c of candidates) {
       if (c >= target) return c;
     }
@@ -297,6 +305,11 @@
     void cssH;
   }
 
+  // Waveform sub-pass styling. Translucent RMS fill underneath the
+  // signed min/max envelope, both clipped to the clip's rounded body.
+  const WAVE_RMS_FILL = 'rgba(255, 255, 255, 0.18)';
+  const WAVE_ENV_STROKE = 'rgba(230, 235, 245, 0.85)';
+
   function drawClips(
     ctx: CanvasRenderingContext2D,
     track: TrackContents,
@@ -340,22 +353,21 @@
       roundRect(ctx, x, cy, Math.max(2, w), ch, 3);
       ctx.fill();
 
+      // Audio waveform overlay (Phase 7.1 M5). Renders the cached
+      // peaks for this clip's source range on top of the clip body
+      // and underneath the border. Visually no-op while the cache is
+      // still fetching — the underlying clip fill shows through.
+      if (track.kind === 'audio' && c.enabled && track.enabled) {
+        const t_in_eff = trimming || moving ? t_in : c.timeline_in_seconds;
+        const source_in_eff = trimming ? trimDrag!.candidateSourceIn : c.source_in_seconds;
+        drawWaveform(ctx, c, x, cy, w, ch, t_in_eff, source_in_eff, dur);
+      }
+
       // Border — thicker accent when selected, lighter when hovered.
       ctx.lineWidth = isSelected ? 2 : 1;
-      ctx.strokeStyle = isSelected
-        ? SELECTED_STROKE
-        : isHovered
-          ? HOVER_STROKE
-          : baseStroke;
+      ctx.strokeStyle = isSelected ? SELECTED_STROKE : isHovered ? HOVER_STROKE : baseStroke;
       const inset = isSelected ? 1 : 0.5;
-      roundRect(
-        ctx,
-        x + inset,
-        cy + inset,
-        Math.max(1, w - 2 * inset),
-        ch - 2 * inset,
-        3
-      );
+      roundRect(ctx, x + inset, cy + inset, Math.max(1, w - 2 * inset), ch - 2 * inset, 3);
       ctx.stroke();
 
       // Label, if there's room.
@@ -383,6 +395,218 @@
         }
       }
     }
+  }
+
+  // Inverse-of-quantizer constants. Hoisting these out of the inner
+  // loops eliminates ~3-6 FP divides per pixel column.
+  const INV_I16 = 1 / 32767;
+  const INV_U16 = 1 / 65535;
+
+  // Round bucket-range start down to a multiple of WAVE_KEY_STRIDE so
+  // a 1-pixel scroll doesn't change the cache key and re-fetch on
+  // every frame. 1024 buckets = ~5.5 s @ 48 kHz at L0; at L3 it's
+  // ~5.8 min. Bigger stride = less thrash + more memory per fetch;
+  // 1024 stays well under the LRU budget.
+  const WAVE_KEY_STRIDE = 1024;
+
+  /** Draw the audio waveform overlay for one clip, clipped to its
+   *  rounded body. Two sub-passes:
+   *  1. Translucent RMS band (single Path2D fill) whose height follows
+   *     the normalized RMS at each screen-pixel column.
+   *  2. Signed min/max envelope (single beginPath / lineTo / stroke
+   *     per clip) drawn as one vertical line per screen-pixel column.
+   *
+   *  Bucket indices are derived from `source_in_seconds` (NOT the
+   *  timeline position), so clip trims/splits/moves leave the cache
+   *  valid. Level selection follows `chooseLevel` exactly.
+   *
+   *  At extreme zoom-out (more buckets per pixel column than 1) the
+   *  per-column envelope folds across the [colStartBucket,
+   *  colEndBucket) range so peaks aren't dropped.
+   *
+   *  Columns past the source media's EOF (when a clip's duration runs
+   *  past `total_samples / sample_rate`) are skipped — the underlying
+   *  clip-body fill shows through, signalling silence instead of
+   *  smearing the last real bucket across the tail.
+   *
+   *  Renders nothing — without throwing — when the cache hasn't yet
+   *  populated meta or peaks for this media. A subsequent draw, after
+   *  the `peaksCache.version` $effect fires, will paint the waveform. */
+  function drawWaveform(
+    ctx: CanvasRenderingContext2D,
+    c: ClipContents,
+    x: number,
+    cy: number,
+    w: number,
+    ch: number,
+    timelineInSeconds: number,
+    sourceInSeconds: number,
+    durationSeconds: number
+  ) {
+    const meta = peaksCache.requestMeta(c.media_id);
+    if (!meta) return;
+    const sampleRate = meta.sample_rate;
+    if (sampleRate <= 0) return;
+
+    const level = chooseLevel(sampleRate, pixelsPerSecond, meta.level_count);
+    const dir = meta.levels[level];
+    if (!dir || dir.bucket_count === 0) return;
+    const spb = dir.samples_per_bucket;
+
+    // Compute the source-frame range for this clip's visible portion,
+    // intersected with the screen and clamped to the source's actual
+    // EOF so trailing samples aren't smeared by the last bucket clamp.
+    const cssW = ctx.canvas.width / (window.devicePixelRatio || 1);
+    const sourceDurationSec = meta.total_samples / sampleRate;
+    const clipSourceRightSec = Math.min(
+      sourceInSeconds + durationSeconds,
+      sourceInSeconds + Math.max(0, sourceDurationSec - sourceInSeconds)
+    );
+    const effectiveTimelineRightSec = timelineInSeconds + (clipSourceRightSec - sourceInSeconds);
+    const visibleClipLeftSec = Math.max(timelineInSeconds, scrollSeconds);
+    const visibleClipRightSec = Math.min(
+      effectiveTimelineRightSec,
+      scrollSeconds + (cssW - TRACK_HEADER_W) / pixelsPerSecond
+    );
+    if (visibleClipRightSec <= visibleClipLeftSec) return;
+
+    const srcStartSec = sourceInSeconds + (visibleClipLeftSec - timelineInSeconds);
+    const srcEndSec = sourceInSeconds + (visibleClipRightSec - timelineInSeconds);
+
+    // Snap the cache key to a stride boundary so scrolling doesn't
+    // thrash the cache. The visible bucket range fits inside
+    // [fetchStartBucket, fetchStartBucket + fetchCount).
+    const visStart = Math.max(0, Math.floor((srcStartSec * sampleRate) / spb));
+    const visEnd = Math.min(dir.bucket_count, Math.ceil((srcEndSec * sampleRate) / spb));
+    if (visEnd <= visStart) return;
+    const fetchStart = Math.max(0, Math.floor(visStart / WAVE_KEY_STRIDE) * WAVE_KEY_STRIDE);
+    const fetchEnd = Math.min(
+      dir.bucket_count,
+      Math.ceil(visEnd / WAVE_KEY_STRIDE) * WAVE_KEY_STRIDE
+    );
+    const fetchCount = fetchEnd - fetchStart;
+    const views = peaksCache.request(c.media_id, level, fetchStart, fetchCount);
+    if (!views) return;
+
+    // Map src→screen for each visible pixel column. We sample per
+    // column rather than per bucket so the loop count is bounded by
+    // the clip's visible CSS width (typically <2000), independent of
+    // how many buckets back the range.
+    const xStart = Math.max(timeToX(visibleClipLeftSec), x);
+    const xEnd = Math.min(timeToX(visibleClipRightSec), x + w);
+    const colW = Math.floor(xEnd - xStart);
+    if (colW < 1) return;
+
+    const mid = cy + ch / 2;
+    const half = (ch - 2) / 2;
+
+    // Hoist loop invariants and precompute per-column bucket spans
+    // so the inner loops don't redo the same arithmetic three times.
+    const clipOriginX = timeToX(timelineInSeconds);
+    const invPps = 1 / pixelsPerSecond;
+    const fetchCountInt = fetchCount | 0;
+    const srcToBucketScale = sampleRate / spb;
+    // bIdxStart[i] = inclusive start bucket index (offset within views).
+    // bIdxEnd[i]   = exclusive end bucket index. For dense zoom the
+    // start..end-1 range is a single bucket; when bps < 1 (zoomed out
+    // past coarsest level) multiple buckets fall in one column and we
+    // fold their min/max/rms.
+    const bIdxStart = new Int32Array(colW);
+    const bIdxEnd = new Int32Array(colW);
+    for (let i = 0; i < colW; i++) {
+      const cx = xStart + i;
+      const colStartSec = sourceInSeconds + (cx - clipOriginX) * invPps;
+      const colEndSec = colStartSec + invPps;
+      let s = Math.floor(colStartSec * srcToBucketScale) - fetchStart;
+      let e = Math.ceil(colEndSec * srcToBucketScale) - fetchStart;
+      if (s < 0) s = 0;
+      if (e > fetchCountInt) e = fetchCountInt;
+      if (e <= s) {
+        // Past-EOF guard — leave start==end so the per-column passes
+        // skip drawing for this column (RMS poly emits mid, envelope
+        // skipped).
+        s = e = -1;
+      }
+      bIdxStart[i] = s;
+      bIdxEnd[i] = e;
+    }
+
+    ctx.save();
+    // Clip to the clip's rounded body so the waveform doesn't bleed
+    // over the border.
+    ctx.beginPath();
+    roundRect(ctx, x, cy, Math.max(2, w), ch, 3);
+    ctx.clip();
+
+    // Pass 1 — RMS band (filled translucent strip). One Path2D poly:
+    // top edge L→R via mid - rmsHalf, bottom edge R→L via mid + rmsHalf.
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < colW; i++) {
+      const s = bIdxStart[i];
+      const e = bIdxEnd[i];
+      let rmsMax = 0;
+      if (s >= 0) {
+        for (let b = s; b < e; b++) {
+          const r = views.rms[b];
+          if (r > rmsMax) rmsMax = r;
+        }
+      }
+      const rmsHalf = rmsMax * INV_U16 * half;
+      const cx = xStart + i + 0.5;
+      if (!started) {
+        ctx.moveTo(cx, mid - rmsHalf);
+        started = true;
+      } else {
+        ctx.lineTo(cx, mid - rmsHalf);
+      }
+    }
+    for (let i = colW - 1; i >= 0; i--) {
+      const s = bIdxStart[i];
+      const e = bIdxEnd[i];
+      let rmsMax = 0;
+      if (s >= 0) {
+        for (let b = s; b < e; b++) {
+          const r = views.rms[b];
+          if (r > rmsMax) rmsMax = r;
+        }
+      }
+      const rmsHalf = rmsMax * INV_U16 * half;
+      ctx.lineTo(xStart + i + 0.5, mid + rmsHalf);
+    }
+    ctx.closePath();
+    ctx.fillStyle = WAVE_RMS_FILL;
+    ctx.fill();
+
+    // Pass 2 — signed min/max envelope, one stroke. Skips columns
+    // whose span is past EOF (s < 0) — the clip body fill shows
+    // through, signalling silence rather than smeared last-bucket.
+    ctx.beginPath();
+    ctx.strokeStyle = WAVE_ENV_STROKE;
+    ctx.lineWidth = 1;
+    for (let i = 0; i < colW; i++) {
+      const s = bIdxStart[i];
+      if (s < 0) continue;
+      const e = bIdxEnd[i];
+      let minV = views.min[s];
+      let maxV = views.max[s];
+      for (let b = s + 1; b < e; b++) {
+        const mn = views.min[b];
+        if (mn < minV) minV = mn;
+        const mx = views.max[b];
+        if (mx > maxV) maxV = mx;
+      }
+      // i16 → [-1, 1] normalized. Negative min → -min*half > 0 →
+      // below mid (drawn at y > mid). Positive max → above mid.
+      const yMin = mid - minV * INV_I16 * half;
+      const yMax = mid - maxV * INV_I16 * half;
+      const cx = xStart + i + 0.5;
+      ctx.moveTo(cx, yMax);
+      ctx.lineTo(cx, yMin);
+    }
+    ctx.stroke();
+
+    ctx.restore();
   }
 
   /** Draw cross-dissolve transitions on a track. Each transition
@@ -461,7 +685,10 @@
   }
 
   /** Kept as a thin shim for code that just needs the clip itself. */
-  function clipAt(localX: number, localY: number): { clip: ClipContents; track: TrackContents } | null {
+  function clipAt(
+    localX: number,
+    localY: number
+  ): { clip: ClipContents; track: TrackContents } | null {
     const h = hitAt(localX, localY);
     return h ? { clip: h.clip, track: h.track } : null;
   }
@@ -600,18 +827,16 @@
   /** Set on every mousemove; drives the cursor style + handle hint. */
   let hoverEdge = $state<'left' | 'right' | null>(null);
 
-  let dragStart:
-    | {
-        kind: DragKind;
-        clientX: number;
-        clientY: number;
-        localX: number;
-        localY: number;
-        scroll: number;
-        modKeys: { shift: boolean; cmd: boolean };
-        downOnClipId: string | null;
-      }
-    | null = null;
+  let dragStart: {
+    kind: DragKind;
+    clientX: number;
+    clientY: number;
+    localX: number;
+    localY: number;
+    scroll: number;
+    modKeys: { shift: boolean; cmd: boolean };
+    downOnClipId: string | null;
+  } | null = null;
 
   function onMouseDown(e: MouseEvent) {
     if (e.button !== 0) return;
@@ -699,8 +924,7 @@
       ensureTrimDrag(dragStart);
       if (trimDrag && canvas) {
         const rect = canvas.getBoundingClientRect();
-        const cursorT =
-          scrollSeconds + (e.clientX - rect.left - TRACK_HEADER_W) / pixelsPerSecond;
+        const cursorT = scrollSeconds + (e.clientX - rect.left - TRACK_HEADER_W) / pixelsPerSecond;
         applyTrimCandidate(trimDrag, cursorT, e.shiftKey);
         scheduleDraw();
       }
@@ -811,8 +1035,7 @@
       const clip = track.clips.find((c) => c.id === ds.downOnClipId);
       if (!clip) continue;
       const rect = canvas.getBoundingClientRect();
-      const cursorT =
-        scrollSeconds + (ds.clientX - rect.left - TRACK_HEADER_W) / pixelsPerSecond;
+      const cursorT = scrollSeconds + (ds.clientX - rect.left - TRACK_HEADER_W) / pixelsPerSecond;
       moveDrag = {
         trackId: track.id,
         trackIdx: i,
@@ -867,9 +1090,7 @@
 
   async function onMouseUp(e: MouseEvent) {
     if (!dragStart) return;
-    const moved =
-      Math.abs(e.clientX - dragStart.clientX) +
-      Math.abs(e.clientY - dragStart.clientY);
+    const moved = Math.abs(e.clientX - dragStart.clientX) + Math.abs(e.clientY - dragStart.clientY);
     const ds = dragStart;
     dragStart = null;
     const wasMarquee = ds.kind === 'marquee' && marquee != null;
@@ -935,9 +1156,7 @@
         // Range-extend: select all clips on the same track between the
         // earliest selected and this one (inclusive). With no prior
         // selection this just selects the clicked clip.
-        const t = sequence.tracks.find((tr) =>
-          tr.clips.some((c) => c.id === ds.downOnClipId)
-        );
+        const t = sequence.tracks.find((tr) => tr.clips.some((c) => c.id === ds.downOnClipId));
         if (t) {
           const selectedOnTrack = t.clips.filter((c) => selectionState.has(c.id));
           if (selectedOnTrack.length === 0) {
