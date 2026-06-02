@@ -192,24 +192,51 @@ class ProjectState {
   /** Fire the backfill probe for legacy `has_audio_track: false`
    *  videos in the just-loaded project. Async + fire-and-forget so it
    *  doesn't block `open` returning. Merges results into `this.media`
-   *  and re-runs `enqueueAllAudio` if any items flipped to true. */
+   *  and enqueues extraction only for the items that flipped to
+   *  `true` — re-enqueuing the whole audio library would double the
+   *  initial extraction queue. */
   private async backfillVideoAudioProbes() {
+    // Capture the path the backfill is associated with so a project
+    // swap mid-backfill (user opens a different bundle) doesn't apply
+    // updates meant for the prior project.
+    const issuedAtPath = this.path;
     try {
       const result = await peaksBackfillVideoAudio();
       if (result.probed === 0) return;
-      if (result.flipped_to_has_audio === 0) {
-        // Nothing changed — no UI work needed.
-        return;
-      }
+      // Drop the result if the project changed while we were probing.
+      if (this.path !== issuedAtPath) return;
+      if (result.flipped_to_has_audio === 0) return;
       // Patch the local media array with the new flags.
-      const map = new Map(result.updates.map((u) => [u.media_id, u.has_audio_track]));
+      const flippedToTrue = result.updates.filter((u) => u.has_audio_track);
+      const flippedSet = new Set(flippedToTrue.map((u) => u.media_id));
       this.media = this.media.map((m) =>
-        map.has(m.id)
-          ? { ...m, has_audio_track: map.get(m.id) ?? m.has_audio_track }
-          : m
+        flippedSet.has(m.id) ? { ...m, has_audio_track: true } : m
       );
-      // Newly-discovered video+audio items need extraction enqueued.
-      await this.enqueueAllAudio();
+      // Enqueue extraction ONLY for the items that flipped.
+      const newlyExtractable = this.media.filter(
+        (m) => flippedSet.has(m.id) && isExtractableAudio(m)
+      );
+      if (newlyExtractable.length === 0) return;
+      const results = await Promise.allSettled(
+        newlyExtractable.map((m) =>
+          peaksEnqueue(
+            m.id,
+            m.path,
+            m.content_hash_prefix_hex,
+            Number.isFinite(m.duration_seconds) ? m.duration_seconds : null
+          )
+        )
+      );
+      const failed = results
+        .map((r, i) => (r.status === 'rejected' ? newlyExtractable[i].id : null))
+        .filter((x): x is string => x !== null);
+      if (failed.length > 0) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `peaksEnqueue (backfill) failed for ${failed.length} media items:`,
+          failed
+        );
+      }
     } catch (e) {
       // eslint-disable-next-line no-console
       console.warn('peaksBackfillVideoAudio failed:', e);

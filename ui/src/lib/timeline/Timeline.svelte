@@ -92,6 +92,16 @@
     scheduleDraw();
   });
 
+  // Redraw when the media library mutates (e.g. Phase 7.2 backfill
+  // flips has_audio_track on legacy videos). drawClips reads
+  // projectState.media.find(...) inside drawWaveform's gating
+  // expression; that read is in the draw function, not in a $effect,
+  // so we need an explicit subscription here.
+  $effect(() => {
+    void projectState.media;
+    scheduleDraw();
+  });
+
   // Re-draw the canvas. Idempotent; draws into the canvas at its
   // current physical-pixel size with the chrome's devicePixelRatio.
   let drawScheduled = false;
@@ -319,6 +329,14 @@
   ) {
     const baseFill = track.kind === 'video' ? VIDEO_FILL : AUDIO_FILL;
     const baseStroke = track.kind === 'video' ? VIDEO_STROKE : AUDIO_STROKE;
+    // Audio/Video are the only kinds that can carry a waveform; skip
+    // the per-clip media lookup entirely for image/title-only tracks.
+    // Build a small per-track Map<id, MediaItemInfo> so the per-clip
+    // gate is O(1) instead of O(N×M) per draw.
+    const trackCanCarryAudio = track.kind === 'audio' || track.kind === 'video';
+    const mediaIndex = trackCanCarryAudio
+      ? new Map(projectState.media.map((m) => [m.id, m]))
+      : null;
 
     for (const c of track.clips) {
       // While moving / trimming this clip, draw it at candidate bounds.
@@ -358,9 +376,9 @@
       // body and underneath the border. Visually no-op while the
       // cache is still fetching — the underlying clip fill shows
       // through. Phase 7.2 extends this to Video clips whose backing
-      // media has an embedded audio track.
-      if (c.enabled && track.enabled) {
-        const media = projectState.media.find((mi) => mi.id === c.media_id);
+      // media has an embedded audio track (looked up via mediaIndex).
+      if (c.enabled && track.enabled && mediaIndex) {
+        const media = mediaIndex.get(c.media_id);
         const clipHasAudio =
           !!media &&
           (media.kind === 'audio' ||
