@@ -492,6 +492,64 @@ fn peaks_enqueue(
 }
 
 #[derive(Serialize)]
+struct PeaksBackfillResult {
+    /// Number of video items the probe was run against.
+    probed: usize,
+    /// Number of items that actually had audio (flipped from
+    /// `false` → `true`).
+    flipped_to_has_audio: usize,
+    /// Lookup table of media_id → has_audio_track for the items that
+    /// were touched. UI consumes this to refresh its `media` array
+    /// + the peaks cache without a full project re-fetch.
+    updates: Vec<PeaksBackfillUpdate>,
+}
+
+#[derive(Serialize)]
+struct PeaksBackfillUpdate {
+    media_id: String,
+    has_audio_track: bool,
+}
+
+/// Backfill `has_audio_track` for every Video media item still
+/// holding the post-deserialize default (`false`). Called by
+/// `ProjectState.open` after a `.vance/` bundle loads, so legacy
+/// projects (pre-Phase-7.2) get their videos probed once and the
+/// timeline can paint waveforms on Video clips without the user
+/// having to re-import each file.
+///
+/// Probes run sequentially via the pooled probe sidecar in
+/// PeaksService — typical cost ~5-15 ms per video file. A
+/// project with 100 video clips therefore pays ~1 s total, executed
+/// after the initial project-open render so the UI stays responsive.
+#[tauri::command]
+fn peaks_backfill_video_audio(
+    engine: tauri::State<'_, EngineHandle>,
+    peaks: tauri::State<'_, PeaksHandle>,
+) -> Result<PeaksBackfillResult, String> {
+    let svc = checkout_peaks(&peaks)?;
+    let targets = engine.lock().list_video_media_needing_audio_probe();
+    let mut updates = Vec::with_capacity(targets.len());
+    let mut flipped = 0;
+    for (id, path) in &targets {
+        let path_str = path.to_string_lossy().into_owned();
+        let has_audio = svc.probe_audio(&path_str).unwrap_or(false);
+        if has_audio {
+            flipped += 1;
+        }
+        let _ = engine.lock().set_media_has_audio_track(*id, has_audio);
+        updates.push(PeaksBackfillUpdate {
+            media_id: id.to_string(),
+            has_audio_track: has_audio,
+        });
+    }
+    Ok(PeaksBackfillResult {
+        probed: targets.len(),
+        flipped_to_has_audio: flipped,
+        updates,
+    })
+}
+
+#[derive(Serialize)]
 struct OpenResponse {
     width: u32,
     height: u32,
@@ -708,12 +766,50 @@ fn diag_log(message: String) {
 #[tauri::command]
 fn import_media_file(
     state: tauri::State<'_, EngineHandle>,
+    peaks: tauri::State<'_, PeaksHandle>,
     path: String,
 ) -> Result<MediaItemInfo, String> {
-    state
-        .lock()
-        .import_media_file(&path)
-        .map_err(|e| e.to_string())
+    let info = state.lock().import_media_file(&path).map_err(|e| e.to_string())?;
+    // Phase 7.2: probe whether the imported file carries an audio
+    // stream. Only relevant for Video media (Audio is always true,
+    // Image/Title always false). Probe via the dedicated long-lived
+    // sidecar pooled in PeaksService, so the per-import cost is
+    // bounded to one IPC round-trip rather than a full spawn.
+    if info.kind == "video" {
+        if let Ok(svc) = checkout_peaks(&peaks) {
+            match svc.probe_audio(&path) {
+                Ok(has_audio) => {
+                    let uuid = info.id.parse::<uuid::Uuid>().ok();
+                    if let Some(uuid) = uuid {
+                        let _ = state
+                            .lock()
+                            .set_media_has_audio_track(
+                                vance_timeline::MediaItemId::from_uuid(uuid),
+                                has_audio,
+                            );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "vance_app.peaks",
+                        path = %path,
+                        err = ?e,
+                        "audio probe failed; treating as no-audio (waveform won't render until rescan)"
+                    );
+                }
+            }
+        }
+    }
+    // Re-read the (possibly updated) info from the engine so the UI
+    // sees has_audio_track reflecting the probe.
+    let updated = match info.id.parse::<uuid::Uuid>() {
+        Ok(uuid) => state
+            .lock()
+            .media_get_info(vance_timeline::MediaItemId::from_uuid(uuid))
+            .unwrap_or(info),
+        Err(_) => info,
+    };
+    Ok(updated)
 }
 
 #[tauri::command]
@@ -1508,6 +1604,7 @@ fn main() {
             peaks_set_cache_dir,
             peaks_use_untitled_cache_dir,
             peaks_service_status,
+            peaks_backfill_video_audio,
         ])
         .build(tauri::generate_context!())
         .expect("tauri failed to start")

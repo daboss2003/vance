@@ -104,7 +104,27 @@ pub fn open(bundle_path: impl AsRef<Path>) -> Result<Project> {
     // Run the migration chain (no-op on v1; rejects future / pre-min
     // versions with UnsupportedFormatVersion).
     let envelope = migrate_to_current(envelope)?;
-    Ok(envelope.project)
+    let mut project = envelope.project;
+    // Phase 7.2 invariant: every MediaKind::Audio item carries audio
+    // by definition. Legacy bundles (pre-7.2) saved before the field
+    // existed deserialize with has_audio_track=false, so force it
+    // true here for Audio items. Video items stay at whatever the
+    // bundle recorded; the project-load backfill handles legacy
+    // videos.
+    let mut updated: Vec<vance_timeline::MediaItemId> = Vec::new();
+    for (id, m) in project.media.iter() {
+        if m.kind == vance_timeline::MediaKind::Audio && !m.has_audio_track {
+            updated.push(*id);
+        }
+    }
+    for id in updated {
+        if let Some(arc) = project.media.get(&id).cloned() {
+            let mut m = (*arc).clone();
+            m.has_audio_track = true;
+            project.media.insert(id, std::sync::Arc::new(m));
+        }
+    }
+    Ok(project)
 }
 
 #[cfg(test)]

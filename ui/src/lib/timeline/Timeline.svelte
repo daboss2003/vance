@@ -353,14 +353,25 @@
       roundRect(ctx, x, cy, Math.max(2, w), ch, 3);
       ctx.fill();
 
-      // Audio waveform overlay (Phase 7.1 M5). Renders the cached
-      // peaks for this clip's source range on top of the clip body
-      // and underneath the border. Visually no-op while the cache is
-      // still fetching — the underlying clip fill shows through.
-      if (track.kind === 'audio' && c.enabled && track.enabled) {
-        const t_in_eff = trimming || moving ? t_in : c.timeline_in_seconds;
-        const source_in_eff = trimming ? trimDrag!.candidateSourceIn : c.source_in_seconds;
-        drawWaveform(ctx, c, x, cy, w, ch, t_in_eff, source_in_eff, dur);
+      // Audio waveform overlay (Phase 7.1 M5 / 7.2). Renders the
+      // cached peaks for this clip's source range on top of the clip
+      // body and underneath the border. Visually no-op while the
+      // cache is still fetching — the underlying clip fill shows
+      // through. Phase 7.2 extends this to Video clips whose backing
+      // media has an embedded audio track.
+      if (c.enabled && track.enabled) {
+        const media = projectState.media.find((mi) => mi.id === c.media_id);
+        const clipHasAudio =
+          !!media &&
+          (media.kind === 'audio' ||
+            (media.kind === 'video' && media.has_audio_track));
+        if (clipHasAudio) {
+          const t_in_eff = trimming || moving ? t_in : c.timeline_in_seconds;
+          const source_in_eff = trimming
+            ? trimDrag!.candidateSourceIn
+            : c.source_in_seconds;
+          drawWaveform(ctx, c, x, cy, w, ch, t_in_eff, source_in_eff, dur);
+        }
       }
 
       // Border — thicker accent when selected, lighter when hovered.

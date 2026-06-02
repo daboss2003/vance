@@ -861,6 +861,10 @@ pub struct MediaItemInfo {
     /// path+mtime+length hash when no real content hash is recorded
     /// yet — same media always yields the same prefix.
     pub content_hash_prefix_hex: String,
+    /// Whether the source has an audio stream (Phase 7.2). UI uses
+    /// this to decide whether to enqueue peaks extraction and
+    /// whether to render a waveform on a video clip's body.
+    pub has_audio_track: bool,
 }
 
 impl From<&MediaItem> for MediaItemInfo {
@@ -884,6 +888,7 @@ impl From<&MediaItem> for MediaItemInfo {
             frame_rate_den: fr_d,
             input_color_space: m.input_color_space.map(color_space_to_str),
             content_hash_prefix_hex: media_item_hash_prefix_hex(m),
+            has_audio_track: m.has_audio_track,
         }
     }
 }
@@ -1969,6 +1974,54 @@ impl Engine {
         Ok(info)
     }
 
+    /// Update `MediaItem.has_audio_track` (Phase 7.2). Called from the
+    /// Tauri layer's `import_media_file` wrapper after probing via
+    /// `PeaksService::probe_audio`, and from the project-load
+    /// backfill pass. Returns `Ok(())` if the id is unknown — backfill
+    /// should not error on a stale id.
+    pub fn set_media_has_audio_track(
+        &mut self,
+        media_id: MediaItemId,
+        has_audio: bool,
+    ) -> Result<(), EngineError> {
+        let project = self
+            .current_project
+            .as_mut()
+            .ok_or(EngineError::NoProject)?;
+        let Some(existing) = project.media.get(&media_id).cloned() else {
+            return Ok(());
+        };
+        if existing.has_audio_track == has_audio {
+            return Ok(());
+        }
+        let mut updated = (*existing).clone();
+        updated.has_audio_track = has_audio;
+        project.media.insert(media_id, Arc::new(updated));
+        Ok(())
+    }
+
+    /// Snapshot every video MediaItem whose `has_audio_track` is still
+    /// the post-deserialize default (`false`). Used by the project-load
+    /// backfill pass to know which items need a probe. Returns
+    /// `(media_id, path)` pairs the caller can hand to
+    /// `PeaksService::probe_audio`. Empty when no project is loaded.
+    pub fn list_video_media_needing_audio_probe(&self) -> Vec<(MediaItemId, PathBuf)> {
+        let Some(project) = self.current_project.as_ref() else {
+            return Vec::new();
+        };
+        project
+            .media
+            .iter()
+            .filter_map(|(id, m)| {
+                if m.kind == MediaKind::Video && !m.has_audio_track {
+                    Some((*id, m.path.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// Override a media item's tagged input color space. Pass `None`
     /// to clear (engine then falls back to Rec.709 Limited). `space`
     /// strings are the labels used by `color_space_to_str` / the UI
@@ -2315,6 +2368,17 @@ impl Engine {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Look up a single media item's info. `None` when no project is
+    /// loaded or the id isn't in the library. Used by the Phase 7.2
+    /// import path to fetch the post-probe view of a freshly added
+    /// item without re-listing the whole library.
+    pub fn media_get_info(&self, media_id: MediaItemId) -> Option<MediaItemInfo> {
+        self.current_project
+            .as_ref()
+            .and_then(|p| p.media.get(&media_id))
+            .map(|arc| MediaItemInfo::from(arc.as_ref()))
     }
 
     /// Start playback of the active sequence from `timeline_seconds`.

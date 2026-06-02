@@ -62,7 +62,8 @@ import {
   peaksEnqueue,
   peaksSetCacheDir,
   peaksServiceStatus,
-  peaksUseUntitledCacheDir
+  peaksUseUntitledCacheDir,
+  peaksBackfillVideoAudio
 } from './ipc';
 import { peaksCache } from './peaks-cache.svelte';
 
@@ -176,8 +177,42 @@ class ProjectState {
       this.untitledCacheDir = null;
       await this.syncPeaksLifecycle();
       await this.commitEdit();
+      // Phase 7.2 — legacy projects (pre-7.2 bundles) deserialize
+      // with `has_audio_track: false` for every video. Probe them
+      // now so the timeline can render waveforms on Video clips that
+      // carry embedded audio. Runs AFTER commitEdit so the chrome is
+      // already responsive; results merge into `this.media` as they
+      // land and the cache picks them up via subsequent enqueueAllAudio.
+      void this.backfillVideoAudioProbes();
     } catch (e) {
       this.error = String(e);
+    }
+  }
+
+  /** Fire the backfill probe for legacy `has_audio_track: false`
+   *  videos in the just-loaded project. Async + fire-and-forget so it
+   *  doesn't block `open` returning. Merges results into `this.media`
+   *  and re-runs `enqueueAllAudio` if any items flipped to true. */
+  private async backfillVideoAudioProbes() {
+    try {
+      const result = await peaksBackfillVideoAudio();
+      if (result.probed === 0) return;
+      if (result.flipped_to_has_audio === 0) {
+        // Nothing changed — no UI work needed.
+        return;
+      }
+      // Patch the local media array with the new flags.
+      const map = new Map(result.updates.map((u) => [u.media_id, u.has_audio_track]));
+      this.media = this.media.map((m) =>
+        map.has(m.id)
+          ? { ...m, has_audio_track: map.get(m.id) ?? m.has_audio_track }
+          : m
+      );
+      // Newly-discovered video+audio items need extraction enqueued.
+      await this.enqueueAllAudio();
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn('peaksBackfillVideoAudio failed:', e);
     }
   }
 
@@ -840,17 +875,16 @@ class ProjectState {
 }
 
 /** Does this media item warrant peak extraction? `audio` items
- *  always do; `video` items with embedded audio will too once
- *  Phase 7.2 plumbs audio-track detection through MediaItemInfo
- *  (the embedded-audio path is deliberately out of scope here —
- *  enqueueing every video file before the extractor knows it has
- *  an audio track would just produce a flood of Failed events).
- *
- *  Zero-duration media are skipped — the freshness check would
- *  always fail (the cache compares duration ±100ms), causing a
- *  re-extract on every project open. */
+ *  always do; `video` items that carry an embedded audio track
+ *  (detected at import via the audio sidecar's probe, surfaced as
+ *  `has_audio_track`) do too. Zero-duration media are skipped — the
+ *  freshness check would always fail (the cache compares duration
+ *  ±100ms), causing a re-extract on every project open. */
 function isExtractableAudio(m: MediaItemInfo): boolean {
-  return m.kind === 'audio' && m.duration_seconds > 0;
+  if (m.duration_seconds <= 0) return false;
+  if (m.kind === 'audio') return true;
+  if (m.kind === 'video') return m.has_audio_track;
+  return false;
 }
 
 /** Singleton — modules import `projectState` and bind to its runes. */

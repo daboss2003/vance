@@ -67,6 +67,17 @@ pub struct MediaItem {
     /// know better (camera raw, P3 capture, etc.).
     #[serde(default)]
     pub input_color_space: Option<ColorSpace>,
+    /// Whether the source has an audio stream the peaks pipeline can
+    /// extract (Phase 7.2). For `MediaKind::Audio` this is always
+    /// `true` (forced by the bundle-load sweep in
+    /// `vance_project::bundle::open` for legacy bundles); for `Video`
+    /// it is set by `Engine::import_media_file`'s audio probe; for
+    /// `Image` / `Title` it stays `false`. `#[serde(default)]` so
+    /// older `.vance/` bundles deserialize with `false` and get
+    /// backfilled by `peaks_backfill_video_audio` (in vance-app's
+    /// Tauri command surface) on first project-open.
+    #[serde(default)]
+    pub has_audio_track: bool,
 }
 
 impl MediaItem {
@@ -77,6 +88,10 @@ impl MediaItem {
         kind: MediaKind,
         duration: RationalTime,
     ) -> Self {
+        // Audio-kind items always carry an audio track; everything
+        // else starts `false` until the import probe (or backfill)
+        // confirms otherwise.
+        let has_audio_track = matches!(kind, MediaKind::Audio);
         Self {
             id: MediaItemId::new(),
             path,
@@ -87,6 +102,7 @@ impl MediaItem {
             content_hash: None,
             title: None,
             input_color_space: None,
+            has_audio_track,
         }
     }
 
@@ -112,6 +128,7 @@ impl MediaItem {
             // trip through the pipeline correctly when the working
             // space differs.
             input_color_space: Some(ColorSpace::Srgb),
+            has_audio_track: false,
         }
     }
 

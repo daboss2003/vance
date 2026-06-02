@@ -298,6 +298,12 @@ export type MediaItemInfo = {
    *  BLAKE3 is computed, so the UI can name `.peaks` slots on the
    *  client side without an extra round-trip. */
   content_hash_prefix_hex: string;
+  /** Whether the source carries an audio stream (Phase 7.2).
+   *  Always `true` for `kind: 'audio'`; for `kind: 'video'` set by
+   *  the import-time audio probe. UI uses this to decide whether
+   *  to enqueue peak extraction and whether to draw a waveform on
+   *  a video clip's body. */
+  has_audio_track: boolean;
 };
 
 /** Pull metadata from a media file via the decoder and register it
@@ -718,6 +724,25 @@ export const peaksSetCacheDir = (cacheDir: string): Promise<void> =>
  *  surface it if needed. */
 export const peaksUseUntitledCacheDir = (label: string): Promise<string> =>
   invoke('peaks_use_untitled_cache_dir', { label });
+
+export type PeaksBackfillUpdate = {
+  media_id: string;
+  has_audio_track: boolean;
+};
+
+export type PeaksBackfillResult = {
+  probed: number;
+  flipped_to_has_audio: number;
+  updates: PeaksBackfillUpdate[];
+};
+
+/** Phase 7.2 — run the audio-track probe against every Video media
+ *  item whose `has_audio_track` is still the post-deserialize
+ *  default (`false`). Called by ProjectState.open after a legacy
+ *  `.vance/` bundle loads. Sequential ~5-15ms per item via the
+ *  pooled probe sidecar. */
+export const peaksBackfillVideoAudio = (): Promise<PeaksBackfillResult> =>
+  invoke('peaks_backfill_video_audio');
 
 export type PeaksServiceAvailability = {
   available: boolean;

@@ -170,6 +170,18 @@ struct Inner {
     /// reads it to send `SIGTERM`, which unsticks any blocking IPC
     /// read inside `next_chunk`.
     current_sidecar_pid: Mutex<Option<u32>>,
+    /// Long-lived sidecar dedicated to `probe_audio` calls (Phase 7.2).
+    /// Lazily spawned on first probe; reused across probes so import-
+    /// time audio detection pays ~5-15 ms per file instead of the
+    /// ~50-200 ms `AudioClient::spawn` cost. The mutex is held ONLY
+    /// to take/insert the client out of/into the pool — the blocking
+    /// IPC calls and the initial spawn happen with the lock released,
+    /// so `do_shutdown` can preempt a hung probe.
+    probe_client: Mutex<Option<AudioClient>>,
+    /// PID of the probe sidecar, populated after spawn. `do_shutdown`
+    /// SIGTERMs it before attempting to drain the pool, so a probe
+    /// blocked inside an open/close IPC read unblocks promptly.
+    probe_sidecar_pid: Mutex<Option<u32>>,
 }
 
 struct Queue {
@@ -217,6 +229,8 @@ impl PeaksService {
             cv: Condvar::new(),
             progress,
             current_sidecar_pid: Mutex::new(None),
+            probe_client: Mutex::new(None),
+            probe_sidecar_pid: Mutex::new(None),
         });
         // Best-effort startup cleanup. Logged but not fatal.
         match clean_orphan_tmp(&inner.cache_dir) {
@@ -408,6 +422,86 @@ impl PeaksService {
         self.inner.queue.lock().statuses.get(&media_id).cloned()
     }
 
+    /// Probe whether `path` carries an audio stream the peaks pipeline
+    /// can decode. Used by `Engine::import_media_file` (Phase 7.2) to
+    /// flag video media items that have embedded audio.
+    ///
+    /// Pools a single long-lived `AudioClient` across calls so each
+    /// probe is one IPC round-trip (~5-15 ms) instead of a full sidecar
+    /// spawn (~50-200 ms). The pool mutex is held ONLY for the brief
+    /// take/insert operations — `AudioClient::spawn` and every blocking
+    /// IPC call happen with the mutex released, so a hung probe does
+    /// NOT block `do_shutdown` (which SIGTERMs the probe sidecar's PID
+    /// to unstick it) and does NOT serialize an unrelated concurrent
+    /// import behind a slow first-spawn.
+    ///
+    /// Treats any `AudioClientError::Open` as `Ok(false)` — the
+    /// engine-side decoder probe has already validated the file exists,
+    /// so an audio-side open failure genuinely means "no audio stream
+    /// we can use" (codec unsupported, no audio in container, etc.).
+    /// Other IPC errors bubble up so the caller can log.
+    ///
+    /// Returns `Err(ShuttingDown)` if the service was shut down before
+    /// or during the call.
+    pub fn probe_audio(&self, path: &str) -> Result<bool, PeaksServiceError> {
+        for attempt in 0..2 {
+            if self.shutdown.load(Ordering::Acquire) {
+                return Err(PeaksServiceError::ShuttingDown);
+            }
+            // Take the client out of the pool, OR spawn one if empty,
+            // with the lock held only for the take. The spawn happens
+            // OUTSIDE the lock so a slow startup doesn't serialize
+            // do_shutdown or a parallel import.
+            let mut client = match self.inner.probe_client.lock().take() {
+                Some(c) => c,
+                None => {
+                    let c = AudioClient::spawn(&self.inner.audio_binary)?;
+                    if let Some(pid) = c.pid() {
+                        *self.inner.probe_sidecar_pid.lock() = Some(pid);
+                    }
+                    c
+                }
+            };
+            match client.open(path.to_string()) {
+                Ok(_info) => {
+                    // Inspect close() — if the sidecar died mid-close,
+                    // drop the client so the next call respawns at the
+                    // same file (better diagnostics than deferring the
+                    // respawn to a later probe of an unrelated file).
+                    if client.close().is_err() {
+                        *self.inner.probe_sidecar_pid.lock() = None;
+                        return Ok(true);
+                    }
+                    *self.inner.probe_client.lock() = Some(client);
+                    return Ok(true);
+                }
+                Err(AudioClientError::Open(_)) => {
+                    // Genuine "no audio stream" / unsupported. Sidecar
+                    // is still alive — return it to the pool.
+                    *self.inner.probe_client.lock() = Some(client);
+                    return Ok(false);
+                }
+                Err(other) => {
+                    // IPC error — sidecar may be dead. Drop it; the
+                    // retry attempt spawns fresh.
+                    tracing::warn!(
+                        target: "vance_app.peaks",
+                        attempt,
+                        path = %path,
+                        err = ?other,
+                        "probe_audio: sidecar IPC error; respawning"
+                    );
+                    drop(client);
+                    *self.inner.probe_sidecar_pid.lock() = None;
+                    if attempt == 1 {
+                        return Err(PeaksServiceError::Audio(other));
+                    }
+                }
+            }
+        }
+        unreachable!("probe_audio loop bounded to 2 attempts");
+    }
+
     /// Resolve `<cache_dir>/<hex(content_hash_prefix)>.peaks`.
     pub fn slot_path(&self, prefix: &HashPrefix) -> PathBuf {
         slot_path(&self.inner.cache_dir, prefix)
@@ -445,9 +539,22 @@ impl PeaksService {
         }
         self.shutdown.store(true, Ordering::Release);
         self.inner.cv.notify_all();
-        // Unstick a currently-blocked sidecar IPC.
+        // Unstick a currently-blocked worker-side sidecar IPC.
         if let Some(p) = *self.inner.current_sidecar_pid.lock() {
             signal_terminate(p);
+        }
+        // Unstick a hung probe BEFORE attempting to drain the pool —
+        // the probe holds the AudioClient outside the pool mutex
+        // while it's mid-IPC, so signaling its PID is the only way
+        // to break a blocking read.
+        if let Some(p) = self.inner.probe_sidecar_pid.lock().take() {
+            signal_terminate(p);
+        }
+        // Drain the pool (any idle client). After the SIGTERM above,
+        // a probe currently in flight will fail and not return its
+        // client to the pool, so this is just for the idle case.
+        if let Some(client) = self.inner.probe_client.lock().take() {
+            let _ = client.shutdown();
         }
         let Some(handle) = self.worker.take() else {
             return;
