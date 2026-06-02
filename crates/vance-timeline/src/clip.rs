@@ -40,10 +40,17 @@ pub struct Clip {
     /// which the editor permits as a transient state during trims.
     pub source_out: RationalTime,
     /// When `false`, the clip is muted/skipped at render time but stays
-    /// in the project so a single click un-mutes it.
+    /// in the project so a single click un-mutes it. For audio clips
+    /// this is also the per-clip mute used by the mixer (Phase 7.3).
     pub enabled: bool,
     /// Effects applied to this clip. Empty by default.
     pub effects: Vec<Effect>,
+    /// Per-clip mixer gain in decibels (Phase 7.3). 0.0 = unity.
+    /// Audio clips: `clip_linear = 10^(gain_db / 20)`. Composed
+    /// multiplicatively with the parent track's gain at mix time.
+    /// Video clips: ignored.
+    #[serde(default)]
+    pub gain_db: f32,
 }
 
 impl Clip {
@@ -68,6 +75,7 @@ impl Clip {
             source_out,
             enabled: true,
             effects: Vec::new(),
+            gain_db: 0.0,
         })
     }
 

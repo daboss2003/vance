@@ -49,6 +49,25 @@ pub struct Track {
     /// transitions across `Track` rewrites.
     #[serde(default)]
     pub transitions: Vec<Arc<Transition>>,
+    /// Mixer mute (Phase 7.3). Distinct from `enabled` — `enabled`
+    /// is the project-level on/off (track disappears from the render
+    /// graph entirely); `mute` is the mix-bus state that silences
+    /// audible output without removing the track from layout. For
+    /// audio tracks: contributes audio iff `enabled && !mute && (no
+    /// other track has solo || self.solo)`. For video tracks: kept
+    /// for symmetry but ignored by the render pipeline.
+    #[serde(default)]
+    pub mute: bool,
+    /// Solo (Phase 7.3). If any track in the sequence has `solo`,
+    /// only soloed tracks contribute to the mix. Symmetric with
+    /// `mute`: defined on both kinds, used by the audio mixer.
+    #[serde(default)]
+    pub solo: bool,
+    /// Mixer gain in decibels (Phase 7.3). 0.0 = unity. Audio tracks
+    /// apply this as `linear = 10^(gain_db / 20)` immediately before
+    /// summing into the master bus. Video tracks ignore it.
+    #[serde(default)]
+    pub gain_db: f32,
 }
 
 impl Track {
@@ -62,6 +81,9 @@ impl Track {
             locked: false,
             clips: Vec::new(),
             transitions: Vec::new(),
+            mute: false,
+            solo: false,
+            gain_db: 0.0,
         }
     }
 
@@ -105,6 +127,9 @@ mod tests {
             locked: false,
             clips: vec![c1, c2],
             transitions: Vec::new(),
+            mute: false,
+            solo: false,
+            gain_db: 0.0,
         };
         assert_eq!(tr.duration(), t(7));
     }

@@ -151,6 +151,9 @@ pub fn add_track_with_id(
         locked: false,
         clips: Vec::new(),
         transitions: Vec::new(),
+        mute: false,
+        solo: false,
+        gain_db: 0.0,
     };
     let mut tracks = seq.tracks.clone();
     tracks.push(Arc::new(new_track));
@@ -211,6 +214,9 @@ pub fn insert_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Result<Sequ
         locked: track.locked,
         clips,
         transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -256,6 +262,9 @@ pub fn ripple_insert_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Resu
         locked: track.locked,
         clips,
         transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -317,6 +326,9 @@ pub fn overwrite_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Result<S
         locked: track.locked,
         clips: kept,
         transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -340,6 +352,9 @@ pub fn remove_clip(seq: &Sequence, track_id: TrackId, clip_id: ClipId) -> Result
         locked: track.locked,
         clips,
         transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -378,6 +393,9 @@ pub fn ripple_remove_clip(
         locked: track.locked,
         clips,
         transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -415,6 +433,9 @@ pub fn slip(
         locked: track.locked,
         clips,
         transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -455,6 +476,9 @@ pub fn slide(
         locked: track.locked,
         clips,
         transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -505,6 +529,9 @@ pub fn trim_in(
         locked: track.locked,
         clips,
         transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -548,6 +575,9 @@ pub fn trim_out(
         locked: track.locked,
         clips,
         transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -580,6 +610,9 @@ pub fn add_effect_to_clip(
         locked: track.locked,
         clips,
         transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -618,6 +651,9 @@ pub fn update_effect_param(
         locked: track.locked,
         clips,
         transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -657,6 +693,9 @@ pub fn update_effect_params(
         locked: track.locked,
         clips,
         transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -687,6 +726,9 @@ pub fn remove_effect_from_clip(
         locked: track.locked,
         clips,
         transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -730,6 +772,9 @@ pub fn move_effect_on_clip(
         locked: track.locked,
         clips,
         transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -767,8 +812,168 @@ pub fn set_effect_enabled(
         locked: track.locked,
         clips,
         transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
     };
     Ok(replace_track(seq, idx, new_track))
+}
+
+// ---- Phase 7.3: mixer property setters ----------------------------------
+//
+// Asymmetry vs. set_effect_enabled: mute and solo are non-destructive
+// playback controls (the user often toggles them on a locked track to
+// audition without unlocking), so they DO NOT call `ensure_unlocked`.
+// `gain_db` is a destructive parameter change (an automation commit
+// could be permanent), so the track and clip gain ops DO call
+// `ensure_unlocked` — matching the policy `set_effect_enabled` uses
+// for effect params.
+
+/// Set `Track.mute` (Phase 7.3). Allowed on locked tracks.
+pub fn set_track_mute(seq: &Sequence, track_id: TrackId, mute: bool) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    if track.mute == mute {
+        return Ok(seq.clone());
+    }
+    let new_track = Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips: track.clips.clone(),
+        transitions: track.transitions.clone(),
+        mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
+    };
+    Ok(replace_track(seq, idx, new_track))
+}
+
+/// Set `Track.solo` (Phase 7.3). Allowed on locked tracks.
+pub fn set_track_solo(seq: &Sequence, track_id: TrackId, solo: bool) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    if track.solo == solo {
+        return Ok(seq.clone());
+    }
+    let new_track = Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips: track.clips.clone(),
+        transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo,
+        gain_db: track.gain_db,
+    };
+    Ok(replace_track(seq, idx, new_track))
+}
+
+/// Set `Track.gain_db` (Phase 7.3). Rejects locked tracks.
+pub fn set_track_gain_db(
+    seq: &Sequence,
+    track_id: TrackId,
+    gain_db: f32,
+) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    let sanitized = sanitize_gain_db(gain_db)?;
+    if track.gain_db == sanitized {
+        return Ok(seq.clone());
+    }
+    let new_track = Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips: track.clips.clone(),
+        transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: sanitized,
+    };
+    Ok(replace_track(seq, idx, new_track))
+}
+
+/// Set `Clip.enabled` (per-clip mute, Phase 7.3). Routed through the
+/// existing `enabled` field — `enabled == !mute`. Allowed on locked
+/// tracks, mirroring `SetTrackMute`.
+pub fn set_clip_mute(
+    seq: &Sequence,
+    track_id: TrackId,
+    clip_id: ClipId,
+    mute: bool,
+) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    let (clip_idx, clip) = find_clip(&track, clip_id)?;
+    let new_enabled = !mute;
+    if clip.enabled == new_enabled {
+        return Ok(seq.clone());
+    }
+    let mut updated = (*clip).clone();
+    updated.enabled = new_enabled;
+    let mut clips = track.clips.clone();
+    clips[clip_idx] = Arc::new(updated);
+    let new_track = Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips,
+        transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
+    };
+    Ok(replace_track(seq, idx, new_track))
+}
+
+/// Set `Clip.gain_db` (Phase 7.3). Rejects locked tracks.
+pub fn set_clip_gain_db(
+    seq: &Sequence,
+    track_id: TrackId,
+    clip_id: ClipId,
+    gain_db: f32,
+) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    let (clip_idx, clip) = find_clip(&track, clip_id)?;
+    let sanitized = sanitize_gain_db(gain_db)?;
+    if clip.gain_db == sanitized {
+        return Ok(seq.clone());
+    }
+    let mut updated = (*clip).clone();
+    updated.gain_db = sanitized;
+    let mut clips = track.clips.clone();
+    clips[clip_idx] = Arc::new(updated);
+    let new_track = Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips,
+        transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
+    };
+    Ok(replace_track(seq, idx, new_track))
+}
+
+/// Reject non-finite gain inputs and clamp to a sane mixer range. The
+/// audio sidecar's PCM is f32 in `[-1, 1]`; +60 dB push or -60 dB
+/// attenuate covers every realistic mixer use without inviting
+/// numeric blow-up.
+fn sanitize_gain_db(gain_db: f32) -> Result<f32> {
+    if !gain_db.is_finite() {
+        return Err(TimelineError::invalid("gain_db must be finite"));
+    }
+    Ok(gain_db.clamp(-60.0, 60.0))
 }
 
 /// Split a clip at `at_timeline` into two clips that together cover the
@@ -813,6 +1018,9 @@ pub fn split(
         locked: track.locked,
         clips,
         transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -878,6 +1086,9 @@ pub fn add_transition_at_cut_with_id(
         locked: track.locked,
         clips: track.clips.clone(),
         transitions,
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -919,6 +1130,9 @@ pub fn remove_transition(
         locked: track.locked,
         clips: track.clips.clone(),
         transitions,
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1210,5 +1424,138 @@ mod tests {
             &[("gain_r".into(), EffectValue::Number(2.0))]
         )
         .is_err());
+    }
+
+    // ---- Phase 7.3: mixer property setters --------------------------
+
+    fn seed_audio_seq() -> (Sequence, TrackId, MediaItemId) {
+        let seq = Sequence::new("Seq", FrameRate::FPS_24);
+        let seq = add_track(&seq, TrackKind::Audio, "A1");
+        let track_id = seq.tracks[0].id;
+        let media = MediaItemId::new();
+        (seq, track_id, media)
+    }
+
+    /// There's no `set_track_locked` op yet, but the field exists; we
+    /// reach into the test sequence directly to flip the first track's
+    /// lock. Used only for asserting the M/S vs gain locked-policy
+    /// asymmetry.
+    fn lock_first_track_for_test(seq: &Sequence) -> Sequence {
+        let mut tracks = seq.tracks.clone();
+        let t = &tracks[0];
+        let locked_track = Track {
+            id: t.id,
+            kind: t.kind,
+            name: t.name.clone(),
+            enabled: t.enabled,
+            locked: true,
+            clips: t.clips.clone(),
+            transitions: t.transitions.clone(),
+            mute: t.mute,
+            solo: t.solo,
+            gain_db: t.gain_db,
+        };
+        tracks[0] = Arc::new(locked_track);
+        Sequence {
+            id: seq.id,
+            name: seq.name.clone(),
+            frame_rate: seq.frame_rate,
+            tracks,
+            markers: seq.markers.clone(),
+        }
+    }
+
+    #[test]
+    fn set_track_mute_toggles_state() {
+        let (seq, tid, _) = seed_audio_seq();
+        assert!(!seq.tracks[0].mute);
+        let seq = set_track_mute(&seq, tid, true).unwrap();
+        assert!(seq.tracks[0].mute);
+        let seq = set_track_mute(&seq, tid, false).unwrap();
+        assert!(!seq.tracks[0].mute);
+    }
+
+    #[test]
+    fn set_track_mute_is_noop_when_already_at_target() {
+        let (seq, tid, _) = seed_audio_seq();
+        let before_arc = Arc::as_ptr(&seq.tracks[0]);
+        let seq2 = set_track_mute(&seq, tid, false).unwrap();
+        // No mutation, so the Arc should be the same Sequence reused.
+        assert_eq!(before_arc, Arc::as_ptr(&seq2.tracks[0]));
+    }
+
+    #[test]
+    fn set_track_mute_allowed_on_locked_tracks() {
+        let (seq, tid, _) = seed_audio_seq();
+        let seq = lock_first_track_for_test(&seq);
+        let seq = set_track_mute(&seq, tid, true).unwrap();
+        assert!(seq.tracks[0].mute);
+    }
+
+    #[test]
+    fn set_track_solo_allowed_on_locked_tracks() {
+        let (seq, tid, _) = seed_audio_seq();
+        let seq = lock_first_track_for_test(&seq);
+        let seq = set_track_solo(&seq, tid, true).unwrap();
+        assert!(seq.tracks[0].solo);
+    }
+
+    #[test]
+    fn set_track_gain_db_rejects_locked_track() {
+        let (seq, tid, _) = seed_audio_seq();
+        let seq = lock_first_track_for_test(&seq);
+        assert!(set_track_gain_db(&seq, tid, -3.0).is_err());
+    }
+
+    #[test]
+    fn set_track_gain_db_clamps_to_mixer_range() {
+        let (seq, tid, _) = seed_audio_seq();
+        let seq = set_track_gain_db(&seq, tid, 200.0).unwrap();
+        assert_eq!(seq.tracks[0].gain_db, 60.0);
+        let seq = set_track_gain_db(&seq, tid, -200.0).unwrap();
+        assert_eq!(seq.tracks[0].gain_db, -60.0);
+    }
+
+    #[test]
+    fn set_track_gain_db_rejects_nan() {
+        let (seq, tid, _) = seed_audio_seq();
+        assert!(set_track_gain_db(&seq, tid, f32::NAN).is_err());
+        assert!(set_track_gain_db(&seq, tid, f32::INFINITY).is_err());
+    }
+
+    #[test]
+    fn set_clip_mute_routes_through_enabled() {
+        let (seq, tid, media) = seed_audio_seq();
+        let clip = Clip::new(media, "a", t(0), t(0), t(5)).unwrap();
+        let cid = clip.id;
+        let seq = insert_clip(&seq, tid, clip).unwrap();
+        let seq = set_clip_mute(&seq, tid, cid, true).unwrap();
+        assert!(!seq.tracks[0].clips[0].enabled);
+        let seq = set_clip_mute(&seq, tid, cid, false).unwrap();
+        assert!(seq.tracks[0].clips[0].enabled);
+    }
+
+    #[test]
+    fn set_clip_gain_db_composes_with_track_gain() {
+        // The composition itself lives in the mixer (M2); here we just
+        // verify that both fields can hold independent values.
+        let (seq, tid, media) = seed_audio_seq();
+        let clip = Clip::new(media, "a", t(0), t(0), t(5)).unwrap();
+        let cid = clip.id;
+        let seq = insert_clip(&seq, tid, clip).unwrap();
+        let seq = set_track_gain_db(&seq, tid, -3.0).unwrap();
+        let seq = set_clip_gain_db(&seq, tid, cid, -6.0).unwrap();
+        assert_eq!(seq.tracks[0].gain_db, -3.0);
+        assert_eq!(seq.tracks[0].clips[0].gain_db, -6.0);
+    }
+
+    #[test]
+    fn set_clip_gain_db_rejects_locked_track() {
+        let (seq, tid, media) = seed_audio_seq();
+        let clip = Clip::new(media, "a", t(0), t(0), t(5)).unwrap();
+        let cid = clip.id;
+        let seq = insert_clip(&seq, tid, clip).unwrap();
+        let seq = lock_first_track_for_test(&seq);
+        assert!(set_clip_gain_db(&seq, tid, cid, -3.0).is_err());
     }
 }

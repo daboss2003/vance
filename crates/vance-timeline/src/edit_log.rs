@@ -201,6 +201,61 @@ pub enum EditOp {
         /// New enabled state.
         enabled: bool,
     },
+    /// Set the mixer mute on a track (Phase 7.3). Distinct from
+    /// `enabled`: `enabled` removes the track from the render graph;
+    /// `mute` silences its audible contribution without affecting
+    /// layout. Permitted on locked tracks — mute/solo are
+    /// non-destructive playback controls.
+    SetTrackMute {
+        /// Track to mutate.
+        track_id: TrackId,
+        /// New mute state.
+        mute: bool,
+    },
+    /// Set the solo flag on a track (Phase 7.3). When any track in the
+    /// sequence has `solo == true`, only soloed tracks contribute to
+    /// the mix. Permitted on locked tracks.
+    SetTrackSolo {
+        /// Track to mutate.
+        track_id: TrackId,
+        /// New solo state.
+        solo: bool,
+    },
+    /// Set the mixer gain in dB on a track (Phase 7.3). 0.0 = unity.
+    /// Respects track lock — locked tracks reject gain changes
+    /// because gain edits are destructive in the way mute/solo are
+    /// not (a gain ramp committed during automation could be
+    /// permanent).
+    SetTrackGainDb {
+        /// Track to mutate.
+        track_id: TrackId,
+        /// New gain in dB.
+        gain_db: f32,
+    },
+    /// Set the per-clip mute on an audio (or video) clip (Phase 7.3).
+    /// Routes through `Clip.enabled`, which is the existing per-clip
+    /// mute used elsewhere in the engine — the EditOp gives mute its
+    /// own name in the audit log so the UI's "mute" intent is
+    /// distinguishable from "disable clip in render".
+    SetClipMute {
+        /// Track holding the clip.
+        track_id: TrackId,
+        /// Clip to mutate.
+        clip_id: ClipId,
+        /// New mute (== !enabled).
+        mute: bool,
+    },
+    /// Set the per-clip mixer gain in dB (Phase 7.3). 0.0 = unity.
+    /// Composes multiplicatively with the parent track's gain.
+    /// Respects track lock.
+    SetClipGainDb {
+        /// Track holding the clip.
+        track_id: TrackId,
+        /// Clip to mutate.
+        clip_id: ClipId,
+        /// New gain in dB.
+        gain_db: f32,
+    },
     /// Update several effect params in one undoable step (color-page
     /// wheel commit writes R/G/B/master together).
     UpdateEffectParams {
@@ -326,6 +381,21 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
             effect_id,
             enabled,
         } => ops::set_effect_enabled(seq, *track_id, *clip_id, *effect_id, *enabled),
+        EditOp::SetTrackMute { track_id, mute } => ops::set_track_mute(seq, *track_id, *mute),
+        EditOp::SetTrackSolo { track_id, solo } => ops::set_track_solo(seq, *track_id, *solo),
+        EditOp::SetTrackGainDb { track_id, gain_db } => {
+            ops::set_track_gain_db(seq, *track_id, *gain_db)
+        }
+        EditOp::SetClipMute {
+            track_id,
+            clip_id,
+            mute,
+        } => ops::set_clip_mute(seq, *track_id, *clip_id, *mute),
+        EditOp::SetClipGainDb {
+            track_id,
+            clip_id,
+            gain_db,
+        } => ops::set_clip_gain_db(seq, *track_id, *clip_id, *gain_db),
         EditOp::UpdateEffectParams {
             track_id,
             clip_id,
