@@ -244,6 +244,8 @@ export type ClipContents = {
   source_in_seconds: number;
   enabled: boolean;
   effects: EffectInfo[];
+  /** Phase 7.3: per-clip mixer gain in dB. 0 = unity. */
+  gain_db: number;
 };
 
 export type TransitionInfo = {
@@ -261,6 +263,13 @@ export type TrackContents = {
   locked: boolean;
   clips: ClipContents[];
   transitions: TransitionInfo[];
+  /** Phase 7.3: mixer mute. Distinct from `enabled` (project on/off). */
+  mute: boolean;
+  /** Phase 7.3: solo flag. If any track in the sequence has solo=true,
+   *  only soloed tracks contribute to the audio mix. */
+  solo: boolean;
+  /** Phase 7.3: mixer gain in dB. 0 = unity. */
+  gain_db: number;
 };
 
 export type SequenceContents = {
@@ -645,6 +654,31 @@ export const trimClipOut = (
   clipId: string,
   newSourceOutSeconds: number
 ): Promise<void> => invoke('trim_clip_out', { trackId, clipId, newSourceOutSeconds });
+
+// ---- Phase 7.3 mixer controls ------------------------------------
+//
+// Mute / solo / gain mutators flow through the same EditLog as every
+// other edit op (so undo/redo work). The engine treats them as
+// non-pause-for-edit because the whole point of mixer controls is
+// live response while playback is running; the AudioMixer republishes
+// its snapshot within one buffer of the IPC returning.
+
+export const setTrackMute = (trackId: string, mute: boolean): Promise<void> =>
+  invoke('set_track_mute', { trackId, mute });
+export const setTrackSolo = (trackId: string, solo: boolean): Promise<void> =>
+  invoke('set_track_solo', { trackId, solo });
+export const setTrackGainDb = (trackId: string, gainDb: number): Promise<void> =>
+  invoke('set_track_gain_db', { trackId, gainDb });
+export const setClipMute = (
+  trackId: string,
+  clipId: string,
+  mute: boolean
+): Promise<void> => invoke('set_clip_mute', { trackId, clipId, mute });
+export const setClipGainDb = (
+  trackId: string,
+  clipId: string,
+  gainDb: number
+): Promise<void> => invoke('set_clip_gain_db', { trackId, clipId, gainDb });
 
 /** Start playback of the active sequence from `timelineSeconds`,
  *  using scene_plan to pick the active clip and swapping the

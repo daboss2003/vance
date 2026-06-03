@@ -20,9 +20,14 @@
 #![warn(missing_docs)]
 
 pub mod client;
+pub mod mixer;
 pub mod player;
 pub mod protocol;
 
 pub use client::{AudioClient, AudioClientError};
+pub use mixer::{
+    db_to_linear, fold_frame, AudioMixer, AudioMixerError, AudioSource, ClipMix,
+    MixerSnapshot, TrackMix,
+};
 pub use player::{AudioPlayer, AudioPlayerError};
 pub use protocol::{AudioRequest, AudioResponse, AudioStreamInfo, PcmChunk};

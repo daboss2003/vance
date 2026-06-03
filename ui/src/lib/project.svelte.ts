@@ -34,6 +34,11 @@ import {
   updateEffectParam as ipcUpdateEffectParam,
   moveEffectOnClip as ipcMoveEffect,
   setEffectEnabled as ipcSetEffectEnabled,
+  setTrackMute as ipcSetTrackMute,
+  setTrackSolo as ipcSetTrackSolo,
+  setTrackGainDb as ipcSetTrackGainDb,
+  setClipMute as ipcSetClipMute,
+  setClipGainDb as ipcSetClipGainDb,
   updateEffectParams as ipcUpdateEffectParams,
   previewGradeParams as ipcPreviewGradeParams,
   loadSource as ipcLoadSource,
@@ -787,6 +792,62 @@ class ProjectState {
     this.error = null;
     try {
       await ipcSetEffectEnabled(trackId, clipId, effectId, enabled);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  // ---- Phase 7.3 mixer controls --------------------------------
+  //
+  // Mute / solo / gain mutators do NOT pause playback — the AudioMixer
+  // republishes its snapshot on the next buffer, so the user hears
+  // the change within ~5-20 ms.
+
+  async setTrackMute(trackId: string, mute: boolean) {
+    this.error = null;
+    try {
+      await ipcSetTrackMute(trackId, mute);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  async setTrackSolo(trackId: string, solo: boolean) {
+    this.error = null;
+    try {
+      await ipcSetTrackSolo(trackId, solo);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  async setTrackGainDb(trackId: string, gainDb: number) {
+    this.error = null;
+    try {
+      await ipcSetTrackGainDb(trackId, gainDb);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  async setClipMute(trackId: string, clipId: string, mute: boolean) {
+    this.error = null;
+    try {
+      await ipcSetClipMute(trackId, clipId, mute);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  async setClipGainDb(trackId: string, clipId: string, gainDb: number) {
+    this.error = null;
+    try {
+      await ipcSetClipGainDb(trackId, clipId, gainDb);
       await this.commitEdit();
     } catch (e) {
       this.error = String(e);

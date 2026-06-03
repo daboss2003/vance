@@ -48,7 +48,11 @@
   // Layout constants.
   const RULER_HEIGHT = 22; // px
   const TRACK_HEIGHT = 36; // px per track row
-  const TRACK_HEADER_W = 56; // px reserved on the left for V1/A1 labels
+  const TRACK_HEADER_W = 88; // px reserved on the left for label + M/S buttons (7.3 mixer)
+  // Mixer button geometry inside the track header.
+  const MIXER_BTN_SIZE = 16; // square button (px)
+  const MIXER_BTN_GAP = 3; // gap between M and S
+  const MIXER_BTN_X = 44; // first button's x (after label area)
 
   // Track rows are alternating shaded.
   const VIDEO_FILL = '#3a4252';
@@ -756,13 +760,76 @@
     ctx.lineTo(TRACK_HEADER_W + 0.5, cssH);
     ctx.stroke();
 
-    ctx.fillStyle = TRACK_HEADER_TEXT;
     ctx.font = '11px ui-sans-serif, system-ui, sans-serif';
     ctx.textBaseline = 'middle';
     sequence.tracks.forEach((track, rowIdx) => {
       const y = trackY(rowIdx);
+      // Track name label (V1, A1, ...).
+      ctx.fillStyle = TRACK_HEADER_TEXT;
       ctx.fillText(track.name, 6, y + TRACK_HEIGHT / 2);
+      // Phase 7.3 — M (mute) and S (solo) toggle buttons. Drawn for
+      // every track for visual consistency; the engine ignores mixer
+      // state on Video tracks during the audio fold.
+      const btnY = y + (TRACK_HEIGHT - MIXER_BTN_SIZE) / 2;
+      drawMixerToggle(ctx, MIXER_BTN_X, btnY, 'M', track.mute, '#cf4444');
+      drawMixerToggle(
+        ctx,
+        MIXER_BTN_X + MIXER_BTN_SIZE + MIXER_BTN_GAP,
+        btnY,
+        'S',
+        track.solo,
+        '#e6c52c'
+      );
     });
+  }
+
+  function drawMixerToggle(
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    label: string,
+    active: boolean,
+    activeColor: string
+  ) {
+    ctx.save();
+    ctx.fillStyle = active ? activeColor : '#2c2f37';
+    ctx.strokeStyle = active ? activeColor : '#4a4e58';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.roundRect(x + 0.5, y + 0.5, MIXER_BTN_SIZE - 1, MIXER_BTN_SIZE - 1, 3);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = active ? '#0d0f12' : '#9099a8';
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 10px ui-sans-serif, system-ui, sans-serif';
+    ctx.fillText(label, x + MIXER_BTN_SIZE / 2, y + MIXER_BTN_SIZE / 2 + 0.5);
+    ctx.textAlign = 'left';
+    ctx.restore();
+  }
+
+  /** Hit-test the mixer toggles in a track header. Returns
+   *  `{ trackId, kind }` if the click is inside an M or S button. */
+  function hitTestMixerButton(
+    cssX: number,
+    cssY: number
+  ): { trackId: string; kind: 'mute' | 'solo' } | null {
+    if (!sequence || cssX > TRACK_HEADER_W) return null;
+    if (cssY < RULER_HEIGHT) return null;
+    const rowIdx = Math.floor((cssY - RULER_HEIGHT) / TRACK_HEIGHT);
+    if (rowIdx < 0 || rowIdx >= sequence.tracks.length) return null;
+    const track = sequence.tracks[rowIdx];
+    const y = trackY(rowIdx);
+    const btnY = y + (TRACK_HEIGHT - MIXER_BTN_SIZE) / 2;
+    if (cssY < btnY || cssY > btnY + MIXER_BTN_SIZE) return null;
+    const mX = MIXER_BTN_X;
+    const sX = MIXER_BTN_X + MIXER_BTN_SIZE + MIXER_BTN_GAP;
+    if (cssX >= mX && cssX < mX + MIXER_BTN_SIZE) {
+      return { trackId: track.id, kind: 'mute' };
+    }
+    if (cssX >= sX && cssX < sX + MIXER_BTN_SIZE) {
+      return { trackId: track.id, kind: 'solo' };
+    }
+    return null;
   }
 
   // ---- Playhead -----------------------------------------------------------
@@ -873,6 +940,22 @@
     const rect = canvas.getBoundingClientRect();
     const localX = e.clientX - rect.left;
     const localY = e.clientY - rect.top;
+    // Phase 7.3 — track-header mixer toggle hit-test runs BEFORE clip
+    // hit-testing because the buttons live inside TRACK_HEADER_W where
+    // hitAt never returns clips anyway. Fire-and-forget so the canvas
+    // stays responsive; commitEdit refreshes the sequence on resolve.
+    const mixHit = hitTestMixerButton(localX, localY);
+    if (mixHit && sequence) {
+      const track = sequence.tracks.find((t) => t.id === mixHit.trackId);
+      if (track) {
+        if (mixHit.kind === 'mute') {
+          void projectState.setTrackMute(track.id, !track.mute);
+        } else {
+          void projectState.setTrackSolo(track.id, !track.solo);
+        }
+      }
+      return;
+    }
     const hit = hitAt(localX, localY);
     const kind: DragKind =
       hit?.kind === 'left'

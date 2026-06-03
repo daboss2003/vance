@@ -32,5 +32,12 @@ ringbuf = "0.4"
 # AAC, FLAC, MP3, OGG, PCM, WAV — everything common in our target media.
 symphonia = { version = "0.5", features = ["aac", "flac", "mp3", "wav", "isomp4", "pcm"] }
 
+# Phase 7.3 mixer: ArcSwap publishes MixerSnapshot from the engine
+# (edit-log thread) to the fold thread without locks; uuid is used as
+# track / clip identifiers to keep vance-audio decoupled from the
+# vance-timeline crate.
+arc-swap = "1"
+uuid = { workspace = true }
+
 [dev-dependencies]
 bincode = { version = "2", features = ["serde"] }

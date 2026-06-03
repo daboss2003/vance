@@ -209,6 +209,12 @@ pub struct TrackContents {
     pub clips: Vec<ClipContents>,
     /// Transitions on this track (cross-dissolves so far).
     pub transitions: Vec<TransitionInfo>,
+    /// Phase 7.3: mixer mute. Distinct from `enabled` (project on/off).
+    pub mute: bool,
+    /// Phase 7.3: solo flag. UI shows the "S" button highlighted.
+    pub solo: bool,
+    /// Phase 7.3: mixer gain in dB (0.0 = unity).
+    pub gain_db: f32,
 }
 
 /// One transition's worth of info for the UI.
@@ -243,6 +249,8 @@ pub struct ClipContents {
     pub enabled: bool,
     /// Effects attached to this clip, in display order.
     pub effects: Vec<EffectInfo>,
+    /// Phase 7.3: per-clip mixer gain in dB (0.0 = unity).
+    pub gain_db: f32,
 }
 
 /// One effect's worth of info for the UI.
@@ -1090,9 +1098,17 @@ pub struct Engine {
     last_bounds: ViewportBounds,
     /// Active playback, if any.
     playback: Option<PlaybackSession>,
-    /// Audio playback owner thread (holds the AudioPlayer; AudioPlayer's
-    /// cpal::Stream is !Send so it has to stay on its own thread).
-    audio_owner: Option<AudioOwner>,
+    /// Audio playback backend (single-file AudioPlayer or multi-source
+    /// AudioMixer per Phase 7.3). Both are owned by a dedicated
+    /// thread because `cpal::Stream` is `!Send`.
+    audio_owner: Option<AudioBackend>,
+    /// Phase 7.3: snapshot-bus handle to the active [`AudioMixer`]
+    /// during sequence playback. The AudioMixer itself stays on its
+    /// owner thread (cpal::Stream is !Send); this Send+Sync handle
+    /// lets the edit-log thread publish fresh snapshots when a
+    /// mixer-affecting EditOp lands. `None` outside of mixer
+    /// playback.
+    audio_mixer_snapshot: Option<Arc<arc_swap::ArcSwap<vance_audio::MixerSnapshot>>>,
     /// Last presented video PTS from the most recent playback session.
     /// Set when a session is reaped (explicit stop OR auto-reap on EOS),
     /// cleared on the next start_playback. Lets the UI learn the EOS PTS
@@ -1176,6 +1192,32 @@ pub struct ClipAnchor {
     pub opacity: f32,
 }
 
+/// Either the single-file [`AudioPlayer`] owner or the multi-source
+/// [`vance_audio::AudioMixer`] owner. Phase 7.3 added the second
+/// variant — the playback loop only needs an `AudioSync` clock from
+/// either, so the variant lives at the boundary where the engine
+/// constructs / tears down the backend.
+pub enum AudioBackend {
+    /// Single-file path (`AudioPlayer`). Used by Source-monitor
+    /// preview and any single-clip workflow that doesn't need mixing.
+    Single(AudioOwner),
+    /// Multi-source mixer path (`vance_audio::AudioMixer`). Used by
+    /// `play_sequence` so mute / solo / gain are audible live.
+    Mixer(AudioMixerOwner),
+}
+
+impl AudioBackend {
+    fn shutdown(self) {
+        match self {
+            AudioBackend::Single(owner) => {
+                owner.stop.store(true, Ordering::Release);
+                let _ = owner.handle.join();
+            }
+            AudioBackend::Mixer(owner) => owner.shutdown(),
+        }
+    }
+}
+
 /// Owns the AudioPlayer on a dedicated thread. The thread parks until
 /// `stop` is set, then drops the AudioPlayer (which stops the cpal
 /// stream and joins its puller).
@@ -1189,6 +1231,12 @@ pub struct AudioOwner {
 enum StartPlaybackKind {
     Video {
         from_pts: i64,
+        /// Phase 7.3: if true, route audio through the multi-source
+        /// [`vance_audio::AudioMixer`] (used by `play_sequence` for
+        /// real mute/solo/gain mixing). Single-clip Source-monitor
+        /// preview stays on the existing single-file [`AudioPlayer`]
+        /// path so we don't perturb its sync behavior.
+        use_mixer: bool,
     },
     Title {
         params: TitleParams,
@@ -1618,7 +1666,24 @@ impl Engine {
     pub fn start_playback(&mut self, from_pts: i64) -> Result<(), EngineError> {
         tracing::info!(from_pts, "start_playback called");
         self.pause_for_edit();
-        self.start_playback_inner(StartPlaybackKind::Video { from_pts })
+        self.start_playback_inner(StartPlaybackKind::Video {
+            from_pts,
+            use_mixer: false,
+        })
+    }
+
+    /// Phase 7.3: like `start_playback` but routes audio through the
+    /// multi-source [`vance_audio::AudioMixer`] so the active
+    /// sequence's mute/solo/gain settings are audible live. Used by
+    /// `play_sequence` so users actually hear the M/S buttons they
+    /// toggle in the track header.
+    pub fn start_playback_mixed(&mut self, from_pts: i64) -> Result<(), EngineError> {
+        tracing::info!(from_pts, "start_playback_mixed called");
+        self.pause_for_edit();
+        self.start_playback_inner(StartPlaybackKind::Video {
+            from_pts,
+            use_mixer: true,
+        })
     }
 
     /// Wraps the heavy lifting so `start_playback` and the title-mode
@@ -1642,7 +1707,10 @@ impl Engine {
         // decoder out and starts streaming on it; title mode renders
         // the title frame and leaves the decoder slot alone.
         let (primary, audio_owner, audio_sync, from_pts) = match kind {
-            StartPlaybackKind::Video { from_pts } => {
+            StartPlaybackKind::Video {
+                from_pts,
+                use_mixer,
+            } => {
                 let info = self
                     .stream_info
                     .as_ref()
@@ -1663,14 +1731,36 @@ impl Engine {
                 } else {
                     0.0
                 };
-                let (audio_owner, audio_sync) =
+                let (audio_owner, audio_sync) = if use_mixer {
+                    match self.start_mixer_session(from_seconds) {
+                        Ok((owner, sync)) => {
+                            (Some(AudioBackend::Mixer(owner)), Some(sync))
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                ?e,
+                                "audio mixer: not started; falling back to single-clip audio"
+                            );
+                            match start_audio(&media_path, from_seconds) {
+                                Ok((owner, sync)) => {
+                                    (Some(AudioBackend::Single(owner)), Some(sync))
+                                }
+                                Err(e2) => {
+                                    tracing::warn!(?e2, "audio: not started either; wall-clock");
+                                    (None, None)
+                                }
+                            }
+                        }
+                    }
+                } else {
                     match start_audio(&media_path, from_seconds) {
-                        Ok((owner, sync)) => (Some(owner), Some(sync)),
+                        Ok((owner, sync)) => (Some(AudioBackend::Single(owner)), Some(sync)),
                         Err(e) => {
                             tracing::warn!(?e, "audio: not started; video will use wall-clock");
                             (None, None)
                         }
-                    };
+                    }
+                };
                 (
                     PlaybackPrimary::Decoder {
                         client: decoder,
@@ -1806,12 +1896,15 @@ impl Engine {
             return Err(EngineError::NoPlayback);
         };
         session.stop.store(true, Ordering::Release);
-        // Stop the audio owner thread (it'll drop the AudioPlayer, which
-        // stops cpal + joins the puller thread).
-        if let Some(owner) = self.audio_owner.take() {
-            owner.stop.store(true, Ordering::Release);
-            let _ = owner.handle.join();
+        // Stop the audio backend. AudioBackend::shutdown drops the
+        // owned cpal stream + joins the puller (and the fold thread
+        // in the mixer case).
+        if let Some(backend) = self.audio_owner.take() {
+            backend.shutdown();
         }
+        // Phase 7.3: clear the snapshot bus so subsequent EditOps
+        // don't try to publish to a torn-down mixer.
+        self.end_mixer_session();
         let resume_pts = if session.ended_at_eos.load(Ordering::Acquire)
             && self.playing_clip_anchor.is_none()
         {
@@ -2593,7 +2686,10 @@ impl Engine {
         // Stash effects for the playback_loop to evaluate per frame.
         self.next_play_effects = clip_effects_snapshot;
         self.next_play_source_in_sec = anchor_source_in;
-        self.start_playback(from_pts)
+        // Phase 7.3: sequence playback uses the multi-source mixer so
+        // mute/solo/gain are live; the single-clip path remains for
+        // Source-monitor preview.
+        self.start_playback_mixed(from_pts)
     }
 
     /// Current playhead position on the active sequence's timeline,
@@ -4105,6 +4201,64 @@ impl Engine {
         })
     }
 
+    /// Phase 7.3: set a track's mute. Does NOT pause playback — the
+    /// whole point of mixer controls is live response. The snapshot
+    /// republish inside `apply_edit_op` makes the change audible
+    /// within one mixer buffer (~5-21 ms at the cpal default).
+    pub fn set_track_mute(
+        &mut self,
+        track_id: TrackId,
+        mute: bool,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::SetTrackMute { track_id, mute })
+    }
+
+    /// Phase 7.3: set a track's solo flag.
+    pub fn set_track_solo(
+        &mut self,
+        track_id: TrackId,
+        solo: bool,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::SetTrackSolo { track_id, solo })
+    }
+
+    /// Phase 7.3: set a track's gain in dB. Live during playback.
+    pub fn set_track_gain_db(
+        &mut self,
+        track_id: TrackId,
+        gain_db: f32,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::SetTrackGainDb { track_id, gain_db })
+    }
+
+    /// Phase 7.3: set a clip's mute. Live during playback.
+    pub fn set_clip_mute(
+        &mut self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+        mute: bool,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::SetClipMute {
+            track_id,
+            clip_id,
+            mute,
+        })
+    }
+
+    /// Phase 7.3: set a clip's mixer gain in dB. Live during playback.
+    pub fn set_clip_gain_db(
+        &mut self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+        gain_db: f32,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::SetClipGainDb {
+            track_id,
+            clip_id,
+            gain_db,
+        })
+    }
+
     /// Live, NON-undoable preview of one or more grade params mid-drag.
     /// Rebuilds the clip's grade chain with ALL `params` overridden
     /// together on `effect_id` (a wheel drag moves R/G/B + master at
@@ -4315,6 +4469,7 @@ impl Engine {
     /// so reads (rendering, save, scene_plan) see the latest state.
     fn apply_edit_op(&mut self, op: EditOp) -> Result<(), EngineError> {
         let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+        let touches_mixer = op_touches_mixer(&op);
         let log = self
             .edit_logs
             .get_mut(&seq_id)
@@ -4326,9 +4481,25 @@ impl Engine {
             .as_mut()
             .ok_or(EngineError::NoProject)?;
         if let Some(slot) = project.sequences.iter_mut().find(|s| s.id == seq_id) {
-            *slot = Arc::new(new_seq);
+            *slot = Arc::new(new_seq.clone());
+        }
+        // Phase 7.3: if this edit touched mixer state AND mixer
+        // playback is active, publish a fresh snapshot. The
+        // ArcSwap::store is lock-free and cheap.
+        if touches_mixer {
+            self.republish_mixer_snapshot_if_active(&new_seq);
         }
         Ok(())
+    }
+
+    /// Build a fresh [`vance_audio::MixerSnapshot`] from the given
+    /// sequence and publish it to the active mixer's snapshot bus.
+    /// No-op when mixer playback isn't active.
+    fn republish_mixer_snapshot_if_active(&self, sequence: &vance_timeline::Sequence) {
+        if let Some(snapshot) = self.audio_mixer_snapshot.as_ref() {
+            let snap = build_mixer_snapshot(sequence);
+            snapshot.store(Arc::new(snap));
+        }
     }
 
     /// Undo the most recent edit on the current sequence. Returns
@@ -4349,8 +4520,12 @@ impl Engine {
             .as_mut()
             .ok_or(EngineError::NoProject)?;
         if let Some(slot) = project.sequences.iter_mut().find(|s| s.id == seq_id) {
-            *slot = Arc::new(new_seq);
+            *slot = Arc::new(new_seq.clone());
         }
+        // Phase 7.3: undo / redo can revert mixer state too — always
+        // republish so the active mixer reflects the post-undo
+        // sequence.
+        self.republish_mixer_snapshot_if_active(&new_seq);
         Ok(true)
     }
 
@@ -4372,8 +4547,10 @@ impl Engine {
             .as_mut()
             .ok_or(EngineError::NoProject)?;
         if let Some(slot) = project.sequences.iter_mut().find(|s| s.id == seq_id) {
-            *slot = Arc::new(new_seq);
+            *slot = Arc::new(new_seq.clone());
         }
+        // Phase 7.3: redo can re-apply mixer state.
+        self.republish_mixer_snapshot_if_active(&new_seq);
         Ok(true)
     }
 
@@ -4462,6 +4639,7 @@ impl Engine {
                                     params: e.params.clone(),
                                 })
                                 .collect(),
+                            gain_db: c.gain_db,
                         })
                         .collect(),
                     transitions: t
@@ -4476,6 +4654,9 @@ impl Engine {
                             duration_seconds: rt_to_seconds(tr.duration),
                         })
                         .collect(),
+                    mute: t.mute,
+                    solo: t.solo,
+                    gain_db: t.gain_db,
                 })
                 .collect(),
         })
@@ -4516,6 +4697,49 @@ impl Engine {
         } else {
             None
         }
+    }
+
+    /// Phase 7.3: probe the current sequence + project to start the
+    /// multi-source audio mixer at `from_seconds`. Returns Err when no
+    /// project / sequence is loaded; otherwise spawns the mixer
+    /// owner thread, stashes the snapshot bus handle on the engine,
+    /// and the caller (M4 Tauri command + UI play_sequence wiring)
+    /// uses the returned `AudioSync` + `AudioMixerOwner` as it would
+    /// the single-file `AudioSync` + `AudioOwner` from `start_audio`.
+    ///
+    /// Audible output begins immediately; no video / scheduler
+    /// integration in this method — that happens at the playback
+    /// loop level in M4.
+    pub fn start_mixer_session(
+        &mut self,
+        from_seconds: f64,
+    ) -> Result<(AudioMixerOwner, AudioSync), EngineError> {
+        let project = self
+            .current_project
+            .as_ref()
+            .ok_or(EngineError::NoProject)?;
+        let seq_id = self
+            .current_sequence_id
+            .ok_or(EngineError::NoCurrentSequence)?;
+        let sequence = project
+            .sequences
+            .iter()
+            .find(|s| s.id == seq_id)
+            .ok_or(EngineError::NoCurrentSequence)?
+            .clone();
+        let (owner, sync, snapshot_handle) =
+            start_audio_mix(&sequence, project, from_seconds).map_err(EngineError::Project)?;
+        self.audio_mixer_snapshot = Some(snapshot_handle);
+        Ok((owner, sync))
+    }
+
+    /// Stop the mixer playback session: drop the snapshot bus so
+    /// subsequent EditOp applies don't try to publish to a torn-down
+    /// mixer. The caller is responsible for actually joining the
+    /// `AudioMixerOwner` (it returns synchronously from
+    /// `shutdown()`).
+    pub fn end_mixer_session(&mut self) {
+        self.audio_mixer_snapshot = None;
     }
 
     /// Is playback currently running? Auto-reaps sessions whose scheduler
@@ -4692,6 +4916,220 @@ fn start_audio(media_path: &str, from_seconds: f64) -> Result<(AudioOwner, Audio
         .recv_timeout(Duration::from_secs(10))
         .map_err(|_| "audio owner thread did not report ready in 10s".to_string())??;
     Ok((AudioOwner { stop, handle }, sync))
+}
+
+// ============================================================
+// Phase 7.3 — multi-source audio mixer integration
+// ============================================================
+
+/// Owner thread for the multi-source [`vance_audio::AudioMixer`].
+/// Mirrors [`AudioOwner`]: the cpal stream is `!Send`, so the mixer
+/// has to live on its own thread.
+pub struct AudioMixerOwner {
+    stop: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+impl AudioMixerOwner {
+    /// Signal the owner thread to drop the mixer (cpal stream stops,
+    /// puller + fold threads join) and join the owner.
+    pub fn shutdown(self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = self.handle.join();
+    }
+}
+
+/// Translate a [`Track`] from vance-timeline into a [`vance_audio::TrackMix`]
+/// with `gain_linear` precomputed at snapshot-build time. Mute and solo
+/// pass through verbatim. Tracks of kind != Audio still emit a TrackMix
+/// (it's keyed by uuid; non-audio tracks just don't have ClipMixes
+/// pointing at them, so they never contribute to the fold).
+fn track_to_mix(track: &Track) -> vance_audio::TrackMix {
+    vance_audio::TrackMix {
+        gain_linear: vance_audio::db_to_linear(track.gain_db),
+        mute: track.mute,
+        solo: track.solo,
+    }
+}
+
+/// Translate a [`Clip`] from vance-timeline into a
+/// [`vance_audio::ClipMix`]. `enabled` mirrors `Clip.enabled` (per-clip
+/// mute), `gain_linear` is precomputed.
+fn clip_to_mix(clip: &Clip, track_id: TrackId) -> vance_audio::ClipMix {
+    vance_audio::ClipMix {
+        gain_linear: vance_audio::db_to_linear(clip.gain_db),
+        enabled: clip.enabled,
+        track_id: track_id.as_uuid(),
+    }
+}
+
+/// Build a [`MixerSnapshot`] covering every track + clip in the
+/// current sequence. The snapshot is sequence-scoped — when an EditOp
+/// lands, the engine rebuilds it from the post-edit sequence and
+/// publishes via [`vance_audio::AudioMixer::publish_snapshot`].
+///
+/// `solo_anywhere` is precomputed (one pass over tracks) so the fold
+/// thread's per-clip lookup never has to sweep the tracks map.
+fn build_mixer_snapshot(sequence: &vance_timeline::Sequence) -> vance_audio::MixerSnapshot {
+    let mut snap = vance_audio::MixerSnapshot::empty();
+    let mut solo_anywhere = false;
+    for track in &sequence.tracks {
+        snap.tracks.insert(track.id.as_uuid(), track_to_mix(track));
+        if track.solo {
+            solo_anywhere = true;
+        }
+        // Only audio tracks contribute clips to the mixer (video
+        // tracks are blended, not summed). This keeps the clips map
+        // small.
+        if track.kind == TrackKind::Audio {
+            for clip in &track.clips {
+                snap.clips
+                    .insert(clip.id.as_uuid(), clip_to_mix(clip, track.id));
+            }
+        }
+    }
+    snap.solo_anywhere = solo_anywhere;
+    snap.master_gain_linear = 1.0;
+    snap
+}
+
+/// Walk the sequence and gather one [`vance_audio::AudioSource`] per
+/// audio clip that overlaps `from_seconds`. Clips that start later
+/// in the timeline are NOT included in this v1 — the spike's
+/// sliding-window scheduler is deferred (genuinely separable; see
+/// Phase 7.3 deferrals).
+fn collect_audio_sources_at(
+    sequence: &vance_timeline::Sequence,
+    project: &vance_timeline::Project,
+    from_seconds: f64,
+) -> Vec<vance_audio::AudioSource> {
+    let mut sources = Vec::new();
+    for track in &sequence.tracks {
+        if track.kind != TrackKind::Audio || !track.enabled {
+            continue;
+        }
+        for clip in &track.clips {
+            let t_in = rt_to_seconds(clip.timeline_in);
+            let dur = rt_to_seconds(clip.duration());
+            let t_out = t_in + dur;
+            // M3 v1: only clips active at the playback start time.
+            if from_seconds < t_in || from_seconds >= t_out {
+                continue;
+            }
+            let media = match project.media.get(&clip.media) {
+                Some(m) => m,
+                None => continue,
+            };
+            // Video media without an audio track contribute nothing.
+            if !media.has_audio_track {
+                continue;
+            }
+            let source_in_sec = rt_to_seconds(clip.source_in);
+            let offset = from_seconds - t_in;
+            sources.push(vance_audio::AudioSource {
+                clip_id: clip.id.as_uuid(),
+                path: media.path.clone(),
+                from_seconds: source_in_sec + offset,
+            });
+        }
+    }
+    sources
+}
+
+/// Spawn the multi-source [`vance_audio::AudioMixer`] on an owner
+/// thread and return the owner handle, the master-frame-derived
+/// [`AudioSync`], and the snapshot bus handle the engine stores for
+/// publishing live updates.
+fn start_audio_mix(
+    sequence: &vance_timeline::Sequence,
+    project: &vance_timeline::Project,
+    from_seconds: f64,
+) -> Result<
+    (
+        AudioMixerOwner,
+        AudioSync,
+        Arc<arc_swap::ArcSwap<vance_audio::MixerSnapshot>>,
+    ),
+    String,
+> {
+    let bin = locate_audio_binary().map_err(|e| format!("{e:?}"))?;
+    let sources = collect_audio_sources_at(sequence, project, from_seconds);
+    let initial_snapshot = build_mixer_snapshot(sequence);
+
+    let (tx, rx) = std::sync::mpsc::sync_channel::<
+        Result<(AudioSync, Arc<arc_swap::ArcSwap<vance_audio::MixerSnapshot>>), String>,
+    >(1);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+
+    let handle = std::thread::Builder::new()
+        .name("vance-engine.audio-mixer-owner".into())
+        .spawn(move || {
+            let mixer = match vance_audio::AudioMixer::start(&bin, sources, initial_snapshot) {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = tx.send(Err(format!("{e}")));
+                    return;
+                }
+            };
+            // Master-frame-derived AudioSync: the mixer counts
+            // device-sample frames since stream start; one frame =
+            // 1/sample_rate seconds. Time base = (1, sample_rate)
+            // makes seconds = pts * 1 / sample_rate.
+            let sync = AudioSync {
+                current_pts: mixer.master_frame_handle(),
+                time_base: (1, mixer.device_sample_rate() as i64),
+            };
+            let snapshot_handle = mixer.snapshot_handle();
+            if tx.send(Ok((sync, snapshot_handle))).is_err() {
+                return;
+            }
+            while !stop_clone.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            drop(mixer); // cpal stops, puller + fold threads join
+        })
+        .map_err(|e| format!("spawn audio mixer owner: {e}"))?;
+
+    let (sync, snapshot_handle) = rx
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|_| "audio mixer owner thread did not report ready in 10s".to_string())??;
+    Ok((
+        AudioMixerOwner { stop, handle },
+        sync,
+        snapshot_handle,
+    ))
+}
+
+/// Does this EditOp affect mixer state (tracks gain/mute/solo, clip
+/// gain/mute, or topology changes that move/add/remove clips on
+/// audio tracks)? The republish path treats any clip-or-track-topology
+/// change as mixer-affecting: a deleted clip removes its ClipMix; an
+/// inserted clip needs one; trim/move don't change ClipMix shape but
+/// the engine republishes anyway to keep the contract conservative.
+fn op_touches_mixer(op: &EditOp) -> bool {
+    match op {
+        EditOp::SetTrackMute { .. }
+        | EditOp::SetTrackSolo { .. }
+        | EditOp::SetTrackGainDb { .. }
+        | EditOp::SetClipMute { .. }
+        | EditOp::SetClipGainDb { .. }
+        | EditOp::AddTrack { .. }
+        | EditOp::RemoveTrack { .. }
+        | EditOp::InsertClip { .. }
+        | EditOp::RippleInsertClip { .. }
+        | EditOp::OverwriteClip { .. }
+        | EditOp::RemoveClip { .. }
+        | EditOp::RippleRemoveClip { .. }
+        | EditOp::Slip { .. }
+        | EditOp::Slide { .. }
+        | EditOp::TrimIn { .. }
+        | EditOp::TrimOut { .. }
+        | EditOp::Split { .. } => true,
+        // Compound republishes once after the whole batch lands.
+        EditOp::Compound { .. } => true,
+        _ => false,
+    }
 }
 
 fn locate_audio_binary() -> Result<PathBuf, EngineError> {
@@ -5376,5 +5814,170 @@ mod tests {
             .compute_scopes(vance_scopes::ScopeConfig::default(), 16, 16, false)
             .expect("ok without render state");
         assert!(out.is_none());
+    }
+
+    // ---- Phase 7.3 mixer integration ---------------------------------
+
+    fn t(num: i64) -> vance_core::RationalTime {
+        vance_core::RationalTime::new(num, 1).unwrap()
+    }
+
+    fn audio_media(path: &str) -> Arc<MediaItem> {
+        let mut m = MediaItem::new(
+            PathBuf::from(path),
+            "clip.wav",
+            MediaKind::Audio,
+            t(10),
+        );
+        m.has_audio_track = true;
+        Arc::new(m)
+    }
+
+    #[test]
+    fn build_mixer_snapshot_inserts_clipmix_only_for_audio_tracks() {
+        let mut seq = vance_timeline::Sequence::new("S", vance_core::FrameRate::FPS_24);
+        let video_t = vance_timeline::Track::new(TrackKind::Video, "V1");
+        let audio_t = vance_timeline::Track::new(TrackKind::Audio, "A1");
+        let video_clip = Arc::new(
+            vance_timeline::Clip::new(MediaItemId::new(), "v", t(0), t(0), t(5)).unwrap(),
+        );
+        let audio_clip = Arc::new(
+            vance_timeline::Clip::new(MediaItemId::new(), "a", t(0), t(0), t(5)).unwrap(),
+        );
+        let mut video_t = video_t;
+        video_t.clips.push(video_clip.clone());
+        let mut audio_t = audio_t;
+        audio_t.clips.push(audio_clip.clone());
+        let audio_track_id = audio_t.id;
+        let audio_clip_id = audio_clip.id;
+        seq.tracks.push(Arc::new(video_t));
+        seq.tracks.push(Arc::new(audio_t));
+
+        let snap = build_mixer_snapshot(&seq);
+        assert_eq!(snap.tracks.len(), 2, "both tracks emit a TrackMix");
+        assert_eq!(snap.clips.len(), 1, "only audio tracks emit ClipMixes");
+        let cm = snap.clips.get(&audio_clip_id.as_uuid()).expect("audio clip present");
+        assert_eq!(cm.track_id, audio_track_id.as_uuid());
+        assert!(cm.enabled);
+        assert!(!snap.solo_anywhere);
+    }
+
+    #[test]
+    fn build_mixer_snapshot_precomputes_gain_linear() {
+        let mut seq = vance_timeline::Sequence::new("S", vance_core::FrameRate::FPS_24);
+        let mut tr = vance_timeline::Track::new(TrackKind::Audio, "A1");
+        tr.gain_db = -6.0;
+        seq.tracks.push(Arc::new(tr));
+        let snap = build_mixer_snapshot(&seq);
+        let tm = snap.tracks.values().next().unwrap();
+        let expected = vance_audio::db_to_linear(-6.0);
+        assert!((tm.gain_linear - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn build_mixer_snapshot_detects_solo_anywhere() {
+        let mut seq = vance_timeline::Sequence::new("S", vance_core::FrameRate::FPS_24);
+        let mut a1 = vance_timeline::Track::new(TrackKind::Audio, "A1");
+        let mut a2 = vance_timeline::Track::new(TrackKind::Audio, "A2");
+        a2.solo = true;
+        seq.tracks.push(Arc::new(a1));
+        seq.tracks.push(Arc::new(a2));
+        assert!(build_mixer_snapshot(&seq).solo_anywhere);
+        // Without solo on any track:
+        seq = vance_timeline::Sequence::new("S", vance_core::FrameRate::FPS_24);
+        a1 = vance_timeline::Track::new(TrackKind::Audio, "A1");
+        seq.tracks.push(Arc::new(a1));
+        assert!(!build_mixer_snapshot(&seq).solo_anywhere);
+    }
+
+    #[test]
+    fn collect_audio_sources_skips_disabled_track_and_clip_without_audio() {
+        let mut project = vance_timeline::Project::new("P");
+        // Two audio media items: one has audio, one doesn't.
+        let mi_with = audio_media("/tmp/with.wav");
+        let mut mi_without_inner =
+            MediaItem::new(PathBuf::from("/tmp/without.mp4"), "x", MediaKind::Video, t(10));
+        mi_without_inner.has_audio_track = false;
+        let mi_without = Arc::new(mi_without_inner);
+        let id_with = mi_with.id;
+        let id_without = mi_without.id;
+        project.media.insert(id_with, mi_with);
+        project.media.insert(id_without, mi_without);
+
+        let mut seq = vance_timeline::Sequence::new("S", vance_core::FrameRate::FPS_24);
+        // Audio track with two clips at t=0..5: one whose media has
+        // audio, one whose media doesn't.
+        let mut at = vance_timeline::Track::new(TrackKind::Audio, "A1");
+        at.clips.push(Arc::new(
+            vance_timeline::Clip::new(id_with, "with", t(0), t(0), t(5)).unwrap(),
+        ));
+        at.clips.push(Arc::new(
+            vance_timeline::Clip::new(id_without, "without", t(0), t(0), t(5)).unwrap(),
+        ));
+        seq.tracks.push(Arc::new(at));
+        // Disabled track is silently skipped even if media has audio.
+        let mut disabled = vance_timeline::Track::new(TrackKind::Audio, "A2");
+        disabled.enabled = false;
+        disabled.clips.push(Arc::new(
+            vance_timeline::Clip::new(id_with, "off", t(0), t(0), t(5)).unwrap(),
+        ));
+        seq.tracks.push(Arc::new(disabled));
+
+        let sources = collect_audio_sources_at(&seq, &project, 1.0);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].path, PathBuf::from("/tmp/with.wav"));
+    }
+
+    #[test]
+    fn collect_audio_sources_skips_clips_outside_window() {
+        let mut project = vance_timeline::Project::new("P");
+        let mi = audio_media("/tmp/clip.wav");
+        let mid = mi.id;
+        project.media.insert(mid, mi);
+        let mut seq = vance_timeline::Sequence::new("S", vance_core::FrameRate::FPS_24);
+        let mut at = vance_timeline::Track::new(TrackKind::Audio, "A1");
+        // Clip at timeline 5..10. Probing at t=2 → empty; t=7 → 1 source.
+        at.clips.push(Arc::new(
+            vance_timeline::Clip::new(mid, "c", t(5), t(0), t(5)).unwrap(),
+        ));
+        seq.tracks.push(Arc::new(at));
+        assert!(collect_audio_sources_at(&seq, &project, 2.0).is_empty());
+        let live = collect_audio_sources_at(&seq, &project, 7.0);
+        assert_eq!(live.len(), 1);
+        // Offset into the source: at timeline t=7 we're 2s past the
+        // clip's timeline_in=5, so the source offset is source_in + 2 = 2.
+        assert!((live[0].from_seconds - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn op_touches_mixer_covers_all_mixer_variants() {
+        use vance_timeline::TrackId;
+        let tid = TrackId::new();
+        let cid = vance_timeline::ClipId::new();
+        assert!(op_touches_mixer(&EditOp::SetTrackMute { track_id: tid, mute: true }));
+        assert!(op_touches_mixer(&EditOp::SetTrackSolo { track_id: tid, solo: true }));
+        assert!(op_touches_mixer(&EditOp::SetTrackGainDb { track_id: tid, gain_db: -3.0 }));
+        assert!(op_touches_mixer(&EditOp::SetClipMute {
+            track_id: tid,
+            clip_id: cid,
+            mute: true,
+        }));
+        assert!(op_touches_mixer(&EditOp::SetClipGainDb {
+            track_id: tid,
+            clip_id: cid,
+            gain_db: -6.0,
+        }));
+        // Compound is conservative-true so a batched edit republishes once.
+        assert!(op_touches_mixer(&EditOp::Compound {
+            ops: vec![],
+            label: "noop".into(),
+        }));
+        // SetEffectEnabled does NOT touch mixer state.
+        assert!(!op_touches_mixer(&EditOp::SetEffectEnabled {
+            track_id: tid,
+            clip_id: cid,
+            effect_id: vance_timeline::EffectId::new(),
+            enabled: true,
+        }));
     }
 }

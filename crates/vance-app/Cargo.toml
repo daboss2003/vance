@@ -52,6 +52,7 @@ vance-timeline = { workspace = true }
 vance-project = { workspace = true }
 vance-peaks = { workspace = true }
 uuid = { workspace = true }
+arc-swap = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

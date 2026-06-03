@@ -1026,6 +1026,103 @@ fn move_effect_on_clip(
         .map_err(|e| e.to_string())
 }
 
+/// Phase 7.3 mixer command: set a track's mute.
+#[tauri::command]
+fn set_track_mute(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    mute: bool,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    state
+        .lock()
+        .set_track_mute(vance_timeline::TrackId::from_uuid(track_uuid), mute)
+        .map_err(|e| e.to_string())
+}
+
+/// Phase 7.3 mixer command: set a track's solo flag.
+#[tauri::command]
+fn set_track_solo(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    solo: bool,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    state
+        .lock()
+        .set_track_solo(vance_timeline::TrackId::from_uuid(track_uuid), solo)
+        .map_err(|e| e.to_string())
+}
+
+/// Phase 7.3 mixer command: set a track's gain in dB.
+#[tauri::command]
+fn set_track_gain_db(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    gain_db: f32,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    state
+        .lock()
+        .set_track_gain_db(vance_timeline::TrackId::from_uuid(track_uuid), gain_db)
+        .map_err(|e| e.to_string())
+}
+
+/// Phase 7.3 mixer command: set a clip's mute (routes through
+/// `Clip.enabled` per the existing semantics).
+#[tauri::command]
+fn set_clip_mute(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    clip_id: String,
+    mute: bool,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let clip_uuid = clip_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid clip id: {e}"))?;
+    state
+        .lock()
+        .set_clip_mute(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            vance_timeline::ClipId::from_uuid(clip_uuid),
+            mute,
+        )
+        .map_err(|e| e.to_string())
+}
+
+/// Phase 7.3 mixer command: set a clip's mixer gain in dB.
+#[tauri::command]
+fn set_clip_gain_db(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    clip_id: String,
+    gain_db: f32,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let clip_uuid = clip_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid clip id: {e}"))?;
+    state
+        .lock()
+        .set_clip_gain_db(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            vance_timeline::ClipId::from_uuid(clip_uuid),
+            gain_db,
+        )
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn set_effect_enabled(
     state: tauri::State<'_, EngineHandle>,
@@ -1575,6 +1672,11 @@ fn main() {
             update_effect_param,
             move_effect_on_clip,
             set_effect_enabled,
+            set_track_mute,
+            set_track_solo,
+            set_track_gain_db,
+            set_clip_mute,
+            set_clip_gain_db,
             update_effect_params,
             preview_grade_params,
             add_transition_at_cut,

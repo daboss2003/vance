@@ -251,4 +251,132 @@ mod tests {
         let reopened = open(&bundle).unwrap();
         assert_eq!(reopened.name, "second");
     }
+
+    // ---- Phase 7.3 mixer persistence ----------------------------------
+
+    fn build_project_with_audio_mixer_state() -> Project {
+        let mut p = Project::new("Mixer Test");
+        let media = MediaItem::new(
+            PathBuf::from("/tmp/clip.wav"),
+            "clip.wav",
+            MediaKind::Audio,
+            t(10),
+        );
+        let media_id = media.id;
+        p.media.insert(media_id, Arc::new(media));
+
+        let mut log = EditLog::new(Sequence::new("Seq 01", FrameRate::FPS_24));
+        let track_id = TrackId::new();
+        log.apply(EditOp::AddTrack {
+            track_id,
+            kind: TrackKind::Audio,
+            name: "A1".into(),
+        })
+        .unwrap();
+        let clip = Clip::new(media_id, "clip.wav", t(0), t(0), t(5)).unwrap();
+        let clip_id = clip.id;
+        log.apply(EditOp::InsertClip { track_id, clip }).unwrap();
+
+        // Set non-default mixer state on both the track AND the clip.
+        log.apply(EditOp::SetTrackMute {
+            track_id,
+            mute: true,
+        })
+        .unwrap();
+        log.apply(EditOp::SetTrackSolo {
+            track_id,
+            solo: true,
+        })
+        .unwrap();
+        log.apply(EditOp::SetTrackGainDb {
+            track_id,
+            gain_db: -3.0,
+        })
+        .unwrap();
+        log.apply(EditOp::SetClipGainDb {
+            track_id,
+            clip_id,
+            gain_db: -6.0,
+        })
+        .unwrap();
+
+        p.sequences.push(Arc::new(log.current().clone()));
+        p
+    }
+
+    #[test]
+    fn mixer_state_round_trips_through_save_and_open() {
+        let tmp = TempDir::new().unwrap();
+        let bundle = tmp.path().join("Mixer.vance");
+        let project = build_project_with_audio_mixer_state();
+        save(&project, &bundle).unwrap();
+        let reopened = open(&bundle).unwrap();
+        let seq = &reopened.sequences[0];
+        let track = &seq.tracks[0];
+        assert!(track.mute, "mute survives round-trip");
+        assert!(track.solo, "solo survives round-trip");
+        assert!(
+            (track.gain_db - (-3.0)).abs() < 1e-6,
+            "track gain survives round-trip"
+        );
+        let clip = &track.clips[0];
+        assert!(
+            (clip.gain_db - (-6.0)).abs() < 1e-6,
+            "clip gain survives round-trip"
+        );
+    }
+
+    #[test]
+    fn legacy_bundle_loads_with_unity_mixer_defaults() {
+        // Build a project using ONLY the pre-7.3 surface (no SetTrack*
+        // / SetClip* ops, no field literals on the new fields). After
+        // a save/open round-trip the new fields take their
+        // serde-default values: mute=false, solo=false, gain_db=0.0,
+        // and Audio-kind media items get has_audio_track forced true
+        // by the bundle-load sweep.
+        let tmp = TempDir::new().unwrap();
+        let bundle = tmp.path().join("Legacy.vance");
+        let mut p = Project::new("Legacy");
+        let media = MediaItem::new(
+            PathBuf::from("/tmp/legacy.wav"),
+            "legacy.wav",
+            MediaKind::Audio,
+            t(10),
+        );
+        // Simulate legacy bundle: the deserialize path normally sets
+        // has_audio_track=false for Audio items missing the field; we
+        // emulate by zeroing it here so the load sweep's job is
+        // verifiable.
+        let mut media_inner = (*Arc::new(media)).clone();
+        media_inner.has_audio_track = false;
+        let media_id = media_inner.id;
+        p.media.insert(media_id, Arc::new(media_inner));
+
+        let mut log = EditLog::new(Sequence::new("Seq 01", FrameRate::FPS_24));
+        let track_id = TrackId::new();
+        log.apply(EditOp::AddTrack {
+            track_id,
+            kind: TrackKind::Audio,
+            name: "A1".into(),
+        })
+        .unwrap();
+        let clip = Clip::new(media_id, "legacy", t(0), t(0), t(5)).unwrap();
+        log.apply(EditOp::InsertClip { track_id, clip }).unwrap();
+        p.sequences.push(Arc::new(log.current().clone()));
+
+        save(&p, &bundle).unwrap();
+        let reopened = open(&bundle).unwrap();
+        let seq = &reopened.sequences[0];
+        let track = &seq.tracks[0];
+        assert!(!track.mute);
+        assert!(!track.solo);
+        assert_eq!(track.gain_db, 0.0);
+        assert_eq!(track.clips[0].gain_db, 0.0);
+        // Bundle-load sweep forces has_audio_track=true on Audio media.
+        let media = reopened.media.get(&media_id).unwrap();
+        assert!(
+            media.has_audio_track,
+            "Audio-kind item's has_audio_track forced true by load sweep"
+        );
+    }
 }
