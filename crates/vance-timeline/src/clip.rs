@@ -48,9 +48,29 @@ pub struct Clip {
     /// Per-clip mixer gain in decibels (Phase 7.3). 0.0 = unity.
     /// Audio clips: `clip_linear = 10^(gain_db / 20)`. Composed
     /// multiplicatively with the parent track's gain at mix time.
-    /// Video clips: ignored.
+    /// Video clips: ignored. When `gain_keyframes` is non-empty,
+    /// this static value is IGNORED in favor of the animation lane.
     #[serde(default)]
     pub gain_db: f32,
+    /// Phase 7.4: time-varying gain automation lane. Keyframes are
+    /// CLIP-RELATIVE seconds (`t = 0` is the clip's `timeline_in`,
+    /// not the sequence origin). Empty = use the static `gain_db`.
+    /// `Keyframe.value` is in dB. See the matching note on
+    /// [`Track.gain_keyframes`] about the
+    /// `eval_keyframes(&[]) = 0.0` footgun — the snapshot-build path
+    /// must check `is_empty()` before invoking the evaluator.
+    #[serde(default)]
+    pub gain_keyframes: Vec<crate::effect::Keyframe>,
+    /// Phase 7.4 M3: optional fade-in. Composed multiplicatively
+    /// with `gain_keyframes` and `gain_db` at mix time — fades do NOT
+    /// clobber the automation lane. `None` = no fade-in.
+    #[serde(default)]
+    pub fade_in: Option<crate::fade::Fade>,
+    /// Phase 7.4 M3: optional fade-out. Same compositional semantics
+    /// as `fade_in`. The fade-out region starts at
+    /// `clip_duration - fade_out.duration_seconds`.
+    #[serde(default)]
+    pub fade_out: Option<crate::fade::Fade>,
 }
 
 impl Clip {
@@ -76,6 +96,9 @@ impl Clip {
             enabled: true,
             effects: Vec::new(),
             gain_db: 0.0,
+            gain_keyframes: Vec::new(),
+            fade_in: None,
+            fade_out: None,
         })
     }
 

@@ -190,6 +190,9 @@ pub struct SequenceContents {
     pub duration_seconds: f64,
     /// Tracks in render order (video first, then audio by convention).
     pub tracks: Vec<TrackContents>,
+    /// Phase 7.4: master bus gain in dB. UI's master fader binds to
+    /// `set_master_gain_db`.
+    pub master_gain_db: f32,
 }
 
 /// One track's worth of clips in `SequenceContents`.
@@ -215,6 +218,10 @@ pub struct TrackContents {
     pub solo: bool,
     /// Phase 7.3: mixer gain in dB (0.0 = unity).
     pub gain_db: f32,
+    /// Phase 7.4: time-varying gain automation lane in timeline-
+    /// seconds. Empty = use the static `gain_db`. Each keyframe's
+    /// `value` is in dB.
+    pub gain_keyframes: Vec<vance_timeline::Keyframe>,
 }
 
 /// One transition's worth of info for the UI.
@@ -251,6 +258,13 @@ pub struct ClipContents {
     pub effects: Vec<EffectInfo>,
     /// Phase 7.3: per-clip mixer gain in dB (0.0 = unity).
     pub gain_db: f32,
+    /// Phase 7.4: time-varying gain automation lane in CLIP-RELATIVE
+    /// seconds. Empty = use the static `gain_db`.
+    pub gain_keyframes: Vec<vance_timeline::Keyframe>,
+    /// Phase 7.4 M3: optional fade-in. `None` = no fade-in.
+    pub fade_in: Option<vance_timeline::Fade>,
+    /// Phase 7.4 M3: optional fade-out. `None` = no fade-out.
+    pub fade_out: Option<vance_timeline::Fade>,
 }
 
 /// One effect's worth of info for the UI.
@@ -4259,6 +4273,75 @@ impl Engine {
         })
     }
 
+    /// Phase 7.4: set the sequence's master bus gain in dB. Live
+    /// during playback — the snapshot republish makes it audible
+    /// within one mixer buffer.
+    pub fn set_master_gain_db(&mut self, gain_db: f32) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::SetMasterGainDb { gain_db })
+    }
+
+    /// Phase 7.4: replace a track's gain automation lane. Empty =
+    /// revert to the static `Track.gain_db`. Live during playback —
+    /// the fold thread reads the new lane via the ArcSwap snapshot
+    /// bus on the next buffer.
+    pub fn set_track_gain_keyframes(
+        &mut self,
+        track_id: TrackId,
+        keyframes: Vec<vance_timeline::Keyframe>,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::SetTrackGainKeyframes { track_id, keyframes })
+    }
+
+    /// Phase 7.4: replace a clip's gain automation lane (clip-relative
+    /// time). Live during playback.
+    pub fn set_clip_gain_keyframes(
+        &mut self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+        keyframes: Vec<vance_timeline::Keyframe>,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::SetClipGainKeyframes {
+            track_id,
+            clip_id,
+            keyframes,
+        })
+    }
+
+    /// Phase 7.4 M3: set the clip's fade-in. `duration_seconds == 0.0`
+    /// clears any existing fade-in. Live during playback — fades compose
+    /// multiplicatively with the keyframe lane.
+    pub fn set_clip_fade_in(
+        &mut self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+        duration_seconds: f64,
+        curve: vance_timeline::FadeCurve,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::SetClipFadeIn {
+            track_id,
+            clip_id,
+            duration_seconds,
+            curve,
+        })
+    }
+
+    /// Phase 7.4 M3: set the clip's fade-out. Mirror of
+    /// [`Self::set_clip_fade_in`].
+    pub fn set_clip_fade_out(
+        &mut self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+        duration_seconds: f64,
+        curve: vance_timeline::FadeCurve,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::SetClipFadeOut {
+            track_id,
+            clip_id,
+            duration_seconds,
+            curve,
+        })
+    }
+
     /// Live, NON-undoable preview of one or more grade params mid-drag.
     /// Rebuilds the clip's grade chain with ALL `params` overridden
     /// together on `effect_id` (a wheel drag moves R/G/B + master at
@@ -4640,6 +4723,9 @@ impl Engine {
                                 })
                                 .collect(),
                             gain_db: c.gain_db,
+                            gain_keyframes: c.gain_keyframes.clone(),
+                            fade_in: c.fade_in,
+                            fade_out: c.fade_out,
                         })
                         .collect(),
                     transitions: t
@@ -4657,8 +4743,10 @@ impl Engine {
                     mute: t.mute,
                     solo: t.solo,
                     gain_db: t.gain_db,
+                    gain_keyframes: t.gain_keyframes.clone(),
                 })
                 .collect(),
+            master_gain_db: seq.master_gain_db,
         })
     }
 
@@ -4947,6 +5035,7 @@ impl AudioMixerOwner {
 fn track_to_mix(track: &Track) -> vance_audio::TrackMix {
     vance_audio::TrackMix {
         gain_linear: vance_audio::db_to_linear(track.gain_db),
+        gain_lane: translate_gain_keyframes(&track.gain_keyframes),
         mute: track.mute,
         solo: track.solo,
     }
@@ -4956,11 +5045,59 @@ fn track_to_mix(track: &Track) -> vance_audio::TrackMix {
 /// [`vance_audio::ClipMix`]. `enabled` mirrors `Clip.enabled` (per-clip
 /// mute), `gain_linear` is precomputed.
 fn clip_to_mix(clip: &Clip, track_id: TrackId) -> vance_audio::ClipMix {
+    let (fade_in_dur, fade_in_curve) = clip
+        .fade_in
+        .as_ref()
+        .map(|f| (f.duration_seconds, translate_fade_curve(f.curve)))
+        .unwrap_or((0.0, vance_audio::FadeCurve::Linear));
+    let (fade_out_dur, fade_out_curve) = clip
+        .fade_out
+        .as_ref()
+        .map(|f| (f.duration_seconds, translate_fade_curve(f.curve)))
+        .unwrap_or((0.0, vance_audio::FadeCurve::Linear));
     vance_audio::ClipMix {
         gain_linear: vance_audio::db_to_linear(clip.gain_db),
+        gain_lane: translate_gain_keyframes(&clip.gain_keyframes),
         enabled: clip.enabled,
         track_id: track_id.as_uuid(),
+        timeline_in_seconds: rt_to_seconds(clip.timeline_in),
+        clip_duration_seconds: rt_to_seconds(clip.duration()),
+        fade_in_duration_seconds: fade_in_dur,
+        fade_in_curve,
+        fade_out_duration_seconds: fade_out_dur,
+        fade_out_curve,
     }
+}
+
+/// Map vance-timeline's `FadeCurve` onto vance-audio's local mirror.
+/// Both crates ship the same Linear / EqualPower / Logarithmic shape
+/// for 7.5 forward-compat; only `Linear` is honoured in 7.4.
+fn translate_fade_curve(curve: vance_timeline::FadeCurve) -> vance_audio::FadeCurve {
+    match curve {
+        vance_timeline::FadeCurve::Linear => vance_audio::FadeCurve::Linear,
+        vance_timeline::FadeCurve::EqualPower => vance_audio::FadeCurve::EqualPower,
+        vance_timeline::FadeCurve::Logarithmic => vance_audio::FadeCurve::Logarithmic,
+    }
+}
+
+/// Translate vance-timeline `Keyframe`s into vance-audio
+/// `GainKeyframe`s by precomputing `db_to_linear` at snapshot build
+/// time — the fold thread MUST never invoke `powf`.
+fn translate_gain_keyframes(
+    keyframes: &[vance_timeline::Keyframe],
+) -> Vec<vance_audio::GainKeyframe> {
+    keyframes
+        .iter()
+        .map(|k| vance_audio::GainKeyframe {
+            time_seconds: k.time_seconds,
+            gain_linear: vance_audio::db_to_linear(k.value as f32),
+            interp: match k.interp {
+                vance_timeline::KeyframeInterp::Linear => vance_audio::GainInterp::Linear,
+                vance_timeline::KeyframeInterp::Bezier => vance_audio::GainInterp::Bezier,
+                vance_timeline::KeyframeInterp::Hold => vance_audio::GainInterp::Hold,
+            },
+        })
+        .collect()
 }
 
 /// Build a [`MixerSnapshot`] covering every track + clip in the
@@ -4989,7 +5126,10 @@ fn build_mixer_snapshot(sequence: &vance_timeline::Sequence) -> vance_audio::Mix
         }
     }
     snap.solo_anywhere = solo_anywhere;
-    snap.master_gain_linear = 1.0;
+    // Phase 7.4: the master fader value lives on the Sequence. Empty
+    // / freshly-deserialized pre-7.4 sequences default to 0 dB →
+    // unity, so behavior is unchanged for old bundles.
+    snap.master_gain_linear = vance_audio::db_to_linear(sequence.master_gain_db);
     snap
 }
 
@@ -5065,7 +5205,12 @@ fn start_audio_mix(
     let handle = std::thread::Builder::new()
         .name("vance-engine.audio-mixer-owner".into())
         .spawn(move || {
-            let mixer = match vance_audio::AudioMixer::start(&bin, sources, initial_snapshot) {
+            let mixer = match vance_audio::AudioMixer::start(
+                &bin,
+                sources,
+                initial_snapshot,
+                from_seconds,
+            ) {
                 Ok(m) => m,
                 Err(e) => {
                     let _ = tx.send(Err(format!("{e}")));
@@ -5114,6 +5259,11 @@ fn op_touches_mixer(op: &EditOp) -> bool {
         | EditOp::SetTrackGainDb { .. }
         | EditOp::SetClipMute { .. }
         | EditOp::SetClipGainDb { .. }
+        | EditOp::SetMasterGainDb { .. }
+        | EditOp::SetTrackGainKeyframes { .. }
+        | EditOp::SetClipGainKeyframes { .. }
+        | EditOp::SetClipFadeIn { .. }
+        | EditOp::SetClipFadeOut { .. }
         | EditOp::AddTrack { .. }
         | EditOp::RemoveTrack { .. }
         | EditOp::InsertClip { .. }
@@ -5966,6 +6116,18 @@ mod tests {
             track_id: tid,
             clip_id: cid,
             gain_db: -6.0,
+        }));
+        assert!(op_touches_mixer(&EditOp::SetClipFadeIn {
+            track_id: tid,
+            clip_id: cid,
+            duration_seconds: 0.5,
+            curve: vance_timeline::FadeCurve::Linear,
+        }));
+        assert!(op_touches_mixer(&EditOp::SetClipFadeOut {
+            track_id: tid,
+            clip_id: cid,
+            duration_seconds: 0.5,
+            curve: vance_timeline::FadeCurve::Linear,
         }));
         // Compound is conservative-true so a batched edit republishes once.
         assert!(op_touches_mixer(&EditOp::Compound {

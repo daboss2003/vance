@@ -39,6 +39,13 @@ import {
   setTrackGainDb as ipcSetTrackGainDb,
   setClipMute as ipcSetClipMute,
   setClipGainDb as ipcSetClipGainDb,
+  setMasterGainDb as ipcSetMasterGainDb,
+  setTrackGainKeyframes as ipcSetTrackGainKeyframes,
+  setClipGainKeyframes as ipcSetClipGainKeyframes,
+  setClipFadeIn as ipcSetClipFadeIn,
+  setClipFadeOut as ipcSetClipFadeOut,
+  type GainKeyframe,
+  type FadeCurveName,
   updateEffectParams as ipcUpdateEffectParams,
   previewGradeParams as ipcPreviewGradeParams,
   loadSource as ipcLoadSource,
@@ -848,6 +855,81 @@ class ProjectState {
     this.error = null;
     try {
       await ipcSetClipGainDb(trackId, clipId, gainDb);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Phase 7.4: master bus gain in dB. Sequence-level — affects every
+   *  audio source after track/clip composition. Live during playback. */
+  async setMasterGainDb(gainDb: number) {
+    this.error = null;
+    try {
+      await ipcSetMasterGainDb(gainDb);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Phase 7.4: replace a track's gain automation lane. Empty list =
+   *  revert to the static gain_db. Times are timeline-seconds. */
+  async setTrackGainKeyframes(trackId: string, keyframes: GainKeyframe[]) {
+    this.error = null;
+    try {
+      await ipcSetTrackGainKeyframes(trackId, keyframes);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Phase 7.4: replace a clip's gain automation lane. Times are
+   *  CLIP-relative seconds. Empty list = revert to static gain_db. */
+  async setClipGainKeyframes(
+    trackId: string,
+    clipId: string,
+    keyframes: GainKeyframe[]
+  ) {
+    this.error = null;
+    try {
+      await ipcSetClipGainKeyframes(trackId, clipId, keyframes);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Phase 7.4 M3: set the clip's fade-in. `durationSeconds == 0`
+   *  clears it. Fades compose multiplicatively with the keyframe lane
+   *  — setting a fade never erases manual automation. */
+  async setClipFadeIn(
+    trackId: string,
+    clipId: string,
+    durationSeconds: number,
+    curve: FadeCurveName = 'linear'
+  ) {
+    this.error = null;
+    try {
+      await ipcSetClipFadeIn(trackId, clipId, durationSeconds, curve);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Phase 7.4 M3: set the clip's fade-out. Mirror of
+   *  [`setClipFadeIn`]. */
+  async setClipFadeOut(
+    trackId: string,
+    clipId: string,
+    durationSeconds: number,
+    curve: FadeCurveName = 'linear'
+  ) {
+    this.error = null;
+    try {
+      await ipcSetClipFadeOut(trackId, clipId, durationSeconds, curve);
       await this.commitEdit();
     } catch (e) {
       this.error = String(e);

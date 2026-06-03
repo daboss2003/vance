@@ -65,9 +65,24 @@ pub struct Track {
     pub solo: bool,
     /// Mixer gain in decibels (Phase 7.3). 0.0 = unity. Audio tracks
     /// apply this as `linear = 10^(gain_db / 20)` immediately before
-    /// summing into the master bus. Video tracks ignore it.
+    /// summing into the master bus. Video tracks ignore it. When
+    /// `gain_keyframes` is non-empty, this static value is IGNORED in
+    /// favor of the animation lane.
     #[serde(default)]
     pub gain_db: f32,
+    /// Phase 7.4: time-varying gain automation lane. Empty = use the
+    /// static `gain_db` (the "no automation" path). Non-empty =
+    /// evaluate at the playhead's timeline-seconds. `Keyframe.value`
+    /// is in dB; the mixer precomputes `db_to_linear` at snapshot
+    /// build time so the audio fold thread never touches `powf`.
+    /// `#[serde(default)]` so pre-7.4 bundles deserialize empty.
+    ///
+    /// IMPORTANT: empty-lane semantics in the mixer are
+    /// "no automation, use static gain", NOT the
+    /// `eval_keyframes(&[]) = 0.0` footgun. The snapshot-build path
+    /// must check `is_empty()` before invoking the evaluator.
+    #[serde(default)]
+    pub gain_keyframes: Vec<crate::effect::Keyframe>,
 }
 
 impl Track {
@@ -84,6 +99,7 @@ impl Track {
             mute: false,
             solo: false,
             gain_db: 0.0,
+            gain_keyframes: Vec::new(),
         }
     }
 
@@ -130,6 +146,7 @@ mod tests {
             mute: false,
             solo: false,
             gain_db: 0.0,
+            gain_keyframes: Vec::new(),
         };
         assert_eq!(tr.duration(), t(7));
     }

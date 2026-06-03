@@ -256,6 +256,61 @@ pub enum EditOp {
         /// New gain in dB.
         gain_db: f32,
     },
+    /// Set the master bus gain in dB (Phase 7.4). 0.0 = unity. Applied
+    /// uniformly to every audio source after track/clip composition.
+    /// Sequence-level — there's no track or clip lock to respect.
+    SetMasterGainDb {
+        /// New master gain in dB.
+        gain_db: f32,
+    },
+    /// Replace a track's gain automation lane (Phase 7.4). Empty
+    /// vector = no automation; the static `Track.gain_db` then drives
+    /// the mixer. Respects track lock (gain edits are
+    /// destructive / persistent, mirroring `SetTrackGainDb`).
+    SetTrackGainKeyframes {
+        /// Track to mutate.
+        track_id: TrackId,
+        /// New lane. Empty = revert to static.
+        keyframes: Vec<crate::effect::Keyframe>,
+    },
+    /// Replace a clip's gain automation lane (Phase 7.4). Keyframe
+    /// times are CLIP-RELATIVE seconds. Respects track lock.
+    SetClipGainKeyframes {
+        /// Track holding the clip.
+        track_id: TrackId,
+        /// Clip to mutate.
+        clip_id: ClipId,
+        /// New lane (clip-relative). Empty = revert to static gain_db.
+        keyframes: Vec<crate::effect::Keyframe>,
+    },
+    /// Set the clip's fade-in (Phase 7.4 M3). `duration_seconds == 0.0`
+    /// removes the fade. Fade is multiplicative with the manual
+    /// `gain_keyframes` lane — fades do not clobber automation.
+    /// Respects track lock.
+    SetClipFadeIn {
+        /// Track holding the clip.
+        track_id: TrackId,
+        /// Clip to mutate.
+        clip_id: ClipId,
+        /// Fade length in seconds, clip-relative. 0.0 = remove.
+        duration_seconds: f64,
+        /// Curve shape. Only `Linear` is implemented in 7.4; the
+        /// other variants are persisted for forward-compat with 7.5.
+        curve: crate::fade::FadeCurve,
+    },
+    /// Set the clip's fade-out (Phase 7.4 M3). Mirror of
+    /// [`EditOp::SetClipFadeIn`]; the fade region starts at
+    /// `clip_duration - duration_seconds`.
+    SetClipFadeOut {
+        /// Track holding the clip.
+        track_id: TrackId,
+        /// Clip to mutate.
+        clip_id: ClipId,
+        /// Fade length in seconds, clip-relative. 0.0 = remove.
+        duration_seconds: f64,
+        /// Curve shape (see [`EditOp::SetClipFadeIn`]).
+        curve: crate::fade::FadeCurve,
+    },
     /// Update several effect params in one undoable step (color-page
     /// wheel commit writes R/G/B/master together).
     UpdateEffectParams {
@@ -396,6 +451,27 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
             clip_id,
             gain_db,
         } => ops::set_clip_gain_db(seq, *track_id, *clip_id, *gain_db),
+        EditOp::SetMasterGainDb { gain_db } => ops::set_master_gain_db(seq, *gain_db),
+        EditOp::SetTrackGainKeyframes { track_id, keyframes } => {
+            ops::set_track_gain_keyframes(seq, *track_id, keyframes.clone())
+        }
+        EditOp::SetClipGainKeyframes {
+            track_id,
+            clip_id,
+            keyframes,
+        } => ops::set_clip_gain_keyframes(seq, *track_id, *clip_id, keyframes.clone()),
+        EditOp::SetClipFadeIn {
+            track_id,
+            clip_id,
+            duration_seconds,
+            curve,
+        } => ops::set_clip_fade_in(seq, *track_id, *clip_id, *duration_seconds, *curve),
+        EditOp::SetClipFadeOut {
+            track_id,
+            clip_id,
+            duration_seconds,
+            curve,
+        } => ops::set_clip_fade_out(seq, *track_id, *clip_id, *duration_seconds, *curve),
         EditOp::UpdateEffectParams {
             track_id,
             clip_id,

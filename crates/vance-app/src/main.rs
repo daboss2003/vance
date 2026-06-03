@@ -1099,6 +1099,163 @@ fn set_clip_mute(
         .map_err(|e| e.to_string())
 }
 
+/// Phase 7.4 mixer command: set the master bus gain in dB. Sequence-
+/// level; no per-track lock to respect.
+#[tauri::command]
+fn set_master_gain_db(
+    state: tauri::State<'_, EngineHandle>,
+    gain_db: f32,
+) -> Result<(), String> {
+    state
+        .lock()
+        .set_master_gain_db(gain_db)
+        .map_err(|e| e.to_string())
+}
+
+/// Phase 7.4 — JSON-friendly keyframe shape. `interp` matches the
+/// vance-timeline `KeyframeInterp` lowercase variants.
+#[derive(serde::Deserialize)]
+struct UiKeyframe {
+    time_seconds: f64,
+    value: f64,
+    #[serde(default)]
+    interp: Option<String>,
+}
+
+fn parse_keyframes(kfs: Vec<UiKeyframe>) -> Result<Vec<vance_timeline::Keyframe>, String> {
+    kfs.into_iter()
+        .map(|k| {
+            let interp = match k.interp.as_deref() {
+                None | Some("linear") | Some("Linear") => {
+                    vance_timeline::KeyframeInterp::Linear
+                }
+                Some("bezier") | Some("Bezier") => vance_timeline::KeyframeInterp::Bezier,
+                Some("hold") | Some("Hold") => vance_timeline::KeyframeInterp::Hold,
+                Some(other) => {
+                    return Err(format!(
+                        "unknown keyframe interp '{other}' (expected linear|bezier|hold)"
+                    ))
+                }
+            };
+            Ok(vance_timeline::Keyframe {
+                time_seconds: k.time_seconds,
+                value: k.value,
+                interp,
+            })
+        })
+        .collect()
+}
+
+/// Phase 7.4: replace a track's gain automation lane. Empty list =
+/// revert to the static `Track.gain_db`.
+#[tauri::command]
+fn set_track_gain_keyframes(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    keyframes: Vec<UiKeyframe>,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let parsed = parse_keyframes(keyframes)?;
+    state
+        .lock()
+        .set_track_gain_keyframes(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            parsed,
+        )
+        .map_err(|e| e.to_string())
+}
+
+/// Phase 7.4: replace a clip's gain automation lane (clip-relative time).
+#[tauri::command]
+fn set_clip_gain_keyframes(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    clip_id: String,
+    keyframes: Vec<UiKeyframe>,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let clip_uuid = clip_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid clip id: {e}"))?;
+    let parsed = parse_keyframes(keyframes)?;
+    state
+        .lock()
+        .set_clip_gain_keyframes(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            vance_timeline::ClipId::from_uuid(clip_uuid),
+            parsed,
+        )
+        .map_err(|e| e.to_string())
+}
+
+/// Parse a UI fade-curve string into the timeline enum. `None` /
+/// unknown values fall back to `Linear` so the UI is forward-compatible
+/// with future shapes.
+fn parse_fade_curve(s: Option<String>) -> vance_timeline::FadeCurve {
+    match s.as_deref() {
+        Some("equal_power") => vance_timeline::FadeCurve::EqualPower,
+        Some("logarithmic") => vance_timeline::FadeCurve::Logarithmic,
+        _ => vance_timeline::FadeCurve::Linear,
+    }
+}
+
+/// Phase 7.4 M3: set the clip's fade-in. `duration_seconds == 0.0`
+/// clears it. `curve` accepts `"linear" | "equal_power" | "logarithmic"`.
+#[tauri::command]
+fn set_clip_fade_in(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    clip_id: String,
+    duration_seconds: f64,
+    curve: Option<String>,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let clip_uuid = clip_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid clip id: {e}"))?;
+    state
+        .lock()
+        .set_clip_fade_in(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            vance_timeline::ClipId::from_uuid(clip_uuid),
+            duration_seconds,
+            parse_fade_curve(curve),
+        )
+        .map_err(|e| e.to_string())
+}
+
+/// Phase 7.4 M3: set the clip's fade-out. Mirror of [`set_clip_fade_in`].
+#[tauri::command]
+fn set_clip_fade_out(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    clip_id: String,
+    duration_seconds: f64,
+    curve: Option<String>,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let clip_uuid = clip_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid clip id: {e}"))?;
+    state
+        .lock()
+        .set_clip_fade_out(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            vance_timeline::ClipId::from_uuid(clip_uuid),
+            duration_seconds,
+            parse_fade_curve(curve),
+        )
+        .map_err(|e| e.to_string())
+}
+
 /// Phase 7.3 mixer command: set a clip's mixer gain in dB.
 #[tauri::command]
 fn set_clip_gain_db(
@@ -1677,6 +1834,11 @@ fn main() {
             set_track_gain_db,
             set_clip_mute,
             set_clip_gain_db,
+            set_master_gain_db,
+            set_track_gain_keyframes,
+            set_clip_gain_keyframes,
+            set_clip_fade_in,
+            set_clip_fade_out,
             update_effect_params,
             preview_grade_params,
             add_transition_at_cut,

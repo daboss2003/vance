@@ -85,6 +85,7 @@ fn replace_track(seq: &Sequence, idx: usize, new_track: Track) -> Sequence {
         frame_rate: seq.frame_rate,
         tracks,
         markers: seq.markers.clone(),
+        master_gain_db: seq.master_gain_db,
     }
 }
 
@@ -154,6 +155,7 @@ pub fn add_track_with_id(
         mute: false,
         solo: false,
         gain_db: 0.0,
+        gain_keyframes: Vec::new(),
     };
     let mut tracks = seq.tracks.clone();
     tracks.push(Arc::new(new_track));
@@ -163,6 +165,7 @@ pub fn add_track_with_id(
         frame_rate: seq.frame_rate,
         tracks,
         markers: seq.markers.clone(),
+        master_gain_db: seq.master_gain_db,
     }
 }
 
@@ -177,6 +180,7 @@ pub fn remove_track(seq: &Sequence, track_id: TrackId) -> Result<Sequence> {
         frame_rate: seq.frame_rate,
         tracks,
         markers: seq.markers.clone(),
+        master_gain_db: seq.master_gain_db,
     })
 }
 
@@ -217,6 +221,7 @@ pub fn insert_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Result<Sequ
         mute: track.mute,
         solo: track.solo,
         gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -265,6 +270,7 @@ pub fn ripple_insert_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Resu
         mute: track.mute,
         solo: track.solo,
         gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -329,6 +335,7 @@ pub fn overwrite_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Result<S
         mute: track.mute,
         solo: track.solo,
         gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -355,6 +362,7 @@ pub fn remove_clip(seq: &Sequence, track_id: TrackId, clip_id: ClipId) -> Result
         mute: track.mute,
         solo: track.solo,
         gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -396,6 +404,7 @@ pub fn ripple_remove_clip(
         mute: track.mute,
         solo: track.solo,
         gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -436,6 +445,7 @@ pub fn slip(
         mute: track.mute,
         solo: track.solo,
         gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -479,6 +489,7 @@ pub fn slide(
         mute: track.mute,
         solo: track.solo,
         gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -532,6 +543,7 @@ pub fn trim_in(
         mute: track.mute,
         solo: track.solo,
         gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -578,6 +590,7 @@ pub fn trim_out(
         mute: track.mute,
         solo: track.solo,
         gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -613,6 +626,7 @@ pub fn add_effect_to_clip(
         mute: track.mute,
         solo: track.solo,
         gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -654,6 +668,7 @@ pub fn update_effect_param(
         mute: track.mute,
         solo: track.solo,
         gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -696,6 +711,7 @@ pub fn update_effect_params(
         mute: track.mute,
         solo: track.solo,
         gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -729,6 +745,7 @@ pub fn remove_effect_from_clip(
         mute: track.mute,
         solo: track.solo,
         gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -775,6 +792,7 @@ pub fn move_effect_on_clip(
         mute: track.mute,
         solo: track.solo,
         gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -815,6 +833,7 @@ pub fn set_effect_enabled(
         mute: track.mute,
         solo: track.solo,
         gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -846,6 +865,7 @@ pub fn set_track_mute(seq: &Sequence, track_id: TrackId, mute: bool) -> Result<S
         mute,
         solo: track.solo,
         gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -867,6 +887,7 @@ pub fn set_track_solo(seq: &Sequence, track_id: TrackId, solo: bool) -> Result<S
         mute: track.mute,
         solo,
         gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -894,6 +915,7 @@ pub fn set_track_gain_db(
         mute: track.mute,
         solo: track.solo,
         gain_db: sanitized,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -928,6 +950,7 @@ pub fn set_clip_mute(
         mute: track.mute,
         solo: track.solo,
         gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -961,6 +984,7 @@ pub fn set_clip_gain_db(
         mute: track.mute,
         solo: track.solo,
         gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -974,6 +998,227 @@ fn sanitize_gain_db(gain_db: f32) -> Result<f32> {
         return Err(TimelineError::invalid("gain_db must be finite"));
     }
     Ok(gain_db.clamp(-60.0, 60.0))
+}
+
+/// Validate a keyframe lane for the mixer: every keyframe must have a
+/// finite `value` (dB) and a finite, non-negative `time_seconds`, and
+/// the list must be sorted ascending by time. Empty lanes are valid
+/// (they mean "no automation, use the static gain").
+fn validate_gain_lane(keyframes: &[crate::effect::Keyframe]) -> Result<()> {
+    let mut prev_t: f64 = f64::NEG_INFINITY;
+    for k in keyframes {
+        if !k.time_seconds.is_finite() || k.time_seconds < 0.0 {
+            return Err(TimelineError::invalid(
+                "gain keyframe time_seconds must be finite and ≥ 0",
+            ));
+        }
+        if !k.value.is_finite() {
+            return Err(TimelineError::invalid(
+                "gain keyframe value (dB) must be finite",
+            ));
+        }
+        if k.time_seconds < prev_t {
+            return Err(TimelineError::invalid(
+                "gain keyframes must be sorted ascending by time_seconds",
+            ));
+        }
+        prev_t = k.time_seconds;
+    }
+    Ok(())
+}
+
+/// Replace `Track.gain_keyframes` (Phase 7.4). Empty lane = revert to
+/// the static `Track.gain_db`. Validates ordering + finiteness;
+/// respects track lock (gain edits are destructive).
+pub fn set_track_gain_keyframes(
+    seq: &Sequence,
+    track_id: TrackId,
+    keyframes: Vec<crate::effect::Keyframe>,
+) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    validate_gain_lane(&keyframes)?;
+    if track.gain_keyframes == keyframes {
+        return Ok(seq.clone());
+    }
+    let new_track = Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips: track.clips.clone(),
+        transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
+        gain_keyframes: keyframes,
+    };
+    Ok(replace_track(seq, idx, new_track))
+}
+
+/// Replace `Clip.gain_keyframes` (Phase 7.4). Keyframe times are
+/// CLIP-RELATIVE seconds (the mixer subtracts `clip.timeline_in` at
+/// snapshot build time). Empty = revert to static `Clip.gain_db`.
+/// Respects track lock.
+pub fn set_clip_gain_keyframes(
+    seq: &Sequence,
+    track_id: TrackId,
+    clip_id: ClipId,
+    keyframes: Vec<crate::effect::Keyframe>,
+) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    let (clip_idx, clip) = find_clip(&track, clip_id)?;
+    validate_gain_lane(&keyframes)?;
+    if clip.gain_keyframes == keyframes {
+        return Ok(seq.clone());
+    }
+    let mut updated = (*clip).clone();
+    updated.gain_keyframes = keyframes;
+    let mut clips = track.clips.clone();
+    clips[clip_idx] = Arc::new(updated);
+    let new_track = Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips,
+        transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
+    };
+    Ok(replace_track(seq, idx, new_track))
+}
+
+/// Set `Clip.fade_in` (Phase 7.4 M3). `duration_seconds == 0.0` clears
+/// the fade. The fade composes multiplicatively with `gain_keyframes`
+/// at mix time — setting a fade does NOT erase the automation lane.
+/// Validates the duration is finite, non-negative, and `<= clip
+/// duration`. Respects track lock.
+pub fn set_clip_fade_in(
+    seq: &Sequence,
+    track_id: TrackId,
+    clip_id: ClipId,
+    duration_seconds: f64,
+    curve: crate::fade::FadeCurve,
+) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    let (clip_idx, clip) = find_clip(&track, clip_id)?;
+    let new_fade = sanitize_fade(duration_seconds, curve, &clip)?;
+    if clip.fade_in == new_fade {
+        return Ok(seq.clone());
+    }
+    let mut updated = (*clip).clone();
+    updated.fade_in = new_fade;
+    let mut clips = track.clips.clone();
+    clips[clip_idx] = Arc::new(updated);
+    let new_track = Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips,
+        transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
+    };
+    Ok(replace_track(seq, idx, new_track))
+}
+
+/// Set `Clip.fade_out` (Phase 7.4 M3). Mirror of [`set_clip_fade_in`];
+/// the fade region runs from `clip_duration - duration_seconds` to
+/// the clip end.
+pub fn set_clip_fade_out(
+    seq: &Sequence,
+    track_id: TrackId,
+    clip_id: ClipId,
+    duration_seconds: f64,
+    curve: crate::fade::FadeCurve,
+) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    let (clip_idx, clip) = find_clip(&track, clip_id)?;
+    let new_fade = sanitize_fade(duration_seconds, curve, &clip)?;
+    if clip.fade_out == new_fade {
+        return Ok(seq.clone());
+    }
+    let mut updated = (*clip).clone();
+    updated.fade_out = new_fade;
+    let mut clips = track.clips.clone();
+    clips[clip_idx] = Arc::new(updated);
+    let new_track = Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips,
+        transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
+    };
+    Ok(replace_track(seq, idx, new_track))
+}
+
+/// Validate a fade duration and produce the `Option<Fade>` to store.
+/// `0.0` (or near-zero floats) collapses to `None` so the mixer can
+/// trivially skip the fade region. Negative / non-finite / longer-
+/// than-clip durations are rejected.
+fn sanitize_fade(
+    duration_seconds: f64,
+    curve: crate::fade::FadeCurve,
+    clip: &crate::clip::Clip,
+) -> Result<Option<crate::fade::Fade>> {
+    if !duration_seconds.is_finite() {
+        return Err(TimelineError::invalid("fade duration must be finite"));
+    }
+    if duration_seconds < 0.0 {
+        return Err(TimelineError::invalid(
+            "fade duration must be non-negative",
+        ));
+    }
+    let clip_dur = clip.duration().0.as_f64();
+    if duration_seconds > clip_dur {
+        return Err(TimelineError::invalid(
+            "fade duration must be <= clip duration",
+        ));
+    }
+    if duration_seconds == 0.0 {
+        Ok(None)
+    } else {
+        Ok(Some(crate::fade::Fade {
+            duration_seconds,
+            curve,
+        }))
+    }
+}
+
+/// Set `Sequence.master_gain_db` (Phase 7.4). Master is sequence-level
+/// — no per-track lock to check. Sanitized through the shared
+/// [-60, +60] clamp + NaN reject.
+pub fn set_master_gain_db(seq: &Sequence, gain_db: f32) -> Result<Sequence> {
+    let sanitized = sanitize_gain_db(gain_db)?;
+    if seq.master_gain_db == sanitized {
+        return Ok(seq.clone());
+    }
+    Ok(Sequence {
+        id: seq.id,
+        name: seq.name.clone(),
+        frame_rate: seq.frame_rate,
+        tracks: seq.tracks.clone(),
+        markers: seq.markers.clone(),
+        master_gain_db: sanitized,
+    })
 }
 
 /// Split a clip at `at_timeline` into two clips that together cover the
@@ -1021,6 +1266,7 @@ pub fn split(
         mute: track.mute,
         solo: track.solo,
         gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1089,6 +1335,7 @@ pub fn add_transition_at_cut_with_id(
         mute: track.mute,
         solo: track.solo,
         gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1133,6 +1380,7 @@ pub fn remove_transition(
         mute: track.mute,
         solo: track.solo,
         gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1454,6 +1702,7 @@ mod tests {
             mute: t.mute,
             solo: t.solo,
             gain_db: t.gain_db,
+            gain_keyframes: t.gain_keyframes.clone(),
         };
         tracks[0] = Arc::new(locked_track);
         Sequence {
@@ -1462,6 +1711,7 @@ mod tests {
             frame_rate: seq.frame_rate,
             tracks,
             markers: seq.markers.clone(),
+        master_gain_db: seq.master_gain_db,
         }
     }
 
@@ -1547,6 +1797,157 @@ mod tests {
         let seq = set_clip_gain_db(&seq, tid, cid, -6.0).unwrap();
         assert_eq!(seq.tracks[0].gain_db, -3.0);
         assert_eq!(seq.tracks[0].clips[0].gain_db, -6.0);
+    }
+
+    fn kf(t: f64, v: f64) -> crate::effect::Keyframe {
+        crate::effect::Keyframe {
+            time_seconds: t,
+            value: v,
+            interp: crate::effect::KeyframeInterp::Linear,
+        }
+    }
+
+    #[test]
+    fn set_track_gain_keyframes_replaces_lane() {
+        let (seq, tid, _) = seed_audio_seq();
+        let lane = vec![kf(0.0, 0.0), kf(1.0, -6.0)];
+        let seq = set_track_gain_keyframes(&seq, tid, lane.clone()).unwrap();
+        assert_eq!(seq.tracks[0].gain_keyframes, lane);
+        // Empty list reverts.
+        let seq = set_track_gain_keyframes(&seq, tid, Vec::new()).unwrap();
+        assert!(seq.tracks[0].gain_keyframes.is_empty());
+    }
+
+    #[test]
+    fn set_track_gain_keyframes_rejects_unsorted() {
+        let (seq, tid, _) = seed_audio_seq();
+        let unsorted = vec![kf(1.0, 0.0), kf(0.5, 0.0)];
+        assert!(set_track_gain_keyframes(&seq, tid, unsorted).is_err());
+    }
+
+    #[test]
+    fn set_track_gain_keyframes_rejects_nan_and_negative_time() {
+        let (seq, tid, _) = seed_audio_seq();
+        assert!(set_track_gain_keyframes(&seq, tid, vec![kf(-0.1, 0.0)]).is_err());
+        assert!(set_track_gain_keyframes(&seq, tid, vec![kf(0.0, f64::NAN)]).is_err());
+        assert!(set_track_gain_keyframes(&seq, tid, vec![kf(0.0, f64::INFINITY)]).is_err());
+        assert!(set_track_gain_keyframes(&seq, tid, vec![kf(f64::NAN, 0.0)]).is_err());
+    }
+
+    #[test]
+    fn set_track_gain_keyframes_rejects_locked_track() {
+        let (seq, tid, _) = seed_audio_seq();
+        let seq = lock_first_track_for_test(&seq);
+        assert!(set_track_gain_keyframes(&seq, tid, vec![kf(0.0, 0.0)]).is_err());
+    }
+
+    #[test]
+    fn set_clip_gain_keyframes_replaces_lane() {
+        let (seq, tid, media) = seed_audio_seq();
+        let clip = Clip::new(media, "c", t(0), t(0), t(5)).unwrap();
+        let cid = clip.id;
+        let seq = insert_clip(&seq, tid, clip).unwrap();
+        let lane = vec![kf(0.0, -60.0), kf(0.5, 0.0)]; // fade-in shape
+        let seq = set_clip_gain_keyframes(&seq, tid, cid, lane.clone()).unwrap();
+        assert_eq!(seq.tracks[0].clips[0].gain_keyframes, lane);
+    }
+
+    #[test]
+    fn set_clip_fade_in_writes_fade_and_zero_clears() {
+        use crate::fade::FadeCurve;
+        let (seq, tid, media) = seed_audio_seq();
+        let clip = Clip::new(media, "c", t(0), t(0), t(5)).unwrap();
+        let cid = clip.id;
+        let seq = insert_clip(&seq, tid, clip).unwrap();
+        let seq = set_clip_fade_in(&seq, tid, cid, 0.5, FadeCurve::Linear).unwrap();
+        let fade = seq.tracks[0].clips[0].fade_in.expect("fade-in set");
+        assert!((fade.duration_seconds - 0.5).abs() < 1e-9);
+        assert_eq!(fade.curve, FadeCurve::Linear);
+        let seq = set_clip_fade_in(&seq, tid, cid, 0.0, FadeCurve::Linear).unwrap();
+        assert!(seq.tracks[0].clips[0].fade_in.is_none());
+    }
+
+    #[test]
+    fn set_clip_fade_out_writes_fade_and_zero_clears() {
+        use crate::fade::FadeCurve;
+        let (seq, tid, media) = seed_audio_seq();
+        let clip = Clip::new(media, "c", t(0), t(0), t(5)).unwrap();
+        let cid = clip.id;
+        let seq = insert_clip(&seq, tid, clip).unwrap();
+        let seq = set_clip_fade_out(&seq, tid, cid, 1.0, FadeCurve::EqualPower).unwrap();
+        let fade = seq.tracks[0].clips[0].fade_out.expect("fade-out set");
+        assert!((fade.duration_seconds - 1.0).abs() < 1e-9);
+        assert_eq!(fade.curve, FadeCurve::EqualPower);
+    }
+
+    #[test]
+    fn set_clip_fade_in_rejects_invalid_duration() {
+        use crate::fade::FadeCurve;
+        let (seq, tid, media) = seed_audio_seq();
+        let clip = Clip::new(media, "c", t(0), t(0), t(5)).unwrap();
+        let cid = clip.id;
+        let seq = insert_clip(&seq, tid, clip).unwrap();
+        assert!(set_clip_fade_in(&seq, tid, cid, -0.1, FadeCurve::Linear).is_err());
+        assert!(set_clip_fade_in(&seq, tid, cid, f64::NAN, FadeCurve::Linear).is_err());
+        assert!(set_clip_fade_in(&seq, tid, cid, f64::INFINITY, FadeCurve::Linear).is_err());
+        // duration > clip duration (5s)
+        assert!(set_clip_fade_in(&seq, tid, cid, 6.0, FadeCurve::Linear).is_err());
+    }
+
+    #[test]
+    fn set_clip_fade_in_rejects_locked_track() {
+        use crate::fade::FadeCurve;
+        let (seq, tid, media) = seed_audio_seq();
+        let clip = Clip::new(media, "c", t(0), t(0), t(5)).unwrap();
+        let cid = clip.id;
+        let seq = insert_clip(&seq, tid, clip).unwrap();
+        let seq = lock_first_track_for_test(&seq);
+        assert!(set_clip_fade_in(&seq, tid, cid, 0.5, FadeCurve::Linear).is_err());
+    }
+
+    #[test]
+    fn fades_coexist_with_gain_keyframes() {
+        // Setting a fade must NOT clear the manual keyframe lane.
+        use crate::fade::FadeCurve;
+        let (seq, tid, media) = seed_audio_seq();
+        let clip = Clip::new(media, "c", t(0), t(0), t(5)).unwrap();
+        let cid = clip.id;
+        let seq = insert_clip(&seq, tid, clip).unwrap();
+        let lane = vec![kf(0.0, -6.0), kf(1.0, 0.0)];
+        let seq = set_clip_gain_keyframes(&seq, tid, cid, lane.clone()).unwrap();
+        let seq = set_clip_fade_in(&seq, tid, cid, 0.5, FadeCurve::Linear).unwrap();
+        assert_eq!(seq.tracks[0].clips[0].gain_keyframes, lane);
+        assert!(seq.tracks[0].clips[0].fade_in.is_some());
+    }
+
+    #[test]
+    fn set_master_gain_db_round_trips() {
+        let (seq, _, _) = seed_audio_seq();
+        assert_eq!(seq.master_gain_db, 0.0);
+        let seq = set_master_gain_db(&seq, -6.0).unwrap();
+        assert!((seq.master_gain_db - (-6.0)).abs() < 1e-6);
+        let seq = set_master_gain_db(&seq, 0.0).unwrap();
+        assert_eq!(seq.master_gain_db, 0.0);
+    }
+
+    #[test]
+    fn set_master_gain_db_clamps_and_rejects_nan() {
+        let (seq, _, _) = seed_audio_seq();
+        let seq = set_master_gain_db(&seq, 999.0).unwrap();
+        assert_eq!(seq.master_gain_db, 60.0);
+        let seq = set_master_gain_db(&seq, -999.0).unwrap();
+        assert_eq!(seq.master_gain_db, -60.0);
+        assert!(set_master_gain_db(&seq, f32::NAN).is_err());
+        assert!(set_master_gain_db(&seq, f32::INFINITY).is_err());
+    }
+
+    #[test]
+    fn set_master_gain_db_is_noop_when_already_at_target() {
+        let (seq, _, _) = seed_audio_seq();
+        let before = Arc::as_ptr(&seq.tracks[0]);
+        let seq2 = set_master_gain_db(&seq, 0.0).unwrap();
+        // No mutation → tracks Arc reused.
+        assert_eq!(before, Arc::as_ptr(&seq2.tracks[0]));
     }
 
     #[test]

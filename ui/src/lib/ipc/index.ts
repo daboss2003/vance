@@ -246,6 +246,20 @@ export type ClipContents = {
   effects: EffectInfo[];
   /** Phase 7.3: per-clip mixer gain in dB. 0 = unity. */
   gain_db: number;
+  /** Phase 7.4: gain automation lane in CLIP-relative seconds. Empty
+   *  = use static `gain_db`. */
+  gain_keyframes: GainKeyframe[];
+  /** Phase 7.4 M3: optional fade-in. `null` = no fade-in. */
+  fade_in: Fade | null;
+  /** Phase 7.4 M3: optional fade-out. `null` = no fade-out. */
+  fade_out: Fade | null;
+};
+
+export type FadeCurveName = 'linear' | 'equal_power' | 'logarithmic';
+
+export type Fade = {
+  duration_seconds: number;
+  curve: FadeCurveName;
 };
 
 export type TransitionInfo = {
@@ -270,6 +284,9 @@ export type TrackContents = {
   solo: boolean;
   /** Phase 7.3: mixer gain in dB. 0 = unity. */
   gain_db: number;
+  /** Phase 7.4: gain automation lane in timeline-seconds. Empty = use
+   *  static `gain_db`. */
+  gain_keyframes: GainKeyframe[];
 };
 
 export type SequenceContents = {
@@ -279,6 +296,9 @@ export type SequenceContents = {
   frame_rate_den: number;
   duration_seconds: number;
   tracks: TrackContents[];
+  /** Phase 7.4: master bus gain in dB. UI's master fader binds to
+   *  `set_master_gain_db`. */
+  master_gain_db: number;
 };
 
 /** Full contents of the engine's current sequence, ready to render on
@@ -679,6 +699,58 @@ export const setClipGainDb = (
   clipId: string,
   gainDb: number
 ): Promise<void> => invoke('set_clip_gain_db', { trackId, clipId, gainDb });
+
+/** Phase 7.4: set the master bus gain in dB. Sequence-level. */
+export const setMasterGainDb = (gainDb: number): Promise<void> =>
+  invoke('set_master_gain_db', { gainDb });
+
+/** Phase 7.4: keyframe for a gain automation lane. `time_seconds` is
+ *  timeline-relative for tracks and CLIP-relative for clips. `value`
+ *  is in dB. `interp` defaults to `linear` if omitted. */
+export type GainKeyframe = {
+  time_seconds: number;
+  value: number;
+  interp?: 'linear' | 'bezier' | 'hold';
+};
+
+/** Phase 7.4: replace a track's gain automation lane. Empty list =
+ *  revert to the static `gain_db`. Live during playback. */
+export const setTrackGainKeyframes = (
+  trackId: string,
+  keyframes: GainKeyframe[]
+): Promise<void> =>
+  invoke('set_track_gain_keyframes', { trackId, keyframes });
+
+/** Phase 7.4: replace a clip's gain automation lane (CLIP-relative
+ *  time). Live during playback. */
+export const setClipGainKeyframes = (
+  trackId: string,
+  clipId: string,
+  keyframes: GainKeyframe[]
+): Promise<void> =>
+  invoke('set_clip_gain_keyframes', { trackId, clipId, keyframes });
+
+/** Phase 7.4 M3: set the clip's fade-in. `durationSeconds == 0` clears
+ *  the fade. Only `'linear'` is honoured in 7.4; the other curve names
+ *  are accepted and persisted for 7.5 forward-compat. Fades compose
+ *  multiplicatively with the keyframe lane — setting a fade never
+ *  erases manual automation. */
+export const setClipFadeIn = (
+  trackId: string,
+  clipId: string,
+  durationSeconds: number,
+  curve: FadeCurveName = 'linear'
+): Promise<void> =>
+  invoke('set_clip_fade_in', { trackId, clipId, durationSeconds, curve });
+
+/** Phase 7.4 M3: set the clip's fade-out. Mirror of [`setClipFadeIn`]. */
+export const setClipFadeOut = (
+  trackId: string,
+  clipId: string,
+  durationSeconds: number,
+  curve: FadeCurveName = 'linear'
+): Promise<void> =>
+  invoke('set_clip_fade_out', { trackId, clipId, durationSeconds, curve });
 
 /** Start playback of the active sequence from `timelineSeconds`,
  *  using scene_plan to pick the active clip and swapping the

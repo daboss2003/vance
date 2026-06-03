@@ -31,6 +31,13 @@ pub struct Sequence {
     pub tracks: Vec<Arc<Track>>,
     /// Sequence-level markers (chapters, notes, range brackets).
     pub markers: Vec<Marker>,
+    /// Phase 7.4: master bus gain in decibels. 0.0 = unity. Applied
+    /// uniformly to every audio source after track / clip gain
+    /// composition. `#[serde(default)]` so pre-7.4 bundles deserialize
+    /// at unity. The mixer snapshot precomputes the linear form into
+    /// `MixerSnapshot.master_gain_linear` at build time.
+    #[serde(default)]
+    pub master_gain_db: f32,
 }
 
 impl Sequence {
@@ -42,6 +49,7 @@ impl Sequence {
             frame_rate,
             tracks: Vec::new(),
             markers: Vec::new(),
+            master_gain_db: 0.0,
         }
     }
 
@@ -95,6 +103,7 @@ mod tests {
             mute: false,
             solo: false,
             gain_db: 0.0,
+            gain_keyframes: Vec::new(),
         });
         let v2 = Arc::new(Track {
             id: TrackId::new(),
@@ -107,6 +116,7 @@ mod tests {
             mute: false,
             solo: false,
             gain_db: 0.0,
+            gain_keyframes: Vec::new(),
         });
         let seq = Sequence {
             id: SequenceId::new(),
@@ -114,6 +124,7 @@ mod tests {
             frame_rate: FrameRate::FPS_24,
             tracks: vec![v1, v2],
             markers: Vec::new(),
+            master_gain_db: 0.0,
         };
         assert_eq!(seq.duration(), t(7));
         assert_eq!(seq.clip_count(), 2);

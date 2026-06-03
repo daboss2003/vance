@@ -1934,6 +1934,33 @@
             Go
           </button>
         </form>
+        <!--
+          Phase 7.4 — master fader. Sequence-level gain in dB,
+          applied at the mixer fold thread after track/clip
+          composition. Live during playback. UI inputs to the
+          slider fire `setMasterGainDb` on every change (cheap IPC,
+          ArcSwap snapshot republish is the audible path).
+        -->
+        <label
+          class="text-vance-muted flex items-center gap-2"
+          title="Master bus gain (dB). 0 = unity, -inf = silence."
+        >
+          Master
+          <input
+            type="range"
+            min="-60"
+            max="12"
+            step="0.5"
+            value={projectState.sequence?.master_gain_db ?? 0}
+            oninput={(e) =>
+              projectState.setMasterGainDb(parseFloat((e.target as HTMLInputElement).value))}
+            disabled={!projectState.sequence}
+            class="w-32 accent-[var(--color-vance-accent)]"
+          />
+          <span class="font-mono text-vance-fg w-12 text-right">
+            {(projectState.sequence?.master_gain_db ?? 0).toFixed(1)} dB
+          </span>
+        </label>
         <span class="text-vance-muted ml-auto">
           last PTS: <span class="text-vance-fg font-mono">{lastPts ?? '—'}</span>
           {#if playError}

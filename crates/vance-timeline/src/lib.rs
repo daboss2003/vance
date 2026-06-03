@@ -33,6 +33,7 @@ pub mod clip;
 pub mod edit_log;
 pub mod effect;
 pub mod error;
+pub mod fade;
 pub mod grade;
 pub mod id;
 pub mod marker;
@@ -49,6 +50,7 @@ pub use clip::Clip;
 pub use edit_log::{apply, EditLog, EditOp};
 pub use effect::{eval_curve, Effect, EffectParams, EffectValue, Keyframe, KeyframeInterp};
 pub use error::{Result, TimelineError};
+pub use fade::{eval_fade_in, eval_fade_out, Fade, FadeCurve};
 pub use id::{
     ClipId, EffectId, MarkerId, MediaItemId, ProjectId, SequenceId, TrackId, TransitionId,
 };
