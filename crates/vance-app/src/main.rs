@@ -1112,6 +1112,55 @@ fn set_master_gain_db(
         .map_err(|e| e.to_string())
 }
 
+/// Phase 7.5 M1 — UI-facing track meter info.
+#[derive(serde::Serialize, Clone, Copy, Debug, Default)]
+struct UiTrackMeter {
+    peak_l: f32,
+    peak_r: f32,
+    rms_l: f32,
+    rms_r: f32,
+}
+
+impl From<vance_audio::TrackMeter> for UiTrackMeter {
+    fn from(m: vance_audio::TrackMeter) -> Self {
+        Self {
+            peak_l: m.peak_l,
+            peak_r: m.peak_r,
+            rms_l: m.rms_l,
+            rms_r: m.rms_r,
+        }
+    }
+}
+
+/// Phase 7.5 M1 — meter snapshot for the UI. `null` when the mixer
+/// backend isn't active (single-source path or no playback).
+#[derive(serde::Serialize, Clone, Debug, Default)]
+struct UiMeterSnapshot {
+    master: UiTrackMeter,
+    /// Per-track meters keyed by track UUID (matches `TrackContents.id`).
+    tracks: std::collections::HashMap<String, UiTrackMeter>,
+    /// Monotonic publish counter. UI uses this to detect a stalled or
+    /// reset fold thread without polling at the fold publish rate.
+    generation: u64,
+}
+
+/// Phase 7.5 M1: read the latest mixer metering snapshot. Cheap
+/// ArcSwap load; safe to poll at 30Hz from the UI.
+#[tauri::command]
+fn meter_snapshot(state: tauri::State<'_, EngineHandle>) -> Option<UiMeterSnapshot> {
+    let snap = state.lock().meter_snapshot()?;
+    let tracks = snap
+        .tracks
+        .into_iter()
+        .map(|(uuid, m)| (uuid.to_string(), m.into()))
+        .collect();
+    Some(UiMeterSnapshot {
+        master: snap.master.into(),
+        tracks,
+        generation: snap.generation,
+    })
+}
+
 /// Phase 7.4 — JSON-friendly keyframe shape. `interp` matches the
 /// vance-timeline `KeyframeInterp` lowercase variants.
 #[derive(serde::Deserialize)]
@@ -1835,6 +1884,7 @@ fn main() {
             set_clip_mute,
             set_clip_gain_db,
             set_master_gain_db,
+            meter_snapshot,
             set_track_gain_keyframes,
             set_clip_gain_keyframes,
             set_clip_fade_in,

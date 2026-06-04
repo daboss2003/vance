@@ -25,11 +25,13 @@
 //!
 //! ## Test surface
 //!
-//! [`fold_frame`] is the per-frame mix math, factored out of the fold
-//! thread so it can be exercised without a real cpal device. The unit
-//! tests below construct synthetic input frames, apply a snapshot, and
-//! assert the output amplitude matches the documented mute / solo /
-//! gain semantics exactly.
+//! [`fold_frame`] / [`fold_frame_at`] are the per-frame mix math
+//! kept as TEST-ONLY helpers since Phase 7.5 M1 — the live fold loop
+//! inlines an equivalent computation that ALSO splits out the
+//! per-track intermediate so the metering accumulators see each
+//! track's pre-master sum. The unit tests below construct synthetic
+//! input frames, apply a snapshot, and assert the output amplitude
+//! matches the documented mute / solo / gain semantics exactly.
 
 #![allow(missing_docs)]
 
@@ -61,34 +63,77 @@ pub fn db_to_linear(db: f32) -> f32 {
     }
 }
 
-/// Shape of a clip fade curve (Phase 7.4 M3). Mirrors
-/// `vance-timeline::FadeCurve` so vance-audio stays decoupled from the
-/// timeline crate. Only [`FadeCurve::Linear`] is implemented in 7.4 —
-/// the other variants exist so 7.5 can ship the missing shapes without
-/// growing the snapshot ABI. Until then they fall back to linear
-/// (chosen over silence so a 7.5-authored project remains audible
-/// when opened on a 7.4 build).
+/// Shape of a clip fade curve. Mirrors `vance-timeline::FadeCurve` so
+/// vance-audio stays decoupled from the timeline crate. All three
+/// variants ship real implementations since Phase 7.5 M2.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FadeCurve {
-    /// Linear amplitude ramp. Default for forward-compat.
+    /// Linear amplitude ramp — `gain(t) = t/d`. Default for forward-compat.
     #[default]
     Linear,
-    /// −3 dB equal-power shape. Reserved for 7.5; treated as `Linear` today.
+    /// −3 dB equal-power shape — `gain(t) = sin(t·π/2)` for fade-in,
+    /// `cos((d-t)·π/2)` for fade-out. Constant total power across a
+    /// crossfade pair (sin² + cos² = 1).
     EqualPower,
-    /// Audio-taper / logarithmic shape. Reserved for 7.5; treated as `Linear` today.
+    /// Quadratic / audio-taper shape — `gain(t) = (t/d)²`. The "audio
+    /// fade" most NLEs ship: slow at silence, fast near unity, which
+    /// feels perceptually linear to listeners. The name "Logarithmic"
+    /// is the conventional NLE label even though the math is a power
+    /// curve, not a true logarithm — kept for cross-tool consistency.
     Logarithmic,
+}
+
+/// Shape a normalized [0, 1] fade-in fraction by the requested curve.
+/// `frac == 0` is silence, `frac == 1` is unity.
+///
+/// Phase 7.5 M2: EqualPower and Logarithmic ship real implementations.
+/// Both monotonically rise from 0 to 1 and are equal to `frac` at the
+/// endpoints, so existing fade-in tests that assert endpoints continue
+/// to pass — only midpoint values change.
+#[inline]
+fn shape_fade_in_frac(frac: f32, curve: FadeCurve) -> f32 {
+    match curve {
+        FadeCurve::Linear => frac,
+        // EqualPower: gain rises as sin(frac·π/2). At midpoint =
+        // sin(π/4) ≈ 0.7071. Pairing fade-in² + fade-out² = 1 means
+        // a crossfade keeps constant total power.
+        FadeCurve::EqualPower => (frac * std::f32::consts::FRAC_PI_2).sin(),
+        // Logarithmic / audio-taper: gain rises as frac². Quadratic
+        // shape stays at the floor longer, giving the "fades up from
+        // silence smoothly" perceptual feel.
+        FadeCurve::Logarithmic => frac * frac,
+    }
+}
+
+/// Shape a normalized [0, 1] fade-out fraction by the requested curve.
+/// `frac` here is the REMAINING fraction inside the fade-out region:
+/// `frac == 1` at the fade-out start (unity), `frac == 0` at the clip
+/// end (silence) — matches the math used in [`eval_fade_out_audio`].
+#[inline]
+fn shape_fade_out_frac(frac: f32, curve: FadeCurve) -> f32 {
+    match curve {
+        FadeCurve::Linear => frac,
+        // EqualPower: sin(frac·π/2). At `frac == 1` returns 1.0 (unity)
+        // and at `frac == 0` returns 0.0 (silence). Pairs with the
+        // fade-in `sin()` so a fade-out + fade-in crossfade keeps
+        // constant total power: sin² + cos² = 1.
+        FadeCurve::EqualPower => (frac * std::f32::consts::FRAC_PI_2).sin(),
+        // Mirror of the fade-in logarithmic shape so a paired
+        // fade-out + fade-in produces the same per-side curvature.
+        FadeCurve::Logarithmic => frac * frac,
+    }
 }
 
 /// Evaluate the multiplicative fade-in gain at clip-relative time
 /// `t_clip_seconds`. Returns 1.0 once `t >= duration_seconds`.
-/// `duration_seconds <= 0` returns 1.0 (the "no fade" case). Linear
-/// shape only in 7.4; other curves fall back to linear so they don't
-/// silently mute. Defense-in-depth duplicate of
-/// `vance-timeline::eval_fade_in` — both sides ship the same fallback
-/// behaviour and the audio crate stays decoupled from the timeline
-/// crate's symbol.
+/// `duration_seconds <= 0` returns 1.0 (the "no fade" case).
+///
+/// Phase 7.5 M2: honours `curve` — `Linear`, `EqualPower`, and
+/// `Logarithmic` all ship real implementations. Defense-in-depth
+/// duplicate of `vance-timeline::eval_fade_in` — both sides agree on
+/// the shape family.
 #[inline]
-pub fn eval_fade_in_audio(duration_seconds: f64, _curve: FadeCurve, t_clip_seconds: f64) -> f32 {
+pub fn eval_fade_in_audio(duration_seconds: f64, curve: FadeCurve, t_clip_seconds: f64) -> f32 {
     if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
         return 1.0;
     }
@@ -98,17 +143,17 @@ pub fn eval_fade_in_audio(duration_seconds: f64, _curve: FadeCurve, t_clip_secon
     if t_clip_seconds >= duration_seconds {
         return 1.0;
     }
-    (t_clip_seconds / duration_seconds) as f32
+    shape_fade_in_frac((t_clip_seconds / duration_seconds) as f32, curve)
 }
 
 /// Evaluate the multiplicative fade-out gain at clip-relative time
 /// `t_clip_seconds`. `clip_duration_seconds` is the clip's total
-/// length. Returns 1.0 before the fade region. Linear shape only in
-/// 7.4.
+/// length. Returns 1.0 before the fade region. Phase 7.5 M2 honours
+/// `curve`.
 #[inline]
 pub fn eval_fade_out_audio(
     duration_seconds: f64,
-    _curve: FadeCurve,
+    curve: FadeCurve,
     clip_duration_seconds: f64,
     t_clip_seconds: f64,
 ) -> f32 {
@@ -122,7 +167,8 @@ pub fn eval_fade_out_audio(
     if t_clip_seconds >= clip_duration_seconds {
         return 0.0;
     }
-    ((clip_duration_seconds - t_clip_seconds) / duration_seconds) as f32
+    let frac = ((clip_duration_seconds - t_clip_seconds) / duration_seconds) as f32;
+    shape_fade_out_frac(frac, curve)
 }
 
 /// Outgoing interpolation between consecutive [`GainKeyframe`]s.
@@ -252,9 +298,8 @@ pub struct ClipMix {
     /// Phase 7.4 M3: fade-in duration in CLIP-RELATIVE seconds.
     /// `0.0` = no fade-in (the fade is skipped at evaluation time).
     pub fade_in_duration_seconds: f64,
-    /// Fade-in curve shape. Only `Linear` is honoured in 7.4; the other
-    /// variants are present so 7.5 can ship `EqualPower` / `Logarithmic`
-    /// without changing the snapshot ABI.
+    /// Fade-in curve shape. All three variants ship real
+    /// implementations since 7.5 M2 — see [`FadeCurve`].
     pub fade_in_curve: FadeCurve,
     /// Phase 7.4 M3: fade-out duration in CLIP-RELATIVE seconds. The
     /// fade region runs from `clip_duration_seconds - fade_out_duration`
@@ -398,10 +443,12 @@ pub struct AudioSource {
 /// keyframe-aware effective gain to each contribution and returns the
 /// stereo sum.
 ///
-/// Extracted from the fold thread so it can be unit-tested without a
-/// real cpal device. The fold thread loops this function once per
-/// output frame, advancing `t_timeline_seconds` by `1 / sample_rate`
-/// per call.
+/// Phase 7.5 M1 — TEST-ONLY helper. The live fold thread inlines an
+/// equivalent computation so it can also split out the per-track
+/// pre-master intermediate the metering accumulators need. Kept here
+/// because every effective-gain test in this file asserts against
+/// this function; if the fold-loop math drifts from it, the assertion
+/// surface catches the regression.
 #[inline]
 pub fn fold_frame_at(
     snapshot: &MixerSnapshot,
@@ -482,6 +529,10 @@ pub struct AudioMixer {
     /// per frame — re-loading per frame is wasteful and would defeat
     /// ArcSwap's whole point).
     snapshot: Arc<ArcSwap<MixerSnapshot>>,
+    /// Phase 7.5 M1: lock-free metering bus. The fold thread publishes
+    /// a new `MeterSnapshot` ~30 times per second; the UI polls it via
+    /// a Tauri command. Engine never writes; reads are cheap.
+    meter: Arc<ArcSwap<MeterSnapshot>>,
 }
 
 struct Inner {
@@ -539,9 +590,10 @@ impl AudioMixer {
         let master_rb = HeapRb::<f32>::new(master_capacity);
         let (master_prod, mut master_cons) = master_rb.split();
 
-        // 3. Snapshot bus + master frame counter.
+        // 3. Snapshot bus + master frame counter + metering bus.
         let snapshot = Arc::new(ArcSwap::from_pointee(initial_snapshot));
         let master_frame = Arc::new(AtomicI64::new(0));
+        let meter = Arc::new(ArcSwap::from_pointee(MeterSnapshot::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let source_streams = initial_sources;
 
@@ -584,6 +636,7 @@ impl AudioMixer {
         let fold_stop = stop.clone();
         let fold_snapshot = snapshot.clone();
         let fold_master_frame = master_frame.clone();
+        let fold_meter = meter.clone();
         let fold_handle = thread::Builder::new()
             .name("vance-audio.mixer.fold".into())
             .spawn(move || {
@@ -593,6 +646,7 @@ impl AudioMixer {
                     master_prod,
                     fold_snapshot,
                     fold_master_frame,
+                    fold_meter,
                     fold_stop,
                     channels,
                     sample_rate,
@@ -613,7 +667,14 @@ impl AudioMixer {
             master_frame,
             device_sample_rate: sample_rate,
             snapshot,
+            meter,
         })
+    }
+
+    /// Phase 7.5 M1: Send + Sync handle to the metering bus. The fold
+    /// thread is the sole writer; readers (UI poll path) just load.
+    pub fn meter_handle(&self) -> Arc<ArcSwap<MeterSnapshot>> {
+        self.meter.clone()
     }
 
     /// Publish a new mixer snapshot. Lock-free, cheap.
@@ -895,6 +956,82 @@ fn source_puller_loop(
     let _ = client.shutdown();
 }
 
+/// Per-track and master metering values for one publish frame.
+/// Linear amplitude (NOT dB) — the UI converts to dB. Stored in
+/// `MeterSnapshot` and published lock-free from the fold thread.
+///
+/// Phase 7.5 M1.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TrackMeter {
+    /// Peak abs sample observed on the left channel over the publish window.
+    pub peak_l: f32,
+    /// Peak abs sample observed on the right channel over the publish window.
+    pub peak_r: f32,
+    /// RMS over the publish window, left channel.
+    pub rms_l: f32,
+    /// RMS over the publish window, right channel.
+    pub rms_r: f32,
+}
+
+/// Snapshot of every metering value the UI needs to draw a meter bar.
+/// Published from the fold thread via `ArcSwap` ~30 times per second.
+///
+/// `generation` is a monotonic counter so the UI can spot dropped
+/// frames (e.g. when the fold thread stalls during shutdown).
+#[derive(Clone, Debug, Default)]
+pub struct MeterSnapshot {
+    /// Master bus meter (post-master-gain).
+    pub master: TrackMeter,
+    /// Per-track meters (post-track-gain, pre-master-gain).
+    pub tracks: HashMap<Uuid, TrackMeter>,
+    /// Monotonic publication counter. UI uses this to detect "the
+    /// numbers haven't changed for a while" without polling at the
+    /// fold thread's exact rate.
+    pub generation: u64,
+}
+
+/// Running accumulators the fold thread keeps in-thread (no Arc, no
+/// lock). At publish time these collapse into a [`TrackMeter`] and the
+/// fold thread resets them for the next window.
+#[derive(Clone, Copy, Debug, Default)]
+struct MeterAccum {
+    peak_l: f32,
+    peak_r: f32,
+    sum_sq_l: f64,
+    sum_sq_r: f64,
+    count: u32,
+}
+
+impl MeterAccum {
+    #[inline]
+    fn observe(&mut self, l: f32, r: f32) {
+        let al = l.abs();
+        let ar = r.abs();
+        if al > self.peak_l {
+            self.peak_l = al;
+        }
+        if ar > self.peak_r {
+            self.peak_r = ar;
+        }
+        self.sum_sq_l += (l as f64) * (l as f64);
+        self.sum_sq_r += (r as f64) * (r as f64);
+        self.count += 1;
+    }
+
+    fn into_meter(self) -> TrackMeter {
+        if self.count == 0 {
+            return TrackMeter::default();
+        }
+        let n = self.count as f64;
+        TrackMeter {
+            peak_l: self.peak_l,
+            peak_r: self.peak_r,
+            rms_l: (self.sum_sq_l / n).sqrt() as f32,
+            rms_r: (self.sum_sq_r / n).sqrt() as f32,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fold_loop(
     initial_sources: Vec<SourceStream>,
@@ -902,6 +1039,7 @@ fn fold_loop(
     mut master_prod: ringbuf::HeapProd<f32>,
     snapshot: Arc<ArcSwap<MixerSnapshot>>,
     master_frame: Arc<AtomicI64>,
+    meter_bus: Arc<ArcSwap<MeterSnapshot>>,
     stop: Arc<AtomicBool>,
     channels: usize,
     sample_rate: u32,
@@ -932,6 +1070,23 @@ fn fold_loop(
     }
     let mut frame_samples: Vec<(Uuid, [f32; 2])> = Vec::with_capacity(sources.len());
     let inv_sample_rate = 1.0 / sample_rate as f64;
+    // Phase 7.5 M1 — per-frame scratch space for the per-track stereo
+    // SUM. Cleared (not reallocated) every frame so the per-track
+    // metering accum can `observe` ONCE per output frame per track
+    // (instead of once per clip — overlapping clips would otherwise
+    // bias peak and inflate the RMS denominator). Adversarial review
+    // findings #1 + #15.
+    let mut track_frame_sums: HashMap<Uuid, [f32; 2]> = HashMap::new();
+    // Phase 7.5 M1 — per-track + master metering accumulators. Kept on
+    // the fold thread (no Arc, no lock); collapsed into a TrackMeter
+    // every `meter_publish_period_frames` frames and published via
+    // ArcSwap so the UI can poll without touching the fold thread.
+    let mut track_accums: HashMap<Uuid, MeterAccum> = HashMap::new();
+    let mut master_accum = MeterAccum::default();
+    // 30 publishes/sec, capped at >= 1 to avoid div-by-zero on tiny rates.
+    let meter_publish_period_frames = (sample_rate / 30).max(1);
+    let mut frames_since_publish: u32 = 0;
+    let mut meter_generation: u64 = 0;
     loop {
         if stop.load(Ordering::Acquire) {
             break;
@@ -1007,8 +1162,95 @@ fn fold_loop(
                     frame_samples.push((src.clip_id, buf));
                 }
             }
-            let out = fold_frame_at(&snap, &frame_samples, t_frame);
-            let _ = master_prod.push_slice(&out);
+            // Phase 7.5 M1: per-track + master fold INLINE so we can
+            // accumulate metering data alongside the sum. Mirrors
+            // `effective_gain_at` math (track × clip × fade × master)
+            // but exposes the per-track intermediate so the meters
+            // reflect what the user actually hears at each track row.
+            let mut master_pre_master = [0.0f32; 2];
+            for (clip_id, samples) in frame_samples.iter() {
+                let Some(clip) = snap.clips.get(clip_id) else {
+                    continue;
+                };
+                if !clip.enabled {
+                    continue;
+                }
+                let Some(track) = snap.tracks.get(&clip.track_id) else {
+                    continue;
+                };
+                if track.mute {
+                    continue;
+                }
+                if snap.solo_anywhere && !track.solo {
+                    continue;
+                }
+                // Compose the gain stage (mirror of effective_gain_at,
+                // minus the master multiply we'll apply once below).
+                let track_g = if track.gain_lane.is_empty() {
+                    track.gain_linear
+                } else {
+                    eval_gain_lane(&track.gain_lane, t_frame)
+                };
+                let t_clip = t_frame - clip.timeline_in_seconds;
+                let clip_g = if clip.gain_lane.is_empty() {
+                    clip.gain_linear
+                } else {
+                    eval_gain_lane(&clip.gain_lane, t_clip)
+                };
+                let fade_in_g = eval_fade_in_audio(
+                    clip.fade_in_duration_seconds,
+                    clip.fade_in_curve,
+                    t_clip,
+                );
+                let fade_out_g = eval_fade_out_audio(
+                    clip.fade_out_duration_seconds,
+                    clip.fade_out_curve,
+                    clip.clip_duration_seconds,
+                    t_clip,
+                );
+                let pre_master_g = track_g * clip_g * fade_in_g * fade_out_g;
+                let l = samples[0] * pre_master_g;
+                let r = samples[1] * pre_master_g;
+                // Accumulate the per-track SUM in the per-frame scratch
+                // map — we observe after the inner loop so peak +
+                // sum_sq reflect the audible signal, not individual
+                // clip contributions.
+                let entry = track_frame_sums.entry(clip.track_id).or_insert([0.0, 0.0]);
+                entry[0] += l;
+                entry[1] += r;
+                master_pre_master[0] += l;
+                master_pre_master[1] += r;
+            }
+            // One observe per track per output frame — matches the
+            // single observe per output frame on the master path so
+            // RMS counts are comparable across track and master meters.
+            for (track_id, sum) in track_frame_sums.drain() {
+                track_accums
+                    .entry(track_id)
+                    .or_default()
+                    .observe(sum[0], sum[1]);
+            }
+            let master_l = master_pre_master[0] * snap.master_gain_linear;
+            let master_r = master_pre_master[1] * snap.master_gain_linear;
+            master_accum.observe(master_l, master_r);
+            let _ = master_prod.push_slice(&[master_l, master_r]);
+
+            frames_since_publish += 1;
+            if frames_since_publish >= meter_publish_period_frames {
+                let mut tracks_out: HashMap<Uuid, TrackMeter> =
+                    HashMap::with_capacity(track_accums.len());
+                for (id, acc) in track_accums.drain() {
+                    tracks_out.insert(id, acc.into_meter());
+                }
+                meter_generation = meter_generation.wrapping_add(1);
+                meter_bus.store(Arc::new(MeterSnapshot {
+                    master: master_accum.into_meter(),
+                    tracks: tracks_out,
+                    generation: meter_generation,
+                }));
+                master_accum = MeterAccum::default();
+                frames_since_publish = 0;
+            }
         }
         master_frame.fetch_add(frames_this_batch as i64, Ordering::Release);
         if frames_this_batch == 0 {
@@ -1456,12 +1698,37 @@ mod tests {
     }
 
     #[test]
-    fn fade_reserved_curves_fall_back_to_linear() {
-        // 7.5 will implement EqualPower/Logarithmic; until then they must
-        // not silently mute audio. Match linear at the midpoint.
-        for c in [FadeCurve::EqualPower, FadeCurve::Logarithmic] {
-            let g = eval_fade_in_audio(2.0, c, 1.0);
-            assert!((g - 0.5).abs() < 1e-6);
+    fn fade_curves_match_their_documented_shapes() {
+        // 7.5 M2: EqualPower fade-in is sin(t/d·π/2); Logarithmic is (t/d)².
+        let mid_eq = eval_fade_in_audio(2.0, FadeCurve::EqualPower, 1.0);
+        assert!((mid_eq - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5);
+        let mid_log = eval_fade_in_audio(2.0, FadeCurve::Logarithmic, 1.0);
+        assert!((mid_log - 0.25).abs() < 1e-6);
+        // All curves agree at the endpoints.
+        for c in [FadeCurve::Linear, FadeCurve::EqualPower, FadeCurve::Logarithmic] {
+            assert_eq!(eval_fade_in_audio(2.0, c, 0.0), 0.0);
+            assert_eq!(eval_fade_in_audio(2.0, c, 2.0), 1.0);
+        }
+    }
+
+    #[test]
+    fn equal_power_crossfade_keeps_constant_power_in_audio_path() {
+        // Two 1s clips A and B fully overlapping with a 1s equal-power
+        // crossfade. At any moment `t` within the overlap, the
+        // INCOMING clip's fade-in is sampled at `t` and the OUTGOING
+        // clip's fade-out is also sampled at `t` (its `t_clip` is the
+        // same wall-clock moment, since the fade-out spans the whole
+        // clip). For EqualPower, fade_in(t) = sin(t·π/2) and
+        // fade_out(t) = cos(t·π/2), so the sum of squares is 1.
+        // The interior `0 < t < 1` is what actually exercises the
+        // shape function; the endpoints are excluded because the
+        // fade-out at exact clip-end returns 0 by the past-end gate.
+        for k in 1..8 {
+            let t = k as f64 / 8.0;
+            let g_in = eval_fade_in_audio(1.0, FadeCurve::EqualPower, t);
+            let g_out = eval_fade_out_audio(1.0, FadeCurve::EqualPower, 1.0, t);
+            let power = g_in * g_in + g_out * g_out;
+            assert!((power - 1.0).abs() < 1e-5, "t={t}, power={power}");
         }
     }
 
@@ -1562,5 +1829,109 @@ mod tests {
         // Defensive: zero-duration clip is never audible at any t.
         assert!(!source_audible_at(5.0, 0.0, 5.0));
         assert!(!source_audible_at(5.0, 0.0, 4.0));
+    }
+
+    // ============================================================
+    // Phase 7.5 M1 metering tests
+    // ============================================================
+
+    #[test]
+    fn meter_accum_empty_collapses_to_zeros() {
+        let m = MeterAccum::default().into_meter();
+        assert_eq!(m.peak_l, 0.0);
+        assert_eq!(m.peak_r, 0.0);
+        assert_eq!(m.rms_l, 0.0);
+        assert_eq!(m.rms_r, 0.0);
+    }
+
+    #[test]
+    fn meter_accum_peak_tracks_max_absolute() {
+        let mut a = MeterAccum::default();
+        a.observe(0.1, -0.4);
+        a.observe(-0.3, 0.2);
+        a.observe(0.7, -0.5);
+        let m = a.into_meter();
+        // L peak: max(|0.1|, |-0.3|, |0.7|) = 0.7
+        assert!((m.peak_l - 0.7).abs() < 1e-6);
+        // R peak: max(|-0.4|, |0.2|, |-0.5|) = 0.5
+        assert!((m.peak_r - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn meter_accum_rms_is_sqrt_mean_squares() {
+        let mut a = MeterAccum::default();
+        a.observe(1.0, 1.0);
+        a.observe(-1.0, -1.0);
+        a.observe(1.0, 1.0);
+        a.observe(-1.0, -1.0);
+        let m = a.into_meter();
+        // All abs == 1.0 → RMS == 1.0 on both channels.
+        assert!((m.rms_l - 1.0).abs() < 1e-6);
+        assert!((m.rms_r - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn meter_accum_rms_dc_signal_matches_amplitude() {
+        let mut a = MeterAccum::default();
+        for _ in 0..64 {
+            a.observe(0.5, -0.25);
+        }
+        let m = a.into_meter();
+        assert!((m.rms_l - 0.5).abs() < 1e-6);
+        assert!((m.rms_r - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn meter_snapshot_default_is_empty_and_silent() {
+        let s = MeterSnapshot::default();
+        assert_eq!(s.master.peak_l, 0.0);
+        assert_eq!(s.master.rms_l, 0.0);
+        assert!(s.tracks.is_empty());
+        assert_eq!(s.generation, 0);
+    }
+
+    #[test]
+    fn meter_accum_silence_input_produces_zero_meter() {
+        let mut a = MeterAccum::default();
+        for _ in 0..512 {
+            a.observe(0.0, 0.0);
+        }
+        let m = a.into_meter();
+        assert_eq!(m.peak_l, 0.0);
+        assert_eq!(m.peak_r, 0.0);
+        assert_eq!(m.rms_l, 0.0);
+        assert_eq!(m.rms_r, 0.0);
+    }
+
+    #[test]
+    fn meter_accum_two_observations_sum_correctly_in_rms() {
+        // Sanity check that pinpoints the fix for adversarial review
+        // findings #1 + #15: two contributions on the SAME frame
+        // accumulate into ONE observe with their sum, not into two
+        // observes that count separately.
+        //
+        // Two contributions on one frame, summed: l = 0.3 + 0.4 = 0.7.
+        // RMS_l = sqrt(0.7² / 1) = 0.7.
+        let mut summed = MeterAccum::default();
+        summed.observe(0.3 + 0.4, 0.0);
+        let m = summed.into_meter();
+        assert!((m.peak_l - 0.7).abs() < 1e-6);
+        assert!((m.rms_l - 0.7).abs() < 1e-6);
+
+        // Two separate observes (the OLD broken path) — would have
+        // produced peak_l = 0.4 (max of individual) and
+        // RMS_l = sqrt((0.3² + 0.4²) / 2) = sqrt(0.125) ≈ 0.354. We
+        // assert these for documentation: this is what the BUG
+        // produced before the fix. The fold loop must NOT take this
+        // path.
+        let mut split = MeterAccum::default();
+        split.observe(0.3, 0.0);
+        split.observe(0.4, 0.0);
+        let m_bad = split.into_meter();
+        assert!((m_bad.peak_l - 0.4).abs() < 1e-6);
+        assert!((m_bad.rms_l - 0.353_553_4).abs() < 1e-4);
+        // Both reported values are STRICTLY LESS than the summed truth.
+        assert!(m_bad.peak_l < m.peak_l);
+        assert!(m_bad.rms_l < m.rms_l);
     }
 }

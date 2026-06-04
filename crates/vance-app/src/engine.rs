@@ -4280,6 +4280,19 @@ impl Engine {
         self.apply_edit_op(EditOp::SetMasterGainDb { gain_db })
     }
 
+    /// Phase 7.5 M1: read the latest mixer metering snapshot. Returns
+    /// `None` when the mixer backend isn't active (no playback or the
+    /// single-source backend is in use instead). The returned snapshot
+    /// is a cheap clone of the ArcSwap value — the fold thread keeps
+    /// writing fresh snapshots ~30Hz regardless.
+    pub fn meter_snapshot(&self) -> Option<vance_audio::MeterSnapshot> {
+        let owner = match self.audio_owner.as_ref()? {
+            AudioBackend::Mixer(o) => o,
+            AudioBackend::Single(_) => return None,
+        };
+        Some((*owner.meter_handle().load_full()).clone())
+    }
+
     /// Phase 7.4: replace a track's gain automation lane. Empty =
     /// revert to the static `Track.gain_db`. Live during playback —
     /// the fold thread reads the new lane via the ArcSwap snapshot
@@ -5040,6 +5053,9 @@ pub struct AudioMixerOwner {
     /// Live counters published by [`vance_audio::AudioMixer`] +
     /// scheduler. Exposed through [`Self::stats`] for the UI / logs.
     stats: Arc<vance_audio::MixerStats>,
+    /// Phase 7.5 M1: lock-free metering bus published by the fold
+    /// thread ~30Hz. UI polls this to render meter bars.
+    meter: Arc<arc_swap::ArcSwap<vance_audio::MeterSnapshot>>,
 }
 
 impl AudioMixerOwner {
@@ -5079,6 +5095,11 @@ impl AudioMixerOwner {
     /// Snapshot of the live mixer counters.
     pub fn stats(&self) -> Arc<vance_audio::MixerStats> {
         self.stats.clone()
+    }
+
+    /// Phase 7.5 M1: metering bus handle for the UI poll path.
+    pub fn meter_handle(&self) -> Arc<arc_swap::ArcSwap<vance_audio::MeterSnapshot>> {
+        self.meter.clone()
     }
 }
 
@@ -5604,6 +5625,7 @@ fn start_audio_mix(
                 Arc<arc_swap::ArcSwap<vance_audio::MixerSnapshot>>,
                 Arc<std::sync::atomic::AtomicI64>,
                 u32,
+                Arc<arc_swap::ArcSwap<vance_audio::MeterSnapshot>>,
             ),
             String,
         >,
@@ -5637,8 +5659,9 @@ fn start_audio_mix(
             let snapshot_handle = mixer.snapshot_handle();
             let master_frame = mixer.master_frame_handle();
             let sample_rate = mixer.device_sample_rate();
+            let meter_handle = mixer.meter_handle();
             if ready_tx
-                .send(Ok((sync, snapshot_handle, master_frame, sample_rate)))
+                .send(Ok((sync, snapshot_handle, master_frame, sample_rate, meter_handle)))
                 .is_err()
             {
                 return;
@@ -5650,7 +5673,7 @@ fn start_audio_mix(
         })
         .map_err(|e| format!("spawn audio mixer owner: {e}"))?;
 
-    let (sync, snapshot_handle, master_frame, sample_rate) = ready_rx
+    let (sync, snapshot_handle, master_frame, sample_rate, meter_handle) = ready_rx
         .recv_timeout(Duration::from_secs(10))
         .map_err(|_| "audio mixer owner thread did not report ready in 10s".to_string())??;
 
@@ -5689,6 +5712,7 @@ fn start_audio_mix(
             scheduler_handle: Some(scheduler_handle),
             scheduler_stop,
             stats,
+            meter: meter_handle,
         },
         sync,
         snapshot_handle,

@@ -25,6 +25,7 @@
   import { dragState } from '$lib/drag.svelte';
   import { selectionState } from '$lib/selection.svelte';
   import { peaksCache, chooseLevel } from '$lib/peaks-cache.svelte';
+  import { metersStore, dbToFill, type MeterDisplay } from '$lib/meters.svelte';
   import {
     yForDb,
     dbForY,
@@ -80,11 +81,19 @@
   // Layout constants.
   const RULER_HEIGHT = 22; // px
   const TRACK_HEIGHT = 36; // px per track row
-  const TRACK_HEADER_W = 88; // px reserved on the left for label + M/S buttons (7.3 mixer)
+  // Phase 7.5 M1 — header widened by 18 px so a stereo meter strip
+  // (2× 6 px bars + 2 px gap + 4 px margin = ~18 px) can sit between
+  // the M/S buttons and the timeline edge without overlapping either.
+  const TRACK_HEADER_W = 106; // px reserved on the left
   // Mixer button geometry inside the track header.
   const MIXER_BTN_SIZE = 16; // square button (px)
   const MIXER_BTN_GAP = 3; // gap between M and S
   const MIXER_BTN_X = 44; // first button's x (after label area)
+  // Phase 7.5 M1 stereo meter strip geometry.
+  const METER_BAR_W = 6;
+  const METER_BAR_GAP = 2;
+  const METER_STRIP_W = METER_BAR_W * 2 + METER_BAR_GAP;
+  const METER_STRIP_X = TRACK_HEADER_W - METER_STRIP_W - 4;
 
   // Track rows are alternating shaded.
   const VIDEO_FILL = '#3a4252';
@@ -978,7 +987,82 @@
         track.solo,
         '#e6c52c'
       );
+      // Phase 7.5 M1 — stereo meter strip for audio tracks. Video
+      // tracks reserve the slot (so the row layout stays uniform) but
+      // skip the live draw — the fold thread never produces a meter
+      // entry for them.
+      if (track.kind === 'audio') {
+        const display = metersStore.tracks[track.id];
+        if (display) drawMeterStrip(ctx, METER_STRIP_X, y + 4, TRACK_HEIGHT - 8, display);
+      }
     });
+  }
+
+  /** Phase 7.5 M1 — stereo vertical meter strip. RMS fills from the
+   *  bottom; held peak is a thin bright line; clip indicator is a
+   *  small red square at the top. */
+  function drawMeterStrip(
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    h: number,
+    display: MeterDisplay
+  ) {
+    if (h < 8) return;
+    const barH = h - 2; // 1 px reserved top + bottom for the clip LED.
+    // Background slot.
+    ctx.fillStyle = '#1c1f25';
+    ctx.fillRect(x, y, METER_STRIP_W, h);
+    drawMeterBar(ctx, x, y + 1, METER_BAR_W, barH, display.l);
+    drawMeterBar(ctx, x + METER_BAR_W + METER_BAR_GAP, y + 1, METER_BAR_W, barH, display.r);
+  }
+
+  function drawMeterBar(
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    ch: { rms: number; peak_db: number; clipping: boolean }
+  ) {
+    // RMS fill (green → amber → red gradient by amplitude).
+    const rmsDb = ch.rms > 0 ? 20 * Math.log10(ch.rms) : -Infinity;
+    const fill = Math.max(0, Math.min(1, dbToFill(rmsDb)));
+    const fillPx = Math.round(fill * h);
+    if (fillPx > 0) {
+      ctx.fillStyle = '#3ab66c';
+      ctx.fillRect(x, y + h - fillPx, w, fillPx);
+      // Yellow band above -6 dB.
+      const sixDbFill = Math.round(dbToFill(-6) * h);
+      if (fillPx > sixDbFill) {
+        ctx.fillStyle = '#e6c52c';
+        const yellowTop = y + h - fillPx;
+        const yellowBot = y + h - sixDbFill;
+        ctx.fillRect(x, yellowTop, w, Math.max(0, yellowBot - yellowTop));
+      }
+      // Red band above 0 dBFS — only triggered if rms exceeds unity,
+      // which is rare in practice but defensive.
+      const zeroDbFill = Math.round(dbToFill(0) * h);
+      if (fillPx > zeroDbFill) {
+        ctx.fillStyle = '#e44b4b';
+        const redTop = y + h - fillPx;
+        const redBot = y + h - zeroDbFill;
+        ctx.fillRect(x, redTop, w, Math.max(0, redBot - redTop));
+      }
+    }
+    // Held-peak line.
+    if (isFinite(ch.peak_db)) {
+      const peakFill = Math.max(0, Math.min(1, dbToFill(ch.peak_db)));
+      const peakPx = Math.round(peakFill * h);
+      const peakY = y + h - peakPx;
+      ctx.fillStyle = '#e6ebf5';
+      ctx.fillRect(x, peakY, w, 1);
+    }
+    // Clip LED.
+    if (ch.clipping) {
+      ctx.fillStyle = '#ff3030';
+      ctx.fillRect(x, y - 1, w, 2);
+    }
   }
 
   function drawMixerToggle(
@@ -2277,6 +2361,13 @@
       }
     }, 100);
 
+    // Phase 7.5 M1 — start the metering poll. Owned by the timeline
+    // (a singleton in this component tree) so the lifecycle is one
+    // start / one stop. A redraw pump fires at the meter cadence so
+    // the bars animate even when nothing else changes on the canvas.
+    metersStore.start();
+    const meterRedraw = window.setInterval(() => scheduleDraw(), 33);
+
     return () => {
       ro.disconnect();
       window.removeEventListener('mousemove', onMouseMove);
@@ -2284,6 +2375,8 @@
       window.removeEventListener('mouseup', onWindowMouseUp);
       window.removeEventListener('keydown', onKeyDown);
       window.clearInterval(playheadPoll);
+      window.clearInterval(meterRedraw);
+      metersStore.stop();
     };
   });
 </script>

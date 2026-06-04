@@ -740,6 +740,28 @@ export const setClipFadeOut = (
   curve: FadeCurveName = 'linear'
 ): Promise<void> => invoke('set_clip_fade_out', { trackId, clipId, durationSeconds, curve });
 
+/** Phase 7.5 M1: per-track and master meter values (linear amplitude,
+ *  NOT dB — the UI converts). */
+export type TrackMeter = {
+  peak_l: number;
+  peak_r: number;
+  rms_l: number;
+  rms_r: number;
+};
+
+/** Phase 7.5 M1: full meter snapshot from the audio mixer's fold
+ *  thread, published ~30Hz via ArcSwap. `null` when no mixer backend
+ *  is currently running (no playback or single-source path). */
+export type MeterSnapshot = {
+  master: TrackMeter;
+  /** Per-track meters keyed by track UUID (matches `TrackContents.id`). */
+  tracks: Record<string, TrackMeter>;
+  /** Monotonic publish counter — wraps on overflow. */
+  generation: number;
+};
+
+export const meterSnapshot = (): Promise<MeterSnapshot | null> => invoke('meter_snapshot');
+
 /** Start playback of the active sequence from `timelineSeconds`,
  *  using scene_plan to pick the active clip and swapping the
  *  decoder onto its media. */

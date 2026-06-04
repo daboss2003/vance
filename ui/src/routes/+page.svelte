@@ -31,6 +31,7 @@
   import { dragState } from '$lib/drag.svelte';
   import { selectionState } from '$lib/selection.svelte';
   import Timeline from '$lib/timeline/Timeline.svelte';
+  import MasterMeter from '$lib/MasterMeter.svelte';
   import ColorWheel from '$lib/color/ColorWheel.svelte';
   import CurveEditor from '$lib/color/CurveEditor.svelte';
   import ScopeCanvas from '$lib/color/ScopeCanvas.svelte';
@@ -1948,6 +1949,11 @@
             {(projectState.sequence?.master_gain_db ?? 0).toFixed(1)} dB
           </span>
         </label>
+        <!-- Phase 7.5 M1 — master meter. Polls the same metersStore as
+             the track meters so the values share their hold + decay
+             tuning. -->
+        <MasterMeter />
+
         <span class="text-vance-muted ml-auto">
           last PTS: <span class="text-vance-fg font-mono">{lastPts ?? '—'}</span>
           {#if playError}
