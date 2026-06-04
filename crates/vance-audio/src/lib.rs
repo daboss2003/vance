@@ -27,8 +27,9 @@ pub mod protocol;
 pub use client::{AudioClient, AudioClientError};
 pub use mixer::{
     db_to_linear, eval_fade_in_audio, eval_fade_out_audio, eval_gain_lane, fold_frame,
-    fold_frame_at, AudioMixer, AudioMixerError, AudioSource, ClipMix, FadeCurve, GainInterp,
-    GainKeyframe, MixerSnapshot, TrackMix,
+    fold_frame_at, per_source_ring_capacity, probe_default_sample_rate, source_audible_at,
+    spawn_source, AudioMixer, AudioMixerError, AudioSource, ClipMix, FadeCurve, GainInterp,
+    GainKeyframe, MixerSnapshot, MixerStats, SourceCommand, SourceStream, TrackMix,
 };
 pub use player::{AudioPlayer, AudioPlayerError};
 pub use protocol::{AudioRequest, AudioResponse, AudioStreamInfo, PcmChunk};

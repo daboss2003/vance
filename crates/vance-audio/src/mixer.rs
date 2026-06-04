@@ -89,7 +89,7 @@ pub enum FadeCurve {
 /// crate's symbol.
 #[inline]
 pub fn eval_fade_in_audio(duration_seconds: f64, _curve: FadeCurve, t_clip_seconds: f64) -> f32 {
-    if !(duration_seconds > 0.0) {
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
         return 1.0;
     }
     if t_clip_seconds <= 0.0 {
@@ -112,7 +112,7 @@ pub fn eval_fade_out_audio(
     clip_duration_seconds: f64,
     t_clip_seconds: f64,
 ) -> f32 {
-    if !(duration_seconds > 0.0) {
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
         return 1.0;
     }
     let fade_start = clip_duration_seconds - duration_seconds;
@@ -255,13 +255,13 @@ pub struct ClipMix {
     /// Fade-in curve shape. Only `Linear` is honoured in 7.4; the other
     /// variants are present so 7.5 can ship `EqualPower` / `Logarithmic`
     /// without changing the snapshot ABI.
-    pub fade_in_curve: crate::FadeCurve,
+    pub fade_in_curve: FadeCurve,
     /// Phase 7.4 M3: fade-out duration in CLIP-RELATIVE seconds. The
     /// fade region runs from `clip_duration_seconds - fade_out_duration`
     /// to the clip's end. `0.0` = no fade-out.
     pub fade_out_duration_seconds: f64,
     /// Fade-out curve shape. See [`Self::fade_in_curve`].
-    pub fade_out_curve: crate::FadeCurve,
+    pub fade_out_curve: FadeCurve,
 }
 
 /// Snapshot of the entire mixer state. Published by the engine to the
@@ -277,9 +277,10 @@ pub struct MixerSnapshot {
     /// snapshot build time so the fold thread doesn't sweep the tracks
     /// map per frame.
     pub solo_anywhere: bool,
-    /// Master bus gain (linear). 1.0 = unity. Phase 7.3 ships with
-    /// 1.0 hard-coded; a future master fader would publish a non-unity
-    /// value here.
+    /// Master bus gain (linear). 1.0 = unity. Phase 7.4 derives this
+    /// from `Sequence.master_gain_db` at snapshot build time (see
+    /// `vance_app::engine::build_mixer_snapshot`); the master fader UI
+    /// drives it via `EditOp::SetMasterGainDb`.
     pub master_gain_linear: f32,
 }
 
@@ -420,10 +421,15 @@ pub fn fold_frame_at(
 }
 
 /// Back-compat shim for the Phase 7.3 fold call. Equivalent to
-/// `fold_frame_at(snapshot, source_samples, f64::NEG_INFINITY)`, which
-/// causes any non-empty lane to evaluate at its first keyframe (the
-/// before-first-key clamp). Retained so existing fold tests stay
-/// meaningful as a regression check on the gating logic.
+/// `fold_frame_at(snapshot, source_samples, f64::NEG_INFINITY)`.
+///
+/// IMPORTANT (Phase 7.4 M3): with `t = -∞`, the clip-relative time
+/// `t_clip = -∞ - timeline_in_seconds = -∞`, which makes
+/// `eval_fade_in_audio` return `0.0` for ANY clip with a non-zero
+/// `fade_in_duration_seconds`. So this shim silently zeroes faded
+/// clips — it only stays correct on clips without a fade-in. Used by
+/// the legacy mute/solo/gain unit tests (which pre-date fades); new
+/// tests should call `fold_frame_at` with a finite time.
 #[inline]
 pub fn fold_frame(snapshot: &MixerSnapshot, source_samples: &[(Uuid, [f32; 2])]) -> [f32; 2] {
     fold_frame_at(snapshot, source_samples, f64::NEG_INFINITY)
@@ -476,13 +482,6 @@ pub struct AudioMixer {
     /// per frame — re-loading per frame is wasteful and would defeat
     /// ArcSwap's whole point).
     snapshot: Arc<ArcSwap<MixerSnapshot>>,
-    /// Phase 7.4: timeline-seconds at the START of this mixer session.
-    /// `t_timeline = playback_start_timeline_seconds + master_frame /
-    /// device_sample_rate`. Used by the fold thread to evaluate
-    /// per-track / per-clip gain lanes at the correct time.
-    playback_start_timeline_seconds: f64,
-    /// Phase 7.4 M4: shared scheduler / fold-thread counters.
-    stats: Arc<MixerStats>,
 }
 
 struct Inner {
@@ -495,31 +494,29 @@ impl AudioMixer {
     /// Spawn the cpal output stream and the fold thread. Returns once
     /// cpal is playing.
     ///
-    /// Phase 7.4 M4 swaps the prior eager-Vec-of-sources contract for a
-    /// scheduler-driven shape:
-    /// - `initial_sources` seeds the fold thread with the clips active
-    ///   right at `playback_start_timeline_seconds` so cpal has audio
-    ///   immediately. Pass an empty vec if the playhead is over a gap.
-    /// - `command_rx` is the channel the scheduler thread sends
-    ///   `SourceCommand::Add` / `Remove` on to grow/shrink the live set
-    ///   without restarting the mixer.
-    /// - `stats` is the shared observability counter struct — the
-    ///   scheduler bumps `scheduler_cap_hits_total`, the fold thread
-    ///   bumps `sources_spawned_total` and `last_open_to_first_sample_ms`.
+    /// Phase 7.4 M4 contract:
+    /// - `initial_sources` is the set of **pre-spawned** SourceStreams
+    ///   the caller wants the fold thread to start mixing from. The
+    ///   caller is expected to have already done the synchronous
+    ///   sidecar handshake via [`spawn_source`] — `AudioMixer::start`
+    ///   does no IPC of its own — so cpal starts producing immediately.
+    /// - `command_rx` is the scheduler's channel — `Add(SourceStream)`
+    ///   delivers a pre-spawned source to the fold thread, `Remove`
+    ///   takes one out. Both are O(1) HashMap ops with no IPC.
     ///
-    /// `sidecar_binary` is the path of the `vance-audio-decoder`
-    /// binary (each source gets its own sidecar process). `initial_snapshot`
-    /// seeds the fold thread; the engine subsequently calls
-    /// `publish_snapshot` after every mixer-affecting `EditOp`.
+    /// `initial_snapshot` seeds the fold thread; the engine subsequently
+    /// calls `publish_snapshot` after every mixer-affecting `EditOp`.
+    ///
+    /// Observability ([`MixerStats`]) lives on the engine side because
+    /// every counter is written from the **scheduler** thread (or the
+    /// caller of [`spawn_source`] for the initial seed) — never inside
+    /// the mixer itself.
     pub fn start(
-        sidecar_binary: impl AsRef<Path>,
-        initial_sources: Vec<AudioSource>,
+        initial_sources: Vec<SourceStream>,
         command_rx: mpsc::Receiver<SourceCommand>,
-        stats: Arc<MixerStats>,
         initial_snapshot: MixerSnapshot,
         playback_start_timeline_seconds: f64,
     ) -> Result<Self, AudioMixerError> {
-        let sidecar_binary = sidecar_binary.as_ref().to_path_buf();
         // 1. Cpal output device — same shape as AudioPlayer.
         let host = cpal::default_host();
         let device = host
@@ -542,32 +539,11 @@ impl AudioMixer {
         let master_rb = HeapRb::<f32>::new(master_capacity);
         let (master_prod, mut master_cons) = master_rb.split();
 
-        // 3. Per-source ring capacity (stereo, ~125 ms). The fold
-        //    thread reuses this for every spawn.
-        let per_source_capacity = (sample_rate as usize) * 2 / 8;
-
-        // 4. Spawn the initial source set BEFORE handing the fold
-        //    thread off — this guarantees clips active at the playback
-        //    start time have producing pullers when cpal first asks
-        //    for samples.
-        let mut source_streams: Vec<SourceStream> = Vec::with_capacity(initial_sources.len());
-        for source in &initial_sources {
-            match spawn_source(&sidecar_binary, source, per_source_capacity, &stats) {
-                Ok(s) => source_streams.push(s),
-                Err(e) => {
-                    tracing::error!(
-                        ?e,
-                        clip_id = %source.clip_id,
-                        "mixer: initial source spawn failed"
-                    );
-                }
-            }
-        }
-
-        // 5. Snapshot bus + master frame counter.
+        // 3. Snapshot bus + master frame counter.
         let snapshot = Arc::new(ArcSwap::from_pointee(initial_snapshot));
         let master_frame = Arc::new(AtomicI64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
+        let source_streams = initial_sources;
 
         // 5. Cpal output stream — identical to AudioPlayer's pattern
         //    (pop_slice + silence fill). The mixer fold thread is the
@@ -603,27 +579,23 @@ impl AudioMixer {
             .play()
             .map_err(|e| AudioMixerError::Play(e.to_string()))?;
 
-        // 6. Fold thread — owns the source set and the command receiver
-        //    so spawn/teardown stays single-threaded.
+        // 6. Fold thread — owns the source HashMap and the command
+        //    receiver. Every state-change is a HashMap op, never IPC.
         let fold_stop = stop.clone();
         let fold_snapshot = snapshot.clone();
         let fold_master_frame = master_frame.clone();
-        let fold_stats = stats.clone();
         let fold_handle = thread::Builder::new()
             .name("vance-audio.mixer.fold".into())
             .spawn(move || {
                 fold_loop(
-                    sidecar_binary,
                     source_streams,
                     command_rx,
-                    fold_stats,
                     master_prod,
                     fold_snapshot,
                     fold_master_frame,
                     fold_stop,
                     channels,
                     sample_rate,
-                    per_source_capacity,
                     playback_start_timeline_seconds,
                 );
             })
@@ -641,14 +613,7 @@ impl AudioMixer {
             master_frame,
             device_sample_rate: sample_rate,
             snapshot,
-            playback_start_timeline_seconds,
-            stats,
         })
-    }
-
-    /// Observability handle for the mixer's lifetime counters.
-    pub fn stats(&self) -> Arc<MixerStats> {
-        self.stats.clone()
     }
 
     /// Publish a new mixer snapshot. Lock-free, cheap.
@@ -700,26 +665,50 @@ impl Drop for AudioMixer {
     }
 }
 
-/// One source-side ring read by the fold thread.
-struct SourceStream {
+/// One source-side ring read by the fold thread. Constructed on the
+/// scheduler thread by [`spawn_source`] and handed to the fold thread
+/// via [`SourceCommand::Add`].
+pub struct SourceStream {
     clip_id: Uuid,
     rx: ringbuf::HeapCons<f32>,
-    /// Per-source stop flag. The fold thread sets this when the source
-    /// is removed (clip slid out of the preload window, was deleted, or
-    /// the playhead moved past it); the puller exits on its next iteration.
+    /// Per-source stop flag. Setting this requests the puller exit on
+    /// its next iteration (i.e. when its current `next_chunk()` returns).
+    /// The puller checks the flag between IPC reads, so the worst-case
+    /// wakeup is one decoder chunk period (~21ms at 48 kHz / 1024 frames).
     stop: Arc<AtomicBool>,
-    /// Puller join handle. Dropped after the per-source stop fires.
+    /// Puller join handle. Phase 7.4 M4 deliberately DETACHES this on
+    /// `shutdown()` — see the method's doc-comment for the rationale.
     handle: Option<JoinHandle<()>>,
 }
 
 impl SourceStream {
-    /// Signal the per-source stop and join the puller. Called when the
-    /// scheduler removes this clip from the live window.
-    fn shutdown(&mut self) {
+    /// Clip uuid this source belongs to.
+    pub fn clip_id(&self) -> Uuid {
+        self.clip_id
+    }
+
+    /// Request the per-source puller exit. Called when the scheduler
+    /// removes this clip from the live window or when the fold thread
+    /// tears the mixer down.
+    ///
+    /// Phase 7.4 M4 — DETACHES (does not `join`) the puller:
+    /// - The puller only checks `stop` between calls to
+    ///   [`AudioClient::next_chunk`], a synchronous blocking IPC read.
+    ///   `join`-ing here would block the caller for the worst-case
+    ///   sidecar response time (a wedged sidecar would hang
+    ///   `AudioMixer::drop` indefinitely — the adversarial review
+    ///   flagged this as a deadlock-class bug).
+    /// - Detaching is sound: setting the stop flag is observed within
+    ///   one chunk period (~21ms); the puller owns the `AudioClient`,
+    ///   so its loop-exit drops the sidecar's `Sidecar`, whose `Drop`
+    ///   kills any still-alive child. Worst case is a ~21ms-late
+    ///   reaper after the source leaves the live set.
+    /// - Future milestone: add a force-kill-on-timeout escalation using
+    ///   the sidecar's PID for the wedged-sidecar case.
+    pub fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        // Detach: drop the handle without joining. See above.
+        let _ = self.handle.take();
     }
 }
 
@@ -732,17 +721,23 @@ impl SourceStream {
 /// mixer shutdown. The fold thread does NOT garbage-collect sources
 /// after EOS — the scheduler is the single source of truth for which
 /// clips should be live.
-#[derive(Debug)]
+///
+/// IMPORTANT: the heavy lift (sidecar spawn, IPC handshake, decoder
+/// start) happens on the SCHEDULER thread via [`spawn_source`] BEFORE
+/// the command is sent. The fold thread then only does a HashMap
+/// insert/remove — never a blocking IPC roundtrip — so cpal never
+/// underruns just because a scheduler tick decided to add a clip.
 pub enum SourceCommand {
-    /// Open and start streaming a new source. The fold thread spawns
-    /// the sidecar + puller and adds the clip to its live set. If
-    /// `Add` arrives for a clip already live, the prior source is
-    /// shut down and replaced (defensive — should not happen under
-    /// normal scheduling).
-    Add(AudioSource),
+    /// Insert a pre-spawned, already-streaming source into the live set.
+    /// The scheduler called [`spawn_source`] before issuing the command
+    /// so the fold thread can take ownership in a single move. If `Add`
+    /// arrives for a clip already live, the prior source is shut down
+    /// and replaced (defensive — should not happen under normal
+    /// scheduling).
+    Add(SourceStream),
     /// Remove the clip with this uuid from the live set. The fold
-    /// thread shuts down the source and stops summing its samples.
-    /// No-op if the clip isn't currently live.
+    /// thread takes ownership and shuts down the source. No-op if the
+    /// clip isn't currently live.
     Remove(Uuid),
 }
 
@@ -778,7 +773,13 @@ pub struct MixerStats {
 /// consumer half and the per-source stop flag the fold thread uses to
 /// tear it down. `MixerStats` is bumped on each successful spawn and
 /// the open→first-sample latency is sampled.
-fn spawn_source(
+///
+/// Phase 7.4 M4: this is invoked from the **scheduler** thread (and the
+/// caller of [`AudioMixer::start`] for the initial seed) so the
+/// blocking IPC handshake never lands on the fold thread that feeds
+/// cpal. The fold thread only takes ownership of the ready
+/// [`SourceStream`] via [`SourceCommand::Add`].
+pub fn spawn_source(
     sidecar_binary: &Path,
     source: &AudioSource,
     capacity: usize,
@@ -821,6 +822,44 @@ fn spawn_source(
     })
 }
 
+/// Phase 7.4 M4 per-source timeline gate. Returns `true` when the
+/// fold thread should pop a sample for the clip at `t_frame`. The gate
+/// is symmetric: it fires `false` BOTH before the clip starts (so
+/// preloaded samples accumulate in the ring without being mixed early)
+/// AND after the clip ends (so the scheduler's grace window cannot
+/// leak post-out source audio that the editor explicitly trimmed off).
+///
+/// Inputs come from the live [`MixerSnapshot`]; pure function so the
+/// boundary cases are unit-testable.
+#[inline]
+pub fn source_audible_at(timeline_in_seconds: f64, clip_duration_seconds: f64, t_frame: f64) -> bool {
+    t_frame >= timeline_in_seconds && t_frame < timeline_in_seconds + clip_duration_seconds
+}
+
+/// Per-source ring capacity at `sample_rate` — stereo, ~125 ms.
+/// Exposed so the scheduler can pre-compute it once and pass it to
+/// [`spawn_source`] without depending on `AudioMixer`'s internals.
+pub fn per_source_ring_capacity(sample_rate: u32) -> usize {
+    (sample_rate as usize) * 2 / 8
+}
+
+/// Probe the default cpal output device's sample rate without opening
+/// the stream. Used by the engine so initial sources can be spawned on
+/// the caller's thread before [`AudioMixer::start`] is invoked — that
+/// way the structurally-required seek-onto-edge pre-spawn doesn't
+/// depend on circular setup (mixer needs sources, sources need rate,
+/// rate is known only after mixer opens the device).
+pub fn probe_default_sample_rate() -> Result<u32, AudioMixerError> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or(AudioMixerError::NoDevice)?;
+    let config = device
+        .default_output_config()
+        .map_err(|e| AudioMixerError::Build(e.to_string()))?;
+    Ok(config.sample_rate().0)
+}
+
 fn source_puller_loop(
     mut client: AudioClient,
     mut producer: ringbuf::HeapProd<f32>,
@@ -858,17 +897,14 @@ fn source_puller_loop(
 
 #[allow(clippy::too_many_arguments)]
 fn fold_loop(
-    sidecar_binary: PathBuf,
     initial_sources: Vec<SourceStream>,
     command_rx: mpsc::Receiver<SourceCommand>,
-    stats: Arc<MixerStats>,
     mut master_prod: ringbuf::HeapProd<f32>,
     snapshot: Arc<ArcSwap<MixerSnapshot>>,
     master_frame: Arc<AtomicI64>,
     stop: Arc<AtomicBool>,
     channels: usize,
     sample_rate: u32,
-    per_source_capacity: usize,
     playback_start_timeline_seconds: f64,
 ) {
     if channels != 2 {
@@ -878,44 +914,46 @@ fn fold_loop(
         );
         return;
     }
+    if sample_rate == 0 {
+        // Defensive: cpal should never report 0 Hz (it errors first),
+        // but if it did `t_frame` would never advance, freezing every
+        // keyframe lane / fade at `playback_start_timeline_seconds`.
+        // Fail closed rather than silently produce time-invariant audio.
+        tracing::error!("mixer: sample_rate=0; fold thread exiting");
+        return;
+    }
     // Live source set, keyed by clip uuid so Remove and Add lookups
-    // stay O(1). Initial set is seeded by the engine for the clips
-    // active at the playback start time so cpal has audio immediately.
+    // stay O(1). The scheduler thread does the slow sidecar spawn and
+    // hands READY SourceStreams to us via SourceCommand::Add — fold
+    // never blocks on IPC.
     let mut sources: HashMap<Uuid, SourceStream> = HashMap::with_capacity(initial_sources.len());
     for s in initial_sources {
         sources.insert(s.clip_id, s);
     }
-    // Reused per-iteration working slice.
     let mut frame_samples: Vec<(Uuid, [f32; 2])> = Vec::with_capacity(sources.len());
-    let inv_sample_rate = if sample_rate == 0 {
-        0.0
-    } else {
-        1.0 / sample_rate as f64
-    };
+    let inv_sample_rate = 1.0 / sample_rate as f64;
     loop {
         if stop.load(Ordering::Acquire) {
             break;
         }
 
         // Phase 7.4 M4: drain pending scheduler commands BEFORE folding
-        // this batch. New Adds need their pullers running before fold
-        // tries to pop; Removes need to land before the next frame so a
-        // clip the user just deleted stops mixing immediately.
+        // this batch. Adds come pre-spawned (no IPC on the fold thread);
+        // Removes detach the puller — see SourceStream::shutdown.
         loop {
+            // Honour the global stop even mid-drain so a panic/fast
+            // shutdown path doesn't grow `sources` after stop=true.
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
             match command_rx.try_recv() {
-                Ok(SourceCommand::Add(src)) => {
-                    if let Some(mut existing) = sources.remove(&src.clip_id) {
+                Ok(SourceCommand::Add(stream)) => {
+                    let clip_id = stream.clip_id;
+                    if let Some(mut existing) = sources.remove(&clip_id) {
                         // Defensive: scheduler asked for a re-spawn.
                         existing.shutdown();
                     }
-                    match spawn_source(&sidecar_binary, &src, per_source_capacity, &stats) {
-                        Ok(stream) => {
-                            sources.insert(src.clip_id, stream);
-                        }
-                        Err(e) => {
-                            tracing::error!(?e, clip_id = %src.clip_id, "mixer: Add spawn failed");
-                        }
-                    }
+                    sources.insert(clip_id, stream);
                 }
                 Ok(SourceCommand::Remove(clip_id)) => {
                     if let Some(mut s) = sources.remove(&clip_id) {
@@ -948,21 +986,19 @@ fn fold_loop(
         for i in 0..frames_this_batch {
             let t_frame = t_batch_start + (i as f64) * inv_sample_rate;
             frame_samples.clear();
-            // Phase 7.4 M4: per-source timeline gate. A clip preloaded
-            // ahead of its `timeline_in` keeps filling its ring but
-            // contributes nothing to the mix until the playhead crosses
-            // its start — at which point the ring already has samples
-            // queued and audible playback begins on the first frame
-            // past the boundary (this is the structural piece of the
-            // seek-onto-edge bounded-silence SLO).
             for src in sources.values_mut() {
-                let timeline_in = snap
+                // Phase 7.4 M4: symmetric per-source timeline gate via
+                // pure helper [`source_audible_at`]. Skipping pop on
+                // either side keeps preloaded samples queued until
+                // `t_frame` enters the clip's live region AND prevents
+                // post-out source audio from leaking during the
+                // scheduler's removal grace window.
+                let (timeline_in, clip_dur) = snap
                     .clips
                     .get(&src.clip_id)
-                    .map(|c| c.timeline_in_seconds)
-                    .unwrap_or(f64::NEG_INFINITY);
-                if t_frame < timeline_in {
-                    // Not yet audible; leave the ring alone.
+                    .map(|c| (c.timeline_in_seconds, c.clip_duration_seconds))
+                    .unwrap_or((f64::NEG_INFINITY, f64::INFINITY));
+                if !source_audible_at(timeline_in, clip_dur, t_frame) {
                     continue;
                 }
                 let mut buf = [0.0f32; 2];
@@ -979,7 +1015,9 @@ fn fold_loop(
             thread::sleep(Duration::from_millis(2));
         }
     }
-    // Drop every live source — sets per-source stop flags and joins the pullers.
+    // Detach every live source — sets per-source stop flags. Pullers
+    // self-clean within one chunk period when their next IPC read
+    // returns.
     for (_, mut s) in sources.drain() {
         s.shutdown();
     }
@@ -1485,5 +1523,44 @@ mod tests {
         };
         let snap = snapshot_with(&[(t, track)], &[(c, clip)]);
         assert_eq!(snap.effective_gain_at(&c, 0.5), 0.0);
+    }
+
+    // ============================================
+    // Phase 7.4 M4 fold-gate boundary tests
+    // ============================================
+
+    #[test]
+    fn source_audible_at_inside_clip_returns_true() {
+        // Clip [0..5]: audible at 0.0, 2.5, 4.999.
+        assert!(source_audible_at(0.0, 5.0, 0.0));
+        assert!(source_audible_at(0.0, 5.0, 2.5));
+        assert!(source_audible_at(0.0, 5.0, 4.999));
+    }
+
+    #[test]
+    fn source_audible_at_before_start_returns_false() {
+        // Before timeline_in: not yet audible (preloaded samples sit
+        // in the ring waiting for the playhead to arrive).
+        assert!(!source_audible_at(5.0, 5.0, 4.999));
+        assert!(!source_audible_at(5.0, 5.0, 0.0));
+        assert!(!source_audible_at(5.0, 5.0, -1.0));
+    }
+
+    #[test]
+    fn source_audible_at_at_or_past_end_returns_false() {
+        // PRIMARY M4 fix: the symmetric past-end gate. Without this,
+        // clips with no fade-out would mix at full level for up to
+        // grace_seconds (50ms) past their timeline-out, leaking audio
+        // the editor explicitly trimmed.
+        assert!(!source_audible_at(0.0, 5.0, 5.0)); // exact end
+        assert!(!source_audible_at(0.0, 5.0, 5.001));
+        assert!(!source_audible_at(0.0, 5.0, 100.0));
+    }
+
+    #[test]
+    fn source_audible_at_zero_duration_clip_never_audible() {
+        // Defensive: zero-duration clip is never audible at any t.
+        assert!(!source_audible_at(5.0, 0.0, 5.0));
+        assert!(!source_audible_at(5.0, 0.0, 4.0));
     }
 }

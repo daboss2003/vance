@@ -4577,11 +4577,18 @@ impl Engine {
 
     /// Build a fresh [`vance_audio::MixerSnapshot`] from the given
     /// sequence and publish it to the active mixer's snapshot bus.
-    /// No-op when mixer playback isn't active.
+    /// Also republishes the scheduling-interval list so the M4
+    /// scheduler picks up topology changes (clip inserts/removes/trims)
+    /// on its next tick. No-op when mixer playback isn't active.
     fn republish_mixer_snapshot_if_active(&self, sequence: &vance_timeline::Sequence) {
         if let Some(snapshot) = self.audio_mixer_snapshot.as_ref() {
             let snap = build_mixer_snapshot(sequence);
             snapshot.store(Arc::new(snap));
+        }
+        if let Some(AudioBackend::Mixer(owner)) = self.audio_owner.as_ref() {
+            if let Some(project) = self.current_project.as_ref() {
+                owner.publish_sched_clips(build_sched_clips(sequence, project));
+            }
         }
     }
 
@@ -5013,17 +5020,349 @@ fn start_audio(media_path: &str, from_seconds: f64) -> Result<(AudioOwner, Audio
 /// Owner thread for the multi-source [`vance_audio::AudioMixer`].
 /// Mirrors [`AudioOwner`]: the cpal stream is `!Send`, so the mixer
 /// has to live on its own thread.
+///
+/// Phase 7.4 M4 also owns the scheduler thread + the snapshot bus the
+/// scheduler watches for sequence changes. Drop / shutdown joins both.
 pub struct AudioMixerOwner {
     stop: Arc<AtomicBool>,
-    handle: std::thread::JoinHandle<()>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    /// Phase 7.4 M4: bus of the current scheduling intervals. The
+    /// engine publishes a new `Vec<SchedClip>` whenever the sequence
+    /// topology / audio clips change; the scheduler reads it each tick.
+    sched_clips: Arc<arc_swap::ArcSwap<Vec<SchedClip>>>,
+    /// Joinable handle for the scheduler thread. Set to `None` after
+    /// `shutdown()` / `Drop`.
+    scheduler_handle: Option<std::thread::JoinHandle<()>>,
+    /// Scheduler stop flag (separate from the mixer-owner stop so the
+    /// scheduler stops emitting commands BEFORE the fold thread tears
+    /// down its receiver — avoids spurious spawn-then-immediate-Remove).
+    scheduler_stop: Arc<AtomicBool>,
+    /// Live counters published by [`vance_audio::AudioMixer`] +
+    /// scheduler. Exposed through [`Self::stats`] for the UI / logs.
+    stats: Arc<vance_audio::MixerStats>,
 }
 
 impl AudioMixerOwner {
-    /// Signal the owner thread to drop the mixer (cpal stream stops,
-    /// puller + fold threads join) and join the owner.
-    pub fn shutdown(self) {
+    fn stop_inner(&mut self) {
+        // Stop scheduler FIRST so it doesn't try to send commands into
+        // a torn-down mixer. The fold thread is fine with a
+        // disconnected receiver.
+        self.scheduler_stop.store(true, Ordering::Release);
+        if let Some(h) = self.scheduler_handle.take() {
+            let _ = h.join();
+        }
         self.stop.store(true, Ordering::Release);
-        let _ = self.handle.join();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+
+    /// Signal the owner thread to drop the mixer (cpal stream stops,
+    /// fold thread exits, pullers detach) and join the owner. Also
+    /// stops the scheduler thread.
+    ///
+    /// Idempotent with `Drop`: calling `shutdown` then dropping (or
+    /// vice versa) is safe. The single source of truth is the two
+    /// `Option<JoinHandle>` fields — once taken, the second call is a
+    /// no-op.
+    pub fn shutdown(mut self) {
+        self.stop_inner();
+    }
+
+    /// Republish the current sequence's audio-clip scheduling intervals
+    /// for the scheduler. Called by [`Engine`] whenever an EditOp that
+    /// touches mixer topology lands.
+    pub fn publish_sched_clips(&self, clips: Vec<SchedClip>) {
+        self.sched_clips.store(Arc::new(clips));
+    }
+
+    /// Snapshot of the live mixer counters.
+    pub fn stats(&self) -> Arc<vance_audio::MixerStats> {
+        self.stats.clone()
+    }
+}
+
+impl Drop for AudioMixerOwner {
+    /// Drop is the safety net for non-`shutdown` paths: panics,
+    /// `Engine` field reassignment (`self.audio_owner = None`), or any
+    /// early return that doesn't go through `shutdown()`. Without this
+    /// the scheduler + owner threads would leak, the cpal device would
+    /// stay open, and N sidecar child processes per leak would survive
+    /// the parent Drop. Idempotent with `shutdown()` via the
+    /// `Option<JoinHandle>` taken-once pattern.
+    fn drop(&mut self) {
+        self.stop_inner();
+    }
+}
+
+/// One audio clip's scheduling interval — the minimum the scheduler
+/// needs to decide whether to spawn / despawn it as the playhead
+/// advances.
+///
+/// Reuses [`uuid::Uuid`] to match the vance-audio identifier shape; the
+/// engine maps `TrackId` / `ClipId` → `Uuid` at publish time.
+#[derive(Clone, Debug)]
+pub struct SchedClip {
+    /// Clip uuid. Matches the key in `MixerSnapshot.clips`.
+    pub clip_id: uuid::Uuid,
+    /// Absolute media path the sidecar should open.
+    pub path: PathBuf,
+    /// Source-domain start, in seconds (clip's `source_in`).
+    pub source_in_seconds: f64,
+    /// Timeline-domain start, in seconds (clip's `timeline_in`).
+    pub timeline_in_seconds: f64,
+    /// Clip's **timeline-domain** length in seconds. In v1 this equals
+    /// `source_out - source_in` (no speed / time-remap yet), but the
+    /// scheduler ALWAYS interprets this field as timeline-domain — the
+    /// day vance-timeline adds time-remap, this value will need to be
+    /// computed from `timeline_out - timeline_in` rather than from
+    /// `Clip::duration()`, so that the
+    /// `live_end = timeline_in + duration_seconds` math stays correct.
+    pub duration_seconds: f64,
+}
+
+/// Phase 7.4 M4 scheduler tuning. Defaults chosen by the design spike;
+/// the constants live here so 7.5 can flip them without re-publishing
+/// the mixer ABI.
+pub mod sched {
+    /// Seconds before a clip's `timeline_in` at which the scheduler
+    /// pre-opens its sidecar so the per-source ring is primed when the
+    /// playhead crosses the boundary. The fold thread leaves the ring
+    /// alone until `t_frame >= timeline_in` — preload is the structural
+    /// piece of the seek-onto-edge bounded-silence SLO.
+    pub const PRELOAD_SECONDS: f64 = 2.0;
+    /// Cap on simultaneously-live sources per mixer. Past this the
+    /// scheduler refuses additional spawns and bumps
+    /// `scheduler_cap_hits_total`; live-audio-track count + clip density
+    /// determines how often this fires. Chosen to be high enough to
+    /// cover typical sequences (~8 tracks × 2 overlapping clips) while
+    /// not letting a pathological project DoS the audio sidecars.
+    pub const MAX_CONCURRENT_SOURCES: usize = 16;
+    /// Scheduler tick period. 50 ms is well above one device buffer
+    /// (typically ~5 ms at 48 kHz / 256 frames) so we add/remove well
+    /// ahead of the buffer boundary, but tight enough that
+    /// PRELOAD_SECONDS (2.0 s) gives the sidecar generous headroom.
+    pub const TICK_MS: u64 = 50;
+}
+
+/// Build the scheduling-interval list for the audio clips in `sequence`.
+/// Mirrors the data the mixer's [`vance_audio::MixerSnapshot`] holds,
+/// but in flat-vector form for cheap iteration on the scheduler thread.
+fn build_sched_clips(
+    sequence: &vance_timeline::Sequence,
+    project: &vance_timeline::Project,
+) -> Vec<SchedClip> {
+    let mut out = Vec::new();
+    for track in &sequence.tracks {
+        if track.kind != TrackKind::Audio || !track.enabled {
+            continue;
+        }
+        for clip in &track.clips {
+            let Some(media) = project.media.get(&clip.media) else {
+                continue;
+            };
+            if !media.has_audio_track {
+                continue;
+            }
+            out.push(SchedClip {
+                clip_id: clip.id.as_uuid(),
+                path: media.path.clone(),
+                source_in_seconds: rt_to_seconds(clip.source_in),
+                timeline_in_seconds: rt_to_seconds(clip.timeline_in),
+                duration_seconds: rt_to_seconds(clip.duration()),
+            });
+        }
+    }
+    out
+}
+
+/// Output of one [`compute_sched_plan`] tick.
+///
+/// Pure decision data — no channel I/O. The IO-bound scheduler loop
+/// turns this into [`vance_audio::SourceCommand`]s. Splitting it out
+/// keeps the planning math unit-testable without a thread or a clock.
+#[derive(Debug)]
+pub struct SchedPlan {
+    /// New clips to spawn this tick.
+    pub to_add: Vec<(uuid::Uuid, PathBuf, f64)>, // (clip_id, path, from_seconds)
+    /// Live clips to despawn this tick.
+    pub to_remove: Vec<uuid::Uuid>,
+    /// Number of clips dropped by the MAX_CONCURRENT_SOURCES cap.
+    /// Bumps [`vance_audio::MixerStats::scheduler_cap_hits_total`] by
+    /// this amount when the IO loop applies the plan.
+    pub cap_drops: u64,
+}
+
+/// Pure scheduler planner. Given the published interval list, the
+/// currently-live set, and the playhead at timeline-time `t`, compute
+/// the Add/Remove diff to be sent to the fold thread.
+///
+/// Phase 7.4 M4 semantics:
+/// - **Window**: a clip is "wanted" when its live region overlaps
+///   `[t - grace, t + PRELOAD]`. `grace_seconds` is one scheduler tick
+///   worth of headroom so a clip that JUST ended isn't yanked
+///   mid-buffer. The fold thread additionally enforces a SYMMETRIC
+///   past-end gate (skips popping when `t_frame >= timeline_in +
+///   duration`), so the grace window only delays cleanup — it does
+///   NOT leak post-out source audio.
+/// - **Cap**: when more clips than `MAX_CONCURRENT_SOURCES` qualify,
+///   prefer the most-imminent (smallest `timeline_in`). The furthest-
+///   future are dropped; `cap_drops` records the count. Note: the
+///   same drops re-count every tick the cap is still exceeded — read
+///   `scheduler_cap_hits_total` as a RATE indicator, not a one-shot
+///   counter.
+/// - **Add source offset**: `from_seconds = source_in + max(0, t -
+///   timeline_in)`. Clips spawning ahead of the playhead start
+///   decoding from their own `source_in`; clips already overlapping
+///   the playhead at spawn time seek into the source so playback
+///   begins from the current playhead immediately.
+pub fn compute_sched_plan(
+    intervals: &[SchedClip],
+    live: &std::collections::HashSet<uuid::Uuid>,
+    t: f64,
+    grace_seconds: f64,
+    preload_seconds: f64,
+    max_concurrent: usize,
+) -> SchedPlan {
+    use std::collections::HashSet;
+
+    let mut candidates: Vec<&SchedClip> = intervals
+        .iter()
+        .filter(|c| {
+            let live_end = c.timeline_in_seconds + c.duration_seconds;
+            live_end > t - grace_seconds && c.timeline_in_seconds <= t + preload_seconds
+        })
+        .collect();
+    candidates.sort_by(|a, b| {
+        a.timeline_in_seconds
+            .partial_cmp(&b.timeline_in_seconds)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let cap_drops = candidates.len().saturating_sub(max_concurrent) as u64;
+    if candidates.len() > max_concurrent {
+        candidates.truncate(max_concurrent);
+    }
+
+    let wanted: HashSet<uuid::Uuid> = candidates.iter().map(|c| c.clip_id).collect();
+
+    let to_remove: Vec<uuid::Uuid> =
+        live.iter().filter(|id| !wanted.contains(id)).copied().collect();
+
+    let to_add: Vec<(uuid::Uuid, PathBuf, f64)> = candidates
+        .iter()
+        .filter(|c| !live.contains(&c.clip_id))
+        .map(|c| {
+            let from_seconds = c.source_in_seconds + (t - c.timeline_in_seconds).max(0.0);
+            (c.clip_id, c.path.clone(), from_seconds)
+        })
+        .collect();
+
+    SchedPlan {
+        to_add,
+        to_remove,
+        cap_drops,
+    }
+}
+
+/// Scheduler thread main loop. Polls the master frame counter to derive
+/// the current timeline-time, sweeps the published `SchedClip` list, and
+/// emits `SourceCommand::Add` / `Remove` to grow / shrink the mixer's
+/// live source set.
+///
+/// Phase 7.4 M4: the scheduler is the **spawn-owner** for all runtime
+/// Adds — it calls [`vance_audio::spawn_source`] (synchronous sidecar
+/// IPC) directly so the heavy lift never lands on the fold thread that
+/// feeds cpal. The fold thread just receives a ready [`vance_audio::SourceStream`]
+/// per `Add` command and inserts it into its HashMap.
+///
+/// The `live` set is seeded with the initial source ids passed in by
+/// `start_audio_mix` so the first tick does NOT re-spawn the clips that
+/// were already pre-spawned synchronously before playback began.
+///
+/// On `sample_rate == 0` (cpal misconfiguration; should be unreachable)
+/// the loop exits early instead of producing time-invariant scheduling
+/// decisions.
+#[allow(clippy::too_many_arguments)]
+fn scheduler_loop(
+    sched_clips: Arc<arc_swap::ArcSwap<Vec<SchedClip>>>,
+    command_tx: std::sync::mpsc::Sender<vance_audio::SourceCommand>,
+    master_frame: Arc<std::sync::atomic::AtomicI64>,
+    sample_rate: u32,
+    playback_start_timeline_seconds: f64,
+    stats: Arc<vance_audio::MixerStats>,
+    stop: Arc<AtomicBool>,
+    sidecar_binary: PathBuf,
+    per_source_capacity: usize,
+    initial_live_ids: std::collections::HashSet<uuid::Uuid>,
+) {
+    if sample_rate == 0 {
+        tracing::error!("scheduler: sample_rate=0; scheduler loop exiting");
+        return;
+    }
+    let inv_sample_rate = 1.0 / sample_rate as f64;
+    let grace_seconds = sched::TICK_MS as f64 / 1000.0;
+    let mut live: std::collections::HashSet<uuid::Uuid> = initial_live_ids;
+    while !stop.load(Ordering::Acquire) {
+        let frame = master_frame.load(Ordering::Acquire);
+        let t = playback_start_timeline_seconds + frame as f64 * inv_sample_rate;
+        let intervals = sched_clips.load_full();
+        let plan = compute_sched_plan(
+            &intervals,
+            &live,
+            t,
+            grace_seconds,
+            sched::PRELOAD_SECONDS,
+            sched::MAX_CONCURRENT_SOURCES,
+        );
+        if plan.cap_drops > 0 {
+            // NOTE: this re-counts the same dropped clips every tick
+            // the cap remains exceeded — read the counter as a rate.
+            stats
+                .scheduler_cap_hits_total
+                .fetch_add(plan.cap_drops, Ordering::Release);
+        }
+        for id in plan.to_remove {
+            live.remove(&id);
+            if command_tx
+                .send(vance_audio::SourceCommand::Remove(id))
+                .is_err()
+            {
+                return;
+            }
+        }
+        for (clip_id, path, from_seconds) in plan.to_add {
+            // Synchronous spawn on THIS thread — sidecar IPC, file open,
+            // start_stream. Takes 50–200ms on a cold cache. The fold
+            // thread keeps producing samples for already-live sources
+            // while we block here.
+            let source = vance_audio::AudioSource {
+                clip_id,
+                path,
+                from_seconds,
+            };
+            match vance_audio::spawn_source(
+                &sidecar_binary,
+                &source,
+                per_source_capacity,
+                &stats,
+            ) {
+                Ok(stream) => {
+                    if command_tx
+                        .send(vance_audio::SourceCommand::Add(stream))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    live.insert(clip_id);
+                }
+                Err(e) => {
+                    tracing::error!(?e, clip_id = %clip_id, "scheduler: spawn failed");
+                    // Don't insert into `live` — next tick will retry.
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(sched::TICK_MS));
     }
 }
 
@@ -5134,16 +5473,31 @@ fn build_mixer_snapshot(sequence: &vance_timeline::Sequence) -> vance_audio::Mix
 }
 
 /// Walk the sequence and gather one [`vance_audio::AudioSource`] per
-/// audio clip that overlaps `from_seconds`. Clips that start later
-/// in the timeline are NOT included in this v1 — the spike's
-/// sliding-window scheduler is deferred (genuinely separable; see
-/// Phase 7.3 deferrals).
+/// audio clip whose live window intersects `[from_seconds,
+/// from_seconds + sched::PRELOAD_SECONDS]`. This includes:
+///
+/// 1. Clips already audible at the start time (`timeline_in <=
+///    from_seconds < timeline_in + duration`) — they're spawned with
+///    a source offset that seeks INTO the clip so playback resumes
+///    from the playhead.
+/// 2. Clips that will become audible within the preload window
+///    (`from_seconds < timeline_in <= from_seconds +
+///    PRELOAD_SECONDS`) — they're spawned with `from_seconds =
+///    source_in`, and the mixer's per-source timeline gate keeps them
+///    silent until `t_frame >= clip.timeline_in`.
+///
+/// Phase 7.4 M4: this is the structural piece of the seek-onto-edge
+/// bounded-silence SLO. Cold seek lands these synchronous spawns
+/// BEFORE the master frame counter starts ticking, so a user seek
+/// landing on or near a clip boundary produces audible audio in ≤1
+/// device buffer — the only latency is cpal's own pre-roll.
 fn collect_audio_sources_at(
     sequence: &vance_timeline::Sequence,
     project: &vance_timeline::Project,
     from_seconds: f64,
 ) -> Vec<vance_audio::AudioSource> {
     let mut sources = Vec::new();
+    let preload_end = from_seconds + sched::PRELOAD_SECONDS;
     for track in &sequence.tracks {
         if track.kind != TrackKind::Audio || !track.enabled {
             continue;
@@ -5152,20 +5506,27 @@ fn collect_audio_sources_at(
             let t_in = rt_to_seconds(clip.timeline_in);
             let dur = rt_to_seconds(clip.duration());
             let t_out = t_in + dur;
-            // M3 v1: only clips active at the playback start time.
-            if from_seconds < t_in || from_seconds >= t_out {
+            // Skip clips entirely behind the playhead.
+            if t_out <= from_seconds {
+                continue;
+            }
+            // Skip clips beyond the preload window.
+            if t_in > preload_end {
                 continue;
             }
             let media = match project.media.get(&clip.media) {
                 Some(m) => m,
                 None => continue,
             };
-            // Video media without an audio track contribute nothing.
             if !media.has_audio_track {
                 continue;
             }
             let source_in_sec = rt_to_seconds(clip.source_in);
-            let offset = from_seconds - t_in;
+            // For clips already overlapping the playhead, seek into the
+            // source so first sample = current playhead. For future-
+            // preload clips, start at source_in and let the timeline
+            // gate hold them silent until the playhead arrives.
+            let offset = (from_seconds - t_in).max(0.0);
             sources.push(vance_audio::AudioSource {
                 clip_id: clip.id.as_uuid(),
                 path: media.path.clone(),
@@ -5193,11 +5554,59 @@ fn start_audio_mix(
     String,
 > {
     let bin = locate_audio_binary().map_err(|e| format!("{e:?}"))?;
-    let sources = collect_audio_sources_at(sequence, project, from_seconds);
+    let initial_audio_sources = collect_audio_sources_at(sequence, project, from_seconds);
     let initial_snapshot = build_mixer_snapshot(sequence);
+    let initial_sched_clips = build_sched_clips(sequence, project);
+    let sched_clips =
+        Arc::new(arc_swap::ArcSwap::from_pointee(initial_sched_clips));
 
-    let (tx, rx) = std::sync::mpsc::sync_channel::<
-        Result<(AudioSync, Arc<arc_swap::ArcSwap<vance_audio::MixerSnapshot>>), String>,
+    // Scheduler ↔ fold thread channel. Unbounded (mpsc::channel) because
+    // scheduler ticks emit at most ~MAX_CONCURRENT_SOURCES commands per
+    // tick; the fold thread drains in a tight try_recv loop.
+    let (command_tx, command_rx) =
+        std::sync::mpsc::channel::<vance_audio::SourceCommand>();
+    let stats = Arc::new(vance_audio::MixerStats::default());
+
+    // Probe the cpal device's sample rate up-front so we can size the
+    // per-source rings to match what `AudioMixer::start` will see.
+    let probed_sample_rate = vance_audio::probe_default_sample_rate()
+        .map_err(|e| format!("audio probe: {e}"))?;
+    let per_source_capacity = vance_audio::per_source_ring_capacity(probed_sample_rate);
+
+    // Phase 7.4 M4: pre-spawn the initial source set on THIS thread (the
+    // calling thread, not the cpal-serving fold thread). This is the
+    // structural piece of the seek-onto-edge SLO: when the user seeks,
+    // every clip whose audio matters in the next PRELOAD seconds is
+    // already spawned (and its puller is already pulling) before cpal
+    // ever asks for samples. `initial_live_ids` becomes the scheduler's
+    // seeded `live` set, preventing the first tick from issuing a
+    // redundant re-spawn for the same clips.
+    let mut initial_streams: Vec<vance_audio::SourceStream> =
+        Vec::with_capacity(initial_audio_sources.len());
+    let mut initial_live_ids: std::collections::HashSet<uuid::Uuid> =
+        std::collections::HashSet::with_capacity(initial_audio_sources.len());
+    for src in &initial_audio_sources {
+        match vance_audio::spawn_source(&bin, src, per_source_capacity, &stats) {
+            Ok(s) => {
+                initial_live_ids.insert(src.clip_id);
+                initial_streams.push(s);
+            }
+            Err(e) => {
+                tracing::error!(?e, clip_id = %src.clip_id, "initial source spawn failed");
+            }
+        }
+    }
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<
+        Result<
+            (
+                AudioSync,
+                Arc<arc_swap::ArcSwap<vance_audio::MixerSnapshot>>,
+                Arc<std::sync::atomic::AtomicI64>,
+                u32,
+            ),
+            String,
+        >,
     >(1);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = stop.clone();
@@ -5206,14 +5615,14 @@ fn start_audio_mix(
         .name("vance-engine.audio-mixer-owner".into())
         .spawn(move || {
             let mixer = match vance_audio::AudioMixer::start(
-                &bin,
-                sources,
+                initial_streams,
+                command_rx,
                 initial_snapshot,
                 from_seconds,
             ) {
                 Ok(m) => m,
                 Err(e) => {
-                    let _ = tx.send(Err(format!("{e}")));
+                    let _ = ready_tx.send(Err(format!("{e}")));
                     return;
                 }
             };
@@ -5226,21 +5635,61 @@ fn start_audio_mix(
                 time_base: (1, mixer.device_sample_rate() as i64),
             };
             let snapshot_handle = mixer.snapshot_handle();
-            if tx.send(Ok((sync, snapshot_handle))).is_err() {
+            let master_frame = mixer.master_frame_handle();
+            let sample_rate = mixer.device_sample_rate();
+            if ready_tx
+                .send(Ok((sync, snapshot_handle, master_frame, sample_rate)))
+                .is_err()
+            {
                 return;
             }
             while !stop_clone.load(Ordering::Acquire) {
                 std::thread::sleep(Duration::from_millis(50));
             }
-            drop(mixer); // cpal stops, puller + fold threads join
+            drop(mixer); // cpal stops, fold + puller threads join
         })
         .map_err(|e| format!("spawn audio mixer owner: {e}"))?;
 
-    let (sync, snapshot_handle) = rx
+    let (sync, snapshot_handle, master_frame, sample_rate) = ready_rx
         .recv_timeout(Duration::from_secs(10))
         .map_err(|_| "audio mixer owner thread did not report ready in 10s".to_string())??;
+
+    // Spawn the scheduler thread once the mixer is ready. The scheduler
+    // owns the Sender; the fold thread holds the Receiver. The scheduler
+    // does the slow `spawn_source` for every runtime Add — the fold
+    // thread only receives ready-to-mix [`SourceStream`]s.
+    let scheduler_stop = Arc::new(AtomicBool::new(false));
+    let sched_clips_for_thread = sched_clips.clone();
+    let sched_stop_for_thread = scheduler_stop.clone();
+    let sched_stats = stats.clone();
+    let sched_bin = bin.clone();
+    let scheduler_handle = std::thread::Builder::new()
+        .name("vance-engine.audio-scheduler".into())
+        .spawn(move || {
+            scheduler_loop(
+                sched_clips_for_thread,
+                command_tx,
+                master_frame,
+                sample_rate,
+                from_seconds,
+                sched_stats,
+                sched_stop_for_thread,
+                sched_bin,
+                per_source_capacity,
+                initial_live_ids,
+            );
+        })
+        .map_err(|e| format!("spawn audio scheduler: {e}"))?;
+
     Ok((
-        AudioMixerOwner { stop, handle },
+        AudioMixerOwner {
+            stop,
+            handle: Some(handle),
+            sched_clips,
+            scheduler_handle: Some(scheduler_handle),
+            scheduler_stop,
+            stats,
+        },
         sync,
         snapshot_handle,
     ))
@@ -6141,5 +6590,266 @@ mod tests {
             effect_id: vance_timeline::EffectId::new(),
             enabled: true,
         }));
+    }
+
+    // ========================================================
+    // Phase 7.4 M4 scheduler unit tests
+    // ========================================================
+
+    fn sched(timeline_in: f64, duration: f64) -> SchedClip {
+        SchedClip {
+            clip_id: uuid::Uuid::new_v4(),
+            path: PathBuf::from("/tmp/x.wav"),
+            source_in_seconds: 0.0,
+            timeline_in_seconds: timeline_in,
+            duration_seconds: duration,
+        }
+    }
+
+    #[test]
+    fn compute_sched_plan_empty_intervals_produces_empty_plan() {
+        let live = std::collections::HashSet::new();
+        let plan = compute_sched_plan(&[], &live, 0.0, 0.05, 2.0, 16);
+        assert!(plan.to_add.is_empty());
+        assert!(plan.to_remove.is_empty());
+        assert_eq!(plan.cap_drops, 0);
+    }
+
+    #[test]
+    fn compute_sched_plan_adds_clip_inside_preload_window() {
+        // Clip starts at t=1.5, playhead at t=0.0, PRELOAD=2.0.
+        // 1.5 <= 0.0 + 2.0 → in window.
+        let c = sched(1.5, 5.0);
+        let live = std::collections::HashSet::new();
+        let plan = compute_sched_plan(&[c.clone()], &live, 0.0, 0.05, 2.0, 16);
+        assert_eq!(plan.to_add.len(), 1);
+        assert_eq!(plan.to_add[0].0, c.clip_id);
+        assert!(plan.to_remove.is_empty());
+        // Spawning ahead of playhead: from_seconds = source_in + 0 = 0.0.
+        assert!((plan.to_add[0].2 - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compute_sched_plan_skips_clip_outside_preload() {
+        // Clip starts at t=5.0, playhead at t=0.0, PRELOAD=2.0 — too far.
+        let c = sched(5.0, 5.0);
+        let plan = compute_sched_plan(
+            &[c],
+            &std::collections::HashSet::new(),
+            0.0,
+            0.05,
+            2.0,
+            16,
+        );
+        assert!(plan.to_add.is_empty());
+    }
+
+    #[test]
+    fn compute_sched_plan_add_source_offset_seeks_into_clip_when_overlapping() {
+        // Clip [10..20] with source_in=3.0, playhead at t=12.
+        // from_seconds = 3.0 + (12 - 10) = 5.0.
+        let mut c = sched(10.0, 10.0);
+        c.source_in_seconds = 3.0;
+        let plan = compute_sched_plan(
+            &[c.clone()],
+            &std::collections::HashSet::new(),
+            12.0,
+            0.05,
+            2.0,
+            16,
+        );
+        assert_eq!(plan.to_add.len(), 1);
+        assert!((plan.to_add[0].2 - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compute_sched_plan_removes_live_clip_no_longer_wanted() {
+        let c1 = sched(0.0, 1.0); // ends at t=1.0, gone by t=5.0
+        let mut live = std::collections::HashSet::new();
+        live.insert(c1.clip_id);
+        // intervals empty → wanted set is empty → c1 is in to_remove.
+        let plan = compute_sched_plan(&[], &live, 5.0, 0.05, 2.0, 16);
+        assert_eq!(plan.to_remove, vec![c1.clip_id]);
+    }
+
+    #[test]
+    fn compute_sched_plan_grace_window_keeps_just_ended_clip() {
+        // Clip [0..1], playhead at t=1.02, grace=0.05 → still kept.
+        // (Fold thread silences it via effective_gain_at; scheduler
+        // does not yank mid-buffer.)
+        let c = sched(0.0, 1.0);
+        let mut live = std::collections::HashSet::new();
+        live.insert(c.clip_id);
+        let plan = compute_sched_plan(&[c.clone()], &live, 1.02, 0.05, 2.0, 16);
+        // Within grace: c is still wanted, so it stays — to_remove empty.
+        assert!(plan.to_remove.is_empty());
+        // And not in to_add (already live).
+        assert!(plan.to_add.is_empty());
+    }
+
+    #[test]
+    fn compute_sched_plan_grace_window_removes_after_grace_elapses() {
+        let c = sched(0.0, 1.0);
+        let mut live = std::collections::HashSet::new();
+        live.insert(c.clip_id);
+        // playhead past grace: t=1.06, grace=0.05 → removed.
+        let plan = compute_sched_plan(&[c.clone()], &live, 1.06, 0.05, 2.0, 16);
+        assert_eq!(plan.to_remove, vec![c.clip_id]);
+    }
+
+    #[test]
+    fn compute_sched_plan_max_concurrent_cap_drops_furthest_future() {
+        // 4 candidates, cap=2 → 2 kept (most imminent), 2 dropped.
+        let c0 = sched(0.0, 5.0);
+        let c1 = sched(0.5, 5.0);
+        let c2 = sched(1.0, 5.0);
+        let c3 = sched(1.5, 5.0);
+        let plan = compute_sched_plan(
+            &[c0.clone(), c1.clone(), c2.clone(), c3.clone()],
+            &std::collections::HashSet::new(),
+            0.0,
+            0.05,
+            2.0,
+            2,
+        );
+        assert_eq!(plan.cap_drops, 2);
+        assert_eq!(plan.to_add.len(), 2);
+        let kept: std::collections::HashSet<_> =
+            plan.to_add.iter().map(|x| x.0).collect();
+        assert!(kept.contains(&c0.clip_id));
+        assert!(kept.contains(&c1.clip_id));
+        assert!(!kept.contains(&c2.clip_id));
+        assert!(!kept.contains(&c3.clip_id));
+    }
+
+    #[test]
+    fn compute_sched_plan_no_cap_drops_under_cap() {
+        let c0 = sched(0.0, 5.0);
+        let plan = compute_sched_plan(
+            &[c0.clone()],
+            &std::collections::HashSet::new(),
+            0.0,
+            0.05,
+            2.0,
+            16,
+        );
+        assert_eq!(plan.cap_drops, 0);
+    }
+
+    #[test]
+    fn compute_sched_plan_keeps_live_when_still_wanted() {
+        let c = sched(0.0, 5.0);
+        let mut live = std::collections::HashSet::new();
+        live.insert(c.clip_id);
+        let plan = compute_sched_plan(&[c.clone()], &live, 2.0, 0.05, 2.0, 16);
+        assert!(plan.to_add.is_empty());
+        assert!(plan.to_remove.is_empty());
+    }
+
+    #[test]
+    fn compute_sched_plan_seek_onto_edge_emits_add_with_zero_offset() {
+        // Seek-onto-edge: playhead at t = clip.timeline_in exactly. The
+        // structural piece of the SLO is that scheduler emits Add this
+        // tick (so the fold thread starts mixing on the next batch).
+        let c = sched(10.0, 5.0);
+        let plan = compute_sched_plan(
+            &[c.clone()],
+            &std::collections::HashSet::new(),
+            10.0,
+            0.05,
+            2.0,
+            16,
+        );
+        assert_eq!(plan.to_add.len(), 1);
+        assert_eq!(plan.to_add[0].0, c.clip_id);
+        // Source offset = source_in + (10 - 10) = 0.0.
+        assert!((plan.to_add[0].2 - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn build_sched_clips_skips_video_tracks_and_disabled_tracks() {
+        let mut project = vance_timeline::Project::new("P");
+        let mi = audio_media("/tmp/a.wav");
+        let mid = mi.id;
+        project.media.insert(mid, mi);
+        let mut seq = vance_timeline::Sequence::new("S", vance_core::FrameRate::FPS_24);
+
+        // Audio track, enabled — included.
+        let mut at = vance_timeline::Track::new(TrackKind::Audio, "A1");
+        at.clips.push(Arc::new(
+            vance_timeline::Clip::new(mid, "c1", t(0), t(0), t(3)).unwrap(),
+        ));
+        seq.tracks.push(Arc::new(at));
+
+        // Video track — excluded even if it overlaps a clip.
+        let mut vt = vance_timeline::Track::new(TrackKind::Video, "V1");
+        vt.clips.push(Arc::new(
+            vance_timeline::Clip::new(mid, "v1", t(0), t(0), t(3)).unwrap(),
+        ));
+        seq.tracks.push(Arc::new(vt));
+
+        // Disabled audio track — excluded.
+        let mut disabled = vance_timeline::Track::new(TrackKind::Audio, "A_off");
+        disabled.enabled = false;
+        disabled.clips.push(Arc::new(
+            vance_timeline::Clip::new(mid, "c_off", t(0), t(0), t(3)).unwrap(),
+        ));
+        seq.tracks.push(Arc::new(disabled));
+
+        let scheds = build_sched_clips(&seq, &project);
+        assert_eq!(scheds.len(), 1, "only the enabled audio track contributes");
+    }
+
+    #[test]
+    fn collect_audio_sources_at_includes_preload_window_clips() {
+        // Phase 7.4 M4: cold-seek to a position slightly before a
+        // clip's start should pre-spawn the source so the
+        // seek-onto-edge SLO holds. PRELOAD_SECONDS=2.0, so a probe at
+        // t=4.0 with a clip starting at t=5.0 must return the clip
+        // (1.0s lead), with from_seconds = source_in + max(0, 4-5) = 0.
+        let mut project = vance_timeline::Project::new("P");
+        let mi = audio_media("/tmp/clip.wav");
+        let mid = mi.id;
+        project.media.insert(mid, mi);
+        let mut seq = vance_timeline::Sequence::new("S", vance_core::FrameRate::FPS_24);
+        let mut at = vance_timeline::Track::new(TrackKind::Audio, "A1");
+        // Clip at timeline 5..10, source_in=0.
+        at.clips.push(Arc::new(
+            vance_timeline::Clip::new(mid, "c", t(5), t(0), t(5)).unwrap(),
+        ));
+        seq.tracks.push(Arc::new(at));
+
+        // Within preload (4.0 is 1.0s before clip start).
+        let pre = collect_audio_sources_at(&seq, &project, 4.0);
+        assert_eq!(pre.len(), 1, "preload window should include t-1s-ahead clip");
+        assert!((pre[0].from_seconds - 0.0).abs() < 1e-9);
+
+        // Outside preload (2.0 is 3.0s before clip start; PRELOAD=2.0).
+        let outside = collect_audio_sources_at(&seq, &project, 2.0);
+        assert!(outside.is_empty(), "clip outside preload must be excluded");
+
+        // Active overlap (7.0 is 2.0s into the clip).
+        let active = collect_audio_sources_at(&seq, &project, 7.0);
+        assert_eq!(active.len(), 1);
+        assert!((active[0].from_seconds - 2.0).abs() < 1e-9);
+
+        // Past the clip (11.0 > clip end 10.0).
+        let past = collect_audio_sources_at(&seq, &project, 11.0);
+        assert!(past.is_empty(), "clips behind the playhead must be excluded");
+    }
+
+    #[test]
+    fn compute_sched_plan_with_initial_live_seed_emits_no_redundant_adds() {
+        // Phase 7.4 M4: when the scheduler's `live` set is seeded with
+        // the initial sources from `start_audio_mix`, the first tick
+        // must NOT issue a fresh Add for the same clip. Without the
+        // seed, the spawn-then-respawn glitch would interrupt audio
+        // ~50 ms after playback begins.
+        let c = sched(0.0, 5.0);
+        let mut live = std::collections::HashSet::new();
+        live.insert(c.clip_id);
+        let plan = compute_sched_plan(&[c.clone()], &live, 0.0, 0.05, 2.0, 16);
+        assert!(plan.to_add.is_empty(), "seeded live set must suppress respawn");
+        assert!(plan.to_remove.is_empty());
     }
 }
