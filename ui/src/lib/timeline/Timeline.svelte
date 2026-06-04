@@ -17,12 +17,45 @@
     isPlaying,
     stopPlayback,
     type TrackContents,
-    type ClipContents
+    type ClipContents,
+    type GainKeyframe,
+    type FadeCurveName
   } from '$lib/ipc';
   import { projectState } from '$lib/project.svelte';
   import { dragState } from '$lib/drag.svelte';
   import { selectionState } from '$lib/selection.svelte';
   import { peaksCache, chooseLevel } from '$lib/peaks-cache.svelte';
+  import {
+    yForDb,
+    dbForY,
+    clampDb,
+    nextInterp,
+    nextFadeCurve,
+    normalizeLane,
+    timeToString,
+    dbToString
+  } from './automation-geom';
+  import {
+    drawGainLane,
+    drawFade,
+    drawChip,
+    drawDragTag,
+    drawZeroBaseline,
+    fadeDragTag,
+    keyframeDragTag,
+    CLIP_GAIN_COLOR,
+    TRACK_GAIN_COLOR
+  } from './automation-draw';
+  import {
+    hitFadeGrip,
+    hitFadeChip,
+    hitClipKeyframe,
+    hitTrackKeyframe,
+    CHIP_W,
+    CHIP_H,
+    type AutomationHit
+  } from './automation-hit';
+  import { interpLetter, fadeCurveLetter } from './automation-geom';
 
   let { refreshTick = 0 }: { refreshTick?: number } = $props();
 
@@ -305,6 +338,11 @@
       ctx.fillStyle = ROW_BG[rowIdx % 2];
       ctx.fillRect(TRACK_HEADER_W, y, cssW - TRACK_HEADER_W, TRACK_HEIGHT);
 
+      // Phase 7.4 M5 — track-wide gain lane underlay. Drawn BEFORE clips
+      // so clip bodies overpaint it inside their rects, then drawClips
+      // re-applies the amber overlay at reduced alpha on top.
+      drawTrackGainLane(ctx, track, y, visibleLeft, visibleRight);
+
       drawClips(ctx, track, y, visibleLeft, visibleRight);
       drawTransitions(ctx, track, y, visibleLeft, visibleRight);
 
@@ -316,7 +354,71 @@
       ctx.stroke();
     });
 
+    // Phase 7.4 M5 — drag readout floats above everything.
+    if (cursorCss && (fadeDrag || kfDrag)) {
+      const tagText = dragReadoutText();
+      if (tagText) drawDragTag(ctx, cursorCss.x, cursorCss.y, tagText);
+    }
+
     void cssH;
+  }
+
+  /** Drag readout text builder, kept inline so both fade and keyframe
+   *  drags route through one call site. */
+  function dragReadoutText(): string | null {
+    if (fadeDrag) {
+      return fadeDragTag(fadeDrag.side, fadeDrag.candidateDurationSeconds, fadeDrag.curve);
+    }
+    if (kfDrag) {
+      const k = kfDrag.candidateLane[kfDrag.index];
+      if (!k) return null;
+      return keyframeDragTag(k.time_seconds, k.value, k.interp);
+    }
+    return null;
+  }
+
+  /** Phase 7.4 M5 — render a track-wide gain automation lane across the
+   *  full row, including over clip bodies. Skipped for non-audio tracks
+   *  to keep the visual quiet. */
+  function drawTrackGainLane(
+    ctx: CanvasRenderingContext2D,
+    track: TrackContents,
+    y: number,
+    visibleLeft: number,
+    visibleRight: number
+  ) {
+    if (track.kind !== 'audio') return;
+    const laneX = TRACK_HEADER_W;
+    const laneW = (ctx.canvas as HTMLCanvasElement).clientWidth - TRACK_HEADER_W;
+    if (laneW <= 0) return;
+    const { top, height } = trackLaneRect(y);
+    // Always show the 0 dB baseline so empty tracks telegraph "drop a
+    // keyframe here." Reinforce alpha when the lane has zero keyframes.
+    drawZeroBaseline(ctx, laneX, top, laneW, height, track.gain_keyframes.length === 0);
+    // Use the local kfDrag preview lane when the user is moving a track
+    // keyframe so the polyline tracks the cursor live.
+    const lane =
+      kfDrag && kfDrag.scope === 'track' && kfDrag.trackId === track.id
+        ? kfDrag.candidateLane
+        : track.gain_keyframes;
+    if (lane.length === 0) return;
+    const selectedIdx =
+      selectedKf && selectedKf.scope === 'track' && selectedKf.trackId === track.id
+        ? selectedKf.index
+        : null;
+    drawGainLane(
+      ctx,
+      lane,
+      laneX,
+      top,
+      laneW,
+      height,
+      (t) => timeToX(t),
+      { start: Math.max(0, visibleLeft - 0.5), end: visibleRight + 0.5 },
+      TRACK_GAIN_COLOR,
+      selectedIdx,
+      0.85
+    );
   }
 
   // Waveform sub-pass styling. Translucent RMS fill underneath the
@@ -384,14 +486,10 @@
       if (c.enabled && track.enabled && mediaIndex) {
         const media = mediaIndex.get(c.media_id);
         const clipHasAudio =
-          !!media &&
-          (media.kind === 'audio' ||
-            (media.kind === 'video' && media.has_audio_track));
+          !!media && (media.kind === 'audio' || (media.kind === 'video' && media.has_audio_track));
         if (clipHasAudio) {
           const t_in_eff = trimming || moving ? t_in : c.timeline_in_seconds;
-          const source_in_eff = trimming
-            ? trimDrag!.candidateSourceIn
-            : c.source_in_seconds;
+          const source_in_eff = trimming ? trimDrag!.candidateSourceIn : c.source_in_seconds;
           drawWaveform(ctx, c, x, cy, w, ch, t_in_eff, source_in_eff, dur);
         }
       }
@@ -402,6 +500,110 @@
       const inset = isSelected ? 1 : 0.5;
       roundRect(ctx, x + inset, cy + inset, Math.max(1, w - 2 * inset), ch - 2 * inset, 3);
       ctx.stroke();
+
+      // Phase 7.4 M5 — fade wedges + grips, drawn inside the clip body
+      // so they clip against the rounded edge. Reads liveFade so the
+      // user sees the wedge follow the cursor during a fade drag.
+      if (track.kind === 'audio' && w > 4) {
+        const liveFadeIn =
+          fadeDrag && fadeDrag.clipId === c.id && fadeDrag.side === 'in'
+            ? fadeDrag.candidateDurationSeconds
+            : (c.fade_in?.duration_seconds ?? 0);
+        const liveFadeOut =
+          fadeDrag && fadeDrag.clipId === c.id && fadeDrag.side === 'out'
+            ? fadeDrag.candidateDurationSeconds
+            : (c.fade_out?.duration_seconds ?? 0);
+        const fadeInPx = Math.min(w - 2, liveFadeIn * pixelsPerSecond);
+        const fadeOutPx = Math.min(w - 2, liveFadeOut * pixelsPerSecond);
+        if (fadeInPx > 0.5) drawFade(ctx, x, cy, w, ch, 'in', fadeInPx, true);
+        if (fadeOutPx > 0.5) drawFade(ctx, x, cy, w, ch, 'out', fadeOutPx, true);
+      }
+
+      // Phase 7.4 M5 — clip-scope gain keyframe lane in the bottom 70%
+      // of the clip body. The amber track lane already painted across
+      // the whole row; we'll re-paint cyan on top here so the local
+      // edit reads strongest where the clip is.
+      const lane = clipLaneRect(cy, ch);
+      if (lane && track.kind === 'audio' && w > 8) {
+        const liveLane =
+          kfDrag && kfDrag.scope === 'clip' && kfDrag.clipId === c.id
+            ? kfDrag.candidateLane
+            : c.gain_keyframes;
+        const selectedIdx =
+          selectedKf && selectedKf.scope === 'clip' && selectedKf.clipId === c.id
+            ? selectedKf.index
+            : null;
+        // Re-stamp the amber track lane CLIPPED to this clip rect at
+        // reduced alpha so the underlying track automation remains
+        // visible through the cyan clip lane.
+        const trackLane =
+          kfDrag && kfDrag.scope === 'track' && kfDrag.trackId === track.id
+            ? kfDrag.candidateLane
+            : track.gain_keyframes;
+        if (trackLane.length > 0) {
+          drawGainLane(
+            ctx,
+            trackLane,
+            x,
+            lane.top,
+            w,
+            lane.height,
+            (t) => timeToX(t),
+            { start: t_in, end: t_in + dur },
+            TRACK_GAIN_COLOR,
+            null,
+            0.55
+          );
+        }
+        if (liveLane.length > 0) {
+          drawGainLane(
+            ctx,
+            liveLane,
+            x,
+            lane.top,
+            w,
+            lane.height,
+            // Clip lane stores CLIP-RELATIVE times; convert to canvas X
+            // via timeToX(t_in + tClip).
+            (tClip) => timeToX(t_in + tClip),
+            { start: 0, end: dur },
+            CLIP_GAIN_COLOR,
+            selectedIdx,
+            0.85
+          );
+        }
+      }
+
+      // Phase 7.4 M5 — fade curve chip in the bottom corner of the wedge.
+      if (track.kind === 'audio' && w > 32) {
+        const fadeInPx = Math.min(w - 2, (c.fade_in?.duration_seconds ?? 0) * pixelsPerSecond);
+        const fadeOutPx = Math.min(w - 2, (c.fade_out?.duration_seconds ?? 0) * pixelsPerSecond);
+        const chipY = cy + ch - CHIP_H - 2;
+        if (fadeInPx >= 28) {
+          drawChip(
+            ctx,
+            x + 3,
+            chipY,
+            CHIP_W,
+            CHIP_H,
+            fadeCurveLetter(c.fade_in?.curve),
+            '#9099a8',
+            true
+          );
+        }
+        if (fadeOutPx >= 28) {
+          drawChip(
+            ctx,
+            x + w - CHIP_W - 3,
+            chipY,
+            CHIP_W,
+            CHIP_H,
+            fadeCurveLetter(c.fade_out?.curve),
+            '#9099a8',
+            true
+          );
+        }
+      }
 
       // Label, if there's room.
       if (w > 24) {
@@ -876,7 +1078,74 @@
     scheduleDraw();
   }
 
-  type DragKind = 'pan' | 'marquee' | 'move' | 'trim-left' | 'trim-right';
+  type DragKind =
+    | 'pan'
+    | 'marquee'
+    | 'move'
+    | 'trim-left'
+    | 'trim-right'
+    // Phase 7.4 M5 — automation overlay drag kinds.
+    | 'fade-in'
+    | 'fade-out'
+    | 'kf-clip-move'
+    | 'kf-track-move';
+
+  // --- Phase 7.4 M5 automation overlay state ----------------------------
+
+  /** Selected keyframe (across both clip and track scopes). null = nothing
+   *  selected. Single-select only in v1 — marquee selection over keyframes
+   *  is a documented future enhancement. */
+  type SelectedKf =
+    | { scope: 'clip'; trackId: string; clipId: string; index: number }
+    | { scope: 'track'; trackId: string; index: number }
+    | null;
+  let selectedKf = $state<SelectedKf>(null);
+
+  /** Live fade-edit preview. The wedge follows the cursor; the IPC
+   *  commit fires on mouseup. */
+  type FadeDrag = {
+    trackId: string;
+    clipId: string;
+    side: 'in' | 'out';
+    originalDurationSeconds: number;
+    candidateDurationSeconds: number;
+    curve: FadeCurveName;
+  };
+  let fadeDrag = $state<FadeDrag | null>(null);
+
+  /** Live keyframe-move preview. The polyline + keyframe symbol render
+   *  against `candidateLane` until mouseup. */
+  type KfDrag = {
+    scope: 'clip' | 'track';
+    trackId: string;
+    clipId?: string;
+    index: number;
+    originalLane: GainKeyframe[];
+    candidateLane: GainKeyframe[];
+    axisLock: 'time' | 'value' | null;
+    fineScale: number;
+  };
+  let kfDrag = $state<KfDrag | null>(null);
+
+  /** Cursor position for the optional drag tag overlay. */
+  let cursorCss = $state<{ x: number; y: number } | null>(null);
+
+  /** dB lane geometry inside a clip body. Returns null when the clip
+   *  is too short vertically to host a useful lane. */
+  function clipLaneRect(cy: number, ch: number): { top: number; height: number } | null {
+    // Top 30% of the clip body remains for waveform + label; bottom 70%
+    // hosts the gain lane.
+    const top = cy + ch * 0.3;
+    const height = ch - (top - cy);
+    if (height < 8) return null;
+    return { top, height };
+  }
+
+  /** dB lane geometry for a track-wide automation lane. Renders across
+   *  the full track row body. */
+  function trackLaneRect(y: number): { top: number; height: number } {
+    return { top: y + 4, height: TRACK_HEIGHT - 8 };
+  }
   /** Width of the edge-grab region in CSS pixels. Cursor within this
    *  many pixels of a clip's left/right edge triggers a trim handle. */
   const HANDLE_PX = 6;
@@ -934,13 +1203,75 @@
     downOnClipId: string | null;
   } | null = null;
 
+  /** Phase 7.4 M5 — resolve every automation hit at (cssX, cssY).
+   *  Walks tracks/clips in the same order draw uses; first hit wins.
+   *  Returns null when the cursor is not on any automation control. */
+  function hitAutomation(cssX: number, cssY: number): AutomationHit | null {
+    if (!sequence || cssX < TRACK_HEADER_W || cssY < RULER_HEIGHT) return null;
+    const rowIdx = Math.floor((cssY - RULER_HEIGHT) / TRACK_HEIGHT);
+    if (rowIdx < 0 || rowIdx >= sequence.tracks.length) return null;
+    const track = sequence.tracks[rowIdx];
+    const y = trackY(rowIdx);
+    // Search audio-clip-level targets first (highest priority).
+    if (track.kind === 'audio') {
+      for (const c of track.clips) {
+        const t_in = c.timeline_in_seconds;
+        const dur = c.duration_seconds;
+        const t_out = t_in + dur;
+        const x = timeToX(t_in);
+        const w = dur * pixelsPerSecond;
+        const cy = y + 4;
+        const ch = TRACK_HEIGHT - 8;
+        if (cssX < x - 8 || cssX > x + w + 8) continue;
+        const fadeInPx = (c.fade_in?.duration_seconds ?? 0) * pixelsPerSecond;
+        const fadeOutPx = (c.fade_out?.duration_seconds ?? 0) * pixelsPerSecond;
+        // B. Fade chip
+        const chip = hitFadeChip(cssX, cssY, track.id, c.id, x, cy, w, ch, fadeInPx, fadeOutPx);
+        if (chip) return chip;
+        // D. Fade grip
+        const grip = hitFadeGrip(cssX, cssY, track.id, c.id, x, cy, w, fadeInPx, fadeOutPx);
+        if (grip) return grip;
+        // E. Clip keyframe
+        const lane = clipLaneRect(cy, ch);
+        if (lane && cssX >= x && cssX <= x + w) {
+          const kf = hitClipKeyframe(
+            cssX,
+            cssY,
+            track.id,
+            c.id,
+            c.gain_keyframes,
+            (tClip) => timeToX(t_in + tClip),
+            (db) => yForDb(db, lane.top, lane.height)
+          );
+          if (kf) return kf;
+        }
+        void t_out;
+      }
+    }
+    // F. Track keyframe — checked AFTER per-clip targets so a kf landing
+    //    on the same pixel as a clip keyframe loses to the clip one.
+    if (track.kind === 'audio') {
+      const lane = trackLaneRect(y);
+      const trackKf = hitTrackKeyframe(
+        cssX,
+        cssY,
+        track.id,
+        track.gain_keyframes,
+        (t) => timeToX(t),
+        (db) => yForDb(db, lane.top, lane.height)
+      );
+      if (trackKf) return trackKf;
+    }
+    return null;
+  }
+
   function onMouseDown(e: MouseEvent) {
     if (e.button !== 0) return;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     const localX = e.clientX - rect.left;
     const localY = e.clientY - rect.top;
-    // Phase 7.3 — track-header mixer toggle hit-test runs BEFORE clip
+    // A. Phase 7.3 — track-header mixer toggle hit-test runs BEFORE clip
     // hit-testing because the buttons live inside TRACK_HEADER_W where
     // hitAt never returns clips anyway. Fire-and-forget so the canvas
     // stays responsive; commitEdit refreshes the sequence on resolve.
@@ -956,7 +1287,49 @@
       }
       return;
     }
+    // Phase 7.4 M5 — automation hit-test runs BEFORE trim/move/marquee
+    // so fade grips and keyframe handles win over the underlying clip
+    // body interactions. Priority resolved inside hitAutomation per the
+    // spike's documented order.
+    const autoHit = hitAutomation(localX, localY);
+    if (autoHit) {
+      handleAutomationMouseDown(e, autoHit, localX, localY);
+      return;
+    }
+    // Phase 7.4 M5 — Alt-click on empty audio-track lane creates a new
+    // track-gain keyframe at the cursor.
+    if (e.altKey && sequence && localX >= TRACK_HEADER_W && localY >= RULER_HEIGHT) {
+      const rowIdx = Math.floor((localY - RULER_HEIGHT) / TRACK_HEIGHT);
+      if (rowIdx >= 0 && rowIdx < sequence.tracks.length) {
+        const track = sequence.tracks[rowIdx];
+        if (track.kind === 'audio') {
+          const lane = trackLaneRect(trackY(rowIdx));
+          const tSec = scrollSeconds + (localX - TRACK_HEADER_W) / pixelsPerSecond;
+          const db = clampDb(dbForY(localY, lane.top, lane.height));
+          void createTrackKeyframe(track.id, tSec, db);
+          // Clear marquee/selection click semantics for this gesture.
+          return;
+        }
+      }
+    }
     const hit = hitAt(localX, localY);
+    // Phase 7.4 M5 — Alt-click inside an audio clip body creates a new
+    // clip-gain keyframe at the cursor.
+    if (e.altKey && hit?.kind === 'body' && sequence) {
+      const track = sequence.tracks.find((t) => t.clips.some((c) => c.id === hit.clip.id));
+      if (track && track.kind === 'audio') {
+        const cy = trackY(sequence.tracks.indexOf(track)) + 4;
+        const ch = TRACK_HEIGHT - 8;
+        const lane = clipLaneRect(cy, ch);
+        if (lane) {
+          const tSec = scrollSeconds + (localX - TRACK_HEADER_W) / pixelsPerSecond;
+          const tClip = Math.max(0, tSec - hit.clip.timeline_in_seconds);
+          const db = clampDb(dbForY(localY, lane.top, lane.height));
+          void createClipKeyframe(track.id, hit.clip.id, tClip, db);
+          return;
+        }
+      }
+    }
     const kind: DragKind =
       hit?.kind === 'left'
         ? 'trim-left'
@@ -965,6 +1338,8 @@
           : hit?.kind === 'body'
             ? 'move'
             : 'marquee';
+    // Clicking empty space clears keyframe selection.
+    if (!hit) selectedKf = null;
     dragStart = {
       kind,
       clientX: e.clientX,
@@ -975,6 +1350,157 @@
       modKeys: { shift: e.shiftKey, cmd: e.metaKey || e.ctrlKey },
       downOnClipId: hit ? hit.clip.id : null
     };
+  }
+
+  /** Phase 7.4 M5 — start the appropriate drag (or commit a click) for
+   *  an automation hit. Mutates dragStart + the per-drag preview state. */
+  function handleAutomationMouseDown(
+    e: MouseEvent,
+    hit: AutomationHit,
+    localX: number,
+    localY: number
+  ) {
+    if (!sequence) return;
+    switch (hit.kind) {
+      case 'fade-chip': {
+        // Single click cycles the curve through linear → equal_power → log.
+        const track = sequence.tracks.find((t) => t.id === hit.trackId);
+        const clip = track?.clips.find((c) => c.id === hit.clipId);
+        if (!clip) return;
+        const fade = hit.side === 'in' ? clip.fade_in : clip.fade_out;
+        const dur = fade?.duration_seconds ?? 0;
+        const curve = nextFadeCurve(fade?.curve);
+        if (hit.side === 'in') {
+          void projectState.setClipFadeIn(track!.id, clip.id, dur, curve);
+        } else {
+          void projectState.setClipFadeOut(track!.id, clip.id, dur, curve);
+        }
+        return;
+      }
+      case 'fade-grip': {
+        const track = sequence.tracks.find((t) => t.id === hit.trackId);
+        const clip = track?.clips.find((c) => c.id === hit.clipId);
+        if (!clip) return;
+        const fade = hit.side === 'in' ? clip.fade_in : clip.fade_out;
+        fadeDrag = {
+          trackId: hit.trackId,
+          clipId: hit.clipId,
+          side: hit.side,
+          originalDurationSeconds: fade?.duration_seconds ?? 0,
+          candidateDurationSeconds: fade?.duration_seconds ?? 0,
+          curve: fade?.curve ?? 'linear'
+        };
+        dragStart = {
+          kind: hit.side === 'in' ? 'fade-in' : 'fade-out',
+          clientX: e.clientX,
+          clientY: e.clientY,
+          localX,
+          localY,
+          scroll: scrollSeconds,
+          modKeys: { shift: e.shiftKey, cmd: e.metaKey || e.ctrlKey },
+          downOnClipId: hit.clipId
+        };
+        return;
+      }
+      case 'kf-clip': {
+        const track = sequence.tracks.find((t) => t.id === hit.trackId);
+        const clip = track?.clips.find((c) => c.id === hit.clipId);
+        if (!clip) return;
+        selectedKf = {
+          scope: 'clip',
+          trackId: hit.trackId,
+          clipId: hit.clipId,
+          index: hit.index
+        };
+        kfDrag = {
+          scope: 'clip',
+          trackId: hit.trackId,
+          clipId: hit.clipId,
+          index: hit.index,
+          originalLane: clip.gain_keyframes,
+          candidateLane: clip.gain_keyframes.map((k) => ({ ...k })),
+          axisLock: e.shiftKey ? 'time' : e.altKey ? 'value' : null,
+          fineScale: e.metaKey || e.ctrlKey ? 0.1 : 1
+        };
+        dragStart = {
+          kind: 'kf-clip-move',
+          clientX: e.clientX,
+          clientY: e.clientY,
+          localX,
+          localY,
+          scroll: scrollSeconds,
+          modKeys: { shift: e.shiftKey, cmd: e.metaKey || e.ctrlKey },
+          downOnClipId: hit.clipId
+        };
+        return;
+      }
+      case 'kf-track': {
+        const track = sequence.tracks.find((t) => t.id === hit.trackId);
+        if (!track) return;
+        selectedKf = { scope: 'track', trackId: hit.trackId, index: hit.index };
+        kfDrag = {
+          scope: 'track',
+          trackId: hit.trackId,
+          index: hit.index,
+          originalLane: track.gain_keyframes,
+          candidateLane: track.gain_keyframes.map((k) => ({ ...k })),
+          axisLock: e.shiftKey ? 'time' : e.altKey ? 'value' : null,
+          fineScale: e.metaKey || e.ctrlKey ? 0.1 : 1
+        };
+        dragStart = {
+          kind: 'kf-track-move',
+          clientX: e.clientX,
+          clientY: e.clientY,
+          localX,
+          localY,
+          scroll: scrollSeconds,
+          modKeys: { shift: e.shiftKey, cmd: e.metaKey || e.ctrlKey },
+          downOnClipId: null
+        };
+        return;
+      }
+      case 'interp-chip':
+        // Reserved for the L/B/H chip near the selected keyframe.
+        return;
+    }
+  }
+
+  /** Append a new keyframe to a clip's lane and commit via IPC. */
+  async function createClipKeyframe(trackId: string, clipId: string, tClip: number, db: number) {
+    const track = sequence?.tracks.find((t) => t.id === trackId);
+    const clip = track?.clips.find((c) => c.id === clipId);
+    if (!clip) return;
+    const next = normalizeLane([
+      ...clip.gain_keyframes,
+      { time_seconds: tClip, value: db, interp: 'linear' }
+    ]);
+    selectedKf = {
+      scope: 'clip',
+      trackId,
+      clipId,
+      index: next.findIndex(
+        (k) => Math.abs(k.time_seconds - tClip) < 1e-6 && Math.abs(k.value - db) < 1e-6
+      )
+    };
+    await projectState.setClipGainKeyframes(trackId, clipId, next);
+  }
+
+  /** Append a new keyframe to a track's lane and commit via IPC. */
+  async function createTrackKeyframe(trackId: string, tSec: number, db: number) {
+    const track = sequence?.tracks.find((t) => t.id === trackId);
+    if (!track) return;
+    const next = normalizeLane([
+      ...track.gain_keyframes,
+      { time_seconds: tSec, value: db, interp: 'linear' }
+    ]);
+    selectedKf = {
+      scope: 'track',
+      trackId,
+      index: next.findIndex(
+        (k) => Math.abs(k.time_seconds - tSec) < 1e-6 && Math.abs(k.value - db) < 1e-6
+      )
+    };
+    await projectState.setTrackGainKeyframes(trackId, next);
   }
 
   function onMouseMove(e: MouseEvent) {
@@ -1040,7 +1566,99 @@
         applyTrimCandidate(trimDrag, cursorT, e.shiftKey);
         scheduleDraw();
       }
+    } else if (dragStart.kind === 'fade-in' || dragStart.kind === 'fade-out') {
+      const fd = fadeDrag;
+      if (!fd || !canvas || !sequence) return;
+      // Phase 7.4 M5 — fade drag: cursor X → fade duration.
+      const rect = canvas.getBoundingClientRect();
+      cursorCss = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+      const track = sequence.tracks.find((t) => t.id === fd.trackId);
+      const clip = track?.clips.find((c) => c.id === fd.clipId);
+      if (clip) {
+        const cursorT = scrollSeconds + (e.clientX - rect.left - TRACK_HEADER_W) / pixelsPerSecond;
+        // For fade-in: duration = cursorT - clip.timeline_in. For fade-out: clip end - cursorT.
+        const raw =
+          fd.side === 'in'
+            ? cursorT - clip.timeline_in_seconds
+            : clip.timeline_in_seconds + clip.duration_seconds - cursorT;
+        // Clamp so the two fades together can't exceed clip duration.
+        const otherFade =
+          fd.side === 'in'
+            ? (clip.fade_out?.duration_seconds ?? 0)
+            : (clip.fade_in?.duration_seconds ?? 0);
+        const maxDur = Math.max(0, clip.duration_seconds - otherFade - 0.001);
+        const fine = e.metaKey || e.ctrlKey ? 0.1 : 1;
+        const original = fd.originalDurationSeconds;
+        const candidate = Math.max(0, Math.min(maxDur, original + (raw - original) * fine));
+        fd.candidateDurationSeconds = candidate;
+        scheduleDraw();
+      }
+    } else if (dragStart.kind === 'kf-clip-move' || dragStart.kind === 'kf-track-move') {
+      if (!kfDrag || !canvas) return;
+      // Phase 7.4 M5 — keyframe drag: cursor → (time, dB).
+      const rect = canvas.getBoundingClientRect();
+      cursorCss = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+      applyKeyframeDrag(e, cursorCss.x, cursorCss.y);
+      scheduleDraw();
     }
+  }
+
+  /** Apply the live cursor position to the kfDrag preview lane. Respects
+   *  axis-lock (Shift = time-only, Alt = value-only) and fine-adjust
+   *  (Cmd/Ctrl scales delta by 0.1). */
+  function applyKeyframeDrag(e: MouseEvent, cssX: number, cssY: number) {
+    const kd = kfDrag;
+    if (!kd || !sequence) return;
+    // Recompute axis-lock + fine each frame so the user can toggle modifiers
+    // mid-drag.
+    kd.axisLock = e.shiftKey ? 'time' : e.altKey ? 'value' : null;
+    kd.fineScale = e.metaKey || e.ctrlKey ? 0.1 : 1;
+    const original = kd.originalLane[kd.index];
+    if (!original) return;
+    let newTime = original.time_seconds;
+    let newValue = original.value;
+    if (kd.scope === 'track') {
+      const lane = trackLaneRect(trackY(sequence.tracks.findIndex((t) => t.id === kd.trackId)));
+      const targetTime = scrollSeconds + (cssX - TRACK_HEADER_W) / pixelsPerSecond;
+      const targetDb = dbForY(cssY, lane.top, lane.height);
+      if (kd.axisLock !== 'value') {
+        newTime = Math.max(
+          0,
+          original.time_seconds + (targetTime - original.time_seconds) * kd.fineScale
+        );
+      }
+      if (kd.axisLock !== 'time') {
+        newValue = clampDb(original.value + (targetDb - original.value) * kd.fineScale);
+      }
+    } else {
+      const track = sequence.tracks.find((t) => t.id === kd.trackId);
+      const clip = track?.clips.find((c) => c.id === kd.clipId);
+      if (!clip || !track) return;
+      const trackIdx = sequence.tracks.indexOf(track);
+      const cy = trackY(trackIdx) + 4;
+      const ch = TRACK_HEIGHT - 8;
+      const lane = clipLaneRect(cy, ch);
+      if (!lane) return;
+      const targetTime =
+        scrollSeconds + (cssX - TRACK_HEADER_W) / pixelsPerSecond - clip.timeline_in_seconds;
+      const targetDb = dbForY(cssY, lane.top, lane.height);
+      if (kd.axisLock !== 'value') {
+        newTime = Math.max(
+          0,
+          Math.min(
+            clip.duration_seconds,
+            original.time_seconds + (targetTime - original.time_seconds) * kd.fineScale
+          )
+        );
+      }
+      if (kd.axisLock !== 'time') {
+        newValue = clampDb(original.value + (targetDb - original.value) * kd.fineScale);
+      }
+    }
+    const next = kd.candidateLane.map((k, i) =>
+      i === kd.index ? { ...k, time_seconds: newTime, value: newValue } : k
+    );
+    kd.candidateLane = next;
   }
 
   function ensureTrimDrag(ds: NonNullable<typeof dragStart>) {
@@ -1224,6 +1842,55 @@
       }
     }
 
+    // ---- Phase 7.4 M5 — Fade-drag release: commit via engine -------------
+    if ((ds.kind === 'fade-in' || ds.kind === 'fade-out') && fadeDrag) {
+      const fd = fadeDrag;
+      fadeDrag = null;
+      cursorCss = null;
+      if (Math.abs(fd.candidateDurationSeconds - fd.originalDurationSeconds) > 1e-3) {
+        if (fd.side === 'in') {
+          await projectState.setClipFadeIn(
+            fd.trackId,
+            fd.clipId,
+            fd.candidateDurationSeconds,
+            fd.curve
+          );
+        } else {
+          await projectState.setClipFadeOut(
+            fd.trackId,
+            fd.clipId,
+            fd.candidateDurationSeconds,
+            fd.curve
+          );
+        }
+        return;
+      }
+      // No-op drag falls through (selection logic below).
+    }
+
+    // ---- Phase 7.4 M5 — Keyframe-drag release: commit via engine ---------
+    if ((ds.kind === 'kf-clip-move' || ds.kind === 'kf-track-move') && kfDrag) {
+      const kd = kfDrag;
+      kfDrag = null;
+      cursorCss = null;
+      const original = kd.originalLane[kd.index];
+      const candidate = kd.candidateLane[kd.index];
+      if (
+        original &&
+        candidate &&
+        (Math.abs(candidate.time_seconds - original.time_seconds) > 1e-4 ||
+          Math.abs(candidate.value - original.value) > 1e-4)
+      ) {
+        const normalized = normalizeLane(kd.candidateLane);
+        if (kd.scope === 'clip' && kd.clipId) {
+          await projectState.setClipGainKeyframes(kd.trackId, kd.clipId, normalized);
+        } else {
+          await projectState.setTrackGainKeyframes(kd.trackId, normalized);
+        }
+        return;
+      }
+    }
+
     // ---- Trim-drag release: commit via engine ----------------------------
     if ((ds.kind === 'trim-left' || ds.kind === 'trim-right') && trimDrag) {
       const td = trimDrag;
@@ -1403,6 +2070,140 @@
 
   // ---- Mount --------------------------------------------------------------
 
+  /** Phase 7.4 M5 keyboard shortcuts:
+   *  Esc — cancel an in-flight fade or keyframe drag (no IPC commit).
+   *  Delete / Backspace — delete the selected keyframe.
+   *  L / B / H — set interp on the selected clip-gain or track-gain
+   *              keyframe (Linear / Bezier / Hold).
+   */
+  function onKeyDown(e: KeyboardEvent) {
+    // Don't steal keys while typing into an input.
+    const target = e.target as HTMLElement | null;
+    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+    if (e.key === 'Escape') {
+      if (fadeDrag || kfDrag) {
+        fadeDrag = null;
+        kfDrag = null;
+        cursorCss = null;
+        dragStart = null;
+        scheduleDraw();
+        e.preventDefault();
+      }
+      return;
+    }
+    if (selectedKf && (e.key === 'Delete' || e.key === 'Backspace')) {
+      e.preventDefault();
+      void deleteSelectedKeyframe();
+      return;
+    }
+    if (
+      selectedKf &&
+      (e.key === 'l' ||
+        e.key === 'L' ||
+        e.key === 'b' ||
+        e.key === 'B' ||
+        e.key === 'h' ||
+        e.key === 'H')
+    ) {
+      const interp: 'linear' | 'bezier' | 'hold' =
+        e.key === 'l' || e.key === 'L'
+          ? 'linear'
+          : e.key === 'b' || e.key === 'B'
+            ? 'bezier'
+            : 'hold';
+      e.preventDefault();
+      void setSelectedKeyframeInterp(interp);
+    }
+  }
+
+  /** Single click on the selected-keyframe interp chip cycles through
+   *  Linear → Bezier → Hold. (Currently only invoked from the keyboard
+   *  shortcuts above; the chip itself is reserved for v1.1 since the
+   *  visible chip would compete with the M/S toggle for header pixels.) */
+  async function setSelectedKeyframeInterp(interp: 'linear' | 'bezier' | 'hold') {
+    const sel = selectedKf;
+    if (!sel || !sequence) return;
+    if (sel.scope === 'clip') {
+      const track = sequence.tracks.find((t) => t.id === sel.trackId);
+      const clip = track?.clips.find((c) => c.id === sel.clipId);
+      if (!track || !clip || sel.index >= clip.gain_keyframes.length) return;
+      const next = clip.gain_keyframes.map((k, i) => (i === sel.index ? { ...k, interp } : k));
+      await projectState.setClipGainKeyframes(track.id, clip.id, next);
+    } else {
+      const track = sequence.tracks.find((t) => t.id === sel.trackId);
+      if (!track || sel.index >= track.gain_keyframes.length) return;
+      const next = track.gain_keyframes.map((k, i) => (i === sel.index ? { ...k, interp } : k));
+      await projectState.setTrackGainKeyframes(track.id, next);
+    }
+  }
+
+  async function deleteSelectedKeyframe() {
+    const sel = selectedKf;
+    if (!sel || !sequence) return;
+    if (sel.scope === 'clip') {
+      const track = sequence.tracks.find((t) => t.id === sel.trackId);
+      const clip = track?.clips.find((c) => c.id === sel.clipId);
+      if (!track || !clip) return;
+      const next = clip.gain_keyframes.filter((_, i) => i !== sel.index);
+      selectedKf = null;
+      await projectState.setClipGainKeyframes(track.id, clip.id, next);
+    } else {
+      const track = sequence.tracks.find((t) => t.id === sel.trackId);
+      if (!track) return;
+      const next = track.gain_keyframes.filter((_, i) => i !== sel.index);
+      selectedKf = null;
+      await projectState.setTrackGainKeyframes(track.id, next);
+    }
+  }
+
+  /** Right-click on a fade wedge — for v1 this just removes the fade.
+   *  A full curve picker context menu is a documented v1.1 enhancement. */
+  function onContextMenu(e: MouseEvent) {
+    if (!canvas || !sequence) return;
+    const rect = canvas.getBoundingClientRect();
+    const localX = e.clientX - rect.left;
+    const localY = e.clientY - rect.top;
+    const hit = hitAutomation(localX, localY);
+    if (!hit) return;
+    if (hit.kind === 'fade-grip' || hit.kind === 'fade-chip') {
+      e.preventDefault();
+      const sideKey = hit.side;
+      const trackId = hit.trackId;
+      const clipId = hit.clipId;
+      const setter = sideKey === 'in' ? projectState.setClipFadeIn : projectState.setClipFadeOut;
+      void setter.call(projectState, trackId, clipId, 0, 'linear');
+    } else if (hit.kind === 'kf-clip' || hit.kind === 'kf-track') {
+      e.preventDefault();
+      selectedKf =
+        hit.kind === 'kf-clip'
+          ? { scope: 'clip', trackId: hit.trackId, clipId: hit.clipId, index: hit.index }
+          : { scope: 'track', trackId: hit.trackId, index: hit.index };
+      void deleteSelectedKeyframe();
+    }
+  }
+
+  /** Double-click on a fade grip removes the fade (= duration 0). */
+  function onDoubleClick(e: MouseEvent) {
+    if (!canvas || !sequence) return;
+    const rect = canvas.getBoundingClientRect();
+    const localX = e.clientX - rect.left;
+    const localY = e.clientY - rect.top;
+    const hit = hitAutomation(localX, localY);
+    if (!hit) return;
+    if (hit.kind === 'fade-grip' || hit.kind === 'fade-chip') {
+      e.preventDefault();
+      const setter = hit.side === 'in' ? projectState.setClipFadeIn : projectState.setClipFadeOut;
+      void setter.call(projectState, hit.trackId, hit.clipId, 0, 'linear');
+    } else if (hit.kind === 'kf-clip' || hit.kind === 'kf-track') {
+      e.preventDefault();
+      selectedKf =
+        hit.kind === 'kf-clip'
+          ? { scope: 'clip', trackId: hit.trackId, clipId: hit.clipId, index: hit.index }
+          : { scope: 'track', trackId: hit.trackId, index: hit.index };
+      void deleteSelectedKeyframe();
+    }
+  }
+
   onMount(() => {
     if (!wrap) return;
     const ro = new ResizeObserver(resizeCanvas);
@@ -1410,6 +2211,7 @@
     resizeCanvas();
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('mouseup', onMouseUp);
+    window.addEventListener('keydown', onKeyDown);
     // Drag-from-Browser-to-canvas uses our own mouse-based drag (Tauri
     // disables HTML5 native drag-and-drop). On mouseup we check
     // dragState and consume it if the cursor is inside our canvas.
@@ -1434,6 +2236,7 @@
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseup', onMouseUp);
       window.removeEventListener('mouseup', onWindowMouseUp);
+      window.removeEventListener('keydown', onKeyDown);
       window.clearInterval(playheadPoll);
     };
   });
@@ -1445,6 +2248,8 @@
     class="block h-full w-full cursor-grab active:cursor-grabbing"
     onwheel={onWheel}
     onmousedown={onMouseDown}
+    oncontextmenu={onContextMenu}
+    ondblclick={onDoubleClick}
     onmouseleave={() => {
       if (hoverClipId !== null) {
         hoverClipId = null;

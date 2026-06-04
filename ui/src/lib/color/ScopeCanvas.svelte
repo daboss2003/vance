@@ -48,7 +48,11 @@
   // Paint a cols×levels grid into an ImageData tinted (tr,tg,tb), with
   // level 0 at the BOTTOM (waveform convention). Returns the ImageData
   // sized cols×levels (caller scales it onto the canvas).
-  function gridImage(grid: ScopeIntensityGrid, tint: [number, number, number], useLog: boolean): ImageData {
+  function gridImage(
+    grid: ScopeIntensityGrid,
+    tint: [number, number, number],
+    useLog: boolean
+  ): ImageData {
     const { cols, levels, bins } = grid;
     const img = new ImageData(cols, levels);
     const max = arrMax(bins);
@@ -68,7 +72,14 @@
 
   // Draw an ImageData scaled to a target rect via a CACHED offscreen
   // canvas (resized to the source only when needed).
-  function blit(ctx: CanvasRenderingContext2D, img: ImageData, dx: number, dy: number, dw: number, dh: number) {
+  function blit(
+    ctx: CanvasRenderingContext2D,
+    img: ImageData,
+    dx: number,
+    dy: number,
+    dw: number,
+    dh: number
+  ) {
     if (!offscreen) offscreen = document.createElement('canvas');
     if (offscreen.width !== img.width) offscreen.width = img.width;
     if (offscreen.height !== img.height) offscreen.height = img.height;
@@ -179,5 +190,10 @@
   });
 </script>
 
-<canvas bind:this={canvas} {width} {height} class="rounded border border-vance-border" style="width:100%;height:auto;"
+<canvas
+  bind:this={canvas}
+  {width}
+  {height}
+  class="rounded border border-vance-border"
+  style="width:100%;height:auto;"
 ></canvas>

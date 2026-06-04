@@ -236,7 +236,15 @@
       <line x1="0" y1={g * SIZE} x2={SIZE} y2={g * SIZE} stroke="#22262e" stroke-width="1" />
     {/each}
     <!-- Identity reference diagonal -->
-    <line x1="0" y1={SIZE} x2={SIZE} y2="0" stroke="#2f3540" stroke-width="1" stroke-dasharray="3 3" />
+    <line
+      x1="0"
+      y1={SIZE}
+      x2={SIZE}
+      y2="0"
+      stroke="#2f3540"
+      stroke-width="1"
+      stroke-dasharray="3 3"
+    />
     <!-- The curve (straight segments = Linear interp, WYSIWYG) -->
     <polyline points={polyline} fill="none" stroke={color} stroke-width="1.5" />
     <!-- Control points -->

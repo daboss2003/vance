@@ -689,16 +689,10 @@ export const setTrackSolo = (trackId: string, solo: boolean): Promise<void> =>
   invoke('set_track_solo', { trackId, solo });
 export const setTrackGainDb = (trackId: string, gainDb: number): Promise<void> =>
   invoke('set_track_gain_db', { trackId, gainDb });
-export const setClipMute = (
-  trackId: string,
-  clipId: string,
-  mute: boolean
-): Promise<void> => invoke('set_clip_mute', { trackId, clipId, mute });
-export const setClipGainDb = (
-  trackId: string,
-  clipId: string,
-  gainDb: number
-): Promise<void> => invoke('set_clip_gain_db', { trackId, clipId, gainDb });
+export const setClipMute = (trackId: string, clipId: string, mute: boolean): Promise<void> =>
+  invoke('set_clip_mute', { trackId, clipId, mute });
+export const setClipGainDb = (trackId: string, clipId: string, gainDb: number): Promise<void> =>
+  invoke('set_clip_gain_db', { trackId, clipId, gainDb });
 
 /** Phase 7.4: set the master bus gain in dB. Sequence-level. */
 export const setMasterGainDb = (gainDb: number): Promise<void> =>
@@ -715,10 +709,7 @@ export type GainKeyframe = {
 
 /** Phase 7.4: replace a track's gain automation lane. Empty list =
  *  revert to the static `gain_db`. Live during playback. */
-export const setTrackGainKeyframes = (
-  trackId: string,
-  keyframes: GainKeyframe[]
-): Promise<void> =>
+export const setTrackGainKeyframes = (trackId: string, keyframes: GainKeyframe[]): Promise<void> =>
   invoke('set_track_gain_keyframes', { trackId, keyframes });
 
 /** Phase 7.4: replace a clip's gain automation lane (CLIP-relative
@@ -727,8 +718,7 @@ export const setClipGainKeyframes = (
   trackId: string,
   clipId: string,
   keyframes: GainKeyframe[]
-): Promise<void> =>
-  invoke('set_clip_gain_keyframes', { trackId, clipId, keyframes });
+): Promise<void> => invoke('set_clip_gain_keyframes', { trackId, clipId, keyframes });
 
 /** Phase 7.4 M3: set the clip's fade-in. `durationSeconds == 0` clears
  *  the fade. Only `'linear'` is honoured in 7.4; the other curve names
@@ -740,8 +730,7 @@ export const setClipFadeIn = (
   clipId: string,
   durationSeconds: number,
   curve: FadeCurveName = 'linear'
-): Promise<void> =>
-  invoke('set_clip_fade_in', { trackId, clipId, durationSeconds, curve });
+): Promise<void> => invoke('set_clip_fade_in', { trackId, clipId, durationSeconds, curve });
 
 /** Phase 7.4 M3: set the clip's fade-out. Mirror of [`setClipFadeIn`]. */
 export const setClipFadeOut = (
@@ -749,8 +738,7 @@ export const setClipFadeOut = (
   clipId: string,
   durationSeconds: number,
   curve: FadeCurveName = 'linear'
-): Promise<void> =>
-  invoke('set_clip_fade_out', { trackId, clipId, durationSeconds, curve });
+): Promise<void> => invoke('set_clip_fade_out', { trackId, clipId, durationSeconds, curve });
 
 /** Start playback of the active sequence from `timelineSeconds`,
  *  using scene_plan to pick the active clip and swapping the

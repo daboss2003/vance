@@ -244,10 +244,7 @@ class ProjectState {
         .filter((x): x is string => x !== null);
       if (failed.length > 0) {
         // eslint-disable-next-line no-console
-        console.warn(
-          `peaksEnqueue (backfill) failed for ${failed.length} media items:`,
-          failed
-        );
+        console.warn(`peaksEnqueue (backfill) failed for ${failed.length} media items:`, failed);
       }
     } catch (e) {
       // eslint-disable-next-line no-console
@@ -887,11 +884,7 @@ class ProjectState {
 
   /** Phase 7.4: replace a clip's gain automation lane. Times are
    *  CLIP-relative seconds. Empty list = revert to static gain_db. */
-  async setClipGainKeyframes(
-    trackId: string,
-    clipId: string,
-    keyframes: GainKeyframe[]
-  ) {
+  async setClipGainKeyframes(trackId: string, clipId: string, keyframes: GainKeyframe[]) {
     this.error = null;
     try {
       await ipcSetClipGainKeyframes(trackId, clipId, keyframes);

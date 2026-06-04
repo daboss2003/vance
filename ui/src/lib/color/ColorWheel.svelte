@@ -175,7 +175,9 @@
     {/if}
   </div>
   <span class="font-mono text-[9px] text-vance-muted">
-    {rgb[0].toFixed(2)} {rgb[1].toFixed(2)} {rgb[2].toFixed(2)} · {master.toFixed(2)}
+    {rgb[0].toFixed(2)}
+    {rgb[1].toFixed(2)}
+    {rgb[2].toFixed(2)} · {master.toFixed(2)}
   </span>
 </div>
 
