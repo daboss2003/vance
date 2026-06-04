@@ -23,14 +23,17 @@ import {
 
 export const CLIP_GAIN_COLOR = '#06b6d4';
 export const TRACK_GAIN_COLOR = '#f59e0b';
-export const FADE_WEDGE_FILL = 'rgba(0, 0, 0, 0.45)';
+const FADE_WEDGE_FILL = 'rgba(0, 0, 0, 0.45)';
 const BASELINE_COLOR = 'rgba(160, 160, 170, 0.22)';
 const BASELINE_COLOR_REINFORCED = 'rgba(160, 160, 170, 0.40)';
 const KF_OUTLINE = '#0a0c10';
 const KF_GLOW_SELECTED = 'rgba(255, 255, 255, 0.95)';
 
-/** 6×6 px keyframe symbol; shape encodes interp. `selected` adds a glow. */
-export function drawKeyframeSymbol(
+/** 6×6 px keyframe symbol; shape encodes interp. `selected` adds a glow.
+ *  Module-private — only [`drawGainLane`] calls this. Exposing it would
+ *  invite callers to draw keyframes outside a lane, which would skip
+ *  the lane's clip + alpha logic. */
+function drawKeyframeSymbol(
   ctx: CanvasRenderingContext2D,
   cx: number,
   cy: number,
@@ -220,9 +223,10 @@ export function drawFade(
 }
 
 /**
- * Capsule chip (L / B / H / E / G letter inside). Mirrors the M/S
- * button's visual language. `active` = filled in accent; otherwise
- * outlined.
+ * Filled capsule chip (L / E / G letter inside) — used by M5 to label
+ * a clip's active fade curve. Mirrors the M/S button's visual language
+ * (same roundRect + 10 px semibold), filled in `accent` with dark
+ * text on top.
  */
 export function drawChip(
   ctx: CanvasRenderingContext2D,
@@ -231,18 +235,17 @@ export function drawChip(
   w: number,
   h: number,
   letter: string,
-  accent: string,
-  active: boolean
+  accent: string
 ) {
   ctx.save();
-  ctx.fillStyle = active ? accent : '#2c2f37';
-  ctx.strokeStyle = active ? accent : '#4a4e58';
+  ctx.fillStyle = accent;
+  ctx.strokeStyle = accent;
   ctx.lineWidth = 1;
   ctx.beginPath();
   ctx.roundRect(x + 0.5, y + 0.5, w - 1, h - 1, 3);
   ctx.fill();
   ctx.stroke();
-  ctx.fillStyle = active ? '#0d0f12' : '#9099a8';
+  ctx.fillStyle = '#0d0f12';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.font = 'bold 9px ui-sans-serif, system-ui, sans-serif';

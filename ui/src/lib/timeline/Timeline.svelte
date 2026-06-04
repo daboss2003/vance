@@ -29,11 +29,9 @@
     yForDb,
     dbForY,
     clampDb,
-    nextInterp,
     nextFadeCurve,
     normalizeLane,
-    timeToString,
-    dbToString
+    fadeCurveLetter
   } from './automation-geom';
   import {
     drawGainLane,
@@ -51,11 +49,12 @@
     hitFadeChip,
     hitClipKeyframe,
     hitTrackKeyframe,
+    fadeChipGeomFor,
     CHIP_W,
     CHIP_H,
+    KF_HITBOX,
     type AutomationHit
   } from './automation-hit';
-  import { interpLetter, fadeCurveLetter } from './automation-geom';
 
   let { refreshTick = 0 }: { refreshTick?: number } = $props();
 
@@ -575,23 +574,21 @@
       }
 
       // Phase 7.4 M5 — fade curve chip in the bottom corner of the wedge.
-      if (track.kind === 'audio' && w > 32) {
-        const fadeInPx = Math.min(w - 2, (c.fade_in?.duration_seconds ?? 0) * pixelsPerSecond);
-        const fadeOutPx = Math.min(w - 2, (c.fade_out?.duration_seconds ?? 0) * pixelsPerSecond);
+      // Geometry comes from the shared fadeChipGeomFor so the hit pass
+      // (hitFadeChip) sees the same chipInVisible / chipOutVisible flags
+      // and can never drift from this draw pass.
+      if (track.kind === 'audio') {
+        const geom = fadeChipGeomFor(
+          c.fade_in?.duration_seconds ?? 0,
+          c.fade_out?.duration_seconds ?? 0,
+          w,
+          pixelsPerSecond
+        );
         const chipY = cy + ch - CHIP_H - 2;
-        if (fadeInPx >= 28) {
-          drawChip(
-            ctx,
-            x + 3,
-            chipY,
-            CHIP_W,
-            CHIP_H,
-            fadeCurveLetter(c.fade_in?.curve),
-            '#9099a8',
-            true
-          );
+        if (geom.chipInVisible) {
+          drawChip(ctx, x + 3, chipY, CHIP_W, CHIP_H, fadeCurveLetter(c.fade_in?.curve), '#9099a8');
         }
-        if (fadeOutPx >= 28) {
+        if (geom.chipOutVisible) {
           drawChip(
             ctx,
             x + w - CHIP_W - 3,
@@ -599,8 +596,7 @@
             CHIP_W,
             CHIP_H,
             fadeCurveLetter(c.fade_out?.curve),
-            '#9099a8',
-            true
+            '#9099a8'
           );
         }
       }
@@ -1101,6 +1097,31 @@
     | null;
   let selectedKf = $state<SelectedKf>(null);
 
+  // Phase 7.4 M5 — re-resolve selectedKf against the live sequence
+  // after every edit. When the underlying clip/track/keyframe goes
+  // away (clip deleted, lane reset, kf-index shifted by another edit),
+  // null the selection so subsequent Delete / interp-set actions can't
+  // operate on a phantom target. Adversarial review finding #4.
+  $effect(() => {
+    const sel = selectedKf;
+    if (!sel || !sequence) return;
+    const track = sequence.tracks.find((t) => t.id === sel.trackId);
+    if (!track) {
+      selectedKf = null;
+      return;
+    }
+    if (sel.scope === 'clip') {
+      const clip = track.clips.find((c) => c.id === sel.clipId);
+      if (!clip || sel.index < 0 || sel.index >= clip.gain_keyframes.length) {
+        selectedKf = null;
+      }
+    } else {
+      if (sel.index < 0 || sel.index >= track.gain_keyframes.length) {
+        selectedKf = null;
+      }
+    }
+  });
+
   /** Live fade-edit preview. The wedge follows the cursor; the IPC
    *  commit fires on mouseup. */
   type FadeDrag = {
@@ -1212,55 +1233,64 @@
     if (rowIdx < 0 || rowIdx >= sequence.tracks.length) return null;
     const track = sequence.tracks[rowIdx];
     const y = trackY(rowIdx);
-    // Search audio-clip-level targets first (highest priority).
+    // Search per-clip targets first (highest priority). Shared
+    // FadeChipGeom ensures the hit pass sees exactly what the draw pass
+    // painted — no draw/hit drift, no zero-fade grip stealing trim.
     if (track.kind === 'audio') {
       for (const c of track.clips) {
         const t_in = c.timeline_in_seconds;
         const dur = c.duration_seconds;
-        const t_out = t_in + dur;
         const x = timeToX(t_in);
         const w = dur * pixelsPerSecond;
         const cy = y + 4;
         const ch = TRACK_HEIGHT - 8;
         if (cssX < x - 8 || cssX > x + w + 8) continue;
-        const fadeInPx = (c.fade_in?.duration_seconds ?? 0) * pixelsPerSecond;
-        const fadeOutPx = (c.fade_out?.duration_seconds ?? 0) * pixelsPerSecond;
-        // B. Fade chip
-        const chip = hitFadeChip(cssX, cssY, track.id, c.id, x, cy, w, ch, fadeInPx, fadeOutPx);
+        const geom = fadeChipGeomFor(
+          c.fade_in?.duration_seconds ?? 0,
+          c.fade_out?.duration_seconds ?? 0,
+          w,
+          pixelsPerSecond
+        );
+        const chip = hitFadeChip(cssX, cssY, track.id, c.id, x, cy, w, ch, geom);
         if (chip) return chip;
-        // D. Fade grip
-        const grip = hitFadeGrip(cssX, cssY, track.id, c.id, x, cy, w, fadeInPx, fadeOutPx);
+        const grip = hitFadeGrip(cssX, cssY, track.id, c.id, x, cy, w, geom);
         if (grip) return grip;
-        // E. Clip keyframe
         const lane = clipLaneRect(cy, ch);
         if (lane && cssX >= x && cssX <= x + w) {
-          const kf = hitClipKeyframe(
-            cssX,
-            cssY,
-            track.id,
-            c.id,
-            c.gain_keyframes,
-            (tClip) => timeToX(t_in + tClip),
-            (db) => yForDb(db, lane.top, lane.height)
-          );
-          if (kf) return kf;
+          // Gate the keyframe hit-test on the lane rect so a click
+          // ABOVE the lane (e.g. on the clip label) can never grab a
+          // keyframe symbol that happens to sit at the lane's top edge.
+          if (cssY >= lane.top - KF_HITBOX / 2 && cssY <= lane.top + lane.height + KF_HITBOX / 2) {
+            const kf = hitClipKeyframe(
+              cssX,
+              cssY,
+              track.id,
+              c.id,
+              c.gain_keyframes,
+              (tClip) => timeToX(t_in + tClip),
+              (db) => yForDb(db, lane.top, lane.height)
+            );
+            if (kf) return kf;
+          }
         }
-        void t_out;
       }
     }
-    // F. Track keyframe — checked AFTER per-clip targets so a kf landing
-    //    on the same pixel as a clip keyframe loses to the clip one.
+    // Track keyframe — checked AFTER per-clip targets so a kf landing
+    // on the same pixel as a clip keyframe loses to the clip one. Y is
+    // gated to the lane rect for the same reason as above.
     if (track.kind === 'audio') {
       const lane = trackLaneRect(y);
-      const trackKf = hitTrackKeyframe(
-        cssX,
-        cssY,
-        track.id,
-        track.gain_keyframes,
-        (t) => timeToX(t),
-        (db) => yForDb(db, lane.top, lane.height)
-      );
-      if (trackKf) return trackKf;
+      if (cssY >= lane.top - KF_HITBOX / 2 && cssY <= lane.top + lane.height + KF_HITBOX / 2) {
+        const trackKf = hitTrackKeyframe(
+          cssX,
+          cssY,
+          track.id,
+          track.gain_keyframes,
+          (t) => timeToX(t),
+          (db) => yForDb(db, lane.top, lane.height)
+        );
+        if (trackKf) return trackKf;
+      }
     }
     return null;
   }
@@ -1296,25 +1326,14 @@
       handleAutomationMouseDown(e, autoHit, localX, localY);
       return;
     }
-    // Phase 7.4 M5 — Alt-click on empty audio-track lane creates a new
-    // track-gain keyframe at the cursor.
-    if (e.altKey && sequence && localX >= TRACK_HEADER_W && localY >= RULER_HEIGHT) {
-      const rowIdx = Math.floor((localY - RULER_HEIGHT) / TRACK_HEIGHT);
-      if (rowIdx >= 0 && rowIdx < sequence.tracks.length) {
-        const track = sequence.tracks[rowIdx];
-        if (track.kind === 'audio') {
-          const lane = trackLaneRect(trackY(rowIdx));
-          const tSec = scrollSeconds + (localX - TRACK_HEADER_W) / pixelsPerSecond;
-          const db = clampDb(dbForY(localY, lane.top, lane.height));
-          void createTrackKeyframe(track.id, tSec, db);
-          // Clear marquee/selection click semantics for this gesture.
-          return;
-        }
-      }
-    }
     const hit = hitAt(localX, localY);
-    // Phase 7.4 M5 — Alt-click inside an audio clip body creates a new
-    // clip-gain keyframe at the cursor.
+    // Phase 7.4 M5 — Alt-click priority resolution:
+    //   1. Inside an audio clip body → create a CLIP-scope keyframe.
+    //   2. On empty audio-track strip (no clip under cursor) → create
+    //      a TRACK-scope keyframe.
+    // The previous ordering ran the track-strip branch unconditionally
+    // on any Alt-click in an audio row, leaving the clip-body branch
+    // unreachable (adversarial review finding #2).
     if (e.altKey && hit?.kind === 'body' && sequence) {
       const track = sequence.tracks.find((t) => t.clips.some((c) => c.id === hit.clip.id));
       if (track && track.kind === 'audio') {
@@ -1326,6 +1345,19 @@
           const tClip = Math.max(0, tSec - hit.clip.timeline_in_seconds);
           const db = clampDb(dbForY(localY, lane.top, lane.height));
           void createClipKeyframe(track.id, hit.clip.id, tClip, db);
+          return;
+        }
+      }
+    }
+    if (e.altKey && sequence && !hit && localX >= TRACK_HEADER_W && localY >= RULER_HEIGHT) {
+      const rowIdx = Math.floor((localY - RULER_HEIGHT) / TRACK_HEIGHT);
+      if (rowIdx >= 0 && rowIdx < sequence.tracks.length) {
+        const track = sequence.tracks[rowIdx];
+        if (track.kind === 'audio') {
+          const lane = trackLaneRect(trackY(rowIdx));
+          const tSec = scrollSeconds + (localX - TRACK_HEADER_W) / pixelsPerSecond;
+          const db = clampDb(dbForY(localY, lane.top, lane.height));
+          void createTrackKeyframe(track.id, tSec, db);
           return;
         }
       }
@@ -1459,9 +1491,6 @@
         };
         return;
       }
-      case 'interp-chip':
-        // Reserved for the L/B/H chip near the selected keyframe.
-        return;
     }
   }
 
@@ -2081,11 +2110,18 @@
     const target = e.target as HTMLElement | null;
     if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
     if (e.key === 'Escape') {
-      if (fadeDrag || kfDrag) {
+      // Cancel any in-flight drag — M5 automation drags AND the
+      // existing move/trim drags. Without clearing all of these the
+      // dragStart record can survive the cancel and re-fire on the
+      // next mousemove (finding #7).
+      if (fadeDrag || kfDrag || moveDrag || trimDrag || dragStart) {
         fadeDrag = null;
         kfDrag = null;
+        moveDrag = null;
+        trimDrag = null;
         cursorCss = null;
         dragStart = null;
+        marquee = null;
         scheduleDraw();
         e.preventDefault();
       }
@@ -2156,10 +2192,19 @@
     }
   }
 
-  /** Right-click on a fade wedge — for v1 this just removes the fade.
-   *  A full curve picker context menu is a documented v1.1 enhancement. */
+  /** Any drag in progress? Used to gate one-shot handlers (contextmenu,
+   *  dblclick) so they can't mutate the underlying lane while a drag
+   *  preview is still holding a captured snapshot — that race would
+   *  silently re-commit the pre-edit state on mouseup. Adversarial
+   *  review finding #3. */
+  function dragInFlight(): boolean {
+    return !!(dragStart || fadeDrag || kfDrag || moveDrag || trimDrag);
+  }
+
+  /** Right-click on a fade wedge or keyframe removes it. */
   function onContextMenu(e: MouseEvent) {
     if (!canvas || !sequence) return;
+    if (dragInFlight()) return;
     const rect = canvas.getBoundingClientRect();
     const localX = e.clientX - rect.left;
     const localY = e.clientY - rect.top;
@@ -2182,9 +2227,10 @@
     }
   }
 
-  /** Double-click on a fade grip removes the fade (= duration 0). */
+  /** Double-click on a fade grip or keyframe removes it. */
   function onDoubleClick(e: MouseEvent) {
     if (!canvas || !sequence) return;
+    if (dragInFlight()) return;
     const rect = canvas.getBoundingClientRect();
     const localX = e.clientX - rect.left;
     const localY = e.clientY - rect.top;

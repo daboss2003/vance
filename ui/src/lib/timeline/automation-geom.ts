@@ -157,10 +157,16 @@ export function fadeCurveLetter(
 }
 
 /**
- * Sort + dedupe a keyframe array. Two keyframes whose times are within
- * `epsilon_t` seconds collapse to the later-modified one (we treat the
- * array's later entry as the survivor). Required because the IPC validator
- * rejects unsorted / duplicate-time lanes.
+ * Sort + dedupe a keyframe array. Two keyframes within `epsilonT`
+ * seconds of each other collapse to the one with the LARGER time
+ * (sort-stable order: the entry later in the sorted array wins, which
+ * is the one with the strictly greater `time_seconds`). This means
+ * "move a keyframe onto another by dragging" keeps the moved keyframe
+ * iff its time advanced past the stationary one; otherwise the
+ * stationary keyframe survives.
+ *
+ * Required because the IPC validator rejects unsorted /
+ * duplicate-time lanes.
  */
 export function normalizeLane(lane: GainKeyframe[], epsilonT = 1e-6): GainKeyframe[] {
   if (lane.length === 0) return lane;
