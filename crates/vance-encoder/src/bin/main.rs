@@ -184,23 +184,25 @@ impl State {
             (0, None, false)
         };
 
-        // 2. Finalise WAV header.
-        let (audio_samples, audio_out) = if let Some(a) = s.audio.take() {
+        // 2. Finalise WAV header + capture target codec for the mux.
+        let (audio_samples, audio_out, audio_codec) = if let Some(a) = s.audio.take() {
             finalize_wav_header(&a)?;
-            (a.samples_written, Some(a.out_path))
+            (a.samples_written, Some(a.out_path), Some(a.codec))
         } else {
-            (0, None)
+            (0, None, None)
         };
 
-        // 3. Mux.
+        // 3. Mux. Re-encode audio to the requested codec at this step
+        // so the final container carries the user-chosen format
+        // (AAC / FLAC / PCM) instead of the side WAV's PCM_S24.
         match (video_out, audio_out) {
             (Some(v), Some(a)) => {
-                run_mux(&v, &a, &s.final_path)?;
+                run_mux(&v, &a, &s.final_path, audio_codec.unwrap())?;
                 let _ = std::fs::remove_file(&v);
                 let _ = std::fs::remove_file(&a);
             }
             (None, Some(a)) => {
-                run_audio_only_export(&a, &s.final_path)?;
+                run_audio_only_export(&a, &s.final_path, audio_codec.unwrap())?;
                 let _ = std::fs::remove_file(&a);
             }
             (Some(_v), None) if had_video => {
@@ -444,9 +446,31 @@ fn finalize_wav_header(a: &AudioPipe) -> Result<(), String> {
     Ok(())
 }
 
-fn run_mux(video_path: &PathBuf, audio_path: &PathBuf, final_path: &str) -> Result<(), String> {
-    let status = Command::new("ffmpeg")
-        .arg("-hide_banner")
+fn audio_codec_args(codec: AudioCodec) -> Vec<String> {
+    match codec {
+        AudioCodec::PcmS16 => vec!["-c:a".into(), "pcm_s16le".into()],
+        AudioCodec::PcmS24 => vec!["-c:a".into(), "pcm_s24le".into()],
+        AudioCodec::Aac => vec![
+            "-c:a".into(),
+            "aac".into(),
+            // Use a constant-quality VBR mode so output bitrate
+            // matches source loudness rather than being padded with
+            // silence at a fixed CBR.
+            "-vbr".into(),
+            "4".into(),
+        ],
+        AudioCodec::Flac => vec!["-c:a".into(), "flac".into(), "-compression_level".into(), "5".into()],
+    }
+}
+
+fn run_mux(
+    video_path: &PathBuf,
+    audio_path: &PathBuf,
+    final_path: &str,
+    audio_codec: AudioCodec,
+) -> Result<(), String> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-hide_banner")
         .arg("-loglevel")
         .arg("warning")
         .arg("-y")
@@ -455,35 +479,39 @@ fn run_mux(video_path: &PathBuf, audio_path: &PathBuf, final_path: &str) -> Resu
         .arg("-i")
         .arg(audio_path)
         .arg("-c:v")
-        .arg("copy")
-        .arg("-c:a")
-        .arg("pcm_s24le")
-        .arg("-map")
+        .arg("copy");
+    for a in audio_codec_args(audio_codec) {
+        cmd.arg(a);
+    }
+    cmd.arg("-map")
         .arg("0:v:0")
         .arg("-map")
         .arg("1:a:0")
-        .arg(final_path)
-        .status()
-        .map_err(|e| format!("mux spawn: {e}"))?;
+        .arg(final_path);
+    let status = cmd.status().map_err(|e| format!("mux spawn: {e}"))?;
     if !status.success() {
         return Err(format!("ffmpeg mux exited with {status:?}"));
     }
     Ok(())
 }
 
-fn run_audio_only_export(audio_path: &PathBuf, final_path: &str) -> Result<(), String> {
-    let status = Command::new("ffmpeg")
-        .arg("-hide_banner")
+fn run_audio_only_export(
+    audio_path: &PathBuf,
+    final_path: &str,
+    audio_codec: AudioCodec,
+) -> Result<(), String> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-hide_banner")
         .arg("-loglevel")
         .arg("warning")
         .arg("-y")
         .arg("-i")
-        .arg(audio_path)
-        .arg("-c:a")
-        .arg("pcm_s24le")
-        .arg(final_path)
-        .status()
-        .map_err(|e| format!("audio export spawn: {e}"))?;
+        .arg(audio_path);
+    for a in audio_codec_args(audio_codec) {
+        cmd.arg(a);
+    }
+    cmd.arg(final_path);
+    let status = cmd.status().map_err(|e| format!("audio export spawn: {e}"))?;
     if !status.success() {
         return Err(format!("ffmpeg audio export exited with {status:?}"));
     }
