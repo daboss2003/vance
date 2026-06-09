@@ -6615,17 +6615,26 @@ impl Engine {
     /// are all correct.
     pub fn render_sequence(&mut self, opts: RenderOptions) -> Result<RenderOutcome, EngineError> {
         let started = Instant::now();
-        let seq = self.current_sequence_ref()?;
-        let seq_duration_r = seq.duration().0;
-        let seq_duration = seq_duration_r.numer() as f64 / seq_duration_r.denom() as f64;
-        let fr_r = seq.frame_rate.0;
-        let frame_rate_num = fr_r.numer() as u32;
-        let frame_rate_den = fr_r.denom() as u32;
-        let nominal_width = 1920u32;
-        let nominal_height = 1080u32;
 
-        let width = opts.width.unwrap_or(nominal_width);
-        let height = opts.height.unwrap_or(nominal_height);
+        // 1. Guard against running while playback owns the primary
+        //    decoder. The integration survey flagged this risk
+        //    explicitly (Phase 8.5 plan / risks).
+        if self.playback.is_some() {
+            let _ = self.stop_playback();
+        }
+
+        // 2. Snapshot sequence shape (frame-rate, duration, walk plan).
+        let (frame_rate_num, frame_rate_den, seq_duration) = {
+            let seq = self.current_sequence_ref()?;
+            let seq_duration_r = seq.duration().0;
+            let seq_duration = seq_duration_r.numer() as f64 / seq_duration_r.denom() as f64;
+            let fr_r = seq.frame_rate.0;
+            let frame_rate_num = fr_r.numer() as u32;
+            let frame_rate_den = fr_r.denom() as u32;
+            (frame_rate_num, frame_rate_den, seq_duration)
+        };
+        let width = opts.width.unwrap_or(1920);
+        let height = opts.height.unwrap_or(1080);
         let start_s = opts.start_seconds.unwrap_or(0.0).max(0.0);
         let end_s = opts.end_seconds.unwrap_or(seq_duration).min(seq_duration);
         if end_s <= start_s {
@@ -6633,68 +6642,168 @@ impl Engine {
                 "render range empty: start={start_s} end={end_s}"
             )));
         }
-
         let total_frames = ((end_s - start_s) * frame_rate_num as f64 / frame_rate_den as f64)
             .ceil() as u64;
         let sample_rate: u32 = 48_000;
 
+        // 3. Ensure a headless render state. install_viewport's render
+        //    state works (it was built via Renderer::new_with against a
+        //    surface but the renderer is surface-agnostic afterwards).
+        //    Fall back to a fresh truly-headless Renderer if none exists.
+        let render_state_arc = if let Some(rs) = self.render_state.as_ref() {
+            rs.clone()
+        } else {
+            let renderer = Renderer::new(RendererConfig::default())
+                .map_err(|e| EngineError::Project(format!("headless renderer: {e}")))?;
+            let arc = Arc::new(Mutex::new(RenderState {
+                renderer,
+                surface_config: None,
+                source_surface_config: None,
+            }));
+            self.render_state = Some(arc.clone());
+            arc
+        };
+
+        // 4. Spawn encoder + open the output. Same path as v1.
         let bin = locate_encoder_binary()?;
         let mut client = vance_encoder::EncoderClient::spawn(&bin)
             .map_err(|e| EngineError::Project(format!("encoder spawn: {e}")))?;
-
-        let v_cfg = vance_encoder::VideoConfig {
-            width,
-            height,
-            frame_rate_num,
-            frame_rate_den,
-            pixel_format: vance_encoder::VideoPixelFormat::Rgba8,
-            preset: opts.preset.clone(),
-            time_base_num: frame_rate_den,
-            time_base_den: frame_rate_num,
-        };
-        let a_cfg = vance_encoder::AudioConfig {
-            sample_rate,
-            channels: 2,
-            sample_format: vance_encoder::AudioSampleFormat::F32Interleaved,
-            codec: vance_encoder::AudioCodec::PcmS24,
-            time_base_num: 1,
-            time_base_den: sample_rate,
-        };
         client
-            .open(opts.output_path.clone(), Some(v_cfg), Some(a_cfg))
+            .open(
+                opts.output_path.clone(),
+                Some(vance_encoder::VideoConfig {
+                    width,
+                    height,
+                    frame_rate_num,
+                    frame_rate_den,
+                    pixel_format: vance_encoder::VideoPixelFormat::Rgba8,
+                    preset: opts.preset.clone(),
+                    time_base_num: frame_rate_den,
+                    time_base_den: frame_rate_num,
+                }),
+                Some(vance_encoder::AudioConfig {
+                    sample_rate,
+                    channels: 2,
+                    sample_format: vance_encoder::AudioSampleFormat::F32Interleaved,
+                    codec: vance_encoder::AudioCodec::PcmS24,
+                    time_base_num: 1,
+                    time_base_den: sample_rate,
+                }),
+            )
             .map_err(|e| EngineError::Project(format!("encoder open: {e}")))?;
 
+        // 5. Reset per-frame renderer state to identity so any prior
+        //    preview doesn't bleed into the export. Mirrors the block
+        //    at decode_and_render_at:1644-1655.
+        {
+            let mut rs = render_state_arc.lock();
+            rs.renderer.set_opacity(1.0);
+            rs.renderer.set_transform([0.0, 0.0], [1.0, 1.0], 0.0);
+            rs.renderer.set_brightness_contrast(0.0, 1.0);
+            rs.renderer.set_crop(0.0, 0.0, 0.0, 0.0);
+            rs.renderer.set_mix_factor(0.0);
+            rs.renderer.set_chroma_key([0.0, 1.0, 0.0], 0.15, 0.05, 0.0);
+            rs.renderer.set_luma_key(0.5, 1.0, 0.05, 0.0);
+            rs.renderer.set_grades(&[]);
+        }
+
+        // 6. Pre-allocate the black-RGBA fallback (used for SceneAt::
+        //    Empty + title clips in v1 + decode errors).
         let pixel_count = (width as usize) * (height as usize) * 4;
-        let mut pixels = vec![0u8; pixel_count];
+        let mut black = vec![0u8; pixel_count];
+        for px in (0..pixel_count).step_by(4) {
+            black[px + 3] = 255;
+        }
+
+        // 7. Frame loop. For each output frame: scene_at → media
+        //    resolution → decode_at → upload_frame → render_to_rgba_buffer
+        //    → push_video.
+        let mut emitted_frames = 0u64;
         for f in 0..total_frames {
-            // Frame-index visualisation. Future 8.5 work replaces this
-            // with the real renderer's RGBA readback.
-            let phase = (f as usize) & 0xff;
-            for y in 0..height as usize {
-                let row_base = y * width as usize * 4;
-                let stripe = ((y / 8) ^ phase) as u8;
-                for x in 0..width as usize {
-                    let i = row_base + x * 4;
-                    pixels[i] = (stripe.wrapping_mul(7).wrapping_add(x as u8)) as u8;
-                    pixels[i + 1] = (stripe.wrapping_add(80) as u8).wrapping_mul(3);
-                    pixels[i + 2] = ((f as u8).wrapping_add(stripe)) as u8;
-                    pixels[i + 3] = 255;
+            let timeline_seconds =
+                start_s + (f as f64) * (frame_rate_den as f64) / (frame_rate_num as f64);
+            let timeline_t = seconds_to_rt(timeline_seconds);
+
+            // Resolve which clip (if any) is on screen.
+            let (active_media, active_source_pts_seconds): (Option<MediaItemId>, f64) = {
+                let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
+                let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+                let seq = project.sequence(seq_id).ok_or(EngineError::SequenceNotFound)?;
+                match vance_timeline::scene_at(seq, timeline_t) {
+                    vance_timeline::SceneAt::Clip(c) => {
+                        (Some(c.media), rt_to_seconds(c.source_pts))
+                    }
+                    vance_timeline::SceneAt::Empty => (None, 0.0),
+                }
+            };
+
+            let mut rgba: Option<Vec<u8>> = None;
+            if let Some(media_id) = active_media {
+                let resolved = self.media_for_active(media_id)?;
+                match resolved {
+                    MediaResolved::File(path) => {
+                        // Open file iff the decoder isn't already on it.
+                        let needs_open = self
+                            .current_media_path
+                            .as_deref()
+                            .map(|p| p != path.as_str())
+                            .unwrap_or(true);
+                        if needs_open {
+                            self.open_file(&path)?;
+                        }
+                        // Convert source PTS-seconds → stream time-base.
+                        let target_pts = if let Some(info) = self.stream_info.as_ref() {
+                            let (tb_n, tb_d) = info.time_base;
+                            if tb_n != 0 {
+                                (active_source_pts_seconds * (tb_d as f64) / (tb_n as f64))
+                                    .round() as i64
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        };
+                        // Decode + upload + headless RGBA readback.
+                        let decoder = self.decoder.as_mut().ok_or(EngineError::NoFileOpen)?;
+                        if let Ok(frame) = decoder.decode_at(target_pts) {
+                            let mut rs = render_state_arc.lock();
+                            rs.renderer
+                                .upload_frame(&frame)
+                                .map_err(|e| EngineError::Project(format!("upload: {e}")))?;
+                            match rs.renderer.render_to_rgba_buffer(width, height) {
+                                Ok(buf) => rgba = Some(buf),
+                                Err(e) => {
+                                    tracing::warn!(?e, frame = f, "render_to_rgba_buffer failed; black");
+                                }
+                            }
+                        }
+                    }
+                    MediaResolved::Title(_) => {
+                        // Title clips are deferred to the iterative
+                        // follow-up — emit black for v1.
+                    }
                 }
             }
+            let push = rgba.unwrap_or_else(|| black.clone());
             client
-                .push_video(f as i64, pixels.clone())
+                .push_video(f as i64, push)
                 .map_err(|e| EngineError::Project(format!("encoder push_video: {e}")))?;
+            emitted_frames += 1;
         }
-        // 1 frame's worth of stereo silence per video frame at audio
-        // SR — the encoder muxes from the side WAV at Finish.
+
+        // 8. Silent audio — one push per video frame, length matched
+        //    to the audio sample rate. Real mixed-down audio lands when
+        //    vance_audio gains an offline `fold_range` API (plan
+        //    work-item 9).
         let samples_per_frame = (sample_rate as u64 * frame_rate_den as u64
             / frame_rate_num as u64) as usize;
         let chunk = vec![0f32; samples_per_frame * 2];
-        for _ in 0..total_frames {
+        for _ in 0..emitted_frames {
             client
                 .push_audio(0, chunk.clone())
                 .map_err(|e| EngineError::Project(format!("encoder push_audio: {e}")))?;
         }
+
         let (video_frames, audio_samples) = client
             .finish()
             .map_err(|e| EngineError::Project(format!("encoder finish: {e}")))?;
@@ -6756,14 +6865,26 @@ fn locate_decoder_binary() -> Result<PathBuf, EngineError> {
                 return Ok(candidate);
             }
             tried.push(candidate);
-
-            // Cargo's `cargo run` puts the binary under target/<profile>/;
-            // the decoder sidecar is built into the same dir.
-            let cargo_candidate = dir.join(exe_name);
-            if cargo_candidate.exists() {
-                return Ok(cargo_candidate);
+            // Integration tests run from `target/<profile>/deps/`; the
+            // sidecar binary is one level up.
+            if let Some(parent) = dir.parent() {
+                let alt = parent.join(exe_name);
+                if alt.exists() {
+                    return Ok(alt);
+                }
+                tried.push(alt);
             }
         }
+    }
+    // Workspace-relative fallback (matches locate_encoder_binary).
+    for c in [
+        PathBuf::from("target/debug").join(exe_name),
+        PathBuf::from("target/release").join(exe_name),
+    ] {
+        if c.exists() {
+            return Ok(c);
+        }
+        tried.push(c);
     }
     Err(EngineError::DecoderBinaryMissing(tried))
 }
