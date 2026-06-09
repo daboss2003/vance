@@ -9,6 +9,7 @@
     windows_subsystem = "windows"
 )]
 
+mod cached_decode;
 mod engine;
 mod peaks;
 

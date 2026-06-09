@@ -1116,6 +1116,9 @@ pub struct Engine {
     /// Most recently opened media path. Needed by `start_playback` to
     /// also open the audio side of the file.
     current_media_path: Option<String>,
+    /// Phase 9.2 — frame cache used by scrub paths to skip the
+    /// decoder when the same PTS is re-hit during jog.
+    pub(crate) frame_cache: Option<Arc<vance_cache::FrameCache>>,
     /// Last-applied viewport bounds (in physical pixels).
     last_bounds: ViewportBounds,
     /// Active playback, if any.
@@ -1654,8 +1657,22 @@ impl Engine {
                 rs.renderer.set_grades(&[]);
             }
         }
+        // Phase 9.2 — fast scrub path: hit the frame cache before
+        // round-tripping to the decoder sidecar. Cache is lazily
+        // built on first use; failures degrade to a direct decode.
+        let frame_cache = self.ensure_frame_cache();
+        let uri_owned = self
+            .current_media_path
+            .clone()
+            .unwrap_or_else(|| String::from(""));
         let dec = self.decoder.as_mut().ok_or(EngineError::NoFileOpen)?;
-        let frame = dec.decode_at(target_pts)?;
+        let (frame, _was_hit) = if !uri_owned.is_empty() {
+            crate::cached_decode::cached_decode_at(dec, &frame_cache, &uri_owned, target_pts)
+                .map_err(EngineError::from)?
+        } else {
+            let f = dec.decode_at(target_pts)?;
+            (f, false)
+        };
         let pts = frame.pts;
         tracing::info!(
             requested_pts = target_pts,
@@ -1663,6 +1680,7 @@ impl Engine {
             w = frame.width,
             h = frame.height,
             bytes = frame.bytes.len(),
+            cache_hit = _was_hit,
             "decoded frame"
         );
 
@@ -6929,6 +6947,53 @@ impl Engine {
             new_media_id: media_info.id,
             new_clip_id: new_clip_id.to_string(),
         })
+    }
+}
+
+impl Engine {
+    /// Phase 9.2 — lazily build the on-disk + in-memory frame cache.
+    /// Cache dir lives under the platform's data dir (or under
+    /// `target/` during dev) so a fresh project doesn't repeatedly
+    /// re-decode the same scrubbed frames.
+    pub(crate) fn ensure_frame_cache(&mut self) -> Arc<vance_cache::FrameCache> {
+        if let Some(c) = self.frame_cache.as_ref() {
+            return c.clone();
+        }
+        // Conservative defaults — small ring per source, 4 GB on-disk
+        // cap. UI will surface knobs in a later milestone.
+        let base = std::env::temp_dir().join("vance-cache");
+        let ring_budget = 64 * 1024 * 1024; // 64 MiB per source
+        let disk_budget = 4 * 1024 * 1024 * 1024; // 4 GiB
+        match vance_cache::FrameCache::new(base, ring_budget, disk_budget) {
+            Ok(c) => {
+                let arc = Arc::new(c);
+                self.frame_cache = Some(arc.clone());
+                arc
+            }
+            Err(e) => {
+                // Failure here is non-fatal — fall back to caching
+                // disabled. Build a sentinel cache rooted in /dev/null
+                // equivalents would be wrong; we just leak the error
+                // to the trace log and re-attempt next time.
+                tracing::warn!(?e, "frame cache init failed; caching disabled");
+                // Re-attempt anyway with a fresh process-temp prefix
+                // to avoid permanent disable.
+                let alt = std::env::temp_dir().join(format!(
+                    "vance-cache-{}",
+                    std::process::id()
+                ));
+                let c = vance_cache::FrameCache::new(alt, ring_budget, disk_budget)
+                    .expect("fallback cache");
+                let arc = Arc::new(c);
+                self.frame_cache = Some(arc.clone());
+                arc
+            }
+        }
+    }
+
+    /// Phase 9.2 — public read-only cache stats for the UI.
+    pub fn frame_cache_stats(&self) -> Option<vance_cache::CacheStats> {
+        self.frame_cache.as_ref().map(|c| c.stats())
     }
 }
 

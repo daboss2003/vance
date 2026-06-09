@@ -5276,6 +5276,7 @@ dependencies = [
  "uuid",
  "vance-audio",
  "vance-audio-plugins",
+ "vance-cache",
  "vance-color",
  "vance-core",
  "vance-decoder",
@@ -5330,6 +5331,13 @@ version = "0.0.0"
 [[package]]
 name = "vance-cache"
 version = "0.0.0"
+dependencies = [
+ "parking_lot",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+]
 
 [[package]]
 name = "vance-cli"

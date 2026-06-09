@@ -4,5 +4,7 @@
 
 #[path = "peaks.rs"]
 pub mod peaks;
+#[path = "cached_decode.rs"]
+pub mod cached_decode;
 #[path = "engine.rs"]
 pub mod engine;
