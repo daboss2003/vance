@@ -1119,6 +1119,10 @@ pub struct Engine {
     /// Phase 9.2 — frame cache used by scrub paths to skip the
     /// decoder when the same PTS is re-hit during jog.
     pub(crate) frame_cache: Option<Arc<vance_cache::FrameCache>>,
+    /// Phase 9.3 — background prefetch worker. Owns its own decoder
+    /// sidecar so the primary decoder isn't fighting for the open
+    /// file handle.
+    pub(crate) prefetch: Option<crate::prefetch::PrefetchWorker>,
     /// Last-applied viewport bounds (in physical pixels).
     last_bounds: ViewportBounds,
     /// Active playback, if any.
@@ -1674,6 +1678,9 @@ impl Engine {
             (f, false)
         };
         let pts = frame.pts;
+        // Phase 9.3 — fire-and-forget kick to the background prefetch
+        // worker so the next jog/play hits the cache.
+        self.kick_prefetch(pts);
         tracing::info!(
             requested_pts = target_pts,
             actual_pts = pts,
@@ -6994,6 +7001,56 @@ impl Engine {
     /// Phase 9.2 — public read-only cache stats for the UI.
     pub fn frame_cache_stats(&self) -> Option<vance_cache::CacheStats> {
         self.frame_cache.as_ref().map(|c| c.stats())
+    }
+
+    /// Phase 9.3 — lazily spawn the prefetch worker. Uses the same
+    /// decoder binary discovery path as the primary decoder.
+    pub(crate) fn ensure_prefetch_worker(&mut self) -> Option<&crate::prefetch::PrefetchWorker> {
+        if self.prefetch.is_none() {
+            let bin = locate_decoder_binary().ok()?;
+            let cache = self.ensure_frame_cache();
+            self.prefetch = Some(crate::prefetch::PrefetchWorker::spawn(cache, bin));
+        }
+        self.prefetch.as_ref()
+    }
+
+    /// Phase 9.3 — kick a forward-prefetch session at `anchor_pts`.
+    /// `step_pts` should equal `time_base_den / frame_rate_num`. v1
+    /// horizon = 24 frames (~1 s at 24 fps).
+    pub(crate) fn kick_prefetch(&mut self, anchor_pts: i64) {
+        let uri = match self.current_media_path.clone() {
+            Some(u) => u,
+            None => return,
+        };
+        let step_pts = match self.stream_info.as_ref() {
+            Some(info) if info.frame_rate.0 > 0 && info.frame_rate.1 > 0 => {
+                let (tb_n, tb_d) = info.time_base;
+                if tb_n <= 0 {
+                    return;
+                }
+                // step = (tb_d / tb_n) * (frame_rate.1 / frame_rate.0)
+                // → represented as i64 to fit AtomicI64.
+                let num = tb_d as i64 * info.frame_rate.1 as i64;
+                let den = tb_n as i64 * info.frame_rate.0 as i64;
+                if den == 0 {
+                    return;
+                }
+                num / den
+            }
+            _ => return,
+        };
+        if step_pts <= 0 {
+            return;
+        }
+        let req = crate::prefetch::PrefetchRequest {
+            source_uri: uri,
+            anchor_pts,
+            step_pts,
+            horizon_frames: 24,
+        };
+        if let Some(worker) = self.ensure_prefetch_worker() {
+            worker.request(req);
+        }
     }
 }
 

@@ -12,6 +12,7 @@
 mod cached_decode;
 mod engine;
 mod peaks;
+mod prefetch;
 
 use engine::{EngineHandle, MediaItemInfo, ProjectInfo, SequenceContents, SourceState, TrackSummary};
 use parking_lot::Mutex as PMutex;

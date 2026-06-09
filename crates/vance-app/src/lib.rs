@@ -6,5 +6,7 @@
 pub mod peaks;
 #[path = "cached_decode.rs"]
 pub mod cached_decode;
+#[path = "prefetch.rs"]
+pub mod prefetch;
 #[path = "engine.rs"]
 pub mod engine;
