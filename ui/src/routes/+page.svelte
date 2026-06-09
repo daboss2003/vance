@@ -33,6 +33,7 @@
   import Timeline from '$lib/timeline/Timeline.svelte';
   import MasterMeter from '$lib/MasterMeter.svelte';
   import AudioEffectChain from '$lib/AudioEffectChain.svelte';
+  import ExportPanel from '$lib/ExportPanel.svelte';
   import ColorWheel from '$lib/color/ColorWheel.svelte';
   import CurveEditor from '$lib/color/CurveEditor.svelte';
   import ScopeCanvas from '$lib/color/ScopeCanvas.svelte';
@@ -1954,6 +1955,13 @@
              the track meters so the values share their hold + decay
              tuning. -->
         <MasterMeter />
+
+        <!-- Phase 8 — sequence export panel. Calls render_sequence
+             via Tauri; v1 emits a frame-index test pattern, real
+             renderer-to-encoder integration lands in 8.5. -->
+        <div class="ml-2 w-56 shrink-0">
+          <ExportPanel />
+        </div>
 
         <span class="text-vance-muted ml-auto">
           last PTS: <span class="text-vance-fg font-mono">{lastPts ?? '—'}</span>

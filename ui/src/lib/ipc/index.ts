@@ -951,6 +951,44 @@ export type AudioPluginDescriptor = {
 export const listAudioPlugins = (): Promise<AudioPluginDescriptor[]> =>
   invoke('list_audio_plugins');
 
+// ---- Phase 8 — Export pipeline -------------------------------------------
+
+/** Phase 8 — encoder preset discriminants (mirrors the Rust enum). */
+export type EncoderPresetKey =
+  | 'ProRes422HQ'
+  | 'ProRes422'
+  | 'ProRes4444'
+  | 'DnxhrHq'
+  | 'DnxhrSq'
+  | 'DnxhrLb'
+  | 'H264'
+  | 'Hevc'
+  | 'Av1';
+
+/** Phase 8 — UI render request. */
+export type RenderRequest = {
+  output_path: string;
+  preset: EncoderPresetKey;
+  crf?: number | null;
+  width?: number | null;
+  height?: number | null;
+  start_seconds?: number | null;
+  end_seconds?: number | null;
+};
+
+/** Phase 8 — UI render outcome. */
+export type RenderOutcome = {
+  output_path: string;
+  video_frames: number;
+  audio_samples: number;
+  elapsed_seconds: number;
+};
+
+/** Phase 8 — fire off a sequence render via the encoder sidecar.
+ *  Blocking on the backend side until the file is fully written. */
+export const renderSequence = (req: RenderRequest): Promise<RenderOutcome> =>
+  invoke('render_sequence', { req });
+
 // ---- Undo / redo ----------------------------------------------------------
 
 export const undo = (): Promise<boolean> => invoke('undo');

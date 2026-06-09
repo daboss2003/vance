@@ -1162,6 +1162,77 @@ struct UiMeterSnapshot {
     loudness: UiLoudness,
 }
 
+/// Phase 8 — UI-facing render request.
+#[derive(serde::Deserialize, Clone, Debug)]
+struct UiRenderRequest {
+    output_path: String,
+    /// "ProRes422HQ" | "ProRes422" | "ProRes4444" | "DnxhrHq" |
+    /// "DnxhrSq" | "DnxhrLb" | "H264" | "Hevc" | "Av1".
+    preset: String,
+    #[serde(default)]
+    crf: Option<u8>,
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
+    #[serde(default)]
+    start_seconds: Option<f64>,
+    #[serde(default)]
+    end_seconds: Option<f64>,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+struct UiRenderOutcome {
+    output_path: String,
+    video_frames: u64,
+    audio_samples: u64,
+    elapsed_seconds: f64,
+}
+
+/// Phase 8 — kick off a sequence render via the encoder sidecar.
+/// Blocks until the encode is complete. Background queue + cancellation
+/// land with 8.5.
+#[tauri::command]
+fn render_sequence(
+    state: tauri::State<'_, EngineHandle>,
+    req: UiRenderRequest,
+) -> Result<UiRenderOutcome, String> {
+    let preset = match req.preset.as_str() {
+        "ProRes422HQ" => vance_encoder::EncoderPreset::ProRes422HQ,
+        "ProRes422" => vance_encoder::EncoderPreset::ProRes422,
+        "ProRes4444" => vance_encoder::EncoderPreset::ProRes4444,
+        "DnxhrHq" => vance_encoder::EncoderPreset::DnxhrHq,
+        "DnxhrSq" => vance_encoder::EncoderPreset::DnxhrSq,
+        "DnxhrLb" => vance_encoder::EncoderPreset::DnxhrLb,
+        "H264" => vance_encoder::EncoderPreset::H264 {
+            crf: req.crf.unwrap_or(23),
+        },
+        "Hevc" => vance_encoder::EncoderPreset::Hevc {
+            crf: req.crf.unwrap_or(28),
+        },
+        "Av1" => vance_encoder::EncoderPreset::Av1 {
+            crf: req.crf.unwrap_or(30),
+        },
+        other => return Err(format!("unknown preset `{other}`")),
+    };
+    let opts = crate::engine::RenderOptions {
+        output_path: req.output_path.clone(),
+        preset,
+        width: req.width,
+        height: req.height,
+        render_and_replace_track: None,
+        start_seconds: req.start_seconds,
+        end_seconds: req.end_seconds,
+    };
+    let outcome = state.lock().render_sequence(opts).map_err(|e| e.to_string())?;
+    Ok(UiRenderOutcome {
+        output_path: outcome.output_path,
+        video_frames: outcome.video_frames,
+        audio_samples: outcome.audio_samples,
+        elapsed_seconds: outcome.elapsed_seconds,
+    })
+}
+
 /// Phase 7.10 / 7.11 — UI-facing plugin descriptor.
 #[derive(serde::Serialize, Clone, Debug)]
 struct UiPluginDescriptor {
@@ -2125,6 +2196,7 @@ fn main() {
             meter_snapshot,
             scrub_burst,
             list_audio_plugins,
+            render_sequence,
             set_track_gain_keyframes,
             set_clip_gain_keyframes,
             set_clip_fade_in,
