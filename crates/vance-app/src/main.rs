@@ -1233,6 +1233,82 @@ fn render_sequence(
     })
 }
 
+/// Phase 8.7 — render-and-replace request from the UI.
+#[derive(serde::Deserialize, Clone, Debug)]
+struct UiRenderAndReplaceRequest {
+    output_path: String,
+    preset: String,
+    #[serde(default)]
+    crf: Option<u8>,
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
+    track_id: String,
+    start_seconds: f64,
+    end_seconds: f64,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+struct UiRenderAndReplaceOutcome {
+    render: UiRenderOutcome,
+    new_media_id: String,
+    new_clip_id: String,
+}
+
+/// Phase 8.7 — render a sub-range of the active sequence to a new
+/// media file + replace the range on `track_id` with a clip
+/// referencing it. Composes render_sequence + import_media_file +
+/// OverwriteClip into one undoable operation.
+#[tauri::command]
+fn render_and_replace(
+    state: tauri::State<'_, EngineHandle>,
+    req: UiRenderAndReplaceRequest,
+) -> Result<UiRenderAndReplaceOutcome, String> {
+    let preset = match req.preset.as_str() {
+        "ProRes422HQ" => vance_encoder::EncoderPreset::ProRes422HQ,
+        "ProRes422" => vance_encoder::EncoderPreset::ProRes422,
+        "ProRes4444" => vance_encoder::EncoderPreset::ProRes4444,
+        "DnxhrHq" => vance_encoder::EncoderPreset::DnxhrHq,
+        "DnxhrSq" => vance_encoder::EncoderPreset::DnxhrSq,
+        "DnxhrLb" => vance_encoder::EncoderPreset::DnxhrLb,
+        "H264" => vance_encoder::EncoderPreset::H264 {
+            crf: req.crf.unwrap_or(23),
+        },
+        "Hevc" => vance_encoder::EncoderPreset::Hevc {
+            crf: req.crf.unwrap_or(28),
+        },
+        "Av1" => vance_encoder::EncoderPreset::Av1 {
+            crf: req.crf.unwrap_or(30),
+        },
+        other => return Err(format!("unknown preset `{other}`")),
+    };
+    let track_uuid: uuid::Uuid = req
+        .track_id
+        .parse()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let opts = crate::engine::RenderAndReplaceOptions {
+        output_path: req.output_path,
+        preset,
+        width: req.width,
+        height: req.height,
+        track_id: vance_timeline::TrackId::from_uuid(track_uuid),
+        start_seconds: req.start_seconds,
+        end_seconds: req.end_seconds,
+    };
+    let outcome = state.lock().render_and_replace(opts).map_err(|e| e.to_string())?;
+    Ok(UiRenderAndReplaceOutcome {
+        render: UiRenderOutcome {
+            output_path: outcome.render.output_path,
+            video_frames: outcome.render.video_frames,
+            audio_samples: outcome.render.audio_samples,
+            elapsed_seconds: outcome.render.elapsed_seconds,
+        },
+        new_media_id: outcome.new_media_id,
+        new_clip_id: outcome.new_clip_id,
+    })
+}
+
 /// Phase 7.10 / 7.11 — UI-facing plugin descriptor.
 #[derive(serde::Serialize, Clone, Debug)]
 struct UiPluginDescriptor {
@@ -2197,6 +2273,7 @@ fn main() {
             scrub_burst,
             list_audio_plugins,
             render_sequence,
+            render_and_replace,
             set_track_gain_keyframes,
             set_clip_gain_keyframes,
             set_clip_fade_in,

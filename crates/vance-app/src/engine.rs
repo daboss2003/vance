@@ -6817,6 +6817,121 @@ impl Engine {
     }
 }
 
+/// Phase 8.7 — Render-and-replace options.
+#[derive(Clone, Debug)]
+pub struct RenderAndReplaceOptions {
+    /// Destination file for the rendered clip. Convention: a sub-dir
+    /// of the project bundle's `media/` so the output travels with
+    /// the project on save.
+    pub output_path: String,
+    /// Encoder preset to use. ProRes 422 HQ is the recommended choice
+    /// for render-and-replace — it's deterministic, fast to decode on
+    /// playback, and visually lossless.
+    pub preset: vance_encoder::EncoderPreset,
+    /// Render output width. Falls back to 1920 when `None`.
+    pub width: Option<u32>,
+    /// Render output height. Falls back to 1080 when `None`.
+    pub height: Option<u32>,
+    /// Track that the new rendered clip lands on. The same track is
+    /// scanned for overlapping clips that get overwritten.
+    pub track_id: TrackId,
+    /// Start of the range to render + replace (seconds).
+    pub start_seconds: f64,
+    /// End of the range (seconds, exclusive).
+    pub end_seconds: f64,
+}
+
+/// Phase 8.7 — outcome of a render-and-replace operation.
+#[derive(Clone, Debug)]
+pub struct RenderAndReplaceOutcome {
+    /// Renderer/encoder summary for the export step.
+    pub render: RenderOutcome,
+    /// `MediaItemId` registered for the new rendered clip (string form).
+    pub new_media_id: String,
+    /// `ClipId` of the inserted replacement clip (string form).
+    pub new_clip_id: String,
+}
+
+impl Engine {
+    /// Phase 8.7 — render a time range of the active sequence to a
+    /// new media file, import it, and overwrite the range on
+    /// `track_id` with a single clip referencing the rendered output.
+    ///
+    /// Composes from existing primitives — `render_sequence`,
+    /// `import_media_file`, and the `OverwriteClip` EditOp — so undo
+    /// is preserved automatically: hitting Cmd-Z reverts the overwrite
+    /// (restoring the original clips); the rendered file stays on
+    /// disk so a follow-up Redo is instant.
+    pub fn render_and_replace(
+        &mut self,
+        opts: RenderAndReplaceOptions,
+    ) -> Result<RenderAndReplaceOutcome, EngineError> {
+        if opts.end_seconds <= opts.start_seconds {
+            return Err(EngineError::Project(format!(
+                "render-and-replace range empty: {} → {}",
+                opts.start_seconds, opts.end_seconds
+            )));
+        }
+        // 1. Render the sub-range out to disk via the existing
+        //    sandboxed encoder path.
+        let render_outcome = self.render_sequence(RenderOptions {
+            output_path: opts.output_path.clone(),
+            preset: opts.preset.clone(),
+            width: opts.width,
+            height: opts.height,
+            render_and_replace_track: Some(opts.track_id),
+            start_seconds: Some(opts.start_seconds),
+            end_seconds: Some(opts.end_seconds),
+        })?;
+
+        // 2. Re-import the rendered file as a fresh MediaItem so the
+        //    timeline can reference it.
+        let media_info = self.import_media_file(&opts.output_path)?;
+        let media_uuid: uuid::Uuid = media_info
+            .id
+            .parse()
+            .map_err(|e| EngineError::Project(format!("media id parse: {e}")))?;
+        let media_id = MediaItemId::from_uuid(media_uuid);
+
+        // 3. Build a Clip targeting the full rendered duration, anchored
+        //    at the export's start timeline-time.
+        let (clip, new_clip_id) = {
+            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
+            let media = project
+                .media
+                .get(&media_id)
+                .ok_or(EngineError::MediaNotFound)?
+                .clone();
+            let timeline_in = seconds_to_rt(opts.start_seconds);
+            let clip = Clip::new(
+                media.id,
+                media.display_name.clone(),
+                timeline_in,
+                vance_core::RationalTime::ZERO,
+                media.duration,
+            )
+            .map_err(|e| EngineError::Project(e.to_string()))?;
+            let id = clip.id;
+            (clip, id)
+        };
+
+        // 4. Overwrite the range on the target track in one undoable
+        //    operation. OverwriteClip trims/removes anything the new
+        //    clip overlaps, matching the standard NLE render-and-
+        //    replace semantics.
+        self.apply_edit_op(EditOp::OverwriteClip {
+            track_id: opts.track_id,
+            clip,
+        })?;
+
+        Ok(RenderAndReplaceOutcome {
+            render: render_outcome,
+            new_media_id: media_info.id,
+            new_clip_id: new_clip_id.to_string(),
+        })
+    }
+}
+
 /// Locate the `vance-encoder` binary using the same fallback chain as
 /// the decoder.
 fn locate_encoder_binary() -> Result<PathBuf, EngineError> {

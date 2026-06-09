@@ -989,6 +989,31 @@ export type RenderOutcome = {
 export const renderSequence = (req: RenderRequest): Promise<RenderOutcome> =>
   invoke('render_sequence', { req });
 
+/** Phase 8.7 — render-and-replace request. Renders the range, imports
+ *  the result as a new media file, then overwrites the range on
+ *  `track_id` with a single clip pointing at the rendered file. */
+export type RenderAndReplaceRequest = {
+  output_path: string;
+  preset: EncoderPresetKey;
+  crf?: number | null;
+  width?: number | null;
+  height?: number | null;
+  track_id: string;
+  start_seconds: number;
+  end_seconds: number;
+};
+
+/** Phase 8.7 — render-and-replace outcome. */
+export type RenderAndReplaceOutcome = {
+  render: RenderOutcome;
+  new_media_id: string;
+  new_clip_id: string;
+};
+
+/** Phase 8.7 — fire a render-and-replace operation. */
+export const renderAndReplace = (req: RenderAndReplaceRequest): Promise<RenderAndReplaceOutcome> =>
+  invoke('render_and_replace', { req });
+
 // ---- Undo / redo ----------------------------------------------------------
 
 export const undo = (): Promise<boolean> => invoke('undo');
