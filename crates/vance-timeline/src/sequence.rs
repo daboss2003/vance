@@ -104,6 +104,8 @@ mod tests {
             solo: false,
             gain_db: 0.0,
             gain_keyframes: Vec::new(),
+            pan: 0.0,
+            audio_effects: Vec::new(),
         });
         let v2 = Arc::new(Track {
             id: TrackId::new(),
@@ -117,6 +119,8 @@ mod tests {
             solo: false,
             gain_db: 0.0,
             gain_keyframes: Vec::new(),
+            pan: 0.0,
+            audio_effects: Vec::new(),
         });
         let seq = Sequence {
             id: SequenceId::new(),

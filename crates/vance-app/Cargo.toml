@@ -45,9 +45,11 @@ vance-tracker = { workspace = true }
 vance-grading-cmd = { workspace = true }
 vance-time = { workspace = true }
 vance-decoder = { workspace = true }
+vance-encoder = { workspace = true }
 vance-render = { workspace = true }
 vance-viewport = { workspace = true }
 vance-audio = { workspace = true }
+vance-audio-plugins = { workspace = true }
 vance-timeline = { workspace = true }
 vance-project = { workspace = true }
 vance-peaks = { workspace = true }

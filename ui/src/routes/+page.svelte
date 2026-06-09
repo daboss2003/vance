@@ -32,6 +32,7 @@
   import { selectionState } from '$lib/selection.svelte';
   import Timeline from '$lib/timeline/Timeline.svelte';
   import MasterMeter from '$lib/MasterMeter.svelte';
+  import AudioEffectChain from '$lib/AudioEffectChain.svelte';
   import ColorWheel from '$lib/color/ColorWheel.svelte';
   import CurveEditor from '$lib/color/CurveEditor.svelte';
   import ScopeCanvas from '$lib/color/ScopeCanvas.svelte';
@@ -2438,6 +2439,61 @@
             <dt class="text-vance-muted">enabled</dt>
             <dd>{c.enabled ? 'yes' : 'muted'}</dd>
           </dl>
+
+          <!-- Phase 7.6 — pan controls. Sliders for the parent track's
+               pan AND the clip's pan, since they compose additively at
+               mix time. Audio tracks only (video tracks accept the
+               edit but the mixer ignores it; we still show the
+               controls so the user sees the value land). -->
+          {#if t.kind === 'audio'}
+            <div class="mt-3">
+              <div class="mb-1 text-[11px] uppercase tracking-wider text-vance-muted">Pan</div>
+              <label class="flex items-center gap-2 font-mono text-xs">
+                <span class="w-12 text-vance-muted">track</span>
+                <input
+                  type="range"
+                  min="-1"
+                  max="1"
+                  step="0.01"
+                  value={t.pan}
+                  oninput={(e) =>
+                    projectState.setTrackPan(
+                      t.id,
+                      parseFloat((e.target as HTMLInputElement).value)
+                    )}
+                  class="flex-1 accent-[var(--color-vance-accent)]"
+                />
+                <span class="w-10 text-right">{t.pan.toFixed(2)}</span>
+              </label>
+              <label class="mt-1 flex items-center gap-2 font-mono text-xs">
+                <span class="w-12 text-vance-muted">clip</span>
+                <input
+                  type="range"
+                  min="-1"
+                  max="1"
+                  step="0.01"
+                  value={c.pan}
+                  oninput={(e) =>
+                    projectState.setClipPan(
+                      t.id,
+                      c.id,
+                      parseFloat((e.target as HTMLInputElement).value)
+                    )}
+                  class="flex-1 accent-[var(--color-vance-accent)]"
+                />
+                <span class="w-10 text-right">{c.pan.toFixed(2)}</span>
+              </label>
+              <div class="mt-0.5 text-[10px] text-vance-muted">
+                composed: {Math.max(-1, Math.min(1, t.pan + c.pan)).toFixed(2)} (clamped)
+              </div>
+            </div>
+
+            <!-- Phase 7.7 — per-track built-in DSP insert chain
+                 (parametric EQ + compressor + limiter). Shown for
+                 audio tracks since the engine ignores the chain on
+                 video tracks. -->
+            <AudioEffectChain trackId={t.id} effects={t.audio_effects} />
+          {/if}
 
           <!-- Effects: list each attached effect with its kind + a
              remove button. 5.2+ adds parameter editing (opacity

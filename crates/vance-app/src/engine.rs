@@ -222,6 +222,12 @@ pub struct TrackContents {
     /// seconds. Empty = use the static `gain_db`. Each keyframe's
     /// `value` is in dB.
     pub gain_keyframes: Vec<vance_timeline::Keyframe>,
+    /// Phase 7.6: stereo pan position, range `[-1, +1]`.
+    pub pan: f32,
+    /// Phase 7.7: ordered audio effect insert chain. Each entry is
+    /// serialised verbatim from the timeline crate's
+    /// [`vance_timeline::AudioEffectSpec`] tagged enum.
+    pub audio_effects: Vec<vance_timeline::AudioEffectSpec>,
 }
 
 /// One transition's worth of info for the UI.
@@ -265,6 +271,8 @@ pub struct ClipContents {
     pub fade_in: Option<vance_timeline::Fade>,
     /// Phase 7.4 M3: optional fade-out. `None` = no fade-out.
     pub fade_out: Option<vance_timeline::Fade>,
+    /// Phase 7.6: per-clip stereo pan position, range `[-1, +1]`.
+    pub pan: f32,
 }
 
 /// One effect's worth of info for the UI.
@@ -1698,6 +1706,24 @@ impl Engine {
             from_pts,
             use_mixer: true,
         })
+    }
+
+    /// Phase 7.9 — start a short audio scrub burst at `from_pts`.
+    ///
+    /// This is a thin wrapper around `stop_playback` + `start_playback_mixed`
+    /// designed for rapid invocation during a playhead drag. The UI is
+    /// responsible for calling `stop_playback` after the desired burst
+    /// duration (typically ~80–120 ms). Consecutive bursts within the
+    /// mixer's `PRELOAD_SECONDS` window benefit from the M4 scheduler's
+    /// warm sidecars; only the first burst of a drag session pays
+    /// cold-start latency.
+    ///
+    /// Returns `Ok` even when the prior `stop_playback` fails (e.g.
+    /// when no playback was active) — only failures of the new
+    /// playback start propagate.
+    pub fn scrub_burst(&mut self, from_pts: i64) -> Result<(), EngineError> {
+        let _ = self.stop_playback();
+        self.start_playback_mixed(from_pts)
     }
 
     /// Wraps the heavy lifting so `start_playback` and the title-mode
@@ -4273,6 +4299,77 @@ impl Engine {
         })
     }
 
+    /// Phase 7.6: set a track's stereo pan. Live during playback —
+    /// snapshot republish recomputes every clip's `pan_linear`.
+    pub fn set_track_pan(&mut self, track_id: TrackId, pan: f32) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::SetTrackPan { track_id, pan })
+    }
+
+    /// Phase 7.6: set a clip's stereo pan. Composes with the parent
+    /// track's pan at mixer snapshot build time.
+    pub fn set_clip_pan(
+        &mut self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+        pan: f32,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::SetClipPan {
+            track_id,
+            clip_id,
+            pan,
+        })
+    }
+
+    /// Phase 7.7: append an audio effect to the track's chain. Live
+    /// during playback — the fold thread reconciles its DSP state on
+    /// the next buffer.
+    pub fn add_audio_effect(
+        &mut self,
+        track_id: TrackId,
+        effect: vance_timeline::AudioEffectSpec,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::AddAudioEffect { track_id, effect })
+    }
+
+    /// Phase 7.7: remove the audio effect at `index` from the chain.
+    /// No-op if the index is out of range. Live during playback.
+    pub fn remove_audio_effect(
+        &mut self,
+        track_id: TrackId,
+        index: usize,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::RemoveAudioEffect { track_id, index })
+    }
+
+    /// Phase 7.7: reorder one effect within the chain.
+    pub fn move_audio_effect(
+        &mut self,
+        track_id: TrackId,
+        from_index: usize,
+        to_index: usize,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::MoveAudioEffect {
+            track_id,
+            from_index,
+            to_index,
+        })
+    }
+
+    /// Phase 7.7: replace one effect's spec (used for every knob
+    /// commit).
+    pub fn update_audio_effect(
+        &mut self,
+        track_id: TrackId,
+        index: usize,
+        effect: vance_timeline::AudioEffectSpec,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::UpdateAudioEffect {
+            track_id,
+            index,
+            effect,
+        })
+    }
+
     /// Phase 7.4: set the sequence's master bus gain in dB. Live
     /// during playback — the snapshot republish makes it audible
     /// within one mixer buffer.
@@ -4746,6 +4843,7 @@ impl Engine {
                             gain_keyframes: c.gain_keyframes.clone(),
                             fade_in: c.fade_in,
                             fade_out: c.fade_out,
+                            pan: c.pan,
                         })
                         .collect(),
                     transitions: t
@@ -4764,6 +4862,8 @@ impl Engine {
                     solo: t.solo,
                     gain_db: t.gain_db,
                     gain_keyframes: t.gain_keyframes.clone(),
+                    pan: t.pan,
+                    audio_effects: t.audio_effects.clone(),
                 })
                 .collect(),
             master_gain_db: seq.master_gain_db,
@@ -5398,13 +5498,89 @@ fn track_to_mix(track: &Track) -> vance_audio::TrackMix {
         gain_lane: translate_gain_keyframes(&track.gain_keyframes),
         mute: track.mute,
         solo: track.solo,
+        audio_effects: track
+            .audio_effects
+            .iter()
+            .map(translate_audio_effect)
+            .collect(),
+    }
+}
+
+/// Phase 7.7 — translate one vance-timeline `AudioEffectSpec` into the
+/// vance-audio mirror, sanitising and pre-computing what the fold
+/// thread needs. The translation keeps the audio crate decoupled from
+/// the timeline crate and centralises range-clamping so the fold
+/// thread can trust every value.
+fn translate_audio_effect(
+    spec: &vance_timeline::AudioEffectSpec,
+) -> vance_audio::AudioEffectKind {
+    use vance_timeline::AudioEffectSpec as Spec;
+    match spec {
+        Spec::Eq6 { enabled, eq } => {
+            let mut out = [vance_audio::EqBandParams {
+                enabled: true,
+                shape: vance_audio::dsp::BiquadShape::Peak,
+                freq_hz: 1_000.0,
+                gain_db: 0.0,
+                q: 0.707,
+            }; 6];
+            for (dst, src) in out.iter_mut().zip(eq.bands.iter()) {
+                dst.enabled = src.enabled;
+                dst.shape = match src.kind {
+                    vance_timeline::EqBandKind::LowShelf => {
+                        vance_audio::dsp::BiquadShape::LowShelf
+                    }
+                    vance_timeline::EqBandKind::Peak => vance_audio::dsp::BiquadShape::Peak,
+                    vance_timeline::EqBandKind::HighShelf => {
+                        vance_audio::dsp::BiquadShape::HighShelf
+                    }
+                    vance_timeline::EqBandKind::LowCut => vance_audio::dsp::BiquadShape::LowCut,
+                    vance_timeline::EqBandKind::HighCut => vance_audio::dsp::BiquadShape::HighCut,
+                };
+                dst.freq_hz = src.freq_hz.clamp(10.0, 22_000.0);
+                dst.gain_db = src.gain_db.clamp(-24.0, 24.0);
+                dst.q = src.q.clamp(0.1, 18.0);
+            }
+            vance_audio::AudioEffectKind::Eq6 {
+                enabled: *enabled,
+                bands: out,
+            }
+        }
+        Spec::Compressor { enabled, spec } => vance_audio::AudioEffectKind::Compressor {
+            enabled: *enabled,
+            params: vance_audio::CompressorParams {
+                threshold_db: spec.threshold_db.clamp(-60.0, 0.0),
+                ratio: spec.ratio.clamp(1.0, 20.0),
+                attack_ms: spec.attack_ms.clamp(0.1, 1000.0),
+                release_ms: spec.release_ms.clamp(0.1, 5000.0),
+                knee_db: spec.knee_db.clamp(0.0, 18.0),
+                makeup_db: spec.makeup_db.clamp(-12.0, 24.0),
+            },
+        },
+        Spec::Limiter { enabled, spec } => vance_audio::AudioEffectKind::Limiter {
+            enabled: *enabled,
+            params: vance_audio::LimiterParams {
+                ceiling_db: spec.ceiling_db.clamp(-30.0, 0.0),
+                release_ms: spec.release_ms.clamp(1.0, 5000.0),
+            },
+        },
+        Spec::Plugin {
+            enabled,
+            descriptor,
+            params: _,
+        } => vance_audio::AudioEffectKind::Plugin {
+            enabled: *enabled,
+            format_str: descriptor.format.clone(),
+            id: descriptor.id.clone(),
+            name: descriptor.name.clone(),
+        },
     }
 }
 
 /// Translate a [`Clip`] from vance-timeline into a
 /// [`vance_audio::ClipMix`]. `enabled` mirrors `Clip.enabled` (per-clip
 /// mute), `gain_linear` is precomputed.
-fn clip_to_mix(clip: &Clip, track_id: TrackId) -> vance_audio::ClipMix {
+fn clip_to_mix(clip: &Clip, track: &Track) -> vance_audio::ClipMix {
     let (fade_in_dur, fade_in_curve) = clip
         .fade_in
         .as_ref()
@@ -5415,17 +5591,24 @@ fn clip_to_mix(clip: &Clip, track_id: TrackId) -> vance_audio::ClipMix {
         .as_ref()
         .map(|f| (f.duration_seconds, translate_fade_curve(f.curve)))
         .unwrap_or((0.0, vance_audio::FadeCurve::Linear));
+    // Phase 7.6: precompose track + clip pan ONCE per snapshot build so
+    // the fold thread never invokes sin/cos. The clamp prevents an
+    // out-of-range sum (e.g. track +0.7 with clip +0.6) from
+    // overshooting the equal-power conversion's domain.
+    let effective_pan = (track.pan + clip.pan).clamp(-1.0, 1.0);
+    let pan_linear = vance_audio::pan_to_equal_power(effective_pan);
     vance_audio::ClipMix {
         gain_linear: vance_audio::db_to_linear(clip.gain_db),
         gain_lane: translate_gain_keyframes(&clip.gain_keyframes),
         enabled: clip.enabled,
-        track_id: track_id.as_uuid(),
+        track_id: track.id.as_uuid(),
         timeline_in_seconds: rt_to_seconds(clip.timeline_in),
         clip_duration_seconds: rt_to_seconds(clip.duration()),
         fade_in_duration_seconds: fade_in_dur,
         fade_in_curve,
         fade_out_duration_seconds: fade_out_dur,
         fade_out_curve,
+        pan_linear,
     }
 }
 
@@ -5481,7 +5664,7 @@ fn build_mixer_snapshot(sequence: &vance_timeline::Sequence) -> vance_audio::Mix
         if track.kind == TrackKind::Audio {
             for clip in &track.clips {
                 snap.clips
-                    .insert(clip.id.as_uuid(), clip_to_mix(clip, track.id));
+                    .insert(clip.id.as_uuid(), clip_to_mix(clip, track));
             }
         }
     }
@@ -5737,6 +5920,12 @@ fn op_touches_mixer(op: &EditOp) -> bool {
         | EditOp::SetClipGainKeyframes { .. }
         | EditOp::SetClipFadeIn { .. }
         | EditOp::SetClipFadeOut { .. }
+        | EditOp::SetTrackPan { .. }
+        | EditOp::SetClipPan { .. }
+        | EditOp::AddAudioEffect { .. }
+        | EditOp::RemoveAudioEffect { .. }
+        | EditOp::MoveAudioEffect { .. }
+        | EditOp::UpdateAudioEffect { .. }
         | EditOp::AddTrack { .. }
         | EditOp::RemoveTrack { .. }
         | EditOp::InsertClip { .. }
@@ -6376,6 +6565,176 @@ fn present_record_only(
     rs.renderer.render_to(&view)?;
     surface_tex.present();
     Ok(())
+}
+
+/// Phase 8 — high-level options for [`Engine::render_sequence`].
+#[derive(Clone, Debug)]
+pub struct RenderOptions {
+    /// Destination container path. Extension picks the container.
+    pub output_path: String,
+    /// Encoder preset (e.g. ProRes 422 HQ — the exit-gate target).
+    pub preset: vance_encoder::EncoderPreset,
+    /// Output resolution. Defaults to the sequence's nominal raster
+    /// when `None`.
+    pub width: Option<u32>,
+    /// Output resolution.
+    pub height: Option<u32>,
+    /// Render-and-replace target track. `None` = full export.
+    pub render_and_replace_track: Option<vance_timeline::TrackId>,
+    /// Start time in seconds. `None` = sequence start.
+    pub start_seconds: Option<f64>,
+    /// End time in seconds. `None` = sequence end.
+    pub end_seconds: Option<f64>,
+}
+
+/// Phase 8 — render outcome surfaced to the UI.
+#[derive(Clone, Debug)]
+pub struct RenderOutcome {
+    /// Final output path the encoder wrote.
+    pub output_path: String,
+    /// Number of video frames pushed.
+    pub video_frames: u64,
+    /// Number of audio sample-pairs pushed.
+    pub audio_samples: u64,
+    /// Wall-clock seconds the encode took.
+    pub elapsed_seconds: f64,
+}
+
+impl Engine {
+    /// Phase 8 — render the current sequence to a file via the
+    /// sandboxed `vance-encoder` sidecar.
+    ///
+    /// v1 scope: synthesises a frame-index test pattern and silent
+    /// audio for every frame, exercising the full
+    /// IPC → ffmpeg → mux pipeline. The renderer-to-encoder
+    /// integration (real wgpu offscreen render target + texture
+    /// readback) lands in 8.5 alongside the render queue UI; until
+    /// then the sidecar's output is a colour-cycling stripe instead
+    /// of the user's actual sequence content, but the file format,
+    /// duration, audio channel count + sample rate, and container
+    /// are all correct.
+    pub fn render_sequence(&mut self, opts: RenderOptions) -> Result<RenderOutcome, EngineError> {
+        let started = Instant::now();
+        let seq = self.current_sequence_ref()?;
+        let seq_duration_r = seq.duration().0;
+        let seq_duration = seq_duration_r.numer() as f64 / seq_duration_r.denom() as f64;
+        let fr_r = seq.frame_rate.0;
+        let frame_rate_num = fr_r.numer() as u32;
+        let frame_rate_den = fr_r.denom() as u32;
+        let nominal_width = 1920u32;
+        let nominal_height = 1080u32;
+
+        let width = opts.width.unwrap_or(nominal_width);
+        let height = opts.height.unwrap_or(nominal_height);
+        let start_s = opts.start_seconds.unwrap_or(0.0).max(0.0);
+        let end_s = opts.end_seconds.unwrap_or(seq_duration).min(seq_duration);
+        if end_s <= start_s {
+            return Err(EngineError::Project(format!(
+                "render range empty: start={start_s} end={end_s}"
+            )));
+        }
+
+        let total_frames = ((end_s - start_s) * frame_rate_num as f64 / frame_rate_den as f64)
+            .ceil() as u64;
+        let sample_rate: u32 = 48_000;
+
+        let bin = locate_encoder_binary()?;
+        let mut client = vance_encoder::EncoderClient::spawn(&bin)
+            .map_err(|e| EngineError::Project(format!("encoder spawn: {e}")))?;
+
+        let v_cfg = vance_encoder::VideoConfig {
+            width,
+            height,
+            frame_rate_num,
+            frame_rate_den,
+            pixel_format: vance_encoder::VideoPixelFormat::Rgba8,
+            preset: opts.preset.clone(),
+            time_base_num: frame_rate_den,
+            time_base_den: frame_rate_num,
+        };
+        let a_cfg = vance_encoder::AudioConfig {
+            sample_rate,
+            channels: 2,
+            sample_format: vance_encoder::AudioSampleFormat::F32Interleaved,
+            codec: vance_encoder::AudioCodec::PcmS24,
+            time_base_num: 1,
+            time_base_den: sample_rate,
+        };
+        client
+            .open(opts.output_path.clone(), Some(v_cfg), Some(a_cfg))
+            .map_err(|e| EngineError::Project(format!("encoder open: {e}")))?;
+
+        let pixel_count = (width as usize) * (height as usize) * 4;
+        let mut pixels = vec![0u8; pixel_count];
+        for f in 0..total_frames {
+            // Frame-index visualisation. Future 8.5 work replaces this
+            // with the real renderer's RGBA readback.
+            let phase = (f as usize) & 0xff;
+            for y in 0..height as usize {
+                let row_base = y * width as usize * 4;
+                let stripe = ((y / 8) ^ phase) as u8;
+                for x in 0..width as usize {
+                    let i = row_base + x * 4;
+                    pixels[i] = (stripe.wrapping_mul(7).wrapping_add(x as u8)) as u8;
+                    pixels[i + 1] = (stripe.wrapping_add(80) as u8).wrapping_mul(3);
+                    pixels[i + 2] = ((f as u8).wrapping_add(stripe)) as u8;
+                    pixels[i + 3] = 255;
+                }
+            }
+            client
+                .push_video(f as i64, pixels.clone())
+                .map_err(|e| EngineError::Project(format!("encoder push_video: {e}")))?;
+        }
+        // 1 frame's worth of stereo silence per video frame at audio
+        // SR — the encoder muxes from the side WAV at Finish.
+        let samples_per_frame = (sample_rate as u64 * frame_rate_den as u64
+            / frame_rate_num as u64) as usize;
+        let chunk = vec![0f32; samples_per_frame * 2];
+        for _ in 0..total_frames {
+            client
+                .push_audio(0, chunk.clone())
+                .map_err(|e| EngineError::Project(format!("encoder push_audio: {e}")))?;
+        }
+        let (video_frames, audio_samples) = client
+            .finish()
+            .map_err(|e| EngineError::Project(format!("encoder finish: {e}")))?;
+        let _ = client.shutdown();
+        Ok(RenderOutcome {
+            output_path: opts.output_path,
+            video_frames,
+            audio_samples,
+            elapsed_seconds: started.elapsed().as_secs_f64(),
+        })
+    }
+}
+
+/// Locate the `vance-encoder` binary using the same fallback chain as
+/// the decoder.
+fn locate_encoder_binary() -> Result<PathBuf, EngineError> {
+    let exe_name = if cfg!(windows) {
+        "vance-encoder.exe"
+    } else {
+        "vance-encoder"
+    };
+    if let Ok(self_exe) = std::env::current_exe() {
+        if let Some(dir) = self_exe.parent() {
+            let candidate = dir.join(exe_name);
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+    }
+    for c in [
+        PathBuf::from("target/debug").join(exe_name),
+        PathBuf::from("target/release").join(exe_name),
+    ] {
+        if c.exists() {
+            return Ok(c);
+        }
+    }
+    Err(EngineError::Project(format!(
+        "could not find {exe_name} (looked next to vance-app + target/debug, target/release)"
+    )))
 }
 
 /// Try a list of locations for the `vance-decoder` binary:

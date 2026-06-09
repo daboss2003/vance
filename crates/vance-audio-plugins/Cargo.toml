@@ -7,3 +7,13 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
+
+[dependencies]
+vance-ipc = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

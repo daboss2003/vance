@@ -90,6 +90,21 @@ class MetersStore {
   /** Last seen publish generation. Stalled fold thread = generation
    *  stops advancing; the decay continues regardless. */
   lastGeneration = $state<number>(0);
+  /** Phase 7.8 — BS.1770 loudness + true-peak readout for the master
+   *  bus. -Infinity / 0 = "no measurement yet"; rendered as `--.- LU`. */
+  loudness = $state<{
+    lufs_m: number;
+    lufs_s: number;
+    lufs_i: number;
+    true_peak_l_db: number;
+    true_peak_r_db: number;
+  }>({
+    lufs_m: -Infinity,
+    lufs_s: -Infinity,
+    lufs_i: -Infinity,
+    true_peak_l_db: -Infinity,
+    true_peak_r_db: -Infinity
+  });
 
   private pollHandle: number | null = null;
   private lastTickMs = 0;
@@ -115,6 +130,13 @@ class MetersStore {
     this.master = emptyMeter();
     this.tracks = {};
     this.lastGeneration = 0;
+    this.loudness = {
+      lufs_m: -Infinity,
+      lufs_s: -Infinity,
+      lufs_i: -Infinity,
+      true_peak_l_db: -Infinity,
+      true_peak_r_db: -Infinity
+    };
   }
 
   private async tick() {
@@ -134,6 +156,23 @@ class MetersStore {
       return;
     }
     this.lastGeneration = snap.generation;
+    // Phase 7.8 — copy the loudness readout verbatim. Sanitise NaN
+    // (which Rust f32 NaN would serialise as `null` on the wire — but
+    // the Rust side currently emits f32 numbers, including the
+    // sentinel `-Infinity` for unmeasured values).
+    if (snap.loudness) {
+      this.loudness = {
+        lufs_m: Number.isFinite(snap.loudness.lufs_m) ? snap.loudness.lufs_m : -Infinity,
+        lufs_s: Number.isFinite(snap.loudness.lufs_s) ? snap.loudness.lufs_s : -Infinity,
+        lufs_i: Number.isFinite(snap.loudness.lufs_i) ? snap.loudness.lufs_i : -Infinity,
+        true_peak_l_db: Number.isFinite(snap.loudness.true_peak_l_db)
+          ? snap.loudness.true_peak_l_db
+          : -Infinity,
+        true_peak_r_db: Number.isFinite(snap.loudness.true_peak_r_db)
+          ? snap.loudness.true_peak_r_db
+          : -Infinity
+      };
+    }
     this.ingest(snap, now, dtSec);
   }
 

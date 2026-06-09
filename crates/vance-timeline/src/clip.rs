@@ -71,6 +71,14 @@ pub struct Clip {
     /// `clip_duration - fade_out.duration_seconds`.
     #[serde(default)]
     pub fade_out: Option<crate::fade::Fade>,
+    /// Phase 7.6: per-clip stereo pan position, range `[-1, +1]`. See
+    /// [`Track.pan`] for the equal-power law. Composes additively
+    /// with the track's pan: the mixer applies both at fold time so
+    /// "track pan +0.5 + clip pan -0.2 → effective pan +0.3" (clamped
+    /// to `[-1, +1]` at evaluation time). Pre-7.6 bundles deserialize
+    /// as 0.0 via `#[serde(default)]`.
+    #[serde(default)]
+    pub pan: f32,
 }
 
 impl Clip {
@@ -99,6 +107,7 @@ impl Clip {
             gain_keyframes: Vec::new(),
             fade_in: None,
             fade_out: None,
+            pan: 0.0,
         })
     }
 

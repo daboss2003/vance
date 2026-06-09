@@ -63,6 +63,30 @@ pub fn db_to_linear(db: f32) -> f32 {
     }
 }
 
+/// Phase 7.6: equal-power stereo pan conversion.
+///
+/// Takes a pan position in `[-1, +1]` (`-1` full left, `0` center, `+1`
+/// full right) and returns the per-channel multipliers `[L_gain,
+/// R_gain]` such that `L² + R² = 1` for every pan value. Center
+/// returns `[√½, √½]` (≈ `[0.7071, 0.7071]`) — the equal-power center
+/// shape every DAW uses. Non-finite or out-of-range inputs are
+/// clamped, never panic.
+///
+/// Engine call site: `vance-app::engine::build_mixer_snapshot` invokes
+/// this once per clip with `track.pan + clip.pan` (clamped) so the
+/// fold thread never touches `sin`/`cos`. Per-clip pan_linear is
+/// stored on [`ClipMix`].
+#[inline]
+pub fn pan_to_equal_power(pan: f32) -> [f32; 2] {
+    let p = if pan.is_finite() {
+        pan.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    let angle = (p + 1.0) * std::f32::consts::FRAC_PI_4;
+    [angle.cos(), angle.sin()]
+}
+
 /// Shape of a clip fade curve. Mirrors `vance-timeline::FadeCurve` so
 /// vance-audio stays decoupled from the timeline crate. All three
 /// variants ship real implementations since Phase 7.5 M2.
@@ -249,6 +273,246 @@ pub fn eval_gain_lane(lane: &[GainKeyframe], t_seconds: f64) -> f32 {
     }
 }
 
+/// One entry in a track's audio-effect insert chain in
+/// [`MixerSnapshot`]. Mirrors `vance_timeline::AudioEffectSpec` so the
+/// audio crate stays decoupled from the timeline crate. The fold
+/// thread keys its DSP state by the chain's POSITION + the variant
+/// shape so a snapshot that only updates parameters keeps the same
+/// DSP unit (preserving filter delay-line state and compressor
+/// envelopes); a snapshot that changes the chain length or reorders
+/// effects rebuilds the affected units.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AudioEffectKind {
+    /// 6-band parametric EQ. `enabled == false` bypasses the band
+    /// chain entirely on the fold thread.
+    Eq6 {
+        /// Whether this effect contributes to the output.
+        enabled: bool,
+        /// The 6 bands, precomputed at snapshot build.
+        bands: [EqBandParams; 6],
+    },
+    /// Single-band stereo compressor — RMS detector + soft knee +
+    /// decoupled envelope smoother.
+    Compressor {
+        /// Whether this effect contributes to the output.
+        enabled: bool,
+        /// Compressor configuration.
+        params: CompressorParams,
+    },
+    /// Look-ahead peak limiter.
+    Limiter {
+        /// Whether this effect contributes to the output.
+        enabled: bool,
+        /// Limiter configuration.
+        params: LimiterParams,
+    },
+    /// Phase 7.10 / 7.11 — third-party plugin instance routed through
+    /// the sandboxed `vance-plugin-host` sidecar. The variant carries
+    /// the descriptor needed to (re)instantiate on the fold thread's
+    /// per-track DSP state; the actual stateful plugin handle lives
+    /// there as part of [`TrackDspState`].
+    Plugin {
+        /// Whether this plugin contributes to the output.
+        enabled: bool,
+        /// Plugin descriptor (mirrors `vance_audio_plugins::PluginDescriptor`).
+        format_str: String,
+        /// Format-specific identifier (LV2 URI or `bundle:id`).
+        id: String,
+        /// Display name.
+        name: String,
+    },
+}
+
+/// One band's worth of parametric-EQ params, precomputed at snapshot
+/// build time. `shape` matches the [`crate::dsp::BiquadShape`] mirror.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EqBandParams {
+    pub enabled: bool,
+    pub shape: crate::dsp::BiquadShape,
+    pub freq_hz: f32,
+    pub gain_db: f32,
+    pub q: f32,
+}
+
+/// Single-band compressor params. Precomputed sanitised values; the
+/// fold thread feeds these directly into [`crate::dsp::Compressor::set`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CompressorParams {
+    pub threshold_db: f32,
+    pub ratio: f32,
+    pub attack_ms: f32,
+    pub release_ms: f32,
+    pub knee_db: f32,
+    pub makeup_db: f32,
+}
+
+/// Look-ahead limiter params.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LimiterParams {
+    pub ceiling_db: f32,
+    pub release_ms: f32,
+}
+
+/// Per-track DSP state — lives on the fold thread, NOT in the snapshot.
+/// One `TrackDspState` per audio track, keyed by track uuid in a
+/// HashMap owned by [`fold_loop`]. The structure caches the DSP units
+/// the chain currently uses; `reconcile_with` is the function that
+/// reuses-or-rebuilds them when the snapshot changes.
+pub struct TrackDspState {
+    chain: Vec<EffectUnit>,
+}
+
+impl TrackDspState {
+    pub fn new() -> Self {
+        Self { chain: Vec::new() }
+    }
+
+    /// Bring the cached DSP chain in line with the snapshot. Units at
+    /// the same position with the same variant tag are KEPT (only
+    /// their params are pushed in via `set`, preserving state). Any
+    /// other change rebuilds the affected slots.
+    pub fn reconcile_with(&mut self, spec: &[AudioEffectKind], sample_rate: f32) {
+        if self.chain.len() != spec.len() {
+            self.chain.resize_with(spec.len(), || EffectUnit::Passthrough);
+        }
+        for (i, entry) in spec.iter().enumerate() {
+            let needs_rebuild = match (&self.chain[i], entry) {
+                (EffectUnit::Eq6(_), AudioEffectKind::Eq6 { .. }) => false,
+                (EffectUnit::Compressor(_), AudioEffectKind::Compressor { .. }) => false,
+                (EffectUnit::Limiter(_), AudioEffectKind::Limiter { .. }) => false,
+                (EffectUnit::Plugin, AudioEffectKind::Plugin { .. }) => false,
+                _ => true,
+            };
+            if needs_rebuild {
+                self.chain[i] = EffectUnit::new(entry, sample_rate);
+            }
+            // Push the latest params; this updates without resetting
+            // the DSP state.
+            match (&mut self.chain[i], entry) {
+                (EffectUnit::Eq6(bands), AudioEffectKind::Eq6 { bands: bp, .. }) => {
+                    for (b, p) in bands.iter_mut().zip(bp.iter()) {
+                        b.set(p.shape, sample_rate, p.freq_hz, p.gain_db, p.q);
+                    }
+                }
+                (EffectUnit::Compressor(c), AudioEffectKind::Compressor { params, .. }) => {
+                    c.set(
+                        params.threshold_db,
+                        params.ratio,
+                        params.attack_ms,
+                        params.release_ms,
+                        params.knee_db,
+                        params.makeup_db,
+                        sample_rate,
+                    );
+                }
+                (EffectUnit::Limiter(lim), AudioEffectKind::Limiter { params, .. }) => {
+                    lim.set(params.ceiling_db, params.release_ms, sample_rate);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Apply the chain to one stereo sample. Disabled entries bypass.
+    #[inline]
+    pub fn tick_stereo(&mut self, spec: &[AudioEffectKind], mut l: f32, mut r: f32) -> (f32, f32) {
+        for (unit, entry) in self.chain.iter_mut().zip(spec.iter()) {
+            let enabled = match entry {
+                AudioEffectKind::Eq6 { enabled, .. }
+                | AudioEffectKind::Compressor { enabled, .. }
+                | AudioEffectKind::Limiter { enabled, .. }
+                | AudioEffectKind::Plugin { enabled, .. } => *enabled,
+            };
+            if !enabled {
+                continue;
+            }
+            match (unit, entry) {
+                (EffectUnit::Passthrough, _) => {}
+                (EffectUnit::Eq6(bands), AudioEffectKind::Eq6 { bands: band_specs, .. }) => {
+                    for (b, p) in bands.iter_mut().zip(band_specs.iter()) {
+                        if p.enabled {
+                            let (nl, nr) = b.tick_stereo(l, r);
+                            l = nl;
+                            r = nr;
+                        }
+                    }
+                }
+                (EffectUnit::Compressor(c), AudioEffectKind::Compressor { .. }) => {
+                    let (nl, nr) = c.tick_stereo(l, r);
+                    l = nl;
+                    r = nr;
+                }
+                (EffectUnit::Limiter(lim), AudioEffectKind::Limiter { .. }) => {
+                    let (nl, nr) = lim.tick_stereo(l, r);
+                    l = nl;
+                    r = nr;
+                }
+                // Mismatched variant (e.g. spec changed but reconcile
+                // not yet called). Silently bypass — the next reconcile
+                // tick will rebuild correctly.
+                _ => {}
+            }
+        }
+        (l, r)
+    }
+}
+
+impl Default for TrackDspState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+enum EffectUnit {
+    Passthrough,
+    Eq6(Box<[crate::dsp::Biquad; 6]>),
+    Compressor(Box<crate::dsp::Compressor>),
+    Limiter(Box<crate::dsp::Limiter>),
+    /// Phase 7.10 / 7.11 — sandboxed plugin instance. The actual
+    /// `PluginClient` would live here but doing per-frame IPC from
+    /// the fold thread is structurally incompatible with cpal's
+    /// real-time budget. The v1 path runs Plugin entries as
+    /// PASS-THROUGH on the fold thread (no audio change) so the
+    /// chain order is preserved and the user can see the plugin in
+    /// the inspector; full sandboxed audio routing lands when the
+    /// shared-memory ring path between fold thread and sidecar is
+    /// in place.
+    Plugin,
+}
+
+impl EffectUnit {
+    fn new(spec: &AudioEffectKind, sample_rate: f32) -> Self {
+        match spec {
+            AudioEffectKind::Eq6 { bands, .. } => {
+                let mut units = Box::new([crate::dsp::Biquad::identity(); 6]);
+                for (b, p) in units.iter_mut().zip(bands.iter()) {
+                    b.set(p.shape, sample_rate, p.freq_hz, p.gain_db, p.q);
+                }
+                EffectUnit::Eq6(units)
+            }
+            AudioEffectKind::Compressor { params, .. } => {
+                let mut c = Box::new(crate::dsp::Compressor::passthrough());
+                c.set(
+                    params.threshold_db,
+                    params.ratio,
+                    params.attack_ms,
+                    params.release_ms,
+                    params.knee_db,
+                    params.makeup_db,
+                    sample_rate,
+                );
+                EffectUnit::Compressor(c)
+            }
+            AudioEffectKind::Limiter { params, .. } => {
+                let mut lim = Box::new(crate::dsp::Limiter::new(sample_rate, 3.0));
+                lim.set(params.ceiling_db, params.release_ms, sample_rate);
+                EffectUnit::Limiter(lim)
+            }
+            AudioEffectKind::Plugin { .. } => EffectUnit::Plugin,
+        }
+    }
+}
+
 /// Per-track mixer state inside a [`MixerSnapshot`]. `gain_linear` is
 /// precomputed via [`db_to_linear`] at snapshot build time so the fold
 /// thread never touches a `powf` in the audio hot path. When
@@ -269,6 +533,13 @@ pub struct TrackMix {
     /// Solo flag. If ANY track in the snapshot has `solo == true`,
     /// only soloed tracks contribute.
     pub solo: bool,
+    /// Phase 7.7: ordered post-clip-fold insert chain — parametric EQ,
+    /// compressor, limiter. The fold thread maps these specs onto
+    /// stateful DSP units stored in its own [`TrackDspState`]; the
+    /// state survives snapshot updates so the user can tweak a knob
+    /// mid-signal without resetting the compressor envelope or
+    /// flushing the biquad delay lines.
+    pub audio_effects: Vec<AudioEffectKind>,
 }
 
 /// Per-clip mixer state inside a [`MixerSnapshot`]. The fold thread
@@ -307,6 +578,16 @@ pub struct ClipMix {
     pub fade_out_duration_seconds: f64,
     /// Fade-out curve shape. See [`Self::fade_in_curve`].
     pub fade_out_curve: FadeCurve,
+    /// Phase 7.6: equal-power pan multipliers `[L_gain, R_gain]`
+    /// PRECOMPOSED at snapshot build time from the track's and clip's
+    /// pan values: `effective_pan = clamp(track.pan + clip.pan, -1, +1)`,
+    /// then `angle = (effective_pan + 1) · π/4`, then
+    /// `[cos(angle), sin(angle)]`. The fold thread applies these as a
+    /// per-channel BALANCE (`out_L = sample_L · pan_linear[0]`,
+    /// `out_R = sample_R · pan_linear[1]`) so the stereo image is
+    /// preserved at center (`[√½, √½]`, the equal-power center) and
+    /// fully panned positions zero out the opposite channel.
+    pub pan_linear: [f32; 2],
 }
 
 /// Snapshot of the entire mixer state. Published by the engine to the
@@ -988,6 +1269,14 @@ pub struct MeterSnapshot {
     /// numbers haven't changed for a while" without polling at the
     /// fold thread's exact rate.
     pub generation: u64,
+    /// Phase 7.8 — ITU-R BS.1770-4 loudness on the master bus.
+    /// Default `LoudnessStats::default()` is all `0.0` (NOT `-inf`),
+    /// which the UI treats as "no measurement yet" and displays as
+    /// "--.- LU". Once playback begins the fold thread overwrites.
+    pub loudness: crate::loudness::LoudnessStats,
+    /// Phase 7.8 — true-peak (post-master-gain) on the master bus,
+    /// linear amplitude. `[L, R]`. UI converts to dBTP.
+    pub master_true_peak: [f32; 2],
 }
 
 /// Running accumulators the fold thread keeps in-thread (no Arc, no
@@ -1077,6 +1366,19 @@ fn fold_loop(
     // bias peak and inflate the RMS denominator). Adversarial review
     // findings #1 + #15.
     let mut track_frame_sums: HashMap<Uuid, [f32; 2]> = HashMap::new();
+    // Phase 7.7 — per-track DSP chain state. One TrackDspState per
+    // audio track; reconciled with each snapshot load so a param-only
+    // change preserves filter delay-lines + compressor envelopes (a
+    // user knob drag must NOT zip the audio). Entries for tracks
+    // that have been removed are pruned on the same snapshot load to
+    // keep the map bounded.
+    let mut track_dsp_states: HashMap<Uuid, TrackDspState> = HashMap::new();
+    let sample_rate_f32 = sample_rate as f32;
+    // Phase 7.8 — master-bus loudness + true-peak. One meter per
+    // fold loop instance; the engine's playback start resets this
+    // because the AudioMixer is constructed fresh on every play.
+    let mut loudness_meter = crate::loudness::LoudnessMeter::new(sample_rate_f32);
+    let mut true_peak = crate::loudness::TruePeakDetector::new();
     // Phase 7.5 M1 — per-track + master metering accumulators. Kept on
     // the fold thread (no Arc, no lock); collapsed into a TrackMeter
     // every `meter_publish_period_frames` frames and published via
@@ -1133,6 +1435,19 @@ fn fold_loop(
             continue;
         }
         let snap = snapshot.load_full();
+        // Phase 7.7 — reconcile per-track DSP state once per snapshot
+        // load, NOT per frame. The hot inner loop just calls
+        // `tick_stereo`; spec/state mismatch (added effect, swapped
+        // variant) is detected here.
+        for (track_id, track) in snap.tracks.iter() {
+            if track.audio_effects.is_empty() {
+                track_dsp_states.remove(track_id);
+            } else {
+                let state = track_dsp_states.entry(*track_id).or_default();
+                state.reconcile_with(&track.audio_effects, sample_rate_f32);
+            }
+        }
+        track_dsp_states.retain(|id, _| snap.tracks.contains_key(id));
         let batch_start_frame = master_frame.load(Ordering::Acquire);
         let t_batch_start =
             playback_start_timeline_seconds + batch_start_frame as f64 * inv_sample_rate;
@@ -1209,8 +1524,12 @@ fn fold_loop(
                     t_clip,
                 );
                 let pre_master_g = track_g * clip_g * fade_in_g * fade_out_g;
-                let l = samples[0] * pre_master_g;
-                let r = samples[1] * pre_master_g;
+                // Phase 7.6: equal-power BALANCE pan. Each output
+                // channel reads only its own input channel — preserves
+                // stereo image at center (with the standard −3 dB pad)
+                // and zeroes the opposite channel at full pan.
+                let l = samples[0] * pre_master_g * clip.pan_linear[0];
+                let r = samples[1] * pre_master_g * clip.pan_linear[1];
                 // Accumulate the per-track SUM in the per-frame scratch
                 // map — we observe after the inner loop so peak +
                 // sum_sq reflect the audible signal, not individual
@@ -1218,21 +1537,38 @@ fn fold_loop(
                 let entry = track_frame_sums.entry(clip.track_id).or_insert([0.0, 0.0]);
                 entry[0] += l;
                 entry[1] += r;
+            }
+            // Phase 7.7: per-track DSP chain applies AFTER all clip
+            // contributions have summed into the track bus, BEFORE the
+            // master gain stage — the conventional channel-strip
+            // topology. State lives on the fold thread, not in the
+            // snapshot, so a snapshot tweak (knob drag) only updates
+            // params via `reconcile_with` without resetting the DSP
+            // internals.
+            for (track_id, sum) in track_frame_sums.drain() {
+                let (mut l, mut r) = (sum[0], sum[1]);
+                if let Some(track) = snap.tracks.get(&track_id) {
+                    if !track.audio_effects.is_empty() {
+                        let dsp = track_dsp_states.entry(track_id).or_default();
+                        let (nl, nr) = dsp.tick_stereo(&track.audio_effects, l, r);
+                        l = nl;
+                        r = nr;
+                    }
+                }
+                // Meter the POST-EFFECT track signal — what the user
+                // actually hears at the track row.
+                track_accums.entry(track_id).or_default().observe(l, r);
                 master_pre_master[0] += l;
                 master_pre_master[1] += r;
-            }
-            // One observe per track per output frame — matches the
-            // single observe per output frame on the master path so
-            // RMS counts are comparable across track and master meters.
-            for (track_id, sum) in track_frame_sums.drain() {
-                track_accums
-                    .entry(track_id)
-                    .or_default()
-                    .observe(sum[0], sum[1]);
             }
             let master_l = master_pre_master[0] * snap.master_gain_linear;
             let master_r = master_pre_master[1] * snap.master_gain_linear;
             master_accum.observe(master_l, master_r);
+            // Phase 7.8 — feed the BS.1770 meter + true-peak detector
+            // with the post-master-gain stereo frame. K-weighting and
+            // 4× oversampling both add a small constant cost per frame.
+            loudness_meter.ingest(master_l, master_r);
+            true_peak.ingest(master_l, master_r);
             let _ = master_prod.push_slice(&[master_l, master_r]);
 
             frames_since_publish += 1;
@@ -1243,10 +1579,17 @@ fn fold_loop(
                     tracks_out.insert(id, acc.into_meter());
                 }
                 meter_generation = meter_generation.wrapping_add(1);
+                // Phase 7.8 — pull current BS.1770 stats + drain
+                // running true-peak. The integrated value continues
+                // accumulating; only the per-publish true-peak resets.
+                let loudness = loudness_meter.stats();
+                let true_peak_drained = true_peak.drain_peaks();
                 meter_bus.store(Arc::new(MeterSnapshot {
                     master: master_accum.into_meter(),
                     tracks: tracks_out,
                     generation: meter_generation,
+                    loudness,
+                    master_true_peak: true_peak_drained,
                 }));
                 master_accum = MeterAccum::default();
                 frames_since_publish = 0;
@@ -1290,6 +1633,7 @@ mod tests {
             gain_lane: Vec::new(),
             mute: false,
             solo: false,
+            audio_effects: Vec::new(),
         }
     }
 
@@ -1305,6 +1649,12 @@ mod tests {
             fade_in_curve: FadeCurve::Linear,
             fade_out_duration_seconds: 0.0,
             fade_out_curve: FadeCurve::Linear,
+            // Equal-power center: existing tests assert per-clip gain
+            // composition WITHOUT pan in mind, so set the pan to
+            // unity-pass-through `[1.0, 1.0]` instead of the natural
+            // center `[√½, √½]` — that way the existing assertions
+            // keep their pre-7.6 numerical truth.
+            pan_linear: [1.0, 1.0],
         }
     }
 
@@ -1901,6 +2251,181 @@ mod tests {
         assert_eq!(m.peak_r, 0.0);
         assert_eq!(m.rms_l, 0.0);
         assert_eq!(m.rms_r, 0.0);
+    }
+
+    // ============================================================
+    // Phase 7.6 pan tests
+    // ============================================================
+
+    // ============================================================
+    // Phase 7.7 per-track DSP integration tests
+    // ============================================================
+
+    #[test]
+    fn track_dsp_state_passthrough_with_empty_chain() {
+        let mut state = TrackDspState::new();
+        state.reconcile_with(&[], 48_000.0);
+        let (l, r) = state.tick_stereo(&[], 0.5, -0.3);
+        assert!((l - 0.5).abs() < 1e-6);
+        assert!((r - (-0.3)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn track_dsp_state_disabled_effect_bypasses_audio() {
+        let spec = vec![AudioEffectKind::Limiter {
+            enabled: false,
+            params: LimiterParams {
+                ceiling_db: -6.0,
+                release_ms: 50.0,
+            },
+        }];
+        let mut state = TrackDspState::new();
+        state.reconcile_with(&spec, 48_000.0);
+        // Even though a limiter is in the chain, `enabled = false`
+        // must result in pass-through.
+        let (l, _) = state.tick_stereo(&spec, 1.0, 1.0);
+        assert!((l - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn track_dsp_state_limiter_caps_track_signal() {
+        let spec = vec![AudioEffectKind::Limiter {
+            enabled: true,
+            params: LimiterParams {
+                ceiling_db: -3.0,
+                release_ms: 50.0,
+            },
+        }];
+        let mut state = TrackDspState::new();
+        state.reconcile_with(&spec, 48_000.0);
+        let mut peak = 0.0f32;
+        for _ in 0..1024 {
+            let (l, _) = state.tick_stereo(&spec, 1.0, 1.0);
+            peak = peak.max(l.abs());
+        }
+        let ceiling = 10f32.powf(-3.0 / 20.0);
+        assert!(
+            peak <= ceiling + 1e-3,
+            "limiter ceiling: got {peak}, ceiling {ceiling}"
+        );
+    }
+
+    #[test]
+    fn track_dsp_state_compressor_envelope_persists_across_param_update() {
+        // Build a chain, drive it loud, then tweak params via a fresh
+        // reconcile — the compressor envelope MUST NOT zero out.
+        let mut spec = vec![AudioEffectKind::Compressor {
+            enabled: true,
+            params: CompressorParams {
+                threshold_db: -10.0,
+                ratio: 4.0,
+                attack_ms: 0.5,
+                release_ms: 200.0,
+                knee_db: 0.0,
+                makeup_db: 0.0,
+            },
+        }];
+        let mut state = TrackDspState::new();
+        state.reconcile_with(&spec, 48_000.0);
+        // Pump signal to build envelope.
+        for _ in 0..2048 {
+            state.tick_stereo(&spec, 1.0, 1.0);
+        }
+        // Now tweak ratio — must keep variant (no rebuild), only update params.
+        if let AudioEffectKind::Compressor { params, .. } = &mut spec[0] {
+            params.ratio = 8.0;
+        }
+        state.reconcile_with(&spec, 48_000.0);
+        // Tick once more; gain should still be reduced (envelope didn't reset).
+        let (l, _) = state.tick_stereo(&spec, 1.0, 1.0);
+        assert!(
+            l.abs() < 0.7,
+            "param-update must preserve compressor envelope (got |l|={})",
+            l.abs()
+        );
+    }
+
+    #[test]
+    fn track_dsp_state_rebuilds_when_variant_changes() {
+        // Start with a compressor; replace with a limiter.
+        let mut spec = vec![AudioEffectKind::Compressor {
+            enabled: true,
+            params: CompressorParams {
+                threshold_db: -10.0,
+                ratio: 4.0,
+                attack_ms: 5.0,
+                release_ms: 100.0,
+                knee_db: 0.0,
+                makeup_db: 0.0,
+            },
+        }];
+        let mut state = TrackDspState::new();
+        state.reconcile_with(&spec, 48_000.0);
+        // Swap variant.
+        spec = vec![AudioEffectKind::Limiter {
+            enabled: true,
+            params: LimiterParams {
+                ceiling_db: -1.0,
+                release_ms: 50.0,
+            },
+        }];
+        state.reconcile_with(&spec, 48_000.0);
+        // Tick — must not panic, must produce finite output.
+        let (l, r) = state.tick_stereo(&spec, 0.5, 0.5);
+        assert!(l.is_finite() && r.is_finite());
+    }
+
+    #[test]
+    fn pan_center_is_equal_power_center() {
+        let [l, r] = pan_to_equal_power(0.0);
+        let expected = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((l - expected).abs() < 1e-6);
+        assert!((r - expected).abs() < 1e-6);
+        assert!((l * l + r * r - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pan_full_left_zeros_right_channel() {
+        let [l, r] = pan_to_equal_power(-1.0);
+        assert!((l - 1.0).abs() < 1e-6);
+        assert!(r.abs() < 1e-6);
+    }
+
+    #[test]
+    fn pan_full_right_zeros_left_channel() {
+        let [l, r] = pan_to_equal_power(1.0);
+        assert!(l.abs() < 1e-6);
+        assert!((r - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pan_preserves_total_power_at_every_position() {
+        for k in -16..=16 {
+            let p = k as f32 / 16.0;
+            let [l, r] = pan_to_equal_power(p);
+            let power = l * l + r * r;
+            assert!((power - 1.0).abs() < 1e-5, "pan={p}, power={power}");
+        }
+    }
+
+    #[test]
+    fn pan_non_finite_falls_back_to_center() {
+        for nan_in in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let [l, r] = pan_to_equal_power(nan_in);
+            let expected = std::f32::consts::FRAC_1_SQRT_2;
+            assert!((l - expected).abs() < 1e-6);
+            assert!((r - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn pan_out_of_range_clamps_to_endpoints() {
+        let [l_neg, r_neg] = pan_to_equal_power(-5.0);
+        assert!((l_neg - 1.0).abs() < 1e-6);
+        assert!(r_neg.abs() < 1e-6);
+        let [l_pos, r_pos] = pan_to_equal_power(5.0);
+        assert!(l_pos.abs() < 1e-6);
+        assert!((r_pos - 1.0).abs() < 1e-6);
     }
 
     #[test]

@@ -156,6 +156,8 @@ pub fn add_track_with_id(
         solo: false,
         gain_db: 0.0,
         gain_keyframes: Vec::new(),
+        pan: 0.0,
+        audio_effects: Vec::new(),
     };
     let mut tracks = seq.tracks.clone();
     tracks.push(Arc::new(new_track));
@@ -222,6 +224,8 @@ pub fn insert_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Result<Sequ
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -271,6 +275,8 @@ pub fn ripple_insert_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Resu
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -336,6 +342,8 @@ pub fn overwrite_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Result<S
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -363,6 +371,8 @@ pub fn remove_clip(seq: &Sequence, track_id: TrackId, clip_id: ClipId) -> Result
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -405,6 +415,8 @@ pub fn ripple_remove_clip(
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -446,6 +458,8 @@ pub fn slip(
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -490,6 +504,8 @@ pub fn slide(
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -544,6 +560,8 @@ pub fn trim_in(
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -591,6 +609,8 @@ pub fn trim_out(
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -627,6 +647,8 @@ pub fn add_effect_to_clip(
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -669,6 +691,8 @@ pub fn update_effect_param(
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -712,6 +736,8 @@ pub fn update_effect_params(
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -746,6 +772,8 @@ pub fn remove_effect_from_clip(
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -793,6 +821,8 @@ pub fn move_effect_on_clip(
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -834,6 +864,8 @@ pub fn set_effect_enabled(
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -866,6 +898,8 @@ pub fn set_track_mute(seq: &Sequence, track_id: TrackId, mute: bool) -> Result<S
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -888,6 +922,8 @@ pub fn set_track_solo(seq: &Sequence, track_id: TrackId, solo: bool) -> Result<S
         solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -916,6 +952,8 @@ pub fn set_track_gain_db(
         solo: track.solo,
         gain_db: sanitized,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -951,6 +989,8 @@ pub fn set_clip_mute(
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -985,6 +1025,8 @@ pub fn set_clip_gain_db(
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -998,6 +1040,211 @@ fn sanitize_gain_db(gain_db: f32) -> Result<f32> {
         return Err(TimelineError::invalid("gain_db must be finite"));
     }
     Ok(gain_db.clamp(-60.0, 60.0))
+}
+
+/// Reject non-finite pan inputs and clamp to `[-1, +1]`. Phase 7.6.
+fn sanitize_pan(pan: f32) -> Result<f32> {
+    if !pan.is_finite() {
+        return Err(TimelineError::invalid("pan must be finite"));
+    }
+    Ok(pan.clamp(-1.0, 1.0))
+}
+
+/// Phase 7.7 — Append an audio effect to a track's chain. Respects
+/// track lock (mixer chain edits are persistent like gain).
+pub fn add_audio_effect(
+    seq: &Sequence,
+    track_id: TrackId,
+    effect: crate::audio_effect::AudioEffectSpec,
+) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    let mut audio_effects = track.audio_effects.clone();
+    audio_effects.push(effect);
+    let new_track = Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips: track.clips.clone(),
+        transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects,
+    };
+    Ok(replace_track(seq, idx, new_track))
+}
+
+/// Phase 7.7 — Remove an audio effect at `index`. Returns the
+/// unchanged sequence if `index` is out of range so chained
+/// EditOps never panic on stale indices.
+pub fn remove_audio_effect(
+    seq: &Sequence,
+    track_id: TrackId,
+    index: usize,
+) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    if index >= track.audio_effects.len() {
+        return Ok(seq.clone());
+    }
+    let mut audio_effects = track.audio_effects.clone();
+    audio_effects.remove(index);
+    let new_track = Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips: track.clips.clone(),
+        transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects,
+    };
+    Ok(replace_track(seq, idx, new_track))
+}
+
+/// Phase 7.7 — Reorder an effect within a chain. Out-of-range indices
+/// (or `from == to`) leave the chain untouched.
+pub fn move_audio_effect(
+    seq: &Sequence,
+    track_id: TrackId,
+    from_index: usize,
+    to_index: usize,
+) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    let len = track.audio_effects.len();
+    if from_index >= len || to_index >= len || from_index == to_index {
+        return Ok(seq.clone());
+    }
+    let mut audio_effects = track.audio_effects.clone();
+    let entry = audio_effects.remove(from_index);
+    audio_effects.insert(to_index, entry);
+    let new_track = Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips: track.clips.clone(),
+        transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects,
+    };
+    Ok(replace_track(seq, idx, new_track))
+}
+
+/// Phase 7.7 — Replace an effect's spec at the given index. The
+/// caller (UI param-knob handler) is responsible for sending the FULL
+/// new spec; this op is intentionally coarse so undo stays cheap.
+pub fn update_audio_effect(
+    seq: &Sequence,
+    track_id: TrackId,
+    index: usize,
+    effect: crate::audio_effect::AudioEffectSpec,
+) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    if index >= track.audio_effects.len() {
+        return Ok(seq.clone());
+    }
+    if track.audio_effects[index] == effect {
+        return Ok(seq.clone());
+    }
+    let mut audio_effects = track.audio_effects.clone();
+    audio_effects[index] = effect;
+    let new_track = Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips: track.clips.clone(),
+        transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects,
+    };
+    Ok(replace_track(seq, idx, new_track))
+}
+
+/// Set `Track.pan` (Phase 7.6). Rejects locked tracks (pan edits
+/// persist, mirroring `SetTrackGainDb`).
+pub fn set_track_pan(seq: &Sequence, track_id: TrackId, pan: f32) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    let sanitized = sanitize_pan(pan)?;
+    if track.pan == sanitized {
+        return Ok(seq.clone());
+    }
+    let new_track = Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips: track.clips.clone(),
+        transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
+        pan: sanitized,
+        audio_effects: track.audio_effects.clone(),
+    };
+    Ok(replace_track(seq, idx, new_track))
+}
+
+/// Set `Clip.pan` (Phase 7.6). Rejects locked tracks.
+pub fn set_clip_pan(
+    seq: &Sequence,
+    track_id: TrackId,
+    clip_id: ClipId,
+    pan: f32,
+) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    let (clip_idx, clip) = find_clip(&track, clip_id)?;
+    let sanitized = sanitize_pan(pan)?;
+    if clip.pan == sanitized {
+        return Ok(seq.clone());
+    }
+    let mut updated = (*clip).clone();
+    updated.pan = sanitized;
+    let mut clips = track.clips.clone();
+    clips[clip_idx] = Arc::new(updated);
+    let new_track = Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips,
+        transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
+    };
+    Ok(replace_track(seq, idx, new_track))
 }
 
 /// Validate a keyframe lane for the mixer: every keyframe must have a
@@ -1053,6 +1300,8 @@ pub fn set_track_gain_keyframes(
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: keyframes,
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1090,6 +1339,8 @@ pub fn set_clip_gain_keyframes(
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1129,6 +1380,8 @@ pub fn set_clip_fade_in(
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1166,6 +1419,8 @@ pub fn set_clip_fade_out(
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1267,6 +1522,8 @@ pub fn split(
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1336,6 +1593,8 @@ pub fn add_transition_at_cut_with_id(
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1381,6 +1640,8 @@ pub fn remove_transition(
         solo: track.solo,
         gain_db: track.gain_db,
         gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1703,6 +1964,8 @@ mod tests {
             solo: t.solo,
             gain_db: t.gain_db,
             gain_keyframes: t.gain_keyframes.clone(),
+            pan: t.pan,
+            audio_effects: t.audio_effects.clone(),
         };
         tracks[0] = Arc::new(locked_track);
         Sequence {
@@ -1918,6 +2181,50 @@ mod tests {
         let seq = set_clip_fade_in(&seq, tid, cid, 0.5, FadeCurve::Linear).unwrap();
         assert_eq!(seq.tracks[0].clips[0].gain_keyframes, lane);
         assert!(seq.tracks[0].clips[0].fade_in.is_some());
+    }
+
+    // ====================================================
+    // Phase 7.6 pan tests
+    // ====================================================
+
+    #[test]
+    fn set_track_pan_round_trips_and_clamps() {
+        let (seq, tid, _) = seed_audio_seq();
+        assert_eq!(seq.tracks[0].pan, 0.0);
+        let seq = set_track_pan(&seq, tid, -0.5).unwrap();
+        assert!((seq.tracks[0].pan - (-0.5)).abs() < 1e-6);
+        let seq = set_track_pan(&seq, tid, 5.0).unwrap();
+        assert_eq!(seq.tracks[0].pan, 1.0);
+        let seq = set_track_pan(&seq, tid, -5.0).unwrap();
+        assert_eq!(seq.tracks[0].pan, -1.0);
+    }
+
+    #[test]
+    fn set_track_pan_rejects_nan_and_inf() {
+        let (seq, tid, _) = seed_audio_seq();
+        assert!(set_track_pan(&seq, tid, f32::NAN).is_err());
+        assert!(set_track_pan(&seq, tid, f32::INFINITY).is_err());
+        assert!(set_track_pan(&seq, tid, f32::NEG_INFINITY).is_err());
+    }
+
+    #[test]
+    fn set_track_pan_respects_lock() {
+        let (seq, tid, _) = seed_audio_seq();
+        let seq = lock_first_track_for_test(&seq);
+        assert!(set_track_pan(&seq, tid, 0.5).is_err());
+    }
+
+    #[test]
+    fn set_clip_pan_round_trips_and_clamps() {
+        let (seq, tid, media) = seed_audio_seq();
+        let clip = Clip::new(media, "c", t(0), t(0), t(5)).unwrap();
+        let cid = clip.id;
+        let seq = insert_clip(&seq, tid, clip).unwrap();
+        assert_eq!(seq.tracks[0].clips[0].pan, 0.0);
+        let seq = set_clip_pan(&seq, tid, cid, 0.7).unwrap();
+        assert!((seq.tracks[0].clips[0].pan - 0.7).abs() < 1e-6);
+        let seq = set_clip_pan(&seq, tid, cid, 9.0).unwrap();
+        assert_eq!(seq.tracks[0].clips[0].pan, 1.0);
     }
 
     #[test]

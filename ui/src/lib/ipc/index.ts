@@ -253,6 +253,8 @@ export type ClipContents = {
   fade_in: Fade | null;
   /** Phase 7.4 M3: optional fade-out. `null` = no fade-out. */
   fade_out: Fade | null;
+  /** Phase 7.6: per-clip stereo pan position, range `[-1, +1]`. */
+  pan: number;
 };
 
 export type FadeCurveName = 'linear' | 'equal_power' | 'logarithmic';
@@ -287,7 +289,110 @@ export type TrackContents = {
   /** Phase 7.4: gain automation lane in timeline-seconds. Empty = use
    *  static `gain_db`. */
   gain_keyframes: GainKeyframe[];
+  /** Phase 7.6: stereo pan position, range `[-1, +1]`. */
+  pan: number;
+  /** Phase 7.7: built-in audio effect chain (EQ + comp + limiter). */
+  audio_effects: AudioEffectSpec[];
 };
+
+/** Phase 7.7 / 7.10 — tagged-enum spec for one entry in a track's audio
+ *  effect chain. Mirrors `vance_timeline::AudioEffectSpec`. */
+export type AudioEffectSpec =
+  | { kind: 'Eq6'; enabled: boolean; eq: Eq6Spec }
+  | { kind: 'Compressor'; enabled: boolean; spec: CompressorSpec }
+  | { kind: 'Limiter'; enabled: boolean; spec: LimiterSpec }
+  | {
+      kind: 'Plugin';
+      enabled: boolean;
+      descriptor: { format: string; id: string; name: string; vendor: string };
+      params: { param_id: number; value: number }[];
+    };
+
+/** Phase 7.10 — default for "Add Plugin" with a captured descriptor. */
+export function defaultPlugin(d: {
+  format: string;
+  id: string;
+  name: string;
+  vendor?: string;
+}): AudioEffectSpec {
+  return {
+    kind: 'Plugin',
+    enabled: true,
+    descriptor: { format: d.format, id: d.id, name: d.name, vendor: d.vendor ?? '' },
+    params: []
+  };
+}
+
+export type Eq6Spec = { bands: EqBandSpec[] };
+
+export type EqBandKind = 'LowShelf' | 'Peak' | 'HighShelf' | 'LowCut' | 'HighCut';
+
+export type EqBandSpec = {
+  kind: EqBandKind;
+  enabled: boolean;
+  freq_hz: number;
+  gain_db: number;
+  q: number;
+};
+
+export type CompressorSpec = {
+  threshold_db: number;
+  ratio: number;
+  attack_ms: number;
+  release_ms: number;
+  knee_db: number;
+  makeup_db: number;
+};
+
+export type LimiterSpec = {
+  ceiling_db: number;
+  release_ms: number;
+};
+
+/** Phase 7.7 — default specs matching the Rust crate constants. Used
+ *  by the "Add EQ / Compressor / Limiter" buttons. */
+export function defaultEq6(): AudioEffectSpec {
+  return {
+    kind: 'Eq6',
+    enabled: true,
+    eq: {
+      bands: [
+        { kind: 'LowShelf', enabled: true, freq_hz: 80, gain_db: 0, q: 0.707 },
+        { kind: 'Peak', enabled: true, freq_hz: 250, gain_db: 0, q: 1.0 },
+        { kind: 'Peak', enabled: true, freq_hz: 800, gain_db: 0, q: 1.0 },
+        { kind: 'Peak', enabled: true, freq_hz: 2500, gain_db: 0, q: 1.0 },
+        { kind: 'Peak', enabled: true, freq_hz: 6000, gain_db: 0, q: 1.0 },
+        { kind: 'HighShelf', enabled: true, freq_hz: 12000, gain_db: 0, q: 0.707 }
+      ]
+    }
+  };
+}
+
+export function defaultCompressor(): AudioEffectSpec {
+  return {
+    kind: 'Compressor',
+    enabled: true,
+    spec: {
+      threshold_db: -18,
+      ratio: 3,
+      attack_ms: 5,
+      release_ms: 100,
+      knee_db: 6,
+      makeup_db: 0
+    }
+  };
+}
+
+export function defaultLimiter(): AudioEffectSpec {
+  return {
+    kind: 'Limiter',
+    enabled: true,
+    spec: {
+      ceiling_db: -0.3,
+      release_ms: 50
+    }
+  };
+}
 
 export type SequenceContents = {
   id: string;
@@ -694,6 +799,33 @@ export const setClipMute = (trackId: string, clipId: string, mute: boolean): Pro
 export const setClipGainDb = (trackId: string, clipId: string, gainDb: number): Promise<void> =>
   invoke('set_clip_gain_db', { trackId, clipId, gainDb });
 
+/** Phase 7.6: set a track's stereo pan. `pan ∈ [-1, +1]`. Live during playback. */
+export const setTrackPan = (trackId: string, pan: number): Promise<void> =>
+  invoke('set_track_pan', { trackId, pan });
+/** Phase 7.6: set a clip's stereo pan. Composes additively with the parent
+ *  track's pan at mixer snapshot build time. Live during playback. */
+export const setClipPan = (trackId: string, clipId: string, pan: number): Promise<void> =>
+  invoke('set_clip_pan', { trackId, clipId, pan });
+
+/** Phase 7.7 — append a built-in audio effect to a track's chain. */
+export const addAudioEffect = (trackId: string, effect: AudioEffectSpec): Promise<void> =>
+  invoke('add_audio_effect', { trackId, effect });
+/** Phase 7.7 — remove the audio effect at `index` from the chain. */
+export const removeAudioEffect = (trackId: string, index: number): Promise<void> =>
+  invoke('remove_audio_effect', { trackId, index });
+/** Phase 7.7 — reorder one effect within the chain. */
+export const moveAudioEffect = (
+  trackId: string,
+  fromIndex: number,
+  toIndex: number
+): Promise<void> => invoke('move_audio_effect', { trackId, fromIndex, toIndex });
+/** Phase 7.7 — replace one effect's spec (used for every knob commit). */
+export const updateAudioEffect = (
+  trackId: string,
+  index: number,
+  effect: AudioEffectSpec
+): Promise<void> => invoke('update_audio_effect', { trackId, index, effect });
+
 /** Phase 7.4: set the master bus gain in dB. Sequence-level. */
 export const setMasterGainDb = (gainDb: number): Promise<void> =>
   invoke('set_master_gain_db', { gainDb });
@@ -749,6 +881,19 @@ export type TrackMeter = {
   rms_r: number;
 };
 
+/** Phase 7.8 — ITU-R BS.1770-4 loudness + true-peak readout. */
+export type LoudnessReadout = {
+  /** Momentary loudness — latest 400 ms block, in LUFS. */
+  lufs_m: number;
+  /** Short-term loudness — sliding 3 s window, in LUFS. */
+  lufs_s: number;
+  /** Integrated loudness — gated across the playback session. */
+  lufs_i: number;
+  /** True-peak dBFS, including inter-sample peaks (4× oversampled). */
+  true_peak_l_db: number;
+  true_peak_r_db: number;
+};
+
 /** Phase 7.5 M1: full meter snapshot from the audio mixer's fold
  *  thread, published ~30Hz via ArcSwap. `null` when no mixer backend
  *  is currently running (no playback or single-source path). */
@@ -758,6 +903,8 @@ export type MeterSnapshot = {
   tracks: Record<string, TrackMeter>;
   /** Monotonic publish counter — wraps on overflow. */
   generation: number;
+  /** Phase 7.8 — BS.1770 loudness + true-peak readout on the master bus. */
+  loudness: LoudnessReadout;
 };
 
 export const meterSnapshot = (): Promise<MeterSnapshot | null> => invoke('meter_snapshot');
@@ -777,6 +924,32 @@ export const decodeSequenceAt = (timelineSeconds: number): Promise<number> =>
  *  sequence playback has started since the last project load. */
 export const currentTimelineSeconds = (): Promise<number | null> =>
   invoke('current_timeline_seconds');
+
+/** Phase 7.9 — fire a single audio scrub burst at the given timeline
+ *  PTS (in 1/48 000 sample units). UI is responsible for sequencing
+ *  start + stop during a playhead drag (typically ~80 ms per burst).
+ *  Cold-start latency on the FIRST burst is bounded by sidecar spawn
+ *  (~100 ms); subsequent bursts within the M4 PRELOAD window
+ *  (2 s) reuse warm sidecars. */
+export const scrubBurst = (fromPts: number): Promise<void> => invoke('scrub_burst', { fromPts });
+
+/** Phase 7.10 / 7.11 — UI descriptor for one enumerated plugin
+ *  returned by `list_audio_plugins`. `format` is `"lv2"` or `"clap"`;
+ *  `runnable` is false when the sidecar can see the plugin (via the
+ *  filesystem walk) but cannot host it (e.g. CLAP support not compiled in). */
+export type AudioPluginDescriptor = {
+  format: string;
+  id: string;
+  name: string;
+  vendor: string;
+  runnable: boolean;
+};
+
+/** Phase 7.10 / 7.11 — enumerate plugins via the sandboxed plugin host
+ *  sidecar. Returns an empty list when the sidecar binary is missing
+ *  so the UI degrades gracefully. */
+export const listAudioPlugins = (): Promise<AudioPluginDescriptor[]> =>
+  invoke('list_audio_plugins');
 
 // ---- Undo / redo ----------------------------------------------------------
 

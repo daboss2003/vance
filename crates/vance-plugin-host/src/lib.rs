@@ -1,6 +1,9 @@
-//! `vance-plugin-host` — stub.
+//! `vance-plugin-host` — sidecar binary that hosts sandboxed audio
+//! plugins for the parent `vance-app` process.
 //!
-//! See PLAN.md §6 for this crate's role.
+//! See `src/main.rs` for the entry point. The lib target keeps the
+//! crate doc-buildable and houses the runtime backends.
 
-#[doc(hidden)]
-pub fn _stub() {}
+#![warn(missing_docs)]
+
+pub mod runtime;

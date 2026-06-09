@@ -263,6 +263,67 @@ pub enum EditOp {
         /// New master gain in dB.
         gain_db: f32,
     },
+    /// Set a track's stereo pan position (Phase 7.6). Range `[-1, +1]`,
+    /// clamped on apply. Audio tracks only; video tracks accept the
+    /// edit but the mixer ignores it. Respects track lock (pan edits
+    /// are persistent — symmetric with `SetTrackGainDb`).
+    SetTrackPan {
+        /// Track to mutate.
+        track_id: TrackId,
+        /// New pan. `-1` = full left, `0` = center, `+1` = full right.
+        pan: f32,
+    },
+    /// Set a clip's stereo pan position (Phase 7.6). Composes
+    /// additively with the parent track's pan at mix time. Respects
+    /// track lock.
+    SetClipPan {
+        /// Track holding the clip.
+        track_id: TrackId,
+        /// Clip to mutate.
+        clip_id: ClipId,
+        /// New pan. `-1` = full left, `0` = center, `+1` = full right.
+        pan: f32,
+    },
+    /// Append an audio effect to the end of a track's chain (Phase 7.7).
+    /// The new effect's `enabled` flag carries through verbatim. Respects
+    /// track lock.
+    AddAudioEffect {
+        /// Track to mutate.
+        track_id: TrackId,
+        /// Effect to append. Use [`crate::audio_effect::AudioEffectSpec::default_eq6`],
+        /// `default_compressor`, or `default_limiter` for the conventional
+        /// "Add EQ" / "Add Compressor" / "Add Limiter" button calls.
+        effect: crate::audio_effect::AudioEffectSpec,
+    },
+    /// Remove the audio effect at the given index from a track's chain
+    /// (Phase 7.7). No-op if the index is out of range.
+    RemoveAudioEffect {
+        /// Track to mutate.
+        track_id: TrackId,
+        /// Zero-based index into `Track.audio_effects`.
+        index: usize,
+    },
+    /// Reorder one audio effect within a track's chain (Phase 7.7). No-op
+    /// if either index is out of range.
+    MoveAudioEffect {
+        /// Track to mutate.
+        track_id: TrackId,
+        /// Where the effect currently lives.
+        from_index: usize,
+        /// Where it should land (0..=chain_len-1).
+        to_index: usize,
+    },
+    /// Replace an audio effect's full spec (Phase 7.7). Used for every
+    /// param-knob update: the engine pushes a fresh spec rather than
+    /// mutating in-place so undo stays trivial.
+    UpdateAudioEffect {
+        /// Track to mutate.
+        track_id: TrackId,
+        /// Zero-based index into `Track.audio_effects`.
+        index: usize,
+        /// New spec — replaces the entry verbatim.
+        effect: crate::audio_effect::AudioEffectSpec,
+    },
     /// Replace a track's gain automation lane (Phase 7.4). Empty
     /// vector = no automation; the static `Track.gain_db` then drives
     /// the mixer. Respects track lock (gain edits are
@@ -452,6 +513,28 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
             gain_db,
         } => ops::set_clip_gain_db(seq, *track_id, *clip_id, *gain_db),
         EditOp::SetMasterGainDb { gain_db } => ops::set_master_gain_db(seq, *gain_db),
+        EditOp::SetTrackPan { track_id, pan } => ops::set_track_pan(seq, *track_id, *pan),
+        EditOp::SetClipPan {
+            track_id,
+            clip_id,
+            pan,
+        } => ops::set_clip_pan(seq, *track_id, *clip_id, *pan),
+        EditOp::AddAudioEffect { track_id, effect } => {
+            ops::add_audio_effect(seq, *track_id, effect.clone())
+        }
+        EditOp::RemoveAudioEffect { track_id, index } => {
+            ops::remove_audio_effect(seq, *track_id, *index)
+        }
+        EditOp::MoveAudioEffect {
+            track_id,
+            from_index,
+            to_index,
+        } => ops::move_audio_effect(seq, *track_id, *from_index, *to_index),
+        EditOp::UpdateAudioEffect {
+            track_id,
+            index,
+            effect,
+        } => ops::update_audio_effect(seq, *track_id, *index, effect.clone()),
         EditOp::SetTrackGainKeyframes { track_id, keyframes } => {
             ops::set_track_gain_keyframes(seq, *track_id, keyframes.clone())
         }

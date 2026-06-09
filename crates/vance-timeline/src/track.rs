@@ -83,6 +83,23 @@ pub struct Track {
     /// must check `is_empty()` before invoking the evaluator.
     #[serde(default)]
     pub gain_keyframes: Vec<crate::effect::Keyframe>,
+    /// Phase 7.6: stereo pan position, range `[-1, +1]` (−1 = full
+    /// left, 0 = center, +1 = full right). Audio tracks only —
+    /// video tracks ignore it. The mixer applies an equal-power pan
+    /// law (`L = cos(θ)`, `R = sin(θ)` where `θ = (pan+1) · π/4`) so
+    /// the total power across the stereo field stays constant as
+    /// the user sweeps the knob. `#[serde(default)]` so pre-7.6
+    /// bundles deserialize as 0.0 (center).
+    #[serde(default)]
+    pub pan: f32,
+    /// Phase 7.7: ordered insert chain of built-in audio effects
+    /// (parametric EQ + compressor + limiter). The mixer applies
+    /// these per-track AFTER clip composition (gain + pan + fade +
+    /// keyframe lane) and BEFORE master gain — the conventional
+    /// channel-strip topology. Empty (the default) = pass-through.
+    /// `#[serde(default)]` so pre-7.7 bundles deserialize empty.
+    #[serde(default)]
+    pub audio_effects: Vec<crate::audio_effect::AudioEffectSpec>,
 }
 
 impl Track {
@@ -100,6 +117,8 @@ impl Track {
             solo: false,
             gain_db: 0.0,
             gain_keyframes: Vec::new(),
+            pan: 0.0,
+            audio_effects: Vec::new(),
         }
     }
 
@@ -147,6 +166,8 @@ mod tests {
             solo: false,
             gain_db: 0.0,
             gain_keyframes: Vec::new(),
+            pan: 0.0,
+            audio_effects: Vec::new(),
         };
         assert_eq!(tr.duration(), t(7));
     }

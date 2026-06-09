@@ -5275,9 +5275,11 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "vance-audio",
+ "vance-audio-plugins",
  "vance-color",
  "vance-core",
  "vance-decoder",
+ "vance-encoder",
  "vance-grading-cmd",
  "vance-ocio",
  "vance-peaks",
@@ -5312,6 +5314,14 @@ dependencies = [
 [[package]]
 name = "vance-audio-plugins"
 version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+ "uuid",
+ "vance-ipc",
+]
 
 [[package]]
 name = "vance-bench"
@@ -5364,6 +5374,15 @@ version = "0.0.0"
 [[package]]
 name = "vance-encoder"
 version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+ "vance-core",
+ "vance-ipc",
+]
 
 [[package]]
 name = "vance-engine"
@@ -5432,6 +5451,14 @@ dependencies = [
 [[package]]
 name = "vance-plugin-host"
 version = "0.0.0"
+dependencies = [
+ "serde",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "vance-audio-plugins",
+ "vance-ipc",
+]
 
 [[package]]
 name = "vance-plugin-sdk"

@@ -26,6 +26,7 @@
   import { selectionState } from '$lib/selection.svelte';
   import { peaksCache, chooseLevel } from '$lib/peaks-cache.svelte';
   import { metersStore, dbToFill, type MeterDisplay } from '$lib/meters.svelte';
+  import { scrubSession } from '$lib/scrub.svelte';
   import {
     yForDb,
     dbForY,
@@ -1168,7 +1169,9 @@
     | 'fade-in'
     | 'fade-out'
     | 'kf-clip-move'
-    | 'kf-track-move';
+    | 'kf-track-move'
+    // Phase 7.9 — drag on the ruler scrubs audio at the cursor.
+    | 'scrub-ruler';
 
   // --- Phase 7.4 M5 automation overlay state ----------------------------
 
@@ -1385,6 +1388,27 @@
     const rect = canvas.getBoundingClientRect();
     const localX = e.clientX - rect.left;
     const localY = e.clientY - rect.top;
+    // Phase 7.9 — drag on the ruler scrubs audio at the cursor. Ruler
+    // is the top `RULER_HEIGHT` px; only the area RIGHT of the track
+    // header is timeline-relative.
+    if (localY < RULER_HEIGHT && localX >= TRACK_HEADER_W) {
+      const t = scrollSeconds + (localX - TRACK_HEADER_W) / pixelsPerSecond;
+      playheadSeconds = Math.max(0, t);
+      scrubSession.begin();
+      void scrubSession.at(playheadSeconds);
+      dragStart = {
+        kind: 'scrub-ruler',
+        clientX: e.clientX,
+        clientY: e.clientY,
+        localX,
+        localY,
+        scroll: scrollSeconds,
+        modKeys: { shift: e.shiftKey, cmd: e.metaKey || e.ctrlKey },
+        downOnClipId: null
+      };
+      scheduleDraw();
+      return;
+    }
     // A. Phase 7.3 — track-header mixer toggle hit-test runs BEFORE clip
     // hit-testing because the buttons live inside TRACK_HEADER_W where
     // hitAt never returns clips anyway. Fire-and-forget so the canvas
@@ -1641,6 +1665,16 @@
 
     if (dragStart.kind === 'pan') {
       scrollSeconds = Math.max(0, dragStart.scroll - dx / pixelsPerSecond);
+      scheduleDraw();
+    } else if (dragStart.kind === 'scrub-ruler' && canvas) {
+      // Phase 7.9 — emit a burst at every new cursor position. The
+      // scrub session throttles to MIN_BURST_INTERVAL_MS so very
+      // rapid drag events don't overwhelm the sidecar startup cost.
+      const rect = canvas.getBoundingClientRect();
+      const cursorX = e.clientX - rect.left;
+      const t = scrollSeconds + (cursorX - TRACK_HEADER_W) / pixelsPerSecond;
+      playheadSeconds = Math.max(0, t);
+      void scrubSession.at(playheadSeconds);
       scheduleDraw();
     } else if (dragStart.kind === 'marquee' && canvas) {
       const rect = canvas.getBoundingClientRect();
@@ -1939,6 +1973,13 @@
     const wasMarquee = ds.kind === 'marquee' && marquee != null;
     const m = marquee;
     marquee = null;
+
+    // Phase 7.9 — release a scrub session: stop the in-flight burst
+    // and clear pending timers.
+    if (ds.kind === 'scrub-ruler') {
+      void scrubSession.end();
+      return;
+    }
 
     // ---- Move-drag release: commit via engine -----------------------------
     if (ds.kind === 'move' && moveDrag) {

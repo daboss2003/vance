@@ -44,6 +44,13 @@ import {
   setClipGainKeyframes as ipcSetClipGainKeyframes,
   setClipFadeIn as ipcSetClipFadeIn,
   setClipFadeOut as ipcSetClipFadeOut,
+  setTrackPan as ipcSetTrackPan,
+  setClipPan as ipcSetClipPan,
+  addAudioEffect as ipcAddAudioEffect,
+  removeAudioEffect as ipcRemoveAudioEffect,
+  moveAudioEffect as ipcMoveAudioEffect,
+  updateAudioEffect as ipcUpdateAudioEffect,
+  type AudioEffectSpec,
   type GainKeyframe,
   type FadeCurveName,
   updateEffectParams as ipcUpdateEffectParams,
@@ -852,6 +859,74 @@ class ProjectState {
     this.error = null;
     try {
       await ipcSetClipGainDb(trackId, clipId, gainDb);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Phase 7.6: track stereo pan. `pan ∈ [-1, +1]`. Live during playback —
+   *  the snapshot republish recomputes every clip's pan_linear. */
+  async setTrackPan(trackId: string, pan: number) {
+    this.error = null;
+    try {
+      await ipcSetTrackPan(trackId, pan);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Phase 7.6: clip stereo pan. Composes with the parent track's pan
+   *  at snapshot build time. Live during playback. */
+  async setClipPan(trackId: string, clipId: string, pan: number) {
+    this.error = null;
+    try {
+      await ipcSetClipPan(trackId, clipId, pan);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Phase 7.7 — append an audio effect to a track's chain. */
+  async addAudioEffect(trackId: string, effect: AudioEffectSpec) {
+    this.error = null;
+    try {
+      await ipcAddAudioEffect(trackId, effect);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Phase 7.7 — remove the effect at `index`. */
+  async removeAudioEffect(trackId: string, index: number) {
+    this.error = null;
+    try {
+      await ipcRemoveAudioEffect(trackId, index);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Phase 7.7 — reorder. */
+  async moveAudioEffect(trackId: string, fromIndex: number, toIndex: number) {
+    this.error = null;
+    try {
+      await ipcMoveAudioEffect(trackId, fromIndex, toIndex);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Phase 7.7 — replace one effect's full spec (knob commit). */
+  async updateAudioEffect(trackId: string, index: number, effect: AudioEffectSpec) {
+    this.error = null;
+    try {
+      await ipcUpdateAudioEffect(trackId, index, effect);
       await this.commitEdit();
     } catch (e) {
       this.error = String(e);

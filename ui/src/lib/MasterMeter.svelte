@@ -75,10 +75,40 @@
     const id = window.setInterval(draw, 33);
     return () => window.clearInterval(id);
   });
+
+  /** Format a LUFS reading. -Infinity / non-finite → "--.-". */
+  function fmtLufs(v: number): string {
+    return Number.isFinite(v) ? v.toFixed(1) : '--.-';
+  }
+
+  /** Format a true-peak dBFS reading. */
+  function fmtTp(v: number): string {
+    return Number.isFinite(v) ? v.toFixed(1) : '--.-';
+  }
 </script>
 
-<canvas
-  bind:this={canvas}
-  style="width:{W}px;height:{H}px;display:block;"
-  title="Master bus meter (peak hold 1.5s, decay 20 dB/s)"
-></canvas>
+<div class="flex items-center gap-2">
+  <canvas
+    bind:this={canvas}
+    style="width:{W}px;height:{H}px;display:block;"
+    title="Master bus meter (peak hold 1.5s, decay 20 dB/s)"
+  ></canvas>
+  <!-- Phase 7.8 — BS.1770 loudness + true-peak readout next to the
+       meter. Compact monospaced grid so the values stay easy to
+       compare against `bs1770gain` for the exit-gate verification. -->
+  <div
+    class="font-mono text-vance-fg grid grid-cols-[auto_auto] gap-x-1 gap-y-0 text-[10px] leading-tight"
+    title="BS.1770-4 loudness — M=momentary, S=short-term, I=integrated; TP=inter-sample true peak"
+  >
+    <span class="text-vance-muted">M</span>
+    <span class="text-right">{fmtLufs(metersStore.loudness.lufs_m)}</span>
+    <span class="text-vance-muted">S</span>
+    <span class="text-right">{fmtLufs(metersStore.loudness.lufs_s)}</span>
+    <span class="text-vance-muted">I</span>
+    <span class="text-right">{fmtLufs(metersStore.loudness.lufs_i)}</span>
+    <span class="text-vance-muted">TP</span>
+    <span class="text-right">
+      {fmtTp(Math.max(metersStore.loudness.true_peak_l_db, metersStore.loudness.true_peak_r_db))}
+    </span>
+  </div>
+</div>

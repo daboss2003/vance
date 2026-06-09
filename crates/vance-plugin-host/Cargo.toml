@@ -7,3 +7,24 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
+
+# Build a binary that the parent process spawns as the plugin sandbox.
+[[bin]]
+name = "vance-plugin-host"
+path = "src/main.rs"
+
+[dependencies]
+vance-audio-plugins = { workspace = true }
+vance-ipc = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+# The actual plugin runtimes are feature-gated so the binary builds
+# cleanly even when the system libraries (liblilv for LV2) aren't
+# installed. Users who want plugin support pass --features lv2,clap.
+[features]
+default = []
+lv2 = []
+clap = []

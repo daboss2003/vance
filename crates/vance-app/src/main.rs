@@ -1132,6 +1132,22 @@ impl From<vance_audio::TrackMeter> for UiTrackMeter {
     }
 }
 
+/// Phase 7.8 — BS.1770 + true-peak readout for the UI.
+#[derive(serde::Serialize, Clone, Copy, Debug, Default)]
+struct UiLoudness {
+    /// Momentary loudness in LUFS (latest 400 ms block). `null`-like
+    /// values become serialised `null` on the wire via NaN→null.
+    lufs_m: f32,
+    /// Short-term loudness — sliding 3 s window.
+    lufs_s: f32,
+    /// Integrated loudness — gated across the playback session.
+    lufs_i: f32,
+    /// True-peak in dBFS, left + right. Includes inter-sample peaks
+    /// via 4× polyphase oversampling.
+    true_peak_l_db: f32,
+    true_peak_r_db: f32,
+}
+
 /// Phase 7.5 M1 — meter snapshot for the UI. `null` when the mixer
 /// backend isn't active (single-source path or no playback).
 #[derive(serde::Serialize, Clone, Debug, Default)]
@@ -1142,6 +1158,97 @@ struct UiMeterSnapshot {
     /// Monotonic publish counter. UI uses this to detect a stalled or
     /// reset fold thread without polling at the fold publish rate.
     generation: u64,
+    /// Phase 7.8 — BS.1770 loudness + true-peak on the master bus.
+    loudness: UiLoudness,
+}
+
+/// Phase 7.10 / 7.11 — UI-facing plugin descriptor.
+#[derive(serde::Serialize, Clone, Debug)]
+struct UiPluginDescriptor {
+    format: String,
+    id: String,
+    name: String,
+    vendor: String,
+    runnable: bool,
+}
+
+/// Phase 7.10 / 7.11 — enumerate every plugin the sandboxed
+/// `vance-plugin-host` sidecar can host on the current system.
+/// Returns an empty list (NOT an error) when the sidecar binary is
+/// not present so the UI degrades gracefully.
+#[tauri::command]
+fn list_audio_plugins(_state: tauri::State<'_, EngineHandle>) -> Result<Vec<UiPluginDescriptor>, String> {
+    let bin = match locate_plugin_host_binary() {
+        Some(p) => p,
+        None => return Ok(Vec::new()),
+    };
+    let mut client = match vance_audio_plugins::PluginClient::spawn(&bin) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(?e, "plugin host spawn failed");
+            return Ok(Vec::new());
+        }
+    };
+    let plugins = client.list_plugins().map_err(|e| e.to_string())?;
+    // Be tidy — drop the sidecar so we don't leak it just for one query.
+    let _ = client.shutdown();
+    Ok(plugins
+        .into_iter()
+        .map(|d| UiPluginDescriptor {
+            format: match d.format {
+                vance_audio_plugins::PluginFormat::Lv2 => "lv2".into(),
+                vance_audio_plugins::PluginFormat::Clap => "clap".into(),
+            },
+            id: d.id,
+            name: d.name,
+            vendor: d.vendor,
+            runnable: d.runnable,
+        })
+        .collect())
+}
+
+/// Locate the `vance-plugin-host` sidecar binary. Mirrors
+/// [`locate_audio_binary`] for the audio decoder.
+fn locate_plugin_host_binary() -> Option<std::path::PathBuf> {
+    let name = if cfg!(windows) {
+        "vance-plugin-host.exe"
+    } else {
+        "vance-plugin-host"
+    };
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let p = parent.join(name);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    // Try `target/debug/<name>` from the workspace root for dev builds.
+    let candidates = [
+        std::path::PathBuf::from("target/debug").join(name),
+        std::path::PathBuf::from("target/release").join(name),
+    ];
+    for c in candidates {
+        if c.exists() {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// Phase 7.9 — fire a short audio scrub burst at the given timeline
+/// PTS. The UI is responsible for sequencing burst start + burst
+/// stop (via `stop_playback`) during a playhead drag.
+///
+/// `time_base_num` / `time_base_den` describe the engine sequence's
+/// time base for `from_pts`. For typical sequences this is `(1,
+/// sample_rate)` so `from_pts` is in device-sample frames since
+/// playback origin. For convenience, the UI calls with `(time_base_num,
+/// time_base_den) = (1, 48_000)` and a PTS computed from
+/// `timelineSeconds * 48000`.
+#[tauri::command]
+fn scrub_burst(state: tauri::State<'_, EngineHandle>, from_pts: i64) -> Result<(), String> {
+    state.lock().scrub_burst(from_pts).map_err(|e| e.to_string())
 }
 
 /// Phase 7.5 M1: read the latest mixer metering snapshot. Cheap
@@ -1154,10 +1261,18 @@ fn meter_snapshot(state: tauri::State<'_, EngineHandle>) -> Option<UiMeterSnapsh
         .into_iter()
         .map(|(uuid, m)| (uuid.to_string(), m.into()))
         .collect();
+    let loudness = UiLoudness {
+        lufs_m: snap.loudness.lufs_m,
+        lufs_s: snap.loudness.lufs_s,
+        lufs_i: snap.loudness.lufs_i,
+        true_peak_l_db: vance_audio::loudness::lin_to_dbfs(snap.master_true_peak[0]),
+        true_peak_r_db: vance_audio::loudness::lin_to_dbfs(snap.master_true_peak[1]),
+    };
     Some(UiMeterSnapshot {
         master: snap.master.into(),
         tracks,
         generation: snap.generation,
+        loudness,
     })
 }
 
@@ -1325,6 +1440,123 @@ fn set_clip_gain_db(
             vance_timeline::TrackId::from_uuid(track_uuid),
             vance_timeline::ClipId::from_uuid(clip_uuid),
             gain_db,
+        )
+        .map_err(|e| e.to_string())
+}
+
+/// Phase 7.6: set a track's stereo pan. `pan ∈ [-1, +1]`.
+#[tauri::command]
+fn set_track_pan(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    pan: f32,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    state
+        .lock()
+        .set_track_pan(vance_timeline::TrackId::from_uuid(track_uuid), pan)
+        .map_err(|e| e.to_string())
+}
+
+/// Phase 7.6: set a clip's stereo pan. `pan ∈ [-1, +1]`.
+#[tauri::command]
+fn set_clip_pan(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    clip_id: String,
+    pan: f32,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let clip_uuid = clip_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid clip id: {e}"))?;
+    state
+        .lock()
+        .set_clip_pan(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            vance_timeline::ClipId::from_uuid(clip_uuid),
+            pan,
+        )
+        .map_err(|e| e.to_string())
+}
+
+/// Phase 7.7: append a built-in audio effect to a track's chain. The
+/// UI side passes a JSON `AudioEffectSpec` (tagged enum) — serde
+/// hydrates the typed variant before we dispatch.
+#[tauri::command]
+fn add_audio_effect(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    effect: vance_timeline::AudioEffectSpec,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    state
+        .lock()
+        .add_audio_effect(vance_timeline::TrackId::from_uuid(track_uuid), effect)
+        .map_err(|e| e.to_string())
+}
+
+/// Phase 7.7: remove the audio effect at `index` from a track's chain.
+#[tauri::command]
+fn remove_audio_effect(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    index: usize,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    state
+        .lock()
+        .remove_audio_effect(vance_timeline::TrackId::from_uuid(track_uuid), index)
+        .map_err(|e| e.to_string())
+}
+
+/// Phase 7.7: reorder one effect within the chain.
+#[tauri::command]
+fn move_audio_effect(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    from_index: usize,
+    to_index: usize,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    state
+        .lock()
+        .move_audio_effect(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            from_index,
+            to_index,
+        )
+        .map_err(|e| e.to_string())
+}
+
+/// Phase 7.7: replace one effect's full spec — the call every knob
+/// commit goes through.
+#[tauri::command]
+fn update_audio_effect(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    index: usize,
+    effect: vance_timeline::AudioEffectSpec,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    state
+        .lock()
+        .update_audio_effect(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            index,
+            effect,
         )
         .map_err(|e| e.to_string())
 }
@@ -1883,8 +2115,16 @@ fn main() {
             set_track_gain_db,
             set_clip_mute,
             set_clip_gain_db,
+            set_track_pan,
+            set_clip_pan,
+            add_audio_effect,
+            remove_audio_effect,
+            move_audio_effect,
+            update_audio_effect,
             set_master_gain_db,
             meter_snapshot,
+            scrub_burst,
+            list_audio_plugins,
             set_track_gain_keyframes,
             set_clip_gain_keyframes,
             set_clip_fade_in,
