@@ -43,6 +43,11 @@ pub struct Project {
     /// present. `None` leaves the file LUT (or nothing) in charge.
     #[serde(default)]
     pub ocio_view: Option<OcioView>,
+    /// Phase 9.5 — project-level "use proxies" toggle. When `true`,
+    /// the engine opens `MediaItem::proxy_path` (if set) for playback
+    /// + scrub. `#[serde(default)]` so older projects open w/ `false`.
+    #[serde(default)]
+    pub use_proxies: bool,
 }
 
 /// A persisted OpenColorIO display-transform spec (Phase 6.1b). Plain
@@ -81,6 +86,7 @@ impl Project {
             working_color_space: default_working_space(),
             view_lut_path: None,
             ocio_view: None,
+            use_proxies: false,
         }
     }
 

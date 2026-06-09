@@ -37,6 +37,20 @@ impl CacheKey {
         }
     }
 
+    /// Phase 9.6 — convenience: build a render-cache key from the
+    /// hash of an input frame's bytes + the hash of the effect chain
+    /// that produced the output. The render cache shares the same
+    /// two-tier storage as the frame cache; keying via a synthetic
+    /// URI like `render:<input_hash>` keeps the ring isolation
+    /// semantics intact (per-input-frame ring).
+    pub fn for_render(input_frame_hash: u64, effect_chain_hash: u64) -> Self {
+        Self {
+            source_uri: format!("render:{input_frame_hash:016x}"),
+            pts: 0,
+            transform_hash: effect_chain_hash,
+        }
+    }
+
     /// Derive the on-disk file name. Returns a 16-character lowercase
     /// hex string that's safe for any filesystem.
     pub fn disk_key(&self) -> String {
@@ -82,6 +96,25 @@ mod tests {
         let a = CacheKey::for_source_frame("file:///x.mp4", 1, 0);
         let b = CacheKey::for_source_frame("file:///x.mp4", 1, 0xdeadbeef);
         assert_ne!(a.disk_key(), b.disk_key());
+    }
+
+    #[test]
+    fn render_key_is_distinct_from_source_key() {
+        let r = CacheKey::for_render(0xdeadbeef, 0xfeedface);
+        // Render keys live under "render:..." namespace so they
+        // never collide with source-frame URIs.
+        assert!(r.source_uri.starts_with("render:"));
+        let s = CacheKey::for_source_frame("file:///x.mp4", 0, 0xfeedface);
+        assert_ne!(r.disk_key(), s.disk_key());
+    }
+
+    #[test]
+    fn render_key_differs_by_input_or_effect() {
+        let a = CacheKey::for_render(1, 1);
+        let b = CacheKey::for_render(2, 1);
+        let c = CacheKey::for_render(1, 2);
+        assert_ne!(a.disk_key(), b.disk_key());
+        assert_ne!(a.disk_key(), c.disk_key());
     }
 
     /// Separator-injection guard: the manual zero-byte separator

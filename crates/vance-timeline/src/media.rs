@@ -78,6 +78,12 @@ pub struct MediaItem {
     /// Tauri command surface) on first project-open.
     #[serde(default)]
     pub has_audio_track: bool,
+    /// Phase 9.5 — when set, points at a transcoded low-bandwidth
+    /// proxy of this media. The engine reads frames from this path
+    /// instead of `path` whenever the project's "use proxy" toggle
+    /// is on. `None` = no proxy generated yet.
+    #[serde(default)]
+    pub proxy_path: Option<PathBuf>,
 }
 
 impl MediaItem {
@@ -103,6 +109,7 @@ impl MediaItem {
             title: None,
             input_color_space: None,
             has_audio_track,
+            proxy_path: None,
         }
     }
 
@@ -129,6 +136,7 @@ impl MediaItem {
             // space differs.
             input_color_space: Some(ColorSpace::Srgb),
             has_audio_track: false,
+            proxy_path: None,
         }
     }
 

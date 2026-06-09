@@ -8,5 +8,9 @@ pub mod peaks;
 pub mod cached_decode;
 #[path = "prefetch.rs"]
 pub mod prefetch;
+#[path = "proxy.rs"]
+pub mod proxy;
+#[path = "profiling.rs"]
+pub mod profiling;
 #[path = "engine.rs"]
 pub mod engine;

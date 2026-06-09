@@ -92,6 +92,7 @@ pub fn unpack_frame(buf: &[u8]) -> Option<FrameData> {
 
 /// Cache-fronted single-frame decode. Returns the decoded frame +
 /// whether the cache served it.
+#[tracing::instrument(skip(decoder, cache), fields(target_pts, hit))]
 pub fn cached_decode_at(
     decoder: &mut DecoderClient,
     cache: &FrameCache,

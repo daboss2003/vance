@@ -13,6 +13,8 @@ mod cached_decode;
 mod engine;
 mod peaks;
 mod prefetch;
+mod profiling;
+mod proxy;
 
 use engine::{EngineHandle, MediaItemInfo, ProjectInfo, SequenceContents, SourceState, TrackSummary};
 use parking_lot::Mutex as PMutex;
@@ -1311,6 +1313,105 @@ fn render_and_replace(
     })
 }
 
+/// Phase 9.4 — enqueue a proxy generation job. Returns the job id.
+#[tauri::command]
+fn enqueue_proxy_generation(
+    state: tauri::State<'_, EngineHandle>,
+    source_path: String,
+    output_path: String,
+) -> Result<String, String> {
+    state
+        .lock()
+        .enqueue_proxy_generation(source_path, output_path)
+        .map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+struct UiProxyJobSnapshot {
+    id: String,
+    source_path: String,
+    output_path: String,
+    /// "queued" | "running" | "done" | "error"
+    state: &'static str,
+    /// Frames processed so far. `null` until the job starts running.
+    frames_done: Option<u64>,
+    /// Error message when `state == "error"`.
+    error: Option<String>,
+}
+
+/// Phase 9.4 — poll proxy-generation status. Safe to call at any rate.
+#[tauri::command]
+fn proxy_jobs(state: tauri::State<'_, EngineHandle>) -> Vec<UiProxyJobSnapshot> {
+    state
+        .lock()
+        .proxy_jobs_snapshot()
+        .into_iter()
+        .map(|j| {
+            let (st, frames_done, error) = match j.status {
+                crate::proxy::ProxyJobStatus::Queued => ("queued", None, None),
+                crate::proxy::ProxyJobStatus::Running { frames_done } => {
+                    ("running", Some(frames_done), None)
+                }
+                crate::proxy::ProxyJobStatus::Done { frames_done } => {
+                    ("done", Some(frames_done), None)
+                }
+                crate::proxy::ProxyJobStatus::Error(msg) => ("error", None, Some(msg)),
+            };
+            UiProxyJobSnapshot {
+                id: j.id,
+                source_path: j.source_path,
+                output_path: j.output_path,
+                state: st,
+                frames_done,
+                error,
+            }
+        })
+        .collect()
+}
+
+/// Phase 9.5 — toggle the project-level "use proxies" flag.
+#[tauri::command]
+fn set_use_proxies(state: tauri::State<'_, EngineHandle>, on: bool) -> Result<(), String> {
+    state.lock().set_use_proxies(on).map_err(|e| e.to_string())
+}
+
+/// Phase 9.5 — register a proxy file for a media item. Passing
+/// `null` clears it.
+#[tauri::command]
+fn set_media_proxy_path(
+    state: tauri::State<'_, EngineHandle>,
+    media_id: String,
+    proxy_path: Option<String>,
+) -> Result<(), String> {
+    let uuid: uuid::Uuid = media_id.parse().map_err(|e| format!("bad media id: {e}"))?;
+    let id = vance_timeline::MediaItemId::from_uuid(uuid);
+    let path = proxy_path.map(std::path::PathBuf::from);
+    state.lock().set_media_proxy_path(id, path).map_err(|e| e.to_string())
+}
+
+/// Phase 9.2 — poll frame-cache stats.
+#[derive(serde::Serialize, Clone, Copy, Debug, Default)]
+struct UiCacheStats {
+    ring_count: u64,
+    ring_total_bytes: u64,
+    disk_entries: u64,
+    disk_bytes: u64,
+}
+
+#[tauri::command]
+fn frame_cache_stats(state: tauri::State<'_, EngineHandle>) -> UiCacheStats {
+    if let Some(s) = state.lock().frame_cache_stats() {
+        UiCacheStats {
+            ring_count: s.ring_count as u64,
+            ring_total_bytes: s.ring_total_bytes as u64,
+            disk_entries: s.disk_entries as u64,
+            disk_bytes: s.disk_bytes,
+        }
+    } else {
+        UiCacheStats::default()
+    }
+}
+
 /// Phase 7.10 / 7.11 — UI-facing plugin descriptor.
 #[derive(serde::Serialize, Clone, Debug)]
 struct UiPluginDescriptor {
@@ -2152,13 +2253,13 @@ fn set_current_sequence(
 }
 
 fn main() {
-    // Quiet by default; bump with RUST_LOG=info for diagnostics.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn,vance=info".parse().unwrap()),
-        )
-        .try_init();
+    // Phase 9.7 — when VANCE_TRACE_PATH is set we emit chrome trace
+    // JSON to that path on top of the stderr fmt subscriber. Without
+    // the env var, only the stderr subscriber runs (same as before).
+    let chrome_on = profiling::init();
+    if chrome_on {
+        eprintln!("[vance] chrome tracing enabled → {}", std::env::var("VANCE_TRACE_PATH").unwrap_or_default());
+    }
 
     let engine = EngineHandle::new();
     let peaks_handle: PeaksHandle = Arc::new(PMutex::new(None));
@@ -2276,6 +2377,11 @@ fn main() {
             list_audio_plugins,
             render_sequence,
             render_and_replace,
+            enqueue_proxy_generation,
+            proxy_jobs,
+            frame_cache_stats,
+            set_use_proxies,
+            set_media_proxy_path,
             set_track_gain_keyframes,
             set_clip_gain_keyframes,
             set_clip_fade_in,

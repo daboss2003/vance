@@ -1123,6 +1123,8 @@ pub struct Engine {
     /// sidecar so the primary decoder isn't fighting for the open
     /// file handle.
     pub(crate) prefetch: Option<crate::prefetch::PrefetchWorker>,
+    /// Phase 9.4 — proxy generation worker.
+    pub(crate) proxy_worker: Option<crate::proxy::ProxyWorker>,
     /// Last-applied viewport bounds (in physical pixels).
     last_bounds: ViewportBounds,
     /// Active playback, if any.
@@ -3241,6 +3243,18 @@ impl Engine {
                 media.title.clone().unwrap_or_default(),
             )),
             MediaKind::Video | MediaKind::Image | MediaKind::Audio => {
+                // Phase 9.5 — when the project's "use proxies" toggle
+                // is on AND this item has a generated proxy file, use
+                // the proxy. Falls back to the original source if the
+                // proxy file disappeared underneath us (e.g. user
+                // deleted it manually).
+                if project.use_proxies {
+                    if let Some(p) = media.proxy_path.as_ref() {
+                        if p.exists() {
+                            return Ok(MediaResolved::File(p.to_string_lossy().into_owned()));
+                        }
+                    }
+                }
                 Ok(MediaResolved::File(media.path.to_string_lossy().into_owned()))
             }
         }
@@ -7012,6 +7026,84 @@ impl Engine {
             self.prefetch = Some(crate::prefetch::PrefetchWorker::spawn(cache, bin));
         }
         self.prefetch.as_ref()
+    }
+
+    /// Phase 9.4 — enqueue a proxy generation job. Returns the
+    /// assigned job id which the UI can poll via
+    /// [`Engine::proxy_jobs_snapshot`].
+    pub fn enqueue_proxy_generation(
+        &mut self,
+        source_path: String,
+        output_path: String,
+    ) -> Result<String, EngineError> {
+        let preset = vance_encoder::EncoderPreset::ProRes422; // proxy default
+        let job = crate::proxy::ProxyJob {
+            id: format!(
+                "proxy-{}-{}",
+                std::process::id(),
+                std::path::Path::new(&source_path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+            ),
+            source_path,
+            output_path,
+            preset,
+        };
+        let worker = self.ensure_proxy_worker()?;
+        let id = worker.enqueue(job);
+        Ok(id)
+    }
+
+    /// Phase 9.5 — toggle the project-level "use proxies" flag.
+    pub fn set_use_proxies(&mut self, on: bool) -> Result<(), EngineError> {
+        let project = self
+            .current_project
+            .as_mut()
+            .ok_or(EngineError::NoProject)?;
+        project.use_proxies = on;
+        Ok(())
+    }
+
+    /// Phase 9.5 — point a media item at its generated proxy file.
+    /// Called automatically by the proxy worker on success, but also
+    /// exposed for the UI when the user picks an existing proxy.
+    pub fn set_media_proxy_path(
+        &mut self,
+        media_id: MediaItemId,
+        proxy_path: Option<std::path::PathBuf>,
+    ) -> Result<(), EngineError> {
+        let project = self
+            .current_project
+            .as_mut()
+            .ok_or(EngineError::NoProject)?;
+        let media = project
+            .media
+            .get_mut(&media_id)
+            .ok_or(EngineError::MediaNotFound)?;
+        let mut updated = (**media).clone();
+        updated.proxy_path = proxy_path;
+        *media = Arc::new(updated);
+        Ok(())
+    }
+
+    /// Phase 9.4 — snapshot of every known proxy job.
+    pub fn proxy_jobs_snapshot(&self) -> Vec<crate::proxy::ProxyJobSnapshot> {
+        self.proxy_worker
+            .as_ref()
+            .map(|w| w.status_snapshot())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn ensure_proxy_worker(
+        &mut self,
+    ) -> Result<&crate::proxy::ProxyWorker, EngineError> {
+        if self.proxy_worker.is_none() {
+            let dec = locate_decoder_binary()?;
+            let enc = locate_encoder_binary()?;
+            self.proxy_worker = Some(crate::proxy::ProxyWorker::spawn(dec, enc));
+        }
+        Ok(self.proxy_worker.as_ref().unwrap())
     }
 
     /// Phase 9.3 — kick a forward-prefetch session at `anchor_pts`.
