@@ -951,6 +951,47 @@ export type AudioPluginDescriptor = {
 export const listAudioPlugins = (): Promise<AudioPluginDescriptor[]> =>
   invoke('list_audio_plugins');
 
+// ---- Phase 10 — WASM effect plugins ---------------------------------------
+
+/** One tunable parameter on a discovered WASM plugin. */
+export type WasmPluginParam = {
+  key: string;
+  label: string;
+  min: number;
+  max: number;
+  default: number;
+};
+
+/** A discovered WASM effect/transition plugin (mirrors the host's
+ *  UiWasmPlugin). */
+export type WasmPlugin = {
+  id: string;
+  name: string;
+  version: string;
+  author: string;
+  kind: 'effect' | 'transition';
+  params: WasmPluginParam[];
+};
+
+/** Phase 10.3 — rescan the plugin folders; returns the count found. */
+export const rescanPlugins = (): Promise<number> => invoke('rescan_plugins');
+
+/** Phase 10.5 — list discovered WASM plugins (rescans first so a
+ *  freshly-dropped .wasm appears without a restart). */
+export const listWasmPlugins = (): Promise<WasmPlugin[]> => invoke('list_wasm_plugins');
+
+/** Apply a discovered WASM plugin to a clip as a `wasm:<id>` effect,
+ *  seeding params with the plugin's declared defaults. */
+export const applyWasmPlugin = (
+  trackId: string,
+  clipId: string,
+  plugin: WasmPlugin
+): Promise<string> => {
+  const params: Record<string, EffectValue> = {};
+  for (const p of plugin.params) params[p.key] = p.default;
+  return addEffectToClip(trackId, clipId, `wasm:${plugin.id}`, params);
+};
+
 // ---- Phase 8 — Export pipeline -------------------------------------------
 
 /** Phase 8 — encoder preset discriminants (mirrors the Rust enum). */

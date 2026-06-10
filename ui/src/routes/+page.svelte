@@ -34,6 +34,7 @@
   import MasterMeter from '$lib/MasterMeter.svelte';
   import AudioEffectChain from '$lib/AudioEffectChain.svelte';
   import ExportPanel from '$lib/ExportPanel.svelte';
+  import EffectsBrowser from '$lib/EffectsBrowser.svelte';
   import ColorWheel from '$lib/color/ColorWheel.svelte';
   import CurveEditor from '$lib/color/CurveEditor.svelte';
   import ScopeCanvas from '$lib/color/ScopeCanvas.svelte';
@@ -2447,6 +2448,12 @@
             <dt class="text-vance-muted">enabled</dt>
             <dd>{c.enabled ? 'yes' : 'muted'}</dd>
           </dl>
+
+          <!-- Phase 10.6 — WASM effect plugins browser. Applies a
+               discovered plugin to this clip as a `wasm:<id>` effect. -->
+          <div class="mt-3">
+            <EffectsBrowser trackId={t.id} clipId={c.id} />
+          </div>
 
           <!-- Phase 7.6 — pan controls. Sliders for the parent track's
                pan AND the clip's pan, since they compose additively at

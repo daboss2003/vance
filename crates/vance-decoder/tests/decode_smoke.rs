@@ -46,7 +46,16 @@ fn handshake_open_decode_close() {
         .expect("open fixture");
     assert_eq!(info.width, 320);
     assert_eq!(info.height, 240);
-    assert_eq!(info.pixel_format, PixelFormat::Yuv420P);
+    // The decoder reports the format FFmpeg negotiated. On macs with
+    // a VideoToolbox-backed h264 path that's NV12; on a software path
+    // it's YUV420P. Both are 4:2:0 and the rest of the pipeline
+    // (renderer upload_frame, proxy converter) handles either, so the
+    // smoke test accepts both rather than pinning one platform's pick.
+    assert!(
+        matches!(info.pixel_format, PixelFormat::Yuv420P | PixelFormat::Nv12),
+        "unexpected pixel format: {:?}",
+        info.pixel_format
+    );
     assert!(info.duration_pts.unwrap_or(0) > 0);
     assert_eq!(info.codec_name, "h264");
 
@@ -54,14 +63,27 @@ fn handshake_open_decode_close() {
     let frame0 = client.decode_at(0).expect("decode frame 0");
     assert_eq!(frame0.width, 320);
     assert_eq!(frame0.height, 240);
-    assert_eq!(frame0.pixel_format, PixelFormat::Yuv420P);
-    let expected_size = PixelFormat::Yuv420P.frame_size(320, 240);
+    assert_eq!(
+        frame0.pixel_format, info.pixel_format,
+        "frame format should match the stream's reported format"
+    );
+    let expected_size = frame0.pixel_format.frame_size(320, 240);
     assert_eq!(
         frame0.bytes.len(),
         expected_size,
         "frame 0 byte count mismatch"
     );
-    assert_eq!(frame0.strides.len(), 3, "YUV420P should have 3 planes");
+    // YUV420P → 3 planes (Y/U/V); NV12 → 2 planes (Y + interleaved UV).
+    let expected_planes = match frame0.pixel_format {
+        PixelFormat::Yuv420P => 3,
+        PixelFormat::Nv12 => 2,
+    };
+    assert_eq!(
+        frame0.strides.len(),
+        expected_planes,
+        "plane count should match {:?}",
+        frame0.pixel_format
+    );
 
     // Decode a frame ~1 second in. Stream time-base for libx264 is typically
     // (1, 15360) — but we pass PTS in the stream's time base, so use the

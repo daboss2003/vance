@@ -1369,6 +1369,67 @@ fn proxy_jobs(state: tauri::State<'_, EngineHandle>) -> Vec<UiProxyJobSnapshot> 
         .collect()
 }
 
+/// Phase 10 — UI descriptor for one discovered WASM plugin.
+#[derive(serde::Serialize, Clone, Debug)]
+struct UiWasmPluginParam {
+    key: String,
+    label: String,
+    min: f32,
+    max: f32,
+    default: f32,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+struct UiWasmPlugin {
+    id: String,
+    name: String,
+    version: String,
+    author: String,
+    /// "effect" | "transition"
+    kind: &'static str,
+    params: Vec<UiWasmPluginParam>,
+}
+
+/// Phase 10.3 — rescan the plugin folders. Returns the count found.
+#[tauri::command]
+fn rescan_plugins(state: tauri::State<'_, EngineHandle>) -> usize {
+    state.lock().rescan_plugins()
+}
+
+/// Phase 10.5 — list discovered WASM plugins for the effects browser.
+/// Triggers a rescan first so freshly-dropped plugins appear without
+/// a restart.
+#[tauri::command]
+fn list_wasm_plugins(state: tauri::State<'_, EngineHandle>) -> Vec<UiWasmPlugin> {
+    let mut eng = state.lock();
+    eng.rescan_plugins();
+    eng.discovered_plugins()
+        .into_iter()
+        .map(|d| UiWasmPlugin {
+            id: d.manifest.id.clone(),
+            name: d.manifest.name.clone(),
+            version: d.manifest.version.clone(),
+            author: d.manifest.author.clone(),
+            kind: match d.manifest.kind {
+                vance_plugin_sdk::manifest::PluginKind::Effect => "effect",
+                vance_plugin_sdk::manifest::PluginKind::Transition => "transition",
+            },
+            params: d
+                .manifest
+                .params
+                .iter()
+                .map(|p| UiWasmPluginParam {
+                    key: p.key.clone(),
+                    label: p.label.clone(),
+                    min: p.min,
+                    max: p.max,
+                    default: p.default,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 /// Phase 9.5 — toggle the project-level "use proxies" flag.
 #[tauri::command]
 fn set_use_proxies(state: tauri::State<'_, EngineHandle>, on: bool) -> Result<(), String> {
@@ -2382,6 +2443,8 @@ fn main() {
             frame_cache_stats,
             set_use_proxies,
             set_media_proxy_path,
+            rescan_plugins,
+            list_wasm_plugins,
             set_track_gain_keyframes,
             set_clip_gain_keyframes,
             set_clip_fade_in,

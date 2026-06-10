@@ -1125,6 +1125,13 @@ pub struct Engine {
     pub(crate) prefetch: Option<crate::prefetch::PrefetchWorker>,
     /// Phase 9.4 — proxy generation worker.
     pub(crate) proxy_worker: Option<crate::proxy::ProxyWorker>,
+    /// Phase 10.3 — discovered WASM plugins (id → manifest + path).
+    pub(crate) plugin_registry: vance_plugin_sdk::discovery::PluginRegistry,
+    /// Phase 10.5 — lazily-instantiated WASM plugin instances, keyed
+    /// by manifest id. A `WasmPlugin` owns a wasmtime store so it's
+    /// kept warm across frames rather than re-loaded each call.
+    pub(crate) loaded_plugins:
+        std::collections::HashMap<String, vance_plugin_sdk::host::WasmPlugin>,
     /// Last-applied viewport bounds (in physical pixels).
     last_bounds: ViewportBounds,
     /// Active playback, if any.
@@ -6763,16 +6770,33 @@ impl Engine {
                 start_s + (f as f64) * (frame_rate_den as f64) / (frame_rate_num as f64);
             let timeline_t = seconds_to_rt(timeline_seconds);
 
-            // Resolve which clip (if any) is on screen.
-            let (active_media, active_source_pts_seconds): (Option<MediaItemId>, f64) = {
+            // Resolve which clip (if any) is on screen. Capture the
+            // clip id + a clone of its effect chain so we can apply
+            // WASM plugin effects (Phase 10.5) after readback without
+            // holding the project borrow.
+            let (active_media, active_source_pts_seconds, clip_effects): (
+                Option<MediaItemId>,
+                f64,
+                Vec<vance_timeline::Effect>,
+            ) = {
                 let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
                 let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
                 let seq = project.sequence(seq_id).ok_or(EngineError::SequenceNotFound)?;
                 match vance_timeline::scene_at(seq, timeline_t) {
                     vance_timeline::SceneAt::Clip(c) => {
-                        (Some(c.media), rt_to_seconds(c.source_pts))
+                        let effects = seq
+                            .tracks
+                            .iter()
+                            .find_map(|t| {
+                                t.clips
+                                    .iter()
+                                    .find(|cl| cl.id == c.clip_id)
+                                    .map(|cl| cl.effects.clone())
+                            })
+                            .unwrap_or_default();
+                        (Some(c.media), rt_to_seconds(c.source_pts), effects)
                     }
-                    vance_timeline::SceneAt::Empty => (None, 0.0),
+                    vance_timeline::SceneAt::Empty => (None, 0.0, Vec::new()),
                 }
             };
 
@@ -6823,7 +6847,13 @@ impl Engine {
                     }
                 }
             }
-            let push = rgba.unwrap_or_else(|| black.clone());
+            let mut push = rgba.unwrap_or_else(|| black.clone());
+            // Phase 10.5 — run the clip's WASM plugin effects over the
+            // composited RGBA before encoding. No-op when the clip has
+            // no `wasm:` effects.
+            if !clip_effects.is_empty() {
+                self.apply_wasm_effects(&mut push, width, height, &clip_effects);
+            }
             client
                 .push_video(f as i64, push)
                 .map_err(|e| EngineError::Project(format!("encoder push_video: {e}")))?;
@@ -7053,6 +7083,100 @@ impl Engine {
         let worker = self.ensure_proxy_worker()?;
         let id = worker.enqueue(job);
         Ok(id)
+    }
+
+    /// Phase 10.3 — (re)scan the plugin search roots: the user-global
+    /// `~/.vance/plugins/` plus the current project's `plugins/`
+    /// folder (when the project is saved to disk). Replaces the
+    /// registry; loaded instances are cleared so a re-scan picks up
+    /// edited plugins. Returns the number discovered.
+    pub fn rescan_plugins(&mut self) -> usize {
+        let mut roots = Vec::new();
+        if let Some(dir) = vance_plugin_sdk::discovery::user_plugins_dir() {
+            roots.push(dir);
+        }
+        // Project-local plugins live next to the .vance bundle.
+        if let Some(path) = self.current_project_path.as_ref() {
+            let p = std::path::Path::new(path);
+            // The project path points at the bundle dir; plugins live
+            // in a sibling `plugins/` folder.
+            if let Some(parent) = p.parent() {
+                roots.push(parent.join("plugins"));
+            }
+            roots.push(p.join("plugins"));
+        }
+        self.plugin_registry = vance_plugin_sdk::discovery::PluginRegistry::scan(&roots);
+        self.loaded_plugins.clear();
+        self.plugin_registry.len()
+    }
+
+    /// Phase 10.5 — UI-facing list of discovered plugins.
+    pub fn discovered_plugins(&self) -> Vec<vance_plugin_sdk::discovery::DiscoveredPlugin> {
+        self.plugin_registry.plugins().to_vec()
+    }
+
+    /// Phase 10.3 — additively scan one extra directory into the
+    /// plugin registry (e.g. a user-added custom folder). Returns the
+    /// new total count. Also drops cached instances so an edited
+    /// plugin reloads.
+    pub fn add_plugin_dir(&mut self, dir: std::path::PathBuf) -> usize {
+        self.plugin_registry.scan_dir(&dir);
+        self.loaded_plugins.clear();
+        self.plugin_registry.len()
+    }
+
+    /// Phase 10.5 — apply every enabled `wasm:<id>` effect on a clip to
+    /// a CPU RGBA buffer, in chain order. Best-effort: a plugin that
+    /// fails to load or traps is logged + skipped so one bad plugin
+    /// can't abort an export.
+    pub(crate) fn apply_wasm_effects(
+        &mut self,
+        rgba: &mut [u8],
+        w: u32,
+        h: u32,
+        effects: &[vance_timeline::Effect],
+    ) {
+        for e in effects {
+            if !e.enabled {
+                continue;
+            }
+            let Some(id) = e.kind.strip_prefix("wasm:") else {
+                continue;
+            };
+            // Lazily load the instance.
+            if !self.loaded_plugins.contains_key(id) {
+                let Some(disc) = self.plugin_registry.by_id(id).cloned() else {
+                    tracing::warn!(plugin = %id, "wasm effect references unknown plugin");
+                    continue;
+                };
+                match std::fs::read(&disc.path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|b| {
+                        vance_plugin_sdk::host::WasmPlugin::load(&b).map_err(|e| e.to_string())
+                    }) {
+                    Ok(p) => {
+                        self.loaded_plugins.insert(id.to_string(), p);
+                    }
+                    Err(err) => {
+                        tracing::warn!(plugin = %id, %err, "wasm plugin load failed");
+                        continue;
+                    }
+                }
+            }
+            let Some(plugin) = self.loaded_plugins.get_mut(id) else {
+                continue;
+            };
+            let manifest = plugin.manifest().clone();
+            let packed = manifest.pack_params(&|key| {
+                e.params.get(key).and_then(|v| match v {
+                    EffectValue::Number(n) => Some(*n as f32),
+                    _ => None,
+                })
+            });
+            if let Err(err) = plugin.process(rgba, w, h, &packed) {
+                tracing::warn!(plugin = %id, ?err, "wasm effect process failed; skipping");
+            }
+        }
     }
 
     /// Phase 9.5 — toggle the project-level "use proxies" flag.

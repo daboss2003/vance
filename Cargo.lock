@@ -5600,6 +5600,7 @@ dependencies = [
  "vance-grading-cmd",
  "vance-ocio",
  "vance-peaks",
+ "vance-plugin-sdk",
  "vance-project",
  "vance-render",
  "vance-scopes",

@@ -23,4 +23,7 @@ pub mod guest;
 #[cfg(feature = "host")]
 pub mod host;
 
+#[cfg(feature = "host")]
+pub mod discovery;
+
 pub use manifest::{ManifestError, ParamSpec, PluginKind, PluginManifest};
