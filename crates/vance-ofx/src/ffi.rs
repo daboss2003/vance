@@ -17,7 +17,15 @@
 //! malformed `.ofx` that segfaults on `dlopen` or returns garbage
 //! pointers takes down only the sidecar.
 
-use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
+use std::ffi::{c_char, c_int, c_uint, c_void};
+
+/// Hard cap on how far we'll scan for a NUL terminator when reading a
+/// plugin-supplied C string. The strings are populated by untrusted
+/// third-party native code (see module docs), so we must NOT do an
+/// unbounded `strlen` walk: a non-terminated / dangling buffer would
+/// read out of bounds (UB + potential adjacent-memory disclosure).
+/// 4 KiB is far longer than any real OFX identifier / API string.
+const MAX_CSTR_BYTES: usize = 4096;
 
 /// Mirror of the OpenFX `OfxPlugin` struct (ABI-compatible layout).
 /// Only the leading fields are read; the two function pointers are
@@ -113,16 +121,28 @@ pub fn enumerate(binary_path: &std::path::Path) -> Result<Vec<OfxPluginInfo>, Of
 
     let mut out = Vec::with_capacity(count as usize);
     for i in 0..count {
-        // SAFETY: index in [0, count); the plugin must return a valid
-        // pointer per the OFX contract. A null is treated as data
-        // error rather than dereferenced.
+        // SAFETY: `i` is in `[0, count)`. `get_plugin` is foreign code
+        // and its returned pointer is UNTRUSTED — validity cannot be
+        // verified in-process. The sidecar boundary is the only
+        // containment for a faulting access; a null is rejected here
+        // rather than dereferenced.
         let p = unsafe { get_plugin(i) };
         if p.is_null() {
             return Err(OfxFfiError::BadData(format!("null OfxPlugin at index {i}")));
         }
-        let plugin = unsafe { &*p };
-        let api = read_cstr(plugin.plugin_api)?;
-        let identifier = read_cstr(plugin.plugin_identifier)?;
+        // Copy the struct out by value with `read_unaligned` rather
+        // than forming `&*p`: building a Rust reference to
+        // possibly-misaligned / possibly-invalid foreign memory is
+        // itself UB with stricter requirements than a raw read. This
+        // narrows (but cannot eliminate — only process isolation can)
+        // the unsafety from a hostile binary.
+        //
+        // SAFETY: `p` is non-null; the read is of exactly one
+        // `OfxPlugin`. Memory validity is unverifiable in-process; the
+        // sidecar contains any fault.
+        let plugin: OfxPlugin = unsafe { std::ptr::read_unaligned(p) };
+        let api = read_cstr_bounded(plugin.plugin_api)?;
+        let identifier = read_cstr_bounded(plugin.plugin_identifier)?;
         out.push(OfxPluginInfo {
             api,
             api_version: plugin.api_version as i32,
@@ -134,12 +154,29 @@ pub fn enumerate(binary_path: &std::path::Path) -> Result<Vec<OfxPluginInfo>, Of
     Ok(out)
 }
 
-fn read_cstr(ptr: *const c_char) -> Result<String, OfxFfiError> {
+/// Read a NUL-terminated C string from an UNTRUSTED pointer with a
+/// hard length bound. Unlike `CStr::from_ptr`, this never does an
+/// unbounded `strlen` walk: it scans at most [`MAX_CSTR_BYTES`] bytes
+/// and fails closed if no NUL is found. The pointer's memory validity
+/// still cannot be checked in-process — the sidecar boundary contains
+/// a fault — but the scan is bounded so it can't walk arbitrarily far
+/// into adjacent memory.
+fn read_cstr_bounded(ptr: *const c_char) -> Result<String, OfxFfiError> {
     if ptr.is_null() {
         return Err(OfxFfiError::BadData("null C string".into()));
     }
-    // SAFETY: the OFX contract guarantees NUL-terminated static
-    // strings for these fields.
-    let s = unsafe { CStr::from_ptr(ptr) };
-    Ok(s.to_string_lossy().into_owned())
+    let mut bytes = Vec::new();
+    for i in 0..MAX_CSTR_BYTES {
+        // SAFETY: single bounded byte read at `ptr + i`, capped by the
+        // loop. `c_char` is one byte so `add(i)` advances `i` bytes.
+        // Validity is unverifiable; the sidecar contains any fault.
+        let b = unsafe { std::ptr::read(ptr.add(i) as *const u8) };
+        if b == 0 {
+            return Ok(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        bytes.push(b);
+    }
+    Err(OfxFfiError::BadData(format!(
+        "unterminated C string (exceeded {MAX_CSTR_BYTES}-byte cap)"
+    )))
 }

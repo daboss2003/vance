@@ -28,6 +28,19 @@ const FUEL_PER_CALL: u64 = 2_000_000_000;
 /// Max linear memory a plugin may grow to (256 MiB).
 const MAX_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 
+/// Hard cap on the manifest blob a guest may return. The guest hands
+/// back a `(ptr, len)` pair and `len` is fully untrusted — without a
+/// cap, a malicious `.wasm` could return `len = u32::MAX` and force
+/// the host to allocate ~4 GiB. 64 KiB is far more than any real RON
+/// manifest needs.
+const MAX_MANIFEST_BYTES: u32 = 64 * 1024;
+
+/// Hard cap on a single frame's byte length. Keeps `len as i32`
+/// marshalling casts from ever truncating (a buffer over `i32::MAX`
+/// would wrap to a negative length). 512 MiB comfortably covers 8K
+/// RGBA (≈132 MiB) while staying well under `i32::MAX`.
+const MAX_FRAME_BYTES: usize = 512 * 1024 * 1024;
+
 /// Per-store host state — just the resource limiter.
 struct HostState {
     limits: StoreLimits,
@@ -140,11 +153,24 @@ impl WasmPlugin {
             });
         }
 
-        // Read manifest.
+        // Read manifest. `m_len` is fully untrusted — clamp it BEFORE
+        // allocating so a malicious plugin returning a huge length
+        // can't force a multi-gigabyte host-heap allocation (the
+        // StoreLimits cap only bounds the GUEST's linear memory, not
+        // host-side Vecs).
         let packed = f_manifest
             .call(&mut store, ())
             .map_err(|e| PluginError::Trap(e.to_string()))?;
         let (m_ptr, m_len) = abi::unpack_ptr_len(packed);
+        if m_len > MAX_MANIFEST_BYTES {
+            // Still try to free the guest buffer to be tidy.
+            let _ = f_dealloc.call(&mut store, (m_ptr as i32, m_len as i32));
+            return Err(PluginError::Manifest(
+                crate::manifest::ManifestError::Invalid(format!(
+                    "manifest length {m_len} exceeds cap {MAX_MANIFEST_BYTES}"
+                )),
+            ));
+        }
         let mut ron = vec![0u8; m_len as usize];
         memory
             .read(&store, m_ptr as usize, &mut ron)
@@ -180,7 +206,7 @@ impl WasmPlugin {
         params: &[f32],
     ) -> Result<(), PluginError> {
         let expected = (w as usize) * (h as usize) * 4;
-        if rgba.len() != expected {
+        if rgba.len() != expected || rgba.len() > MAX_FRAME_BYTES {
             return Err(PluginError::FrameSize {
                 got: rgba.len(),
                 expected,
@@ -193,26 +219,41 @@ impl WasmPlugin {
 
         let buf_ptr = self.guest_alloc(rgba.len() as i32)?;
         let params_bytes = f32_to_le(params);
-        let params_ptr = self.guest_alloc(params_bytes.len() as i32)?;
+        let params_ptr = match self.guest_alloc(params_bytes.len() as i32) {
+            Ok(p) => p,
+            Err(e) => {
+                // Free the first allocation before bailing.
+                self.guest_dealloc(buf_ptr, rgba.len() as i32);
+                return Err(e);
+            }
+        };
 
-        self.mem_write(buf_ptr, rgba)?;
-        self.mem_write(params_ptr, &params_bytes)?;
+        // Run the write → call → read sequence in one fallible block so
+        // the guest allocations are ALWAYS freed afterwards, even when
+        // the guest traps. Without this, a plugin that traps every
+        // frame would leak its frame buffer each call and eventually
+        // exhaust the 256 MiB guest cap (bricking the plugin).
+        let result = (|| -> Result<i32, PluginError> {
+            self.mem_write(buf_ptr, rgba)?;
+            self.mem_write(params_ptr, &params_bytes)?;
+            let f: TypedFunc<(i32, i32, i32, i32, i32), i32> = self
+                .instance
+                .get_typed_func(&mut self.store, abi::EXPORT_PROCESS)
+                .map_err(|_| PluginError::MissingExport(abi::EXPORT_PROCESS))?;
+            let rc = f
+                .call(
+                    &mut self.store,
+                    (buf_ptr, w as i32, h as i32, params_ptr, params_bytes.len() as i32),
+                )
+                .map_err(|e| PluginError::Trap(e.to_string()))?;
+            self.mem_read(buf_ptr, rgba)?;
+            Ok(rc)
+        })();
 
-        let f: TypedFunc<(i32, i32, i32, i32, i32), i32> = self
-            .instance
-            .get_typed_func(&mut self.store, abi::EXPORT_PROCESS)
-            .map_err(|_| PluginError::MissingExport(abi::EXPORT_PROCESS))?;
-        let rc = f
-            .call(
-                &mut self.store,
-                (buf_ptr, w as i32, h as i32, params_ptr, params_bytes.len() as i32),
-            )
-            .map_err(|e| PluginError::Trap(e.to_string()))?;
-
-        self.mem_read(buf_ptr, rgba)?;
         self.guest_dealloc(buf_ptr, rgba.len() as i32);
         self.guest_dealloc(params_ptr, params_bytes.len() as i32);
 
+        let rc = result?;
         if rc != 0 {
             return Err(PluginError::Trap(format!("process returned {rc}")));
         }
@@ -229,7 +270,7 @@ impl WasmPlugin {
         params: &[f32],
     ) -> Result<(), PluginError> {
         let expected = (w as usize) * (h as usize) * 4;
-        if a.len() != expected || b.len() != expected {
+        if a.len() != expected || b.len() != expected || expected > MAX_FRAME_BYTES {
             return Err(PluginError::FrameSize {
                 got: a.len().min(b.len()),
                 expected,
@@ -240,38 +281,56 @@ impl WasmPlugin {
         }
         self.refuel()?;
 
+        // Allocate the three guest buffers, unwinding earlier allocs on
+        // a later failure so nothing leaks.
         let a_ptr = self.guest_alloc(a.len() as i32)?;
-        let b_ptr = self.guest_alloc(b.len() as i32)?;
+        let b_ptr = match self.guest_alloc(b.len() as i32) {
+            Ok(p) => p,
+            Err(e) => {
+                self.guest_dealloc(a_ptr, a.len() as i32);
+                return Err(e);
+            }
+        };
         let params_bytes = f32_to_le(params);
-        let params_ptr = self.guest_alloc(params_bytes.len() as i32)?;
+        let params_ptr = match self.guest_alloc(params_bytes.len() as i32) {
+            Ok(p) => p,
+            Err(e) => {
+                self.guest_dealloc(a_ptr, a.len() as i32);
+                self.guest_dealloc(b_ptr, b.len() as i32);
+                return Err(e);
+            }
+        };
 
-        self.mem_write(a_ptr, a)?;
-        self.mem_write(b_ptr, b)?;
-        self.mem_write(params_ptr, &params_bytes)?;
+        let result = (|| -> Result<i32, PluginError> {
+            self.mem_write(a_ptr, a)?;
+            self.mem_write(b_ptr, b)?;
+            self.mem_write(params_ptr, &params_bytes)?;
+            let f: TypedFunc<(i32, i32, i32, i32, i32, i32), i32> = self
+                .instance
+                .get_typed_func(&mut self.store, abi::EXPORT_PROCESS2)
+                .map_err(|_| PluginError::MissingExport(abi::EXPORT_PROCESS2))?;
+            let rc = f
+                .call(
+                    &mut self.store,
+                    (
+                        a_ptr,
+                        b_ptr,
+                        w as i32,
+                        h as i32,
+                        params_ptr,
+                        params_bytes.len() as i32,
+                    ),
+                )
+                .map_err(|e| PluginError::Trap(e.to_string()))?;
+            self.mem_read(a_ptr, a)?;
+            Ok(rc)
+        })();
 
-        let f: TypedFunc<(i32, i32, i32, i32, i32, i32), i32> = self
-            .instance
-            .get_typed_func(&mut self.store, abi::EXPORT_PROCESS2)
-            .map_err(|_| PluginError::MissingExport(abi::EXPORT_PROCESS2))?;
-        let rc = f
-            .call(
-                &mut self.store,
-                (
-                    a_ptr,
-                    b_ptr,
-                    w as i32,
-                    h as i32,
-                    params_ptr,
-                    params_bytes.len() as i32,
-                ),
-            )
-            .map_err(|e| PluginError::Trap(e.to_string()))?;
-
-        self.mem_read(a_ptr, a)?;
         self.guest_dealloc(a_ptr, a.len() as i32);
         self.guest_dealloc(b_ptr, b.len() as i32);
         self.guest_dealloc(params_ptr, params_bytes.len() as i32);
 
+        let rc = result?;
         if rc != 0 {
             return Err(PluginError::Trap(format!("process2 returned {rc}")));
         }

@@ -6,9 +6,13 @@
 //! mismatch, bad manifest) is skipped with a warning so one bad file
 //! never breaks discovery of the rest.
 //!
-//! Default search roots (Phase 10 spec):
-//! - `~/.vance/plugins/` — user-global.
-//! - `<project>/plugins/` — project-local (passed in by the engine).
+//! ## Precedence
+//!
+//! De-dup is first-seen-wins by manifest id, and roots are scanned in
+//! the order given. So **earlier roots win** on an id conflict —
+//! callers that want project-local plugins to override a globally-
+//! installed plugin of the same id must pass the project-local root
+//! BEFORE the user-global one (see `Engine::rescan_plugins`).
 
 use crate::host::WasmPlugin;
 use crate::manifest::PluginManifest;
@@ -48,16 +52,23 @@ impl PluginRegistry {
 
     /// Scan one directory, adding any loadable plugins. Public so the
     /// engine can incrementally add a newly-created plugins folder.
+    ///
+    /// Entries are sorted by path before loading so that, when two
+    /// `.wasm` files in the SAME directory carry the same manifest id,
+    /// first-seen-wins de-dup is deterministic across runs +
+    /// platforms (`read_dir` order is otherwise unspecified).
     pub fn scan_dir(&mut self, dir: &Path) {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return, // missing dir is fine
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("wasm") {
-                continue;
-            }
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("wasm"))
+            .collect();
+        paths.sort();
+        for path in paths {
             match load_manifest(&path) {
                 Ok(manifest) => self.add(DiscoveredPlugin { path, manifest }),
                 Err(e) => {

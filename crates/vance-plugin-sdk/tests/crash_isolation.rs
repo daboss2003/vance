@@ -136,3 +136,43 @@ fn garbage_bytes_fail_to_load() {
     let err = expect_load_err(b"not a wasm module");
     assert!(matches!(err, PluginError::Load(_)));
 }
+
+/// Review finding #4 — a guest that returns a huge manifest length
+/// must be rejected at load, NOT allocate gigabytes on the host heap.
+#[test]
+fn oversized_manifest_length_is_rejected_without_huge_alloc() {
+    // vance_manifest returns (ptr=1024, len=0x7FFF_FFFF ≈ 2 GiB). A
+    // pre-fix host would `vec![0u8; 2GiB]`; the fixed host rejects it
+    // up front. The data segment is tiny — we never actually read it.
+    let wat = r#"(module
+        (memory (export "memory") 2)
+        (data (i32.const 1024) "x")
+        (func (export "vance_abi_version") (result i32) (i32.const 1))
+        (func (export "vance_alloc") (param i32) (result i32) (i32.const 65536))
+        (func (export "vance_dealloc") (param i32) (param i32))
+        (func (export "vance_manifest") (result i64)
+            (i64.or (i64.shl (i64.const 1024) (i64.const 32)) (i64.const 0x7fffffff))))"#;
+    let bytes = wat::parse_str(wat).unwrap();
+    let err = expect_load_err(&bytes);
+    // Surfaces as a Manifest error (length cap exceeded), fast.
+    assert!(matches!(err, PluginError::Manifest(_)), "got {err:?}");
+}
+
+/// Review finding #6 — an effect call whose buffer exceeds the frame
+/// cap is rejected as FrameSize, never marshalled through a truncated
+/// i32 length.
+#[test]
+fn oversized_frame_is_rejected() {
+    let bytes = wat_plugin("(i32.const 0)");
+    let mut plugin = WasmPlugin::load(&bytes).expect("load");
+    // Claim a resolution whose byte length overflows i32 (46341² * 4 >
+    // i32::MAX). The buffer length won't actually match, but the cap
+    // check fires first / alongside the size mismatch.
+    let w = 46_341u32;
+    let h = 46_341u32;
+    // Don't allocate the real buffer (that'd be 8 GiB) — pass a small
+    // slice; the w*h*4 mismatch + cap both trigger FrameSize.
+    let mut tiny = vec![0u8; 16];
+    let err = plugin.process(&mut tiny, w, h, &[]).unwrap_err();
+    assert!(matches!(err, PluginError::FrameSize { .. }), "got {err:?}");
+}

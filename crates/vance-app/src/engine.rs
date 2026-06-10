@@ -1129,9 +1129,14 @@ pub struct Engine {
     pub(crate) plugin_registry: vance_plugin_sdk::discovery::PluginRegistry,
     /// Phase 10.5 — lazily-instantiated WASM plugin instances, keyed
     /// by manifest id. A `WasmPlugin` owns a wasmtime store so it's
-    /// kept warm across frames rather than re-loaded each call.
-    pub(crate) loaded_plugins:
-        std::collections::HashMap<String, vance_plugin_sdk::host::WasmPlugin>,
+    /// kept warm across frames rather than re-loaded each call. The
+    /// `SystemTime` is the source `.wasm` file's mtime at load — used
+    /// to auto-reload when a plugin is edited in place between exports
+    /// (without an explicit rescan).
+    pub(crate) loaded_plugins: std::collections::HashMap<
+        String,
+        (vance_plugin_sdk::host::WasmPlugin, Option<std::time::SystemTime>),
+    >,
     /// Last-applied viewport bounds (in physical pixels).
     last_bounds: ViewportBounds,
     /// Active playback, if any.
@@ -6774,29 +6779,30 @@ impl Engine {
             // clip id + a clone of its effect chain so we can apply
             // WASM plugin effects (Phase 10.5) after readback without
             // holding the project borrow.
-            let (active_media, active_source_pts_seconds, clip_effects): (
+            let (active_media, active_source_pts_seconds, clip_effects, clip_source_in_seconds): (
                 Option<MediaItemId>,
                 f64,
                 Vec<vance_timeline::Effect>,
+                f64,
             ) = {
                 let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
                 let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
                 let seq = project.sequence(seq_id).ok_or(EngineError::SequenceNotFound)?;
                 match vance_timeline::scene_at(seq, timeline_t) {
                     vance_timeline::SceneAt::Clip(c) => {
-                        let effects = seq
+                        let (effects, source_in) = seq
                             .tracks
                             .iter()
                             .find_map(|t| {
                                 t.clips
                                     .iter()
                                     .find(|cl| cl.id == c.clip_id)
-                                    .map(|cl| cl.effects.clone())
+                                    .map(|cl| (cl.effects.clone(), rt_to_seconds(cl.source_in)))
                             })
                             .unwrap_or_default();
-                        (Some(c.media), rt_to_seconds(c.source_pts), effects)
+                        (Some(c.media), rt_to_seconds(c.source_pts), effects, source_in)
                     }
-                    vance_timeline::SceneAt::Empty => (None, 0.0, Vec::new()),
+                    vance_timeline::SceneAt::Empty => (None, 0.0, Vec::new(), 0.0),
                 }
             };
 
@@ -6852,7 +6858,8 @@ impl Engine {
             // composited RGBA before encoding. No-op when the clip has
             // no `wasm:` effects.
             if !clip_effects.is_empty() {
-                self.apply_wasm_effects(&mut push, width, height, &clip_effects);
+                let clip_t = active_source_pts_seconds - clip_source_in_seconds;
+                self.apply_wasm_effects(&mut push, width, height, &clip_effects, clip_t);
             }
             client
                 .push_video(f as i64, push)
@@ -7091,19 +7098,23 @@ impl Engine {
     /// registry; loaded instances are cleared so a re-scan picks up
     /// edited plugins. Returns the number discovered.
     pub fn rescan_plugins(&mut self) -> usize {
+        // Precedence: project-local plugins should OVERRIDE a globally-
+        // installed plugin of the same id. Discovery is first-seen-wins
+        // by id, so project-local roots must be pushed BEFORE the
+        // user-global root.
         let mut roots = Vec::new();
-        if let Some(dir) = vance_plugin_sdk::discovery::user_plugins_dir() {
-            roots.push(dir);
-        }
-        // Project-local plugins live next to the .vance bundle.
         if let Some(path) = self.current_project_path.as_ref() {
             let p = std::path::Path::new(path);
             // The project path points at the bundle dir; plugins live
-            // in a sibling `plugins/` folder.
+            // in a sibling `plugins/` folder (and, for convenience, an
+            // inner one too).
             if let Some(parent) = p.parent() {
                 roots.push(parent.join("plugins"));
             }
             roots.push(p.join("plugins"));
+        }
+        if let Some(dir) = vance_plugin_sdk::discovery::user_plugins_dir() {
+            roots.push(dir);
         }
         self.plugin_registry = vance_plugin_sdk::discovery::PluginRegistry::scan(&roots);
         self.loaded_plugins.clear();
@@ -7129,12 +7140,16 @@ impl Engine {
     /// a CPU RGBA buffer, in chain order. Best-effort: a plugin that
     /// fails to load or traps is logged + skipped so one bad plugin
     /// can't abort an export.
+    ///
+    /// `clip_t` is the clip-relative time in seconds (source PTS minus
+    /// the clip's source-in), used to evaluate keyframed parameters.
     pub(crate) fn apply_wasm_effects(
         &mut self,
         rgba: &mut [u8],
         w: u32,
         h: u32,
         effects: &[vance_timeline::Effect],
+        clip_t: f64,
     ) {
         for e in effects {
             if !e.enabled {
@@ -7143,38 +7158,62 @@ impl Engine {
             let Some(id) = e.kind.strip_prefix("wasm:") else {
                 continue;
             };
-            // Lazily load the instance.
-            if !self.loaded_plugins.contains_key(id) {
-                let Some(disc) = self.plugin_registry.by_id(id).cloned() else {
-                    tracing::warn!(plugin = %id, "wasm effect references unknown plugin");
-                    continue;
-                };
-                match std::fs::read(&disc.path)
-                    .map_err(|e| e.to_string())
-                    .and_then(|b| {
-                        vance_plugin_sdk::host::WasmPlugin::load(&b).map_err(|e| e.to_string())
-                    }) {
-                    Ok(p) => {
-                        self.loaded_plugins.insert(id.to_string(), p);
-                    }
-                    Err(err) => {
-                        tracing::warn!(plugin = %id, %err, "wasm plugin load failed");
-                        continue;
-                    }
-                }
+            if !self.ensure_plugin_loaded(id) {
+                continue;
             }
-            let Some(plugin) = self.loaded_plugins.get_mut(id) else {
+            let Some((plugin, _)) = self.loaded_plugins.get_mut(id) else {
                 continue;
             };
             let manifest = plugin.manifest().clone();
+            // Evaluate each param at the clip-relative time so keyframed
+            // (animated) values are honoured, not dropped to the
+            // manifest default. Non-finite (NaN/Inf) values fall back to
+            // the default rather than poisoning the guest.
             let packed = manifest.pack_params(&|key| {
-                e.params.get(key).and_then(|v| match v {
-                    EffectValue::Number(n) => Some(*n as f32),
-                    _ => None,
-                })
+                e.params
+                    .get(key)
+                    .and_then(|v| v.eval_number(clip_t))
+                    .filter(|n| n.is_finite())
+                    .map(|n| n as f32)
             });
             if let Err(err) = plugin.process(rgba, w, h, &packed) {
                 tracing::warn!(plugin = %id, ?err, "wasm effect process failed; skipping");
+            }
+        }
+    }
+
+    /// Ensure the plugin with manifest `id` is loaded + fresh. Reloads
+    /// when the source `.wasm` file's mtime changed since the cached
+    /// instance was built (so an in-place edit between exports is
+    /// picked up without an explicit rescan). Returns whether a usable
+    /// instance is now cached.
+    fn ensure_plugin_loaded(&mut self, id: &str) -> bool {
+        let Some(disc) = self.plugin_registry.by_id(id).cloned() else {
+            tracing::warn!(plugin = %id, "wasm effect references unknown plugin");
+            return false;
+        };
+        let current_mtime = std::fs::metadata(&disc.path).and_then(|m| m.modified()).ok();
+        // Reuse the cached instance only if its mtime matches.
+        if let Some((_, cached_mtime)) = self.loaded_plugins.get(id) {
+            if *cached_mtime == current_mtime {
+                return true;
+            }
+            // Stale — drop it so we reload below.
+            self.loaded_plugins.remove(id);
+        }
+        match std::fs::read(&disc.path)
+            .map_err(|e| e.to_string())
+            .and_then(|b| {
+                vance_plugin_sdk::host::WasmPlugin::load(&b).map_err(|e| e.to_string())
+            }) {
+            Ok(p) => {
+                self.loaded_plugins
+                    .insert(id.to_string(), (p, current_mtime));
+                true
+            }
+            Err(err) => {
+                tracing::warn!(plugin = %id, %err, "wasm plugin load failed");
+                false
             }
         }
     }
