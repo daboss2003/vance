@@ -992,6 +992,29 @@ export const applyWasmPlugin = (
   return addEffectToClip(trackId, clipId, `wasm:${plugin.id}`, params);
 };
 
+/** Phase 10.7 — one installed OFX plugin (read-only catalog entry). */
+export type OfxPlugin = {
+  bundle: string;
+  identifier: string;
+  api: string;
+  api_version: number;
+  version_major: number;
+  version_minor: number;
+};
+
+/** Phase 10.7 — OFX catalog: installed plugins + per-bundle load
+ *  errors. */
+export type OfxCatalog = {
+  plugins: OfxPlugin[];
+  errors: string[];
+};
+
+/** Phase 10.7 — list installed OFX plugins via the sandboxed
+ *  vance-ofx-host sidecar. Read-only: OFX plugins are catalogued but
+ *  not yet runnable in the pipeline (post-v1). Empty when the sidecar
+ *  binary is absent. */
+export const listOfxPlugins = (): Promise<OfxCatalog> => invoke('list_ofx_plugins');
+
 // ---- Phase 8 — Export pipeline -------------------------------------------
 
 /** Phase 8 — encoder preset discriminants (mirrors the Rust enum). */

@@ -25,6 +25,8 @@ members = [
     "crates/vance-cache",
     "crates/vance-plugin-host",
     "crates/vance-plugin-sdk",
+    "crates/vance-ofx",
+    "crates/vance-ofx-testplugin",
     "crates/vance-ai",
     "crates/vance-ai-runtime",
     "crates/vance-ipc",
@@ -76,6 +78,7 @@ vance-otio = { path = "crates/vance-otio" }
 vance-cache = { path = "crates/vance-cache" }
 vance-plugin-host = { path = "crates/vance-plugin-host" }
 vance-plugin-sdk = { path = "crates/vance-plugin-sdk" }
+vance-ofx = { path = "crates/vance-ofx" }
 vance-ai = { path = "crates/vance-ai" }
 vance-ai-runtime = { path = "crates/vance-ai-runtime" }
 vance-ipc = { path = "crates/vance-ipc" }
@@ -94,6 +97,7 @@ tokio = { version = "1", features = ["full"] }
 parking_lot = "0.12"
 uuid = { version = "1", features = ["v4", "serde"] }
 ron = "0.8"
+libloading = "0.8"
 tempfile = "3"
 proptest = "1"
 libc = "0.2"

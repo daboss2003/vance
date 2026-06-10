@@ -10,7 +10,13 @@
    * time.
    */
 
-  import { listWasmPlugins, applyWasmPlugin, type WasmPlugin } from '$lib/ipc';
+  import {
+    listWasmPlugins,
+    applyWasmPlugin,
+    listOfxPlugins,
+    type WasmPlugin,
+    type OfxPlugin
+  } from '$lib/ipc';
   import { projectState } from '$lib/project.svelte';
 
   let {
@@ -24,6 +30,7 @@
   } = $props();
 
   let plugins = $state<WasmPlugin[] | null>(null);
+  let ofxPlugins = $state<OfxPlugin[] | null>(null);
   let loading = $state(false);
   let error = $state<string | null>(null);
   let lastApplied = $state<string | null>(null);
@@ -36,6 +43,13 @@
     } catch (e) {
       error = String(e);
       plugins = [];
+    }
+    // OFX is best-effort + read-only; failures here don't block WASM.
+    try {
+      const cat = await listOfxPlugins();
+      ofxPlugins = cat.plugins;
+    } catch {
+      ofxPlugins = [];
     } finally {
       loading = false;
     }
@@ -121,5 +135,24 @@
 
   {#if lastApplied}
     <div class="text-vance-muted mt-1 text-[10px]">Applied: {lastApplied}</div>
+  {/if}
+
+  <!-- Phase 10.7 — read-only OFX catalog. Installed OFX plugins are
+       listed for transparency; running them through the pipeline is
+       post-v1, so there's no Apply button yet. -->
+  {#if ofxPlugins && ofxPlugins.length > 0}
+    <div class="border-vance-border mt-2 border-t pt-2">
+      <div class="text-vance-muted mb-1 uppercase tracking-wider">OFX (read-only)</div>
+      <ul class="flex flex-col gap-1">
+        {#each ofxPlugins as p (p.identifier)}
+          <li class="text-vance-muted truncate text-[10px]" title={p.identifier}>
+            {p.bundle} · {p.identifier} · v{p.version_major}.{p.version_minor}
+          </li>
+        {/each}
+      </ul>
+      <div class="text-vance-muted mt-1 text-[10px] italic">
+        OFX plugins are catalogued; running them lands post-v1.
+      </div>
+    </div>
   {/if}
 </div>

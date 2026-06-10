@@ -1,0 +1,29 @@
+[package]
+name = "vance-ofx"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# Sidecar that dlopen()s OFX bundles out-of-process, so a crashing
+# binary takes down only this process, not the editor.
+[[bin]]
+name = "vance-ofx-host"
+path = "src/bin/main.rs"
+
+[dependencies]
+vance-ipc = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+libloading = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

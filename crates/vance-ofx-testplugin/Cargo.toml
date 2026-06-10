@@ -1,0 +1,17 @@
+[package]
+name = "vance-ofx-testplugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# A minimal native binary that exports the OpenFX enumeration entry
+# points, used to test the OFX host's `dlopen` enumeration without a
+# real third-party OFX plugin installed. Built as a cdylib for the
+# host platform.
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"

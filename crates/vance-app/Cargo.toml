@@ -48,6 +48,7 @@ vance-decoder = { workspace = true }
 vance-encoder = { workspace = true }
 vance-cache = { workspace = true }
 vance-plugin-sdk = { workspace = true, features = ["host"] }
+vance-ofx = { workspace = true }
 tracing-chrome = { workspace = true }
 vance-render = { workspace = true }
 vance-viewport = { workspace = true }

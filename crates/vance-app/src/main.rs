@@ -1430,6 +1430,95 @@ fn list_wasm_plugins(state: tauri::State<'_, EngineHandle>) -> Vec<UiWasmPlugin>
         .collect()
 }
 
+/// Phase 10.7 — read-only OFX plugin catalog entry for the UI.
+#[derive(serde::Serialize, Clone, Debug)]
+struct UiOfxPlugin {
+    bundle: String,
+    identifier: String,
+    api: String,
+    api_version: i32,
+    version_major: u32,
+    version_minor: u32,
+}
+
+#[derive(serde::Serialize, Clone, Debug, Default)]
+struct UiOfxCatalog {
+    plugins: Vec<UiOfxPlugin>,
+    /// Per-bundle non-fatal load errors (so the UI can show why a
+    /// bundle didn't enumerate).
+    errors: Vec<String>,
+}
+
+/// Phase 10.7 — list installed OFX plugins via the sandboxed
+/// `vance-ofx-host` sidecar (out-of-process dlopen, so a bad bundle
+/// crashes only the sidecar). Read-only catalog: OFX plugins are not
+/// yet runnable in the render pipeline (post-v1). Returns an empty
+/// catalog when the sidecar binary is absent.
+#[tauri::command]
+fn list_ofx_plugins(_state: tauri::State<'_, EngineHandle>) -> UiOfxCatalog {
+    let bin = match locate_ofx_host_binary() {
+        Some(p) => p,
+        None => return UiOfxCatalog::default(),
+    };
+    let mut client = match vance_ofx::OfxHostClient::spawn(&bin) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(?e, "ofx host spawn failed");
+            return UiOfxCatalog::default();
+        }
+    };
+    let (plugins, errors) = match client.list_plugins(Vec::new()) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(?e, "ofx list_plugins failed");
+            let _ = client.shutdown();
+            return UiOfxCatalog::default();
+        }
+    };
+    let _ = client.shutdown();
+    UiOfxCatalog {
+        plugins: plugins
+            .into_iter()
+            .map(|p| UiOfxPlugin {
+                bundle: p.bundle,
+                identifier: p.identifier,
+                api: p.api,
+                api_version: p.api_version,
+                version_major: p.version_major,
+                version_minor: p.version_minor,
+            })
+            .collect(),
+        errors,
+    }
+}
+
+/// Locate the `vance-ofx-host` sidecar binary (next to the app exe, or
+/// under target/debug|release for dev).
+fn locate_ofx_host_binary() -> Option<std::path::PathBuf> {
+    let name = if cfg!(windows) {
+        "vance-ofx-host.exe"
+    } else {
+        "vance-ofx-host"
+    };
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let p = parent.join(name);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    for c in [
+        std::path::PathBuf::from("target/debug").join(name),
+        std::path::PathBuf::from("target/release").join(name),
+    ] {
+        if c.exists() {
+            return Some(c);
+        }
+    }
+    None
+}
+
 /// Phase 9.5 — toggle the project-level "use proxies" flag.
 #[tauri::command]
 fn set_use_proxies(state: tauri::State<'_, EngineHandle>, on: bool) -> Result<(), String> {
@@ -2445,6 +2534,7 @@ fn main() {
             set_media_proxy_path,
             rescan_plugins,
             list_wasm_plugins,
+            list_ofx_plugins,
             set_track_gain_keyframes,
             set_clip_gain_keyframes,
             set_clip_fade_in,

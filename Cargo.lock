@@ -5599,6 +5599,7 @@ dependencies = [
  "vance-encoder",
  "vance-grading-cmd",
  "vance-ocio",
+ "vance-ofx",
  "vance-peaks",
  "vance-plugin-sdk",
  "vance-project",
@@ -5759,6 +5760,23 @@ dependencies = [
  "thiserror 2.0.18",
  "vance-color",
 ]
+
+[[package]]
+name = "vance-ofx"
+version = "0.0.0"
+dependencies = [
+ "libloading 0.8.9",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+ "vance-ipc",
+]
+
+[[package]]
+name = "vance-ofx-testplugin"
+version = "0.0.0"
 
 [[package]]
 name = "vance-otio"
