@@ -31,3 +31,6 @@ Thumbs.db
 # Tauri build artifacts
 src-tauri/target/
 src-tauri/gen/
+
+# Phase 10 sample plugin build artifacts
+plugins/*/target/

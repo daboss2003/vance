@@ -7,3 +7,31 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
+
+[features]
+# Default: just the shared ABI + manifest types. Lean enough that a
+# wasm32 guest plugin can depend on this crate without pulling host
+# machinery.
+default = []
+# `host` pulls in the wasmtime runtime + frame-processing host. Enabled
+# by vance-app / vance-effects.
+host = ["dep:wasmtime", "dep:anyhow"]
+# `guest` provides the export-glue helpers a plugin author uses.
+guest = []
+
+[dependencies]
+serde = { workspace = true }
+ron = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Host-only deps (feature-gated so guest builds stay tiny).
+wasmtime = { version = "27", optional = true, default-features = false, features = [
+    "cranelift",
+    "runtime",
+] }
+anyhow = { workspace = true, optional = true }
+
+[dev-dependencies]
+ron = { workspace = true }
+wat = "1"

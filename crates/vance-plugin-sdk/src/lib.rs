@@ -1,6 +1,26 @@
-//! `vance-plugin-sdk` — stub.
+//! `vance-plugin-sdk` — WASM effect-plugin SDK + host runtime.
 //!
-//! See PLAN.md §6 for this crate's role.
+//! Two audiences share this crate:
+//! - **Plugin authors** compile to `wasm32-unknown-unknown` with the
+//!   `guest` feature and use [`guest`] helpers to export the ABI.
+//! - **The host** (`vance-app`) enables the `host` feature to get the
+//!   `wasmtime`-backed [`host::WasmPlugin`] loader + frame processor.
+//!
+//! Both share the [`abi`] contract + [`manifest`] types, which build
+//! on any target with no extra features.
+//!
+//! See [`abi`] for the function-level contract a plugin must satisfy
+//! and [`manifest`] for the RON schema.
 
-#[doc(hidden)]
-pub fn _stub() {}
+#![warn(missing_docs)]
+
+pub mod abi;
+pub mod manifest;
+
+#[cfg(feature = "guest")]
+pub mod guest;
+
+#[cfg(feature = "host")]
+pub mod host;
+
+pub use manifest::{ManifestError, ParamSpec, PluginKind, PluginManifest};

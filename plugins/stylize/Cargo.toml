@@ -1,0 +1,18 @@
+[package]
+name = "vance-plugin-stylize"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+vance-plugin-sdk = { path = "../../crates/vance-plugin-sdk", features = ["guest"] }
+
+[profile.release]
+# Small wasm: optimize for size, strip, no panic unwinding.
+opt-level = "s"
+lto = true
+panic = "abort"
+strip = true

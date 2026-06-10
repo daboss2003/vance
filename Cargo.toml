@@ -33,6 +33,15 @@ members = [
     "crates/vance-cli",
     "crates/vance-bench",
 ]
+# Phase 10 — sample WASM plugins. Excluded from the host workspace
+# build because they only target wasm32-unknown-unknown (cdylib). Build
+# them with `xtask build-plugins` or directly:
+#   cargo build --release --target wasm32-unknown-unknown \
+#       --manifest-path plugins/stylize/Cargo.toml
+exclude = [
+    "plugins/stylize",
+    "plugins/dissolve",
+]
 
 [workspace.package]
 version = "0.0.0"
