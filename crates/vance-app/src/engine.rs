@@ -3204,6 +3204,99 @@ impl Engine {
         }
     }
 
+    /// Phase 8 (real export) — set ALL per-clip render uniforms
+    /// (opacity, transform, brightness/contrast, crop, chroma/luma
+    /// key, color grades, color pipeline, per-clip LUT) for `clip_id`
+    /// at clip-relative time `entry_clip_t`. This is the single source
+    /// of truth shared by the live preview (`decode_and_render_at`) and
+    /// the offline export (`render_sequence`), so an exported frame
+    /// renders identically to what the viewport shows.
+    ///
+    /// Call AFTER `upload_frame` and BEFORE `render_to`/
+    /// `render_to_rgba_buffer`. Takes its own render-state lock(s);
+    /// must not be called while a lock is held.
+    fn apply_clip_render_params(
+        &mut self,
+        clip_id: vance_timeline::ClipId,
+        media_id: MediaItemId,
+        entry_clip_t: f64,
+    ) {
+        let matte = self.matte_node;
+        // Color pipeline is resolved from the media's input color space.
+        let pipeline_params = self.pipeline_for_media(media_id);
+        let computed = {
+            let project = match self.current_project.as_ref() {
+                Some(p) => p,
+                None => return,
+            };
+            let seq_id = match self.current_sequence_id {
+                Some(id) => id,
+                None => return,
+            };
+            let seq = match project.sequence(seq_id) {
+                Some(s) => s,
+                None => return,
+            };
+            (
+                clip_opacity_at(seq, clip_id, entry_clip_t),
+                clip_transform_at(seq, clip_id, entry_clip_t),
+                clip_crop_at(seq, clip_id, entry_clip_t),
+                clip_brightness_contrast_at(seq, clip_id, entry_clip_t),
+                clip_chroma_key_at(seq, clip_id, entry_clip_t),
+                clip_luma_key_at(seq, clip_id, entry_clip_t),
+                clip_grades_at(seq, clip_id, entry_clip_t, matte),
+            )
+        };
+        let (opacity, xform, crop, bc, chroma, luma, grades) = computed;
+        if let Some(rs) = self.render_state.as_ref() {
+            let mut rs = rs.lock();
+            rs.renderer.set_opacity(opacity);
+            rs.renderer
+                .set_transform(xform.translate, xform.scale, xform.rotation_radians);
+            rs.renderer.set_brightness_contrast(bc.0, bc.1);
+            rs.renderer.set_crop(crop[0], crop[1], crop[2], crop[3]);
+            rs.renderer.set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
+            rs.renderer.set_luma_key(luma.0, luma.1, luma.2, luma.3);
+            rs.renderer.set_grades(&grades);
+            if let Some(p) = pipeline_params {
+                rs.renderer.set_pipeline(p);
+            }
+        }
+        // LUT application locks render_state itself — call after drop.
+        self.apply_lut_for_clip(clip_id);
+    }
+
+    /// Phase 8 (real export) — render a title clip to an RGBA buffer
+    /// headlessly: rasterize the title, upload it, apply the clip's
+    /// native effects, and read back. Returns `None` on any failure
+    /// (caller falls back to a black frame).
+    fn render_title_to_rgba(
+        &mut self,
+        params: &TitleParams,
+        clip_id: vance_timeline::ClipId,
+        media_id: MediaItemId,
+        entry_clip_t: f64,
+        width: u32,
+        height: u32,
+    ) -> Option<Vec<u8>> {
+        let frame = render_title_yuv420(params).ok()?;
+        let render_state = self.render_state.as_ref()?.clone();
+        {
+            let mut rs = render_state.lock();
+            if rs.renderer.upload_frame(&frame).is_err() {
+                return None;
+            }
+            // No A↔B blend for a standalone title.
+            rs.renderer.set_mix_factor(0.0);
+        }
+        // Title media carries `input_color_space = Srgb`, so the shared
+        // effect-application path resolves the correct sRGB→working→sRGB
+        // pipeline + the clip's grades/transform/opacity.
+        self.apply_clip_render_params(clip_id, media_id, entry_clip_t);
+        let mut rs = render_state.lock();
+        rs.renderer.render_to_rgba_buffer(width, height).ok()
+    }
+
     /// Working color space currently active on the project. Falls
     /// back to LinearRec709 when no project is loaded (single-file
     /// Open File… playback path).
@@ -6779,11 +6872,19 @@ impl Engine {
             // clip id + a clone of its effect chain so we can apply
             // WASM plugin effects (Phase 10.5) after readback without
             // holding the project borrow.
-            let (active_media, active_source_pts_seconds, clip_effects, clip_source_in_seconds): (
+            #[allow(clippy::type_complexity)]
+            let (
+                active_media,
+                active_source_pts_seconds,
+                clip_effects,
+                clip_source_in_seconds,
+                active_clip_id,
+            ): (
                 Option<MediaItemId>,
                 f64,
                 Vec<vance_timeline::Effect>,
                 f64,
+                Option<vance_timeline::ClipId>,
             ) = {
                 let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
                 let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
@@ -6800,15 +6901,22 @@ impl Engine {
                                     .map(|cl| (cl.effects.clone(), rt_to_seconds(cl.source_in)))
                             })
                             .unwrap_or_default();
-                        (Some(c.media), rt_to_seconds(c.source_pts), effects, source_in)
+                        (
+                            Some(c.media),
+                            rt_to_seconds(c.source_pts),
+                            effects,
+                            source_in,
+                            Some(c.clip_id),
+                        )
                     }
-                    vance_timeline::SceneAt::Empty => (None, 0.0, Vec::new(), 0.0),
+                    vance_timeline::SceneAt::Empty => (None, 0.0, Vec::new(), 0.0, None),
                 }
             };
 
             let mut rgba: Option<Vec<u8>> = None;
-            if let Some(media_id) = active_media {
+            if let (Some(media_id), Some(clip_id)) = (active_media, active_clip_id) {
                 let resolved = self.media_for_active(media_id)?;
+                let entry_clip_t = active_source_pts_seconds - clip_source_in_seconds;
                 match resolved {
                     MediaResolved::File(path) => {
                         // Open file iff the decoder isn't already on it.
@@ -6832,13 +6940,23 @@ impl Engine {
                         } else {
                             0
                         };
-                        // Decode + upload + headless RGBA readback.
+                        // Decode + upload the source frame.
                         let decoder = self.decoder.as_mut().ok_or(EngineError::NoFileOpen)?;
-                        if let Ok(frame) = decoder.decode_at(target_pts) {
+                        let decoded = decoder.decode_at(target_pts).ok();
+                        if let Some(frame) = decoded {
+                            {
+                                let mut rs = render_state_arc.lock();
+                                rs.renderer.upload_frame(&frame).map_err(|e| {
+                                    EngineError::Project(format!("upload: {e}"))
+                                })?;
+                            }
+                            // Phase 8 (real export) — apply the clip's
+                            // native effects (grades, transform, opacity,
+                            // crop, keys, LUT, color pipeline) to the
+                            // renderer BEFORE readback so the export
+                            // matches the viewport. Takes its own locks.
+                            self.apply_clip_render_params(clip_id, media_id, entry_clip_t);
                             let mut rs = render_state_arc.lock();
-                            rs.renderer
-                                .upload_frame(&frame)
-                                .map_err(|e| EngineError::Project(format!("upload: {e}")))?;
                             match rs.renderer.render_to_rgba_buffer(width, height) {
                                 Ok(buf) => rgba = Some(buf),
                                 Err(e) => {
@@ -6847,9 +6965,20 @@ impl Engine {
                             }
                         }
                     }
-                    MediaResolved::Title(_) => {
-                        // Title clips are deferred to the iterative
-                        // follow-up — emit black for v1.
+                    MediaResolved::Title(params) => {
+                        // Phase 8 (real export) — render title clips
+                        // procedurally into the renderer's A-side, then
+                        // read back. Same path the live title scrub uses.
+                        if let Some(buf) = self.render_title_to_rgba(
+                            &params,
+                            clip_id,
+                            media_id,
+                            entry_clip_t,
+                            width,
+                            height,
+                        ) {
+                            rgba = Some(buf);
+                        }
                     }
                 }
             }
