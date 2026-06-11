@@ -3297,6 +3297,208 @@ impl Engine {
         rs.renderer.render_to_rgba_buffer(width, height).ok()
     }
 
+    /// Phase 8 (real export) — offline audio mixdown for the timeline
+    /// range `[start_s, end_s)` at `sample_rate`, returning interleaved
+    /// stereo f32. Faithfully mirrors the live fold thread: per-clip
+    /// gain/fades/keyframes (via the SAME `effective_gain_at`),
+    /// equal-power pan, per-track DSP (EQ/comp/limiter via
+    /// `TrackDspState`), then master gain — but headless, re-decoding
+    /// each clip via a dedicated audio sidecar. Replaces the silent
+    /// audio the encoder used to receive.
+    pub fn offline_audio_bounce(
+        &mut self,
+        start_s: f64,
+        end_s: f64,
+        sample_rate: u32,
+    ) -> Result<Vec<f32>, EngineError> {
+        let snapshot = {
+            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
+            let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+            let seq = project.sequence(seq_id).ok_or(EngineError::SequenceNotFound)?;
+            build_mixer_snapshot(seq)
+        };
+        let master_lin = snapshot.master_gain_linear;
+        let total_frames = (((end_s - start_s) * sample_rate as f64).round() as i64).max(0) as usize;
+        let mut master = vec![0.0f32; total_frames * 2];
+        if total_frames == 0 {
+            return Ok(master);
+        }
+
+        // Gather audio-clip decode jobs + the audio tracks' DSP chains,
+        // resolving media paths, while we hold the project borrow.
+        struct ClipJob {
+            clip_id: uuid::Uuid,
+            track_id: uuid::Uuid,
+            path: String,
+            timeline_in: f64,
+            source_in: f64,
+            duration: f64,
+        }
+        let (clip_jobs, audio_tracks): (Vec<ClipJob>, Vec<uuid::Uuid>) = {
+            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
+            let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+            let seq = project.sequence(seq_id).ok_or(EngineError::SequenceNotFound)?;
+            let mut jobs = Vec::new();
+            let mut tracks = Vec::new();
+            for track in &seq.tracks {
+                if track.kind != TrackKind::Audio {
+                    continue;
+                }
+                tracks.push(track.id.as_uuid());
+                // Track-level mute / solo gating is time-invariant, so
+                // skip decoding clips that can't contribute at all.
+                if track.mute || (snapshot.solo_anywhere && !track.solo) {
+                    continue;
+                }
+                for clip in &track.clips {
+                    if !clip.enabled {
+                        continue;
+                    }
+                    let Some(media) = project.media.get(&clip.media) else {
+                        continue;
+                    };
+                    if media.path.as_os_str().is_empty() {
+                        continue; // titles / synthetic media have no audio
+                    }
+                    jobs.push(ClipJob {
+                        clip_id: clip.id.as_uuid(),
+                        track_id: track.id.as_uuid(),
+                        path: media.path.to_string_lossy().into_owned(),
+                        timeline_in: rt_to_seconds(clip.timeline_in),
+                        source_in: rt_to_seconds(clip.source_in),
+                        duration: rt_to_seconds(clip.duration()),
+                    });
+                }
+            }
+            (jobs, tracks)
+        };
+
+        // Per-track accumulators (interleaved stereo).
+        let mut track_bufs: std::collections::HashMap<uuid::Uuid, Vec<f32>> = audio_tracks
+            .iter()
+            .map(|id| (*id, vec![0.0f32; total_frames * 2]))
+            .collect();
+
+        // Spawn one audio decoder sidecar, reused across clips.
+        let bin = locate_audio_binary()?;
+        let mut audio = vance_audio::AudioClient::spawn(&bin)
+            .map_err(|e| EngineError::Project(format!("audio decoder spawn: {e}")))?;
+
+        for job in &clip_jobs {
+            // Timeline overlap with the export range.
+            let clip_tl_start = job.timeline_in.max(start_s);
+            let clip_tl_end = (job.timeline_in + job.duration).min(end_s);
+            if clip_tl_end <= clip_tl_start {
+                continue;
+            }
+            let out_frames =
+                ((clip_tl_end - clip_tl_start) * sample_rate as f64).round() as usize;
+            if out_frames == 0 {
+                continue;
+            }
+            let src_start = job.source_in + (clip_tl_start - job.timeline_in);
+
+            // Decode the clip's native-rate PCM for the overlapping span.
+            let info = match audio.open(job.path.clone()) {
+                Ok(i) => i,
+                Err(e) => {
+                    continue;
+                }
+            };
+            let (tb_n, tb_d) = info.time_base;
+            let from_pts = if tb_n != 0 {
+                (src_start * tb_d as f64 / tb_n as f64).round() as i64
+            } else {
+                0
+            };
+            if let Err(e) = audio.start_stream(from_pts, 8192) {
+                let _ = audio.close();
+                continue;
+            }
+            let needed_native =
+                ((clip_tl_end - clip_tl_start) * info.sample_rate as f64).ceil() as usize + 2;
+            let mut native_pcm: Vec<f32> = Vec::with_capacity(needed_native * 2);
+            while native_pcm.len() < needed_native * 2 {
+                match audio.next_chunk() {
+                    Ok(Some(c)) => native_pcm.extend_from_slice(&c.samples),
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+            let _ = audio.stop_stream();
+            let _ = audio.close();
+
+            // Resample to the export rate.
+            let resampled = crate::audio_bounce::resample_linear_stereo(
+                &native_pcm,
+                info.sample_rate,
+                sample_rate,
+                out_frames,
+            );
+
+            // Place into the track buffer with pre-master gain + pan.
+            let pan = snapshot
+                .clips
+                .get(&job.clip_id)
+                .map(|c| c.pan_linear)
+                .unwrap_or([1.0, 1.0]);
+            let out_start_frame =
+                ((clip_tl_start - start_s) * sample_rate as f64).round() as usize;
+            let Some(track_buf) = track_bufs.get_mut(&job.track_id) else {
+                continue;
+            };
+            for j in 0..out_frames {
+                let timeline_t = clip_tl_start + j as f64 / sample_rate as f64;
+                let g_with_master = snapshot.effective_gain_at(&job.clip_id, timeline_t);
+                if g_with_master == 0.0 {
+                    continue;
+                }
+                // Master is applied once at the end (AFTER per-track DSP,
+                // matching the live order); divide it back out here.
+                let pre = if master_lin != 0.0 {
+                    g_with_master / master_lin
+                } else {
+                    0.0
+                };
+                let oi = out_start_frame + j;
+                if oi >= total_frames {
+                    break;
+                }
+                track_buf[oi * 2] += resampled[j * 2] * pre * pan[0];
+                track_buf[oi * 2 + 1] += resampled[j * 2 + 1] * pre * pan[1];
+            }
+        }
+        let _ = audio.shutdown();
+
+        // Per-track DSP (EQ / comp / limiter), then sum into master.
+        for track_id in &audio_tracks {
+            let Some(mut buf) = track_bufs.remove(track_id) else {
+                continue;
+            };
+            if let Some(tm) = snapshot.tracks.get(track_id) {
+                if !tm.audio_effects.is_empty() {
+                    let mut dsp = vance_audio::TrackDspState::new();
+                    dsp.reconcile_with(&tm.audio_effects, sample_rate as f32);
+                    for fr in 0..total_frames {
+                        let (nl, nr) =
+                            dsp.tick_stereo(&tm.audio_effects, buf[fr * 2], buf[fr * 2 + 1]);
+                        buf[fr * 2] = nl;
+                        buf[fr * 2 + 1] = nr;
+                    }
+                }
+            }
+            for i in 0..total_frames * 2 {
+                master[i] += buf[i];
+            }
+        }
+
+        // Master gain, applied last (mirrors the live fold order).
+        for s in master.iter_mut() {
+            *s *= master_lin;
+        }
+        Ok(master)
+    }
+
     /// Working color space currently active on the project. Falls
     /// back to LinearRec709 when no project is loaded (single-file
     /// Open File… playback path).
@@ -6097,12 +6299,33 @@ fn locate_audio_binary() -> Result<PathBuf, EngineError> {
     let mut tried = Vec::new();
     if let Ok(self_exe) = std::env::current_exe() {
         if let Some(dir) = self_exe.parent() {
+            // Next to the running exe (production layout).
             let cand = dir.join(exe_name);
             if cand.exists() {
                 return Ok(cand);
             }
             tried.push(cand);
+            // When running under `cargo test`, the test binary lives in
+            // target/<profile>/deps/ — the sidecar is one level up.
+            if let Some(parent) = dir.parent() {
+                let cand = parent.join(exe_name);
+                if cand.exists() {
+                    return Ok(cand);
+                }
+                tried.push(cand);
+            }
         }
+    }
+    // Dev fallback: relative to the workspace cwd (mirrors
+    // locate_encoder_binary / locate_decoder_binary).
+    for c in [
+        PathBuf::from("target/debug").join(exe_name),
+        PathBuf::from("target/release").join(exe_name),
+    ] {
+        if c.exists() {
+            return Ok(c);
+        }
+        tried.push(c);
     }
     Err(EngineError::DecoderBinaryMissing(tried))
 }
@@ -6996,17 +7219,28 @@ impl Engine {
             emitted_frames += 1;
         }
 
-        // 8. Silent audio — one push per video frame, length matched
-        //    to the audio sample rate. Real mixed-down audio lands when
-        //    vance_audio gains an offline `fold_range` API (plan
-        //    work-item 9).
-        let samples_per_frame = (sample_rate as u64 * frame_rate_den as u64
-            / frame_rate_num as u64) as usize;
-        let chunk = vec![0f32; samples_per_frame * 2];
-        for _ in 0..emitted_frames {
+        // 8. Real mixed audio — offline bounce of the export range
+        //    through the full mixer model (per-clip gain/fades/pan,
+        //    per-track DSP, master), then push to the encoder in
+        //    chunks. Falls back to silence only if the bounce fails
+        //    (e.g. no audio sidecar), so the file is always valid.
+        let mixed = match self.offline_audio_bounce(start_s, end_s, sample_rate) {
+            Ok(samples) => samples,
+            Err(e) => {
+                tracing::warn!(?e, "audio bounce failed; exporting silent track");
+                let total = ((end_s - start_s) * sample_rate as f64).round() as usize;
+                vec![0f32; total * 2]
+            }
+        };
+        // Push in ~0.1 s chunks (interleaved stereo).
+        let push_chunk_frames = (sample_rate as usize / 10).max(1);
+        let mut pos = 0usize;
+        while pos < mixed.len() {
+            let end = (pos + push_chunk_frames * 2).min(mixed.len());
             client
-                .push_audio(0, chunk.clone())
+                .push_audio(0, mixed[pos..end].to_vec())
                 .map_err(|e| EngineError::Project(format!("encoder push_audio: {e}")))?;
+            pos = end;
         }
 
         let (video_frames, audio_samples) = client

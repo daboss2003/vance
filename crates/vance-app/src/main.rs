@@ -9,6 +9,7 @@
     windows_subsystem = "windows"
 )]
 
+mod audio_bounce;
 mod cached_decode;
 mod engine;
 mod peaks;

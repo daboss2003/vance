@@ -6,6 +6,8 @@
 pub mod peaks;
 #[path = "cached_decode.rs"]
 pub mod cached_decode;
+#[path = "audio_bounce.rs"]
+pub mod audio_bounce;
 #[path = "prefetch.rs"]
 pub mod prefetch;
 #[path = "proxy.rs"]
