@@ -3266,35 +3266,41 @@ impl Engine {
         self.apply_lut_for_clip(clip_id);
     }
 
-    /// Phase 8 (real export) — render a title clip to an RGBA buffer
-    /// headlessly: rasterize the title, upload it, apply the clip's
-    /// native effects, and read back. Returns `None` on any failure
-    /// (caller falls back to a black frame).
-    fn render_title_to_rgba(
+    /// Phase 8 (real export) — decode (or rasterize) one clip's frame
+    /// at `source_pts_sec` into a [`vance_decoder::FrameData`]. Files
+    /// go through the primary decoder (opening on demand); titles are
+    /// rasterized procedurally. Returns `None` on any failure.
+    fn decode_clip_framedata(
         &mut self,
-        params: &TitleParams,
-        clip_id: vance_timeline::ClipId,
         media_id: MediaItemId,
-        entry_clip_t: f64,
-        width: u32,
-        height: u32,
-    ) -> Option<Vec<u8>> {
-        let frame = render_title_yuv420(params).ok()?;
-        let render_state = self.render_state.as_ref()?.clone();
-        {
-            let mut rs = render_state.lock();
-            if rs.renderer.upload_frame(&frame).is_err() {
-                return None;
+        source_pts_sec: f64,
+    ) -> Option<vance_decoder::FrameData> {
+        let resolved = self.media_for_active(media_id).ok()?;
+        match resolved {
+            MediaResolved::File(path) => {
+                let needs_open = self
+                    .current_media_path
+                    .as_deref()
+                    .map(|p| p != path.as_str())
+                    .unwrap_or(true);
+                if needs_open {
+                    self.open_file(&path).ok()?;
+                }
+                let target_pts = if let Some(info) = self.stream_info.as_ref() {
+                    let (tb_n, tb_d) = info.time_base;
+                    if tb_n != 0 {
+                        (source_pts_sec * (tb_d as f64) / (tb_n as f64)).round() as i64
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+                let dec = self.decoder.as_mut()?;
+                dec.decode_at(target_pts).ok()
             }
-            // No A↔B blend for a standalone title.
-            rs.renderer.set_mix_factor(0.0);
+            MediaResolved::Title(params) => render_title_yuv420(&params).ok(),
         }
-        // Title media carries `input_color_space = Srgb`, so the shared
-        // effect-application path resolves the correct sRGB→working→sRGB
-        // pipeline + the clip's grades/transform/opacity.
-        self.apply_clip_render_params(clip_id, media_id, entry_clip_t);
-        let mut rs = render_state.lock();
-        rs.renderer.render_to_rgba_buffer(width, height).ok()
     }
 
     /// Phase 8 (real export) — offline audio mixdown for the timeline
@@ -3402,6 +3408,7 @@ impl Engine {
             let info = match audio.open(job.path.clone()) {
                 Ok(i) => i,
                 Err(e) => {
+                    tracing::warn!(path = %job.path, ?e, "audio bounce: open failed; skipping clip");
                     continue;
                 }
             };
@@ -3411,7 +3418,7 @@ impl Engine {
             } else {
                 0
             };
-            if let Err(e) = audio.start_stream(from_pts, 8192) {
+            if audio.start_stream(from_pts, 8192).is_err() {
                 let _ = audio.close();
                 continue;
             }
@@ -7082,27 +7089,30 @@ impl Engine {
             black[px + 3] = 255;
         }
 
-        // 7. Frame loop. For each output frame: scene_at → media
-        //    resolution → decode_at → upload_frame → render_to_rgba_buffer
-        //    → push_video.
-        let mut emitted_frames = 0u64;
+        // 7. Frame loop. For each output frame: transition_at / scene_at
+        //    → decode → upload → effects → render_to_rgba_buffer →
+        //    push_video.
         for f in 0..total_frames {
             let timeline_seconds =
                 start_s + (f as f64) * (frame_rate_den as f64) / (frame_rate_num as f64);
             let timeline_t = seconds_to_rt(timeline_seconds);
 
-            // Resolve which clip (if any) is on screen. Capture the
-            // clip id + a clone of its effect chain so we can apply
-            // WASM plugin effects (Phase 10.5) after readback without
-            // holding the project borrow.
+            // Resolve what's on screen from ONE project borrow. An
+            // active transition (dissolve window) takes priority over a
+            // plain clip, mirroring the live renderer. `transition_plan`
+            // carries (from_media, from_clip, from_src_pts, from_src_in,
+            // to_media, to_src_pts, mix). The clip tuple is the
+            // single-clip fall-through.
             #[allow(clippy::type_complexity)]
             let (
+                transition_plan,
                 active_media,
                 active_source_pts_seconds,
                 clip_effects,
                 clip_source_in_seconds,
                 active_clip_id,
             ): (
+                Option<(MediaItemId, vance_timeline::ClipId, f64, f64, MediaItemId, f64, f32)>,
                 Option<MediaItemId>,
                 f64,
                 Vec<vance_timeline::Effect>,
@@ -7112,95 +7122,100 @@ impl Engine {
                 let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
                 let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
                 let seq = project.sequence(seq_id).ok_or(EngineError::SequenceNotFound)?;
-                match vance_timeline::scene_at(seq, timeline_t) {
-                    vance_timeline::SceneAt::Clip(c) => {
-                        let (effects, source_in) = seq
-                            .tracks
-                            .iter()
-                            .find_map(|t| {
-                                t.clips
-                                    .iter()
-                                    .find(|cl| cl.id == c.clip_id)
-                                    .map(|cl| (cl.effects.clone(), rt_to_seconds(cl.source_in)))
-                            })
-                            .unwrap_or_default();
-                        (
-                            Some(c.media),
-                            rt_to_seconds(c.source_pts),
-                            effects,
-                            source_in,
-                            Some(c.clip_id),
-                        )
+                if let Some(tr) = vance_timeline::transition_at(seq, timeline_t) {
+                    let from_src_in = seq
+                        .tracks
+                        .iter()
+                        .find_map(|t| {
+                            t.clips
+                                .iter()
+                                .find(|cl| cl.id == tr.from.clip_id)
+                                .map(|cl| rt_to_seconds(cl.source_in))
+                        })
+                        .unwrap_or(0.0);
+                    (
+                        Some((
+                            tr.from.media,
+                            tr.from.clip_id,
+                            rt_to_seconds(tr.from.source_pts),
+                            from_src_in,
+                            tr.to.media,
+                            rt_to_seconds(tr.to.source_pts),
+                            tr.mix,
+                        )),
+                        None,
+                        0.0,
+                        Vec::new(),
+                        0.0,
+                        None,
+                    )
+                } else {
+                    match vance_timeline::scene_at(seq, timeline_t) {
+                        vance_timeline::SceneAt::Clip(c) => {
+                            let (effects, source_in) = seq
+                                .tracks
+                                .iter()
+                                .find_map(|t| {
+                                    t.clips.iter().find(|cl| cl.id == c.clip_id).map(|cl| {
+                                        (cl.effects.clone(), rt_to_seconds(cl.source_in))
+                                    })
+                                })
+                                .unwrap_or_default();
+                            (
+                                None,
+                                Some(c.media),
+                                rt_to_seconds(c.source_pts),
+                                effects,
+                                source_in,
+                                Some(c.clip_id),
+                            )
+                        }
+                        vance_timeline::SceneAt::Empty => {
+                            (None, None, 0.0, Vec::new(), 0.0, None)
+                        }
                     }
-                    vance_timeline::SceneAt::Empty => (None, 0.0, Vec::new(), 0.0, None),
                 }
             };
 
             let mut rgba: Option<Vec<u8>> = None;
-            if let (Some(media_id), Some(clip_id)) = (active_media, active_clip_id) {
-                let resolved = self.media_for_active(media_id)?;
-                let entry_clip_t = active_source_pts_seconds - clip_source_in_seconds;
-                match resolved {
-                    MediaResolved::File(path) => {
-                        // Open file iff the decoder isn't already on it.
-                        let needs_open = self
-                            .current_media_path
-                            .as_deref()
-                            .map(|p| p != path.as_str())
-                            .unwrap_or(true);
-                        if needs_open {
-                            self.open_file(&path)?;
-                        }
-                        // Convert source PTS-seconds → stream time-base.
-                        let target_pts = if let Some(info) = self.stream_info.as_ref() {
-                            let (tb_n, tb_d) = info.time_base;
-                            if tb_n != 0 {
-                                (active_source_pts_seconds * (tb_d as f64) / (tb_n as f64))
-                                    .round() as i64
-                            } else {
-                                0
-                            }
-                        } else {
-                            0
-                        };
-                        // Decode + upload the source frame.
-                        let decoder = self.decoder.as_mut().ok_or(EngineError::NoFileOpen)?;
-                        let decoded = decoder.decode_at(target_pts).ok();
-                        if let Some(frame) = decoded {
-                            {
-                                let mut rs = render_state_arc.lock();
-                                rs.renderer.upload_frame(&frame).map_err(|e| {
-                                    EngineError::Project(format!("upload: {e}"))
-                                })?;
-                            }
-                            // Phase 8 (real export) — apply the clip's
-                            // native effects (grades, transform, opacity,
-                            // crop, keys, LUT, color pipeline) to the
-                            // renderer BEFORE readback so the export
-                            // matches the viewport. Takes its own locks.
-                            self.apply_clip_render_params(clip_id, media_id, entry_clip_t);
-                            let mut rs = render_state_arc.lock();
-                            match rs.renderer.render_to_rgba_buffer(width, height) {
-                                Ok(buf) => rgba = Some(buf),
-                                Err(e) => {
-                                    tracing::warn!(?e, frame = f, "render_to_rgba_buffer failed; black");
-                                }
-                            }
-                        }
+            if let Some((from_media, from_clip, from_src_pts, from_src_in, to_media, to_src_pts, mix)) =
+                transition_plan
+            {
+                // Cross-dissolve: decode A → A-side, B → B-side (the B
+                // decode may swap the primary decoder's open file, but
+                // A's frame is already on the GPU), apply A's native
+                // effects, set the mix factor, read back.
+                if let Some(frame_a) = self.decode_clip_framedata(from_media, from_src_pts) {
+                    {
+                        let mut rs = render_state_arc.lock();
+                        let _ = rs.renderer.upload_frame(&frame_a);
                     }
-                    MediaResolved::Title(params) => {
-                        // Phase 8 (real export) — render title clips
-                        // procedurally into the renderer's A-side, then
-                        // read back. Same path the live title scrub uses.
-                        if let Some(buf) = self.render_title_to_rgba(
-                            &params,
-                            clip_id,
-                            media_id,
-                            entry_clip_t,
-                            width,
-                            height,
-                        ) {
-                            rgba = Some(buf);
+                    if let Some(frame_b) = self.decode_clip_framedata(to_media, to_src_pts) {
+                        let mut rs = render_state_arc.lock();
+                        let _ = rs.renderer.upload_frame_b(&frame_b);
+                    }
+                    let from_clip_t = from_src_pts - from_src_in;
+                    self.apply_clip_render_params(from_clip, from_media, from_clip_t);
+                    let mut rs = render_state_arc.lock();
+                    rs.renderer.set_mix_factor(mix);
+                    rgba = rs.renderer.render_to_rgba_buffer(width, height).ok();
+                }
+            } else if let (Some(media_id), Some(clip_id)) = (active_media, active_clip_id) {
+                // Single clip: decode (File or Title), apply native
+                // effects, read back.
+                let entry_clip_t = active_source_pts_seconds - clip_source_in_seconds;
+                if let Some(frame) = self.decode_clip_framedata(media_id, active_source_pts_seconds) {
+                    {
+                        let mut rs = render_state_arc.lock();
+                        let _ = rs.renderer.upload_frame(&frame);
+                        rs.renderer.set_mix_factor(0.0);
+                    }
+                    self.apply_clip_render_params(clip_id, media_id, entry_clip_t);
+                    let mut rs = render_state_arc.lock();
+                    match rs.renderer.render_to_rgba_buffer(width, height) {
+                        Ok(buf) => rgba = Some(buf),
+                        Err(e) => {
+                            tracing::warn!(?e, frame = f, "render_to_rgba_buffer failed; black");
                         }
                     }
                 }
@@ -7216,7 +7231,6 @@ impl Engine {
             client
                 .push_video(f as i64, push)
                 .map_err(|e| EngineError::Project(format!("encoder push_video: {e}")))?;
-            emitted_frames += 1;
         }
 
         // 8. Real mixed audio — offline bounce of the export range
