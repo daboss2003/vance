@@ -18,6 +18,10 @@ path = "src/bin/main.rs"
 [dependencies]
 vance-core = { workspace = true }
 vance-ipc = { workspace = true }
+# Parent-side plugin client (PluginClient) + shared wire types: the
+# fold thread talks to the sandboxed `vance-plugin-host` sidecar for
+# out-of-process CLAP processing.
+vance-audio-plugins = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

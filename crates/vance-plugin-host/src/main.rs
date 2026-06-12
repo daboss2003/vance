@@ -9,7 +9,7 @@ use vance_audio_plugins::{
     PluginDescriptor, PluginFormat, PluginParam, PluginRequest, PluginResponse, PROTOCOL_VERSION,
 };
 use vance_ipc::Result;
-use vance_plugin_host::runtime::{supported_formats, PluginBackend, StubBackend};
+use vance_plugin_host::runtime::{supported_formats, Router};
 
 fn main() -> Result<()> {
     // Per-bundle CLAP probe mode: `vance-plugin-host --vance-probe-clap
@@ -31,7 +31,7 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt().with_writer(std::io::stderr).init();
     tracing::info!("plugin-host sidecar starting");
 
-    let mut backend = StubBackend::new();
+    let mut router = Router::new();
     let mut cached_plugins: Option<Vec<PluginDescriptor>> = None;
 
     vance_ipc::serve::<PluginRequest, PluginResponse, _>(|req| match req {
@@ -54,7 +54,7 @@ fn main() -> Result<()> {
                     // Built-in stubs first, then every discovered CLAP
                     // plugin on the system (scanned + enumerated once,
                     // then cached for the life of the sidecar).
-                    let mut list = backend.list();
+                    let mut list = router.list_builtin();
                     list.extend(vance_plugin_host::clap_discovery::discover());
                     list
                 })
@@ -65,18 +65,18 @@ fn main() -> Result<()> {
             descriptor,
             sample_rate,
             max_block_frames,
-        } => match backend.instantiate(&descriptor, sample_rate, max_block_frames) {
+        } => match router.instantiate(&descriptor, sample_rate, max_block_frames) {
             Ok(instance_id) => PluginResponse::Instantiated { instance_id },
             Err(message) => PluginResponse::Error { message },
         },
         PluginRequest::Process {
             instance_id,
             frames_in,
-        } => match backend.process(instance_id, &frames_in) {
+        } => match router.process(instance_id, &frames_in) {
             Ok(frames_out) => PluginResponse::Processed { frames_out },
             Err(message) => PluginResponse::Error { message },
         },
-        PluginRequest::ListParams { instance_id } => match backend.list_params(instance_id) {
+        PluginRequest::ListParams { instance_id } => match router.list_params(instance_id) {
             Ok(params) => PluginResponse::Params { params },
             Err(message) => PluginResponse::Error { message },
         },
@@ -84,11 +84,11 @@ fn main() -> Result<()> {
             instance_id,
             param_id,
             value,
-        } => match backend.set_param(instance_id, param_id, value) {
+        } => match router.set_param(instance_id, param_id, value) {
             Ok(()) => PluginResponse::Ok,
             Err(message) => PluginResponse::Error { message },
         },
-        PluginRequest::Destroy { instance_id } => match backend.destroy(instance_id) {
+        PluginRequest::Destroy { instance_id } => match router.destroy(instance_id) {
             Ok(()) => PluginResponse::Ok,
             Err(message) => PluginResponse::Error { message },
         },

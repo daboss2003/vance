@@ -184,6 +184,127 @@ impl PluginBackend for StubBackend {
     }
 }
 
+/// Which backend owns a given instance.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    Stub,
+    #[cfg(feature = "clap")]
+    Clap,
+}
+
+/// Dispatches plugin requests to the right backend by format (on
+/// instantiate) and by instance ownership (thereafter). The built-in
+/// [`StubBackend`] is always present; the CLAP processing backend is
+/// added when the `clap` feature is compiled in. A crash inside a CLAP
+/// plugin takes down this whole sidecar process — which is the point:
+/// the parent editor survives and bypasses the slot.
+pub struct Router {
+    stub: StubBackend,
+    #[cfg(feature = "clap")]
+    clap: crate::clap_backend::ClapBackend,
+    owners: HashMap<Uuid, Owner>,
+}
+
+impl Default for Router {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Router {
+    /// New router with every compiled-in backend.
+    pub fn new() -> Self {
+        Self {
+            stub: StubBackend::new(),
+            #[cfg(feature = "clap")]
+            clap: crate::clap_backend::ClapBackend::new(),
+            owners: HashMap::new(),
+        }
+    }
+
+    /// Built-in (stub) plugin descriptors. CLAP discovery is appended by
+    /// the caller (`main`) from `clap_discovery`.
+    pub fn list_builtin(&mut self) -> Vec<PluginDescriptor> {
+        self.stub.list()
+    }
+
+    /// Instantiate, routing by the descriptor's format.
+    pub fn instantiate(
+        &mut self,
+        descriptor: &PluginDescriptor,
+        sample_rate: f32,
+        max_block_frames: u32,
+    ) -> Result<Uuid, String> {
+        match descriptor.format {
+            PluginFormat::Builtin => {
+                let id = self.stub.instantiate(descriptor, sample_rate, max_block_frames)?;
+                self.owners.insert(id, Owner::Stub);
+                Ok(id)
+            }
+            PluginFormat::Clap => {
+                #[cfg(feature = "clap")]
+                {
+                    let id = self.clap.instantiate(descriptor, sample_rate, max_block_frames)?;
+                    self.owners.insert(id, Owner::Clap);
+                    Ok(id)
+                }
+                #[cfg(not(feature = "clap"))]
+                {
+                    let _ = (sample_rate, max_block_frames);
+                    Err("CLAP hosting not compiled into this sidecar (build --features clap)".into())
+                }
+            }
+            PluginFormat::Lv2 => {
+                Err("LV2 hosting not compiled into this sidecar (build --features lv2)".into())
+            }
+        }
+    }
+
+    /// Process one stereo block on the backend that owns `instance`.
+    pub fn process(&mut self, instance: Uuid, frames_in: &[f32]) -> Result<Vec<f32>, String> {
+        match self.owner(instance)? {
+            Owner::Stub => self.stub.process(instance, frames_in),
+            #[cfg(feature = "clap")]
+            Owner::Clap => self.clap.process(instance, frames_in),
+        }
+    }
+
+    /// List one instance's parameters.
+    pub fn list_params(&self, instance: Uuid) -> Result<Vec<PluginParam>, String> {
+        match self.owner(instance)? {
+            Owner::Stub => self.stub.list_params(instance),
+            #[cfg(feature = "clap")]
+            Owner::Clap => self.clap.list_params(instance),
+        }
+    }
+
+    /// Set one parameter.
+    pub fn set_param(&mut self, instance: Uuid, param_id: u32, value: f32) -> Result<(), String> {
+        match self.owner(instance)? {
+            Owner::Stub => self.stub.set_param(instance, param_id, value),
+            #[cfg(feature = "clap")]
+            Owner::Clap => self.clap.set_param(instance, param_id, value),
+        }
+    }
+
+    /// Destroy an instance (idempotent).
+    pub fn destroy(&mut self, instance: Uuid) -> Result<(), String> {
+        match self.owners.remove(&instance) {
+            Some(Owner::Stub) => self.stub.destroy(instance),
+            #[cfg(feature = "clap")]
+            Some(Owner::Clap) => self.clap.destroy(instance),
+            None => Ok(()), // unknown / already gone → no-op
+        }
+    }
+
+    fn owner(&self, instance: Uuid) -> Result<Owner, String> {
+        self.owners
+            .get(&instance)
+            .copied()
+            .ok_or_else(|| format!("no such plugin instance `{instance}`"))
+    }
+}
+
 /// Static list of formats the binary was compiled with. The parent
 /// uses this to populate its UI plugin-format dropdown.
 pub fn supported_formats() -> Vec<PluginFormat> {

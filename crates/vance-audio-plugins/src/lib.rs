@@ -42,6 +42,43 @@ pub enum PluginFormat {
     Clap,
 }
 
+/// Split a plugin id into `(bundle path, optional clap plugin id)`.
+///
+/// CLAP discovery emits ids as either a bare bundle path or the
+/// composite `"<bundle-path>::<clap-plugin-id>"` (a `.clap` bundle can
+/// publish several plugins). Both halves may themselves contain `::` — a
+/// path with `::` is unusual but legal; a clap id with `::` is unusual
+/// but not forbidden — so a naive split mis-routes either one. We resolve
+/// the ambiguity against the filesystem:
+///
+/// 1. If the whole id is an existing path, it is a bare bundle (no
+///    specific plugin); a real bundle whose name contains `::` wins.
+/// 2. Otherwise scan `::` boundaries left-to-right and take the FIRST
+///    whose left side is an existing path; the remainder (which may
+///    contain further `::`) is the clap plugin id.
+/// 3. If no boundary yields an existing path, the whole id is treated as
+///    the (doomed) bundle path — the load fails downstream and the slot
+///    is bypassed.
+///
+/// Shared by the in-process host (`vance_audio::clap_host`) and the
+/// sidecar backend (`vance_plugin_host::clap_backend`) so both agree.
+pub fn split_clap_id(id: &str) -> (&str, Option<&str>) {
+    use std::path::Path;
+    if Path::new(id).exists() {
+        return (id, None);
+    }
+    let mut from = 0;
+    while let Some(rel) = id[from..].find("::") {
+        let pos = from + rel;
+        let left = &id[..pos];
+        if Path::new(left).exists() {
+            return (left, Some(&id[pos + 2..]));
+        }
+        from = pos + 2;
+    }
+    (id, None)
+}
+
 /// One enumerated plugin descriptor.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PluginDescriptor {

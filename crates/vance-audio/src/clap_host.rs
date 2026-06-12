@@ -108,40 +108,7 @@ impl AudioPlugin for ClapPlugin {
     }
 }
 
-/// Split a plugin id into `(bundle path, optional clap plugin id)`.
-///
-/// The id is either a bare bundle path or the composite
-/// `"<bundle-path>::<clap-plugin-id>"` emitted by discovery. Both the
-/// bundle path AND the clap plugin id may themselves contain `::` (a
-/// path with `::` is unusual but legal; a clap id with `::` is unusual
-/// but not forbidden), so a naive `rsplit_once`/`split_once` mis-splits
-/// either one. We resolve the ambiguity against the filesystem:
-///
-/// 1. If the whole id is itself an existing path, it is a bare bundle —
-///    no specific plugin requested. (A real bundle whose name contains
-///    `::` wins over any coincidental sub-split.)
-/// 2. Otherwise scan `::` boundaries left-to-right and take the FIRST one
-///    whose left side is an existing path; the remainder (which may
-///    contain further `::`) is the clap plugin id.
-/// 3. If no boundary yields an existing path, treat the whole id as a
-///    bundle path (load will simply fail downstream and the slot is
-///    bypassed).
-fn split_clap_id(id: &str) -> (&str, Option<&str>) {
-    use std::path::Path;
-    if Path::new(id).exists() {
-        return (id, None);
-    }
-    let mut from = 0;
-    while let Some(rel) = id[from..].find("::") {
-        let pos = from + rel;
-        let left = &id[..pos];
-        if Path::new(left).exists() {
-            return (left, Some(&id[pos + 2..]));
-        }
-        from = pos + 2;
-    }
-    (id, None)
-}
+use vance_audio_plugins::split_clap_id;
 
 /// Instantiate a CLAP plugin. `id` is either a bare `.clap` bundle path
 /// (the first plugin in the bundle is used) or a composite

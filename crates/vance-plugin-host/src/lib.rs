@@ -6,5 +6,7 @@
 
 #![warn(missing_docs)]
 
+#[cfg(feature = "clap")]
+pub mod clap_backend;
 pub mod clap_discovery;
 pub mod runtime;
