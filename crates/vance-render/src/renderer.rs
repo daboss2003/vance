@@ -58,6 +58,31 @@ impl Default for RendererConfig {
 /// playback uses A only and leaves B's mix factor at 0 — the shader just
 /// returns A. Cross-dissolve transitions (Phase 5.4) upload both sides
 /// and dial `mix_factor` from 0 → 1 to blend.
+/// Fullscreen-triangle RGBA passthrough blit (Phase 10 preview). Maps
+/// vertex index → a triangle covering the viewport + samples the
+/// source RGBA texture.
+const BLIT_WGSL: &str = r#"
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+    var o: VsOut;
+    let x = f32((vi << 1u) & 2u);
+    let y = f32(vi & 2u);
+    o.uv = vec2<f32>(x, y);
+    o.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+    return o;
+}
+@group(0) @binding(0) var src_tex: texture_2d<f32>;
+@group(0) @binding(1) var src_smp: sampler;
+@fragment
+fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
+    return textureSample(src_tex, src_smp, i.uv);
+}
+"#;
+
 pub struct Renderer {
     adapter: wgpu::Adapter,
     device: wgpu::Device,
@@ -111,6 +136,24 @@ pub struct Renderer {
     /// in sync.
     params_buffer: wgpu::Buffer,
     current_params: RenderParams,
+    /// Lazily-built RGBA blit resources for [`Renderer::present_rgba`]
+    /// (Phase 10 — showing CPU-side WASM effect output in the preview).
+    blit: Option<BlitResources>,
+}
+
+/// Resources for the RGBA passthrough blit (a fullscreen-triangle
+/// sample of one Rgba8UnormSrgb texture). Built on first
+/// [`Renderer::present_rgba`] call + reused; the source texture is
+/// resized as the frame size changes.
+struct BlitResources {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    /// Target format the `pipeline` was built for. Rebuilt if a later
+    /// call targets a different format.
+    format: wgpu::TextureFormat,
+    texture: Option<wgpu::Texture>,
+    tex_dims: (u32, u32),
 }
 
 #[repr(C)]
@@ -885,7 +928,208 @@ impl Renderer {
             bind_group: None,
             params_buffer,
             current_params: initial_params,
+            blit: None,
         })
+    }
+
+    /// Phase 10 — blit a CPU-side RGBA8 (sRGB) buffer to `target_view`
+    /// with a fullscreen pass. Used by the live preview to display the
+    /// composited frame after CPU WASM effects have run on it. `rgba`
+    /// is row-major `width * height * 4` bytes, sRGB-encoded (the same
+    /// shape `render_to_rgba_buffer` produces + WASM plugins mutate).
+    /// `target_format` must match `target_view`'s texture format.
+    pub fn present_rgba(
+        &mut self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        target_view: &wgpu::TextureView,
+        target_format: wgpu::TextureFormat,
+    ) -> Result<(), RenderError> {
+        if width == 0 || height == 0 || rgba.len() != (width as usize) * (height as usize) * 4 {
+            return Err(RenderError::DeviceRequest(format!(
+                "present_rgba bad buffer: {} bytes for {width}x{height}",
+                rgba.len()
+            )));
+        }
+        // (Re)build the blit pipeline if absent or the target format
+        // changed (e.g. surface vs offscreen test target).
+        let needs_build = match &self.blit {
+            Some(b) => b.format != target_format,
+            None => true,
+        };
+        if needs_build {
+            self.blit = Some(self.build_blit(target_format));
+        }
+        // Ensure the source texture matches the frame size.
+        {
+            let blit = self.blit.as_mut().unwrap();
+            if blit.texture.is_none() || blit.tex_dims != (width, height) {
+                blit.texture = Some(self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("vance-render.blit-src"),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                }));
+                blit.tex_dims = (width, height);
+            }
+        }
+        let blit = self.blit.as_ref().unwrap();
+        let texture = blit.texture.as_ref().unwrap();
+        // Upload the RGBA bytes.
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("vance-render.blit-bg"),
+            layout: &blit.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&blit.sampler),
+                },
+            ],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("vance-render.blit-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("vance-render.blit-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&blit.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        Ok(())
+    }
+
+    fn build_blit(&self, target_format: wgpu::TextureFormat) -> BlitResources {
+        let bind_group_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("vance-render.blit-bgl"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+        let pipeline_layout =
+            self.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("vance-render.blit-layout"),
+                    bind_group_layouts: &[Some(&bind_group_layout)],
+                    ..Default::default()
+                });
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("vance-render.blit-shader"),
+                source: wgpu::ShaderSource::Wgsl(BLIT_WGSL.into()),
+            });
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("vance-render.blit-pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("vance-render.blit-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        BlitResources {
+            pipeline,
+            bind_group_layout,
+            sampler,
+            format: target_format,
+            texture: None,
+            tex_dims: (0, 0),
+        }
     }
 
     /// Set the per-frame opacity uniform. `1.0` = passthrough,
@@ -1724,6 +1968,96 @@ impl Renderer {
             let start = (row * padded_row) as usize;
             let end = start + unpadded_row as usize;
             out.extend_from_slice(&mapped[start..end]);
+        }
+        drop(mapped);
+        staging.unmap();
+        Ok(out)
+    }
+
+    /// Phase 10 — headless convenience: blit `rgba` via
+    /// [`Self::present_rgba`] to an internal Rgba8UnormSrgb target and
+    /// read it back. Used to test the preview blit path; production
+    /// preview blits straight to the surface view.
+    pub fn present_rgba_to_buffer(
+        &mut self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, RenderError> {
+        let target = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("vance-render.blit-test-target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        self.present_rgba(rgba, width, height, &view, wgpu::TextureFormat::Rgba8UnormSrgb)?;
+
+        let bytes_per_pixel = 4u32;
+        let unpadded_row = width * bytes_per_pixel;
+        let padded_row = unpadded_row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("vance-render.blit-test-staging"),
+            size: (padded_row as u64) * (height as u64),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("vance-render.blit-test-copy"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = sender.send(r);
+        });
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .ok();
+        receiver
+            .recv()
+            .map_err(|e| RenderError::DeviceRequest(format!("blit staging recv: {e}")))?
+            .map_err(|e| RenderError::DeviceRequest(format!("blit staging map: {e}")))?;
+        let mapped = slice.get_mapped_range();
+        let mut out = Vec::with_capacity((unpadded_row * height) as usize);
+        for row in 0..height {
+            let start = (row * padded_row) as usize;
+            out.extend_from_slice(&mapped[start..start + unpadded_row as usize]);
         }
         drop(mapped);
         staging.unmap();

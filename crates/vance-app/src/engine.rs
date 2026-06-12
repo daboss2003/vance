@@ -1137,6 +1137,12 @@ pub struct Engine {
         String,
         (vance_plugin_sdk::host::WasmPlugin, Option<std::time::SystemTime>),
     >,
+    /// Phase 10 — transient hand-off from `decode_sequence_at` to
+    /// `decode_and_render_at`: the active clip's effect chain + its
+    /// clip-relative time, so the live preview can apply WASM effects
+    /// (readback → process → blit) in the viewport. Taken (cleared) on
+    /// each render.
+    pub(crate) preview_wasm: Option<(Vec<vance_timeline::Effect>, f64)>,
     /// Last-applied viewport bounds (in physical pixels).
     last_bounds: ViewportBounds,
     /// Active playback, if any.
@@ -1716,8 +1722,100 @@ impl Engine {
             .ok_or(EngineError::NoViewport)?
             .clone();
         let last_bounds = self.last_bounds;
-        upload_and_render(&render_state, &viewport, &frame, last_bounds)?;
+        // Phase 10 — if the active clip carries enabled WASM effects,
+        // render via the CPU readback → WASM → blit path so the plugin
+        // output shows in the viewport. Otherwise the normal GPU path.
+        let preview_wasm = self.preview_wasm.take();
+        match preview_wasm {
+            Some((effects, clip_t))
+                if effects
+                    .iter()
+                    .any(|e| e.enabled && e.kind.starts_with("wasm:")) =>
+            {
+                self.upload_render_with_wasm(
+                    &render_state,
+                    &viewport,
+                    &frame,
+                    last_bounds,
+                    &effects,
+                    clip_t,
+                )?;
+            }
+            _ => {
+                upload_and_render(&render_state, &viewport, &frame, last_bounds)?;
+            }
+        }
         Ok(pts)
+    }
+
+    /// Phase 10 — live-preview render that applies the clip's WASM
+    /// effects: composite to an offscreen RGBA buffer (native effects
+    /// already set on the renderer), run the WASM plugins over it on
+    /// the CPU, then blit the result to the viewport surface.
+    fn upload_render_with_wasm(
+        &mut self,
+        render_state: &Arc<Mutex<RenderState>>,
+        viewport: &Arc<Viewport>,
+        frame: &vance_decoder::FrameData,
+        bounds: ViewportBounds,
+        effects: &[vance_timeline::Effect],
+        clip_t: f64,
+    ) -> Result<(), EngineError> {
+        if bounds.is_empty() {
+            // No surface size yet → fall back to the normal path.
+            return upload_and_render(render_state, viewport, frame, bounds);
+        }
+        let (w, h) = (bounds.w, bounds.h);
+        // 1. Upload + offscreen composite (native effects already on
+        //    the renderer's uniforms).
+        let mut rgba = {
+            let mut rs = render_state.lock();
+            rs.renderer
+                .upload_frame(frame)
+                .map_err(|e| EngineError::Project(format!("preview upload: {e}")))?;
+            rs.renderer
+                .render_to_rgba_buffer(w, h)
+                .map_err(|e| EngineError::Project(format!("preview readback: {e}")))?
+        };
+        // 2. CPU WASM effects (render_state unlocked).
+        self.apply_wasm_effects(&mut rgba, w, h, effects, clip_t);
+        // 3. Blit to the surface.
+        let mut rs = render_state.lock();
+        let surface = viewport.surface();
+        if rs.surface_config.is_none() {
+            if let Some(cfg) = rs.renderer.recommended_surface_config(surface, w, h) {
+                rs.renderer.configure_surface(surface, &cfg);
+                rs.surface_config = Some(cfg);
+            }
+        }
+        let Some(format) = rs.surface_config.as_ref().map(|c| c.format) else {
+            return Err(EngineError::SurfaceAcquire(
+                "viewport bounds not yet reported".into(),
+            ));
+        };
+        let surface_tex = match surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            wgpu::CurrentSurfaceTexture::Outdated
+            | wgpu::CurrentSurfaceTexture::Lost
+            | wgpu::CurrentSurfaceTexture::Validation => {
+                rs.surface_config = None;
+                return Err(EngineError::SurfaceAcquire("surface outdated".into()));
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return Err(EngineError::SurfaceAcquire(
+                    "surface timeout/occluded".into(),
+                ));
+            }
+        };
+        let view = surface_tex
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        rs.renderer
+            .present_rgba(&rgba, w, h, &view, format)
+            .map_err(|e| EngineError::Project(format!("preview blit: {e}")))?;
+        surface_tex.present();
+        Ok(())
     }
 
     /// Begin streaming playback starting at `from_pts`. The scheduler
@@ -3752,6 +3850,30 @@ impl Engine {
             time_base_den: tb_d,
             opacity: anchor_opacity,
         });
+        // Phase 10 — hand the active clip's effect chain + clip-relative
+        // time to `decode_and_render_at` so WASM effects show in the
+        // preview. Only worth it when the clip actually has a `wasm:`
+        // effect; otherwise leave it clear (normal GPU present).
+        self.preview_wasm = {
+            let clip_t = source_pts_seconds - anchor_source_in;
+            self.current_project
+                .as_ref()
+                .and_then(|p| p.sequence(self.current_sequence_id?))
+                .and_then(|seq| {
+                    seq.tracks.iter().find_map(|t| {
+                        t.clips
+                            .iter()
+                            .find(|c| c.id == anchor_clip_id)
+                            .map(|c| c.effects.clone())
+                    })
+                })
+                .filter(|effects| {
+                    effects
+                        .iter()
+                        .any(|e| e.enabled && e.kind.starts_with("wasm:"))
+                })
+                .map(|effects| (effects, clip_t))
+        };
         let pts = self.decode_and_render_at(target_pts)?;
         // Park the engine's "where am I" pointer at the just-rendered
         // frame so a subsequent Play resumes from this click, not from
