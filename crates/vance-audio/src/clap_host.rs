@@ -1,0 +1,189 @@
+//! Phase 7.11 — CLAP audio-plugin backend (feature `clap`).
+//!
+//! Hosts a third-party `.clap` plugin in-process via `clack-host`
+//! (pure-Rust + dlopen) and adapts it to the fold chain's
+//! [`crate::audio_plugin::AudioPlugin`] block interface. The plugin
+//! instance + its audio processor have no lifetime params (the
+//! instance refcounts the loaded entry), so both live in one struct —
+//! no self-referential gymnastics.
+//!
+//! v1 scope: stereo 32-bit float, fixed block size, first plugin in
+//! the bundle, no parameter events yet (the host passes audio + empty
+//! event streams). Parameter automation is a follow-up.
+
+use crate::audio_plugin::AudioPlugin;
+use clack_host::events::io::{InputEvents, OutputEvents};
+use clack_host::prelude::*;
+
+/// Minimal no-op host. Audio plugins only need the three request
+/// callbacks (we don't act on them — offline/realtime pull model).
+struct VanceHostShared;
+impl<'a> SharedHandler<'a> for VanceHostShared {
+    fn request_restart(&self) {}
+    fn request_process(&self) {}
+    fn request_callback(&self) {}
+}
+
+struct VanceHost;
+impl HostHandlers for VanceHost {
+    type Shared<'a> = VanceHostShared;
+    type MainThread<'a> = ();
+    type AudioProcessor<'a> = ();
+}
+
+/// A loaded CLAP plugin wrapped as a block-processing [`AudioPlugin`].
+pub struct ClapPlugin {
+    // Field order matters for Drop: the processor must drop before the
+    // instance. `processor` is listed first.
+    processor: Option<StartedPluginAudioProcessor<VanceHost>>,
+    instance: PluginInstance<VanceHost>,
+    in_ports: AudioPorts,
+    out_ports: AudioPorts,
+    in_l: Vec<f32>,
+    in_r: Vec<f32>,
+    event_out: EventBuffer,
+    block: usize,
+}
+
+impl AudioPlugin for ClapPlugin {
+    fn process_block(&mut self, in_l: &[f32], in_r: &[f32], out_l: &mut [f32], out_r: &mut [f32]) {
+        let n = in_l.len().min(self.block);
+        let Some(proc) = self.processor.as_mut() else {
+            // No active processor → bypass.
+            out_l[..n].copy_from_slice(&in_l[..n]);
+            out_r[..n].copy_from_slice(&in_r[..n]);
+            return;
+        };
+        // Copy the input into the plugin's (mutable) input buffers.
+        self.in_l[..n].copy_from_slice(&in_l[..n]);
+        self.in_r[..n].copy_from_slice(&in_r[..n]);
+
+        let input_audio = self.in_ports.with_input_buffers([AudioPortBuffer {
+            latency: 0,
+            channels: AudioPortBufferType::f32_input_only(
+                [
+                    InputChannel::variable(&mut self.in_l[..n]),
+                    InputChannel::variable(&mut self.in_r[..n]),
+                ]
+                .into_iter(),
+            ),
+        }]);
+        let mut output_audio = self.out_ports.with_output_buffers([AudioPortBuffer {
+            latency: 0,
+            channels: AudioPortBufferType::f32_output_only(
+                [&mut out_l[..n], &mut out_r[..n]].into_iter(),
+            ),
+        }]);
+
+        let input_events = InputEvents::empty();
+        let mut output_events = OutputEvents::from_buffer(&mut self.event_out);
+        let res = proc.process(
+            &input_audio,
+            &mut output_audio,
+            &input_events,
+            &mut output_events,
+            None,
+            None,
+        );
+        if res.is_err() {
+            // On a process error, pass audio through unchanged.
+            out_l[..n].copy_from_slice(&in_l[..n]);
+            out_r[..n].copy_from_slice(&in_r[..n]);
+        }
+        self.event_out.clear();
+    }
+}
+
+/// Instantiate a CLAP plugin. `id` is the `.clap` bundle path (the
+/// first plugin in the bundle is used). Returns `None` on any failure
+/// so the caller bypasses the chain slot.
+pub fn instantiate(
+    id: &str,
+    _params: &[(u32, f32)],
+    sample_rate: f32,
+    block: usize,
+) -> Option<Box<dyn AudioPlugin>> {
+    let entry = unsafe { PluginEntry::load(id) }.ok()?;
+    let factory = entry.get_plugin_factory()?;
+    // First plugin descriptor in the bundle.
+    let plugin_id = factory
+        .plugin_descriptors()
+        .next()
+        .and_then(|d| d.id())?
+        .to_owned();
+    let host_info = HostInfo::new("Vance", "Vance", "https://vance.app", "1.0").ok()?;
+
+    let mut instance = PluginInstance::<VanceHost>::new(
+        |_| VanceHostShared,
+        |_| (),
+        &entry,
+        &plugin_id,
+        &host_info,
+    )
+    .ok()?;
+
+    let config = PluginAudioConfiguration {
+        sample_rate: sample_rate as f64,
+        min_frames_count: block as u32,
+        max_frames_count: block as u32,
+    };
+    let stopped = instance.activate(|_, _| (), config).ok()?;
+    let started = stopped.start_processing().ok()?;
+
+    Some(Box::new(ClapPlugin {
+        processor: Some(started),
+        instance,
+        in_ports: AudioPorts::with_capacity(2, 1),
+        out_ports: AudioPorts::with_capacity(2, 1),
+        in_l: vec![0.0; block],
+        in_r: vec![0.0; block],
+        event_out: EventBuffer::new(),
+        block,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn fixture_path() -> Option<PathBuf> {
+        let (prefix, ext) = if cfg!(target_os = "windows") {
+            ("", "dll")
+        } else if cfg!(target_os = "macos") {
+            ("lib", "dylib")
+        } else {
+            ("lib", "so")
+        };
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug")
+            .join(format!("{prefix}vance_clap_testplugin.{ext}"));
+        p.exists().then_some(p)
+    }
+
+    #[test]
+    fn loads_and_processes_real_clap_plugin() {
+        let Some(path) = fixture_path() else {
+            eprintln!("clap test fixture not built — skipping");
+            return;
+        };
+        let block = 64usize;
+        let mut plugin = instantiate(&path.to_string_lossy(), &[], 48_000.0, block)
+            .expect("instantiate CLAP fixture");
+        // The fixture applies a fixed 0.5x gain. Feed 1.0, expect ~0.5.
+        let inl = vec![1.0f32; block];
+        let inr = vec![1.0f32; block];
+        let mut outl = vec![0.0f32; block];
+        let mut outr = vec![0.0f32; block];
+        plugin.process_block(&inl, &inr, &mut outl, &mut outr);
+        for (&l, &r) in outl.iter().zip(outr.iter()) {
+            assert!((l - 0.5).abs() < 1e-3, "L expected ~0.5, got {l}");
+            assert!((r - 0.5).abs() < 1e-3, "R expected ~0.5, got {r}");
+        }
+    }
+
+    #[test]
+    fn missing_clap_bundle_is_none() {
+        assert!(instantiate("/nonexistent/x.clap", &[], 48_000.0, 64).is_none());
+    }
+}

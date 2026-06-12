@@ -27,6 +27,7 @@ members = [
     "crates/vance-plugin-sdk",
     "crates/vance-ofx",
     "crates/vance-ofx-testplugin",
+    "crates/vance-clap-testplugin",
     "crates/vance-ai",
     "crates/vance-ai-runtime",
     "crates/vance-ipc",

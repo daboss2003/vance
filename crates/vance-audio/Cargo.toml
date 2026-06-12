@@ -39,5 +39,19 @@ symphonia = { version = "0.5", features = ["aac", "flac", "mp3", "wav", "isomp4"
 arc-swap = "1"
 uuid = { workspace = true }
 
+# Phase 7.10/7.11 — real third-party audio plugin backends, feature-
+# gated so the default build needs no system libs / extra crates.
+# `clap` is pure-Rust (clack-host) + dlopen; `lv2` links system liblilv.
+clack-host = { version = "0.1", optional = true }
+clack-extensions = { version = "0.1", optional = true, features = [
+    "audio-ports",
+] }
+livi = { version = "0.7", optional = true }
+
+[features]
+default = []
+clap = ["dep:clack-host", "dep:clack-extensions"]
+lv2 = ["dep:livi"]
+
 [dev-dependencies]
 bincode = { version = "2", features = ["serde"] }

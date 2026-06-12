@@ -20,6 +20,8 @@
 #![warn(missing_docs)]
 
 pub mod audio_plugin;
+#[cfg(feature = "clap")]
+pub mod clap_host;
 pub mod client;
 pub mod dsp;
 pub mod loudness;

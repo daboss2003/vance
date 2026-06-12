@@ -1,0 +1,20 @@
+[package]
+name = "vance-clap-testplugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# A minimal real CLAP plugin (a fixed -6 dB / 0.5x stereo gain) used to
+# verify the CLAP host end-to-end without a third-party .clap installed.
+# Built as a cdylib exporting the standard `clap_entry` symbol; the host
+# dlopen()s it directly.
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+clack-plugin = "0.1"
