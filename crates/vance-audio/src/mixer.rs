@@ -306,20 +306,24 @@ pub enum AudioEffectKind {
         /// Limiter configuration.
         params: LimiterParams,
     },
-    /// Phase 7.10 / 7.11 — third-party plugin instance routed through
-    /// the sandboxed `vance-plugin-host` sidecar. The variant carries
-    /// the descriptor needed to (re)instantiate on the fold thread's
-    /// per-track DSP state; the actual stateful plugin handle lives
-    /// there as part of [`TrackDspState`].
+    /// Phase 7.10 / 7.11 — third-party (or built-in) audio effect
+    /// plugin. The fold thread instantiates a real in-process
+    /// [`crate::audio_plugin::BlockProcessor`] for this entry (built-in
+    /// gain, CLAP, or LV2 per `format_str`) and runs the audio through
+    /// it — no longer a passthrough.
     Plugin {
         /// Whether this plugin contributes to the output.
         enabled: bool,
-        /// Plugin descriptor (mirrors `vance_audio_plugins::PluginDescriptor`).
+        /// Plugin format: `"builtin"`, `"clap"`, or `"lv2"`.
         format_str: String,
-        /// Format-specific identifier (LV2 URI or `bundle:id`).
+        /// Format-specific identifier (built-in id, LV2 URI, or
+        /// `bundle:id` for CLAP).
         id: String,
         /// Display name.
         name: String,
+        /// Parameter values as `(param_id, value)`, precomputed at
+        /// snapshot build time.
+        params: Vec<(u32, f32)>,
     },
 }
 
@@ -380,7 +384,18 @@ impl TrackDspState {
                 (EffectUnit::Eq6(_), AudioEffectKind::Eq6 { .. }) => false,
                 (EffectUnit::Compressor(_), AudioEffectKind::Compressor { .. }) => false,
                 (EffectUnit::Limiter(_), AudioEffectKind::Limiter { .. }) => false,
-                (EffectUnit::Plugin, AudioEffectKind::Plugin { .. }) => false,
+                // Rebuild a plugin only when its identity or params
+                // change — a bare enable/disable toggle keeps the warm
+                // instance (so its internal state isn't reset).
+                (
+                    EffectUnit::Plugin(slot),
+                    AudioEffectKind::Plugin {
+                        format_str,
+                        id,
+                        params,
+                        ..
+                    },
+                ) => slot.format_str != *format_str || slot.id != *id || slot.params != *params,
                 _ => true,
             };
             if needs_rebuild {
@@ -447,6 +462,14 @@ impl TrackDspState {
                     l = nl;
                     r = nr;
                 }
+                (EffectUnit::Plugin(slot), AudioEffectKind::Plugin { .. }) => {
+                    if let Some(proc) = slot.proc.as_mut() {
+                        let (nl, nr) = proc.tick(l, r);
+                        l = nl;
+                        r = nr;
+                    }
+                    // proc == None (unknown plugin) → bypass.
+                }
                 // Mismatched variant (e.g. spec changed but reconcile
                 // not yet called). Silently bypass — the next reconcile
                 // tick will rebuild correctly.
@@ -463,21 +486,26 @@ impl Default for TrackDspState {
     }
 }
 
+/// A fold-thread audio plugin slot: the real in-process processor plus
+/// the inputs it was built from (for cheap rebuild detection on
+/// reconcile). `proc` is `None` when the plugin id is unknown — the
+/// slot then bypasses (audio passes through unchanged).
+struct PluginSlot {
+    format_str: String,
+    id: String,
+    params: Vec<(u32, f32)>,
+    proc: Option<crate::audio_plugin::BlockProcessor>,
+}
+
 enum EffectUnit {
     Passthrough,
     Eq6(Box<[crate::dsp::Biquad; 6]>),
     Compressor(Box<crate::dsp::Compressor>),
     Limiter(Box<crate::dsp::Limiter>),
-    /// Phase 7.10 / 7.11 — sandboxed plugin instance. The actual
-    /// `PluginClient` would live here but doing per-frame IPC from
-    /// the fold thread is structurally incompatible with cpal's
-    /// real-time budget. The v1 path runs Plugin entries as
-    /// PASS-THROUGH on the fold thread (no audio change) so the
-    /// chain order is preserved and the user can see the plugin in
-    /// the inspector; full sandboxed audio routing lands when the
-    /// shared-memory ring path between fold thread and sidecar is
-    /// in place.
-    Plugin,
+    /// Phase 7.10 / 7.11 — real in-process audio plugin (built-in /
+    /// CLAP / LV2), block-processed via
+    /// [`crate::audio_plugin::BlockProcessor`].
+    Plugin(Box<PluginSlot>),
 }
 
 impl EffectUnit {
@@ -508,7 +536,26 @@ impl EffectUnit {
                 lim.set(params.ceiling_db, params.release_ms, sample_rate);
                 EffectUnit::Limiter(lim)
             }
-            AudioEffectKind::Plugin { .. } => EffectUnit::Plugin,
+            AudioEffectKind::Plugin {
+                format_str,
+                id,
+                params,
+                ..
+            } => {
+                let proc = crate::audio_plugin::instantiate(
+                    format_str,
+                    id,
+                    params,
+                    sample_rate,
+                    crate::audio_plugin::DEFAULT_BLOCK,
+                );
+                EffectUnit::Plugin(Box::new(PluginSlot {
+                    format_str: format_str.clone(),
+                    id: id.clone(),
+                    params: params.clone(),
+                    proc,
+                }))
+            }
         }
     }
 }
@@ -2268,6 +2315,59 @@ mod tests {
         let (l, r) = state.tick_stereo(&[], 0.5, -0.3);
         assert!((l - 0.5).abs() < 1e-6);
         assert!((r - (-0.3)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn track_dsp_state_plugin_processes_audio() {
+        // A built-in gain plugin at -6.02 dB (≈0.5x) in the chain must
+        // actually attenuate the track signal (no longer passthrough).
+        let spec = vec![AudioEffectKind::Plugin {
+            enabled: true,
+            format_str: "builtin".into(),
+            id: "vance:gain".into(),
+            name: "Gain".into(),
+            params: vec![(0, -6.0206)],
+        }];
+        let mut state = TrackDspState::new();
+        state.reconcile_with(&spec, 48_000.0);
+        // Drive a constant 1.0; after the block-priming latency the
+        // output settles to ≈0.5.
+        let mut last = 0.0f32;
+        for _ in 0..256 {
+            last = state.tick_stereo(&spec, 1.0, 1.0).0;
+        }
+        assert!((last - 0.5).abs() < 1e-2, "plugin gain not applied: {last}");
+    }
+
+    #[test]
+    fn track_dsp_state_disabled_plugin_bypasses() {
+        let spec = vec![AudioEffectKind::Plugin {
+            enabled: false,
+            format_str: "builtin".into(),
+            id: "vance:gain".into(),
+            name: "Gain".into(),
+            params: vec![(0, -60.0)], // would be near-silent if applied
+        }];
+        let mut state = TrackDspState::new();
+        state.reconcile_with(&spec, 48_000.0);
+        let (l, _) = state.tick_stereo(&spec, 1.0, 1.0);
+        assert!((l - 1.0).abs() < 1e-6, "disabled plugin must pass through");
+    }
+
+    #[test]
+    fn track_dsp_state_unknown_plugin_bypasses() {
+        let spec = vec![AudioEffectKind::Plugin {
+            enabled: true,
+            format_str: "clap".into(),
+            id: "nonexistent.plugin".into(),
+            name: "X".into(),
+            params: vec![],
+        }];
+        let mut state = TrackDspState::new();
+        state.reconcile_with(&spec, 48_000.0);
+        // No CLAP plugin by that id → proc is None → bypass, not a crash.
+        let (l, r) = state.tick_stereo(&spec, 0.7, -0.4);
+        assert!((l - 0.7).abs() < 1e-6 && (r - (-0.4)).abs() < 1e-6);
     }
 
     #[test]

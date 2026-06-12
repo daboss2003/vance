@@ -5920,12 +5920,15 @@ fn translate_audio_effect(
         Spec::Plugin {
             enabled,
             descriptor,
-            params: _,
+            params,
         } => vance_audio::AudioEffectKind::Plugin {
             enabled: *enabled,
             format_str: descriptor.format.clone(),
             id: descriptor.id.clone(),
             name: descriptor.name.clone(),
+            // Project param overrides → packed (param_id, value) the
+            // fold thread feeds the in-process plugin.
+            params: params.iter().map(|p| (p.param_id, p.value)).collect(),
         },
     }
 }

@@ -19,6 +19,7 @@
 
 #![warn(missing_docs)]
 
+pub mod audio_plugin;
 pub mod client;
 pub mod dsp;
 pub mod loudness;
