@@ -12,6 +12,21 @@ use vance_ipc::Result;
 use vance_plugin_host::runtime::{supported_formats, PluginBackend, StubBackend};
 
 fn main() -> Result<()> {
+    // Per-bundle CLAP probe mode: `vance-plugin-host --vance-probe-clap
+    // <path>` loads exactly one `.clap` in THIS process, prints its
+    // descriptors as JSON, and exits. The long-lived sidecar spawns one
+    // of these per bundle so a crash on load is contained to the child.
+    // Handled before anything else so stdout carries only the JSON.
+    {
+        let mut args = std::env::args_os().skip(1);
+        if let Some(flag) = args.next() {
+            if flag == vance_plugin_host::clap_discovery::PROBE_FLAG {
+                let path = args.next().map(std::path::PathBuf::from).unwrap_or_default();
+                vance_plugin_host::clap_discovery::probe_main(&path);
+            }
+        }
+    }
+
     // Stderr is inherited by the parent so tracing surfaces there.
     tracing_subscriber::fmt().with_writer(std::io::stderr).init();
     tracing::info!("plugin-host sidecar starting");
@@ -34,7 +49,16 @@ fn main() -> Result<()> {
             }
         }
         PluginRequest::ListPlugins => {
-            let plugins = cached_plugins.get_or_insert_with(|| backend.list()).clone();
+            let plugins = cached_plugins
+                .get_or_insert_with(|| {
+                    // Built-in stubs first, then every discovered CLAP
+                    // plugin on the system (scanned + enumerated once,
+                    // then cached for the life of the sidecar).
+                    let mut list = backend.list();
+                    list.extend(vance_plugin_host::clap_discovery::discover());
+                    list
+                })
+                .clone();
             PluginResponse::Plugins { plugins }
         }
         PluginRequest::Instantiate {

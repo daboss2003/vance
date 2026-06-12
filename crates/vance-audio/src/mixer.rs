@@ -2370,6 +2370,44 @@ mod tests {
         assert!((l - 0.7).abs() < 1e-6 && (r - (-0.4)).abs() < 1e-6);
     }
 
+    #[cfg(feature = "clap")]
+    #[test]
+    fn track_dsp_state_real_clap_plugin_processes_audio() {
+        // Drive the full discovery→processing contract: a `clap`-format
+        // effect whose id is the discovery-style composite
+        // `"<bundle>::<plugin-id>"` must load via clack-host and apply
+        // the fixture's fixed 0.5x gain through the mixer chain.
+        let (prefix, ext) = if cfg!(target_os = "windows") {
+            ("", "dll")
+        } else if cfg!(target_os = "macos") {
+            ("lib", "dylib")
+        } else {
+            ("lib", "so")
+        };
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug")
+            .join(format!("{prefix}vance_clap_testplugin.{ext}"));
+        if !path.exists() {
+            eprintln!("clap test fixture not built — skipping mixer clap test");
+            return;
+        }
+        let id = format!("{}::vance.test.gain", path.to_string_lossy());
+        let spec = vec![AudioEffectKind::Plugin {
+            enabled: true,
+            format_str: "clap".into(),
+            id,
+            name: "Vance Test Gain".into(),
+            params: vec![],
+        }];
+        let mut state = TrackDspState::new();
+        state.reconcile_with(&spec, 48_000.0);
+        let mut last = 0.0f32;
+        for _ in 0..256 {
+            last = state.tick_stereo(&spec, 1.0, 1.0).0;
+        }
+        assert!((last - 0.5).abs() < 1e-2, "real CLAP gain not applied: {last}");
+    }
+
     #[test]
     fn track_dsp_state_disabled_effect_bypasses_audio() {
         let spec = vec![AudioEffectKind::Limiter {

@@ -6,4 +6,5 @@
 
 #![warn(missing_docs)]
 
+pub mod clap_discovery;
 pub mod runtime;

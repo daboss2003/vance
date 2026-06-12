@@ -31,6 +31,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// names in the wire format for forward-compat).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PluginFormat {
+    /// Built-in reference effect hosted in-process (no external file).
+    /// Ids like `vance:gain`, `vance:identity`.
+    Builtin,
     /// LV2 plugin discovered via `lilv` (`LV2_PATH` walk).
     Lv2,
     /// CLAP plugin discovered via the host's `~/.clap` and

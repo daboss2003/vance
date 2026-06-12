@@ -17,9 +17,15 @@ path = "src/main.rs"
 vance-audio-plugins = { workspace = true }
 vance-ipc = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+
+# CLAP discovery enumerates real `.clap` bundles via clack-host
+# (pure-Rust + dlopen). Feature-gated so the default build pulls in
+# nothing extra and runs without any plugins installed.
+clack-host = { version = "0.1", optional = true }
 
 # The actual plugin runtimes are feature-gated so the binary builds
 # cleanly even when the system libraries (liblilv for LV2) aren't
@@ -27,4 +33,4 @@ uuid = { workspace = true }
 [features]
 default = []
 lv2 = []
-clap = []
+clap = ["dep:clack-host"]

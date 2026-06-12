@@ -5751,6 +5751,7 @@ dependencies = [
  "vance-ocio",
  "vance-ofx",
  "vance-peaks",
+ "vance-plugin-host",
  "vance-plugin-sdk",
  "vance-project",
  "vance-render",
@@ -5955,7 +5956,9 @@ dependencies = [
 name = "vance-plugin-host"
 version = "0.0.0"
 dependencies = [
+ "clack-host",
  "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
  "uuid",

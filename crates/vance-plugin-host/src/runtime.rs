@@ -84,23 +84,21 @@ impl Default for StubBackend {
 
 impl PluginBackend for StubBackend {
     fn format(&self) -> PluginFormat {
-        // The stub claims LV2 since it's the format the engine
-        // requests by default; real LV2 will take over when the
-        // `lv2` feature is compiled in.
-        PluginFormat::Lv2
+        // The stub hosts the in-process built-in reference plugins.
+        PluginFormat::Builtin
     }
 
     fn list(&mut self) -> Vec<PluginDescriptor> {
         vec![
             PluginDescriptor {
-                format: PluginFormat::Lv2,
+                format: PluginFormat::Builtin,
                 id: "vance:identity".into(),
                 name: "Identity (stub)".into(),
                 vendor: "vance".into(),
                 runnable: true,
             },
             PluginDescriptor {
-                format: PluginFormat::Lv2,
+                format: PluginFormat::Builtin,
                 id: "vance:gain".into(),
                 name: "Gain (stub)".into(),
                 vendor: "vance".into(),
@@ -189,15 +187,13 @@ impl PluginBackend for StubBackend {
 /// Static list of formats the binary was compiled with. The parent
 /// uses this to populate its UI plugin-format dropdown.
 pub fn supported_formats() -> Vec<PluginFormat> {
-    let mut out = vec![];
-    // Stub is always present.
-    out.push(PluginFormat::Lv2);
-    #[cfg(feature = "lv2")]
-    if !out.contains(&PluginFormat::Lv2) {
-        out.push(PluginFormat::Lv2);
-    }
+    // The built-in stub backend is always present; CLAP / LV2 hosting
+    // light up only when their cargo features are compiled in.
+    let mut out = vec![PluginFormat::Builtin];
     #[cfg(feature = "clap")]
     out.push(PluginFormat::Clap);
+    #[cfg(feature = "lv2")]
+    out.push(PluginFormat::Lv2);
     out
 }
 

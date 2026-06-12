@@ -141,8 +141,8 @@
         <div class="italic">Querying sandbox…</div>
       {:else if availablePlugins.length === 0}
         <div class="italic">
-          No plugins found. (The sandbox sidecar isn't installed, or your LV2_PATH / ~/.clap
-          directories are empty.)
+          No plugins found. (The sandbox sidecar isn't installed/built with plugin support, or your
+          CLAP / LV2 plugin folders are empty.)
         </div>
       {:else}
         {#each availablePlugins as p}

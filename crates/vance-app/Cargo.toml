@@ -26,6 +26,18 @@ default = []
 # Without it, OCIO commands return a clear "not enabled" error.
 ocio = ["vance-ocio/ocio"]
 
+# Third-party audio-plugin support. Each forwards to BOTH the in-process
+# processing path (`vance-audio`, run on the real-time fold thread) AND
+# the sandboxed discovery sidecar (`vance-plugin-host`), so a single
+# opt-in lights up the whole chain — discovery + hosting. Build the app
+# and the sidecar together so feature unification reaches the sidecar
+# binary, e.g.:
+#   cargo build -p vance-app -p vance-plugin-host --features vance-app/clap
+# `clap` is pure-Rust (clack-host + dlopen); `lv2` links system liblilv
+# (`brew install lilv`).
+clap = ["vance-audio/clap", "vance-plugin-host/clap"]
+lv2 = ["vance-audio/lv2", "vance-plugin-host/lv2"]
+
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
@@ -54,6 +66,10 @@ vance-render = { workspace = true }
 vance-viewport = { workspace = true }
 vance-audio = { workspace = true }
 vance-audio-plugins = { workspace = true }
+# Linked only so the app's `clap`/`lv2` features can forward to the
+# sidecar's, building it with matching support in one invocation. The
+# sidecar itself runs as a spawned process, not an in-proc library.
+vance-plugin-host = { workspace = true }
 vance-timeline = { workspace = true }
 vance-project = { workspace = true }
 vance-peaks = { workspace = true }

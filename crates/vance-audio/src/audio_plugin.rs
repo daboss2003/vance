@@ -130,10 +130,42 @@ pub fn instantiate(
     let plugin: Box<dyn AudioPlugin> = match format {
         "builtin" => builtin(id, params)?,
         #[cfg(feature = "clap")]
-        "clap" => crate::clap_host::instantiate(id, params, sample_rate, block)?,
+        "clap" => {
+            // Loading runs untrusted third-party native init via dlopen.
+            // Contain a Rust panic so it degrades to a bypassed slot
+            // instead of taking down the audio thread. NOTE: only helps
+            // under `panic = "unwind"`; under the release `panic =
+            // "abort"` it's a no-op and a segfault is uncatchable —
+            // crash-proof plugin *processing* needs out-of-process
+            // hosting (a tracked follow-up). Discovery already loads
+            // out-of-process; see `vance-plugin-host::clap_discovery`.
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::clap_host::instantiate(id, params, sample_rate, block)
+            })) {
+                Ok(Some(p)) => p,
+                _ => return None,
+            }
+        }
         #[cfg(feature = "lv2")]
         "lv2" => crate::lv2_host::instantiate(id, params, sample_rate, block)?,
-        _ => return None,
+        // A format the binary recognises but wasn't compiled to host
+        // must NOT silently produce dry audio — make the dead route
+        // observable. (When a feature IS on, its gated arm above shadows
+        // this, so the runtime check only fires for not-compiled-in
+        // formats.)
+        other => {
+            if matches!(other, "clap" | "lv2") {
+                tracing::warn!(
+                    format = other,
+                    id,
+                    "audio plugin format not compiled into this build — bypassing slot \
+                     (rebuild with the matching feature, e.g. --features vance-app/clap)"
+                );
+            } else {
+                tracing::warn!(format = other, id, "unknown audio plugin format — bypassing slot");
+            }
+            return None;
+        }
     };
     let _ = sample_rate;
     Some(BlockProcessor::new(plugin, block))

@@ -1590,6 +1590,33 @@ fn list_audio_plugins(_state: tauri::State<'_, EngineHandle>) -> Result<Vec<UiPl
             return Ok(Vec::new());
         }
     };
+
+    // Detect a discovery/processing feature split: the app hosts plugins
+    // in-process (its own `clap`/`lv2` features) while the sidecar
+    // discovers them (its features, reported via the Hello handshake). A
+    // partial build (one rebuilt, the other not) yields a confusing
+    // "plugin added but silent / discovered but unusable" state — warn
+    // loudly so it's diagnosable instead of mysterious.
+    let sidecar_formats = client.supported_formats();
+    let sidecar_has = |f: vance_audio_plugins::PluginFormat| sidecar_formats.contains(&f);
+    for (feat_on, fmt, name) in [
+        (cfg!(feature = "clap"), vance_audio_plugins::PluginFormat::Clap, "CLAP"),
+        (cfg!(feature = "lv2"), vance_audio_plugins::PluginFormat::Lv2, "LV2"),
+    ] {
+        let sidecar_on = sidecar_has(fmt);
+        if feat_on != sidecar_on {
+            tracing::warn!(
+                format = name,
+                app_supports = feat_on,
+                sidecar_supports = sidecar_on,
+                "audio-plugin support is split between the app and its discovery sidecar — \
+                 rebuild BOTH together, e.g. `cargo build -p vance-app -p vance-plugin-host \
+                 --features vance-app/{}`",
+                name.to_lowercase()
+            );
+        }
+    }
+
     let plugins = client.list_plugins().map_err(|e| e.to_string())?;
     // Be tidy — drop the sidecar so we don't leak it just for one query.
     let _ = client.shutdown();
@@ -1597,6 +1624,7 @@ fn list_audio_plugins(_state: tauri::State<'_, EngineHandle>) -> Result<Vec<UiPl
         .into_iter()
         .map(|d| UiPluginDescriptor {
             format: match d.format {
+                vance_audio_plugins::PluginFormat::Builtin => "builtin".into(),
                 vance_audio_plugins::PluginFormat::Lv2 => "lv2".into(),
                 vance_audio_plugins::PluginFormat::Clap => "clap".into(),
             },
