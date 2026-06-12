@@ -1777,8 +1777,9 @@ impl Engine {
                 .render_to_rgba_buffer(w, h)
                 .map_err(|e| EngineError::Project(format!("preview readback: {e}")))?
         };
-        // 2. CPU WASM effects (render_state unlocked).
-        self.apply_wasm_effects(&mut rgba, w, h, effects, clip_t);
+        // 2. CPU WASM effects (render_state unlocked), render-cached so
+        //    a scrub-back to the same (frame, effects) is instant.
+        self.apply_wasm_effects_cached(&mut rgba, w, h, effects, clip_t);
         // 3. Blit to the surface.
         let mut rs = render_state.lock();
         let surface = viewport.surface();
@@ -7645,7 +7646,7 @@ impl Engine {
     ///
     /// `clip_t` is the clip-relative time in seconds (source PTS minus
     /// the clip's source-in), used to evaluate keyframed parameters.
-    pub(crate) fn apply_wasm_effects(
+    pub fn apply_wasm_effects(
         &mut self,
         rgba: &mut [u8],
         w: u32,
@@ -7682,6 +7683,67 @@ impl Engine {
                 tracing::warn!(plugin = %id, ?err, "wasm effect process failed; skipping");
             }
         }
+    }
+
+    /// Phase 9.6 — render-cache-wrapped [`Self::apply_wasm_effects`].
+    /// Keys the cache on `hash(input RGBA) ⊕ hash(effect chain @ clip_t
+    /// + dims)`; a hit returns the previously-processed output without
+    /// re-running the (CPU-expensive) WASM plugins. Used by the live
+    /// preview so scrubbing back to an already-seen (frame, effects)
+    /// pair is instant. The export path stays uncached (linear, every
+    /// frame unique → no hits, only hash overhead).
+    pub fn apply_wasm_effects_cached(
+        &mut self,
+        rgba: &mut [u8],
+        w: u32,
+        h: u32,
+        effects: &[vance_timeline::Effect],
+        clip_t: f64,
+    ) {
+        // Hash the effect chain (id + time-evaluated params + dims).
+        // BTreeMap param iteration is key-sorted → deterministic.
+        let mut chain = vance_cache::Fnv1a64::new();
+        chain.write(&w.to_le_bytes());
+        chain.write(&h.to_le_bytes());
+        let mut any_wasm = false;
+        for e in effects {
+            if !e.enabled {
+                continue;
+            }
+            let Some(id) = e.kind.strip_prefix("wasm:") else {
+                continue;
+            };
+            any_wasm = true;
+            chain.write(id.as_bytes());
+            chain.write(&[0]);
+            for (k, v) in &e.params {
+                if let Some(n) = v.eval_number(clip_t) {
+                    chain.write(k.as_bytes());
+                    chain.write(&n.to_le_bytes());
+                }
+            }
+            chain.write(&[0xff]);
+        }
+        if !any_wasm {
+            return;
+        }
+        let effect_hash = chain.finish();
+        let input_hash = {
+            let mut h = vance_cache::Fnv1a64::new();
+            h.write(rgba);
+            h.finish()
+        };
+        let key = vance_cache::CacheKey::for_render(input_hash, effect_hash);
+        let cache = self.ensure_frame_cache();
+        if let Some(cached) = cache.get(&key) {
+            if cached.len() == rgba.len() {
+                rgba.copy_from_slice(&cached);
+                return;
+            }
+        }
+        // Miss — process then cache.
+        self.apply_wasm_effects(rgba, w, h, effects, clip_t);
+        let _ = cache.put(&key, rgba);
     }
 
     /// Ensure the plugin with manifest `id` is loaded + fresh. Reloads

@@ -29,6 +29,61 @@ fn tools_present() -> bool {
         && Command::new("ffprobe").arg("-version").output().is_ok()
 }
 
+/// Phase 9.6 — the render-cache-wrapped WASM apply must produce the
+/// SAME output as the uncached apply on both the miss (first call) and
+/// the hit (second identical call). Proves the cache doesn't corrupt
+/// the frame + returns the cached output on re-visit.
+#[test]
+fn render_cache_matches_uncached_and_hits_on_revisit() {
+    if !stylize_dir().join("vance_plugin_stylize.wasm").exists() {
+        eprintln!("stylize.wasm not built — skipping render cache test");
+        return;
+    }
+    let w = 16u32;
+    let h = 16u32;
+    let mut input = vec![0u8; (w * h * 4) as usize];
+    for (i, px) in input.chunks_exact_mut(4).enumerate() {
+        px[0] = (i * 5) as u8;
+        px[1] = (i * 9) as u8;
+        px[2] = (i * 3) as u8;
+        px[3] = 255;
+    }
+    let effect = {
+        let mut params: BTreeMap<String, EffectValue> = BTreeMap::new();
+        params.insert("levels".into(), EffectValue::Number(3.0));
+        params.insert("saturation".into(), EffectValue::Number(1.5));
+        // Build an Effect with kind wasm:<id>.
+        vance_timeline::Effect {
+            id: vance_timeline::EffectId::new(),
+            kind: "wasm:com.vance.sample.stylize".into(),
+            enabled: true,
+            params,
+        }
+    };
+
+    let mut engine = Engine::default();
+    engine.new_project("rc".into()).expect("project");
+    assert!(engine.add_plugin_dir(stylize_dir()) >= 1);
+
+    // Uncached reference.
+    let mut a = input.clone();
+    engine.apply_wasm_effects(&mut a, w, h, std::slice::from_ref(&effect), 0.0);
+    assert_ne!(a, input, "effect should change the frame");
+
+    // Cached miss (first) then cached hit (second), both from the same
+    // pristine input.
+    let mut b = input.clone();
+    engine.apply_wasm_effects_cached(&mut b, w, h, std::slice::from_ref(&effect), 0.0);
+    let mut c = input.clone();
+    engine.apply_wasm_effects_cached(&mut c, w, h, std::slice::from_ref(&effect), 0.0);
+
+    assert_eq!(a, b, "cached miss must match uncached");
+    assert_eq!(b, c, "cached hit must match cached miss");
+    // A render-cache entry now exists.
+    let stats = engine.frame_cache_stats().expect("cache stats");
+    assert!(stats.disk_entries >= 1, "render cache entry not created");
+}
+
 fn sidecars_present() -> bool {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug");
     dir.join(if cfg!(windows) { "vance-decoder.exe" } else { "vance-decoder" }).exists()
