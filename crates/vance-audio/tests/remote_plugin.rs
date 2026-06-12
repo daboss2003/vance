@@ -137,6 +137,32 @@ fn sidecar_crash_degrades_to_bypass_then_respawns() {
     assert!(host.process(inst, gen, &block).is_none());
 }
 
+#[test]
+fn mixer_track_dsp_routes_clap_through_sidecar() {
+    let Some((bin, id)) = prerequisites() else {
+        return;
+    };
+    // A track DSP chain with a single CLAP plugin, driven through the
+    // real out-of-process path. After the block-priming latency the
+    // fixture's 0.5x gain must show up at the chain output.
+    let mut host = RemotePluginHost::new(bin, 48_000.0, 512);
+    let spec = vec![vance_audio::AudioEffectKind::Plugin {
+        enabled: true,
+        format_str: "clap".into(),
+        id,
+        name: "Vance Test Gain".into(),
+        params: vec![],
+    }];
+    let mut dsp = vance_audio::TrackDspState::new();
+    dsp.reconcile_with(&spec, 48_000.0, Some(&mut host));
+    let mut last = (0.0f32, 0.0f32);
+    for _ in 0..512 {
+        last = dsp.tick_stereo(&spec, 1.0, 1.0, Some(&mut host));
+    }
+    assert!((last.0 - 0.5).abs() < 1e-2, "L expected ~0.5, got {}", last.0);
+    assert!((last.1 - 0.5).abs() < 1e-2, "R expected ~0.5, got {}", last.1);
+}
+
 #[cfg(unix)]
 fn kill(pid: u32) {
     unsafe {

@@ -3576,7 +3576,18 @@ impl Engine {
         }
         let _ = audio.shutdown();
 
-        // Per-track DSP (EQ / comp / limiter), then sum into master.
+        // Per-track DSP (EQ / comp / limiter / plugins), then sum into
+        // master. CLAP/LV2 plugins process out-of-process through the
+        // sandbox sidecar — the same path as live playback — so an export
+        // applies them too (and a plugin crash bypasses the slot rather
+        // than aborting the render). Shared across tracks; lazily spawned.
+        let mut plugin_host = locate_plugin_host_binary().map(|bin| {
+            vance_audio::remote_plugin::RemotePluginHost::new(
+                bin,
+                sample_rate as f32,
+                vance_audio::audio_plugin::DEFAULT_BLOCK as u32,
+            )
+        });
         for track_id in &audio_tracks {
             let Some(mut buf) = track_bufs.remove(track_id) else {
                 continue;
@@ -3584,10 +3595,14 @@ impl Engine {
             if let Some(tm) = snapshot.tracks.get(track_id) {
                 if !tm.audio_effects.is_empty() {
                     let mut dsp = vance_audio::TrackDspState::new();
-                    dsp.reconcile_with(&tm.audio_effects, sample_rate as f32);
+                    dsp.reconcile_with(&tm.audio_effects, sample_rate as f32, plugin_host.as_mut());
                     for fr in 0..total_frames {
-                        let (nl, nr) =
-                            dsp.tick_stereo(&tm.audio_effects, buf[fr * 2], buf[fr * 2 + 1]);
+                        let (nl, nr) = dsp.tick_stereo(
+                            &tm.audio_effects,
+                            buf[fr * 2],
+                            buf[fr * 2 + 1],
+                            plugin_host.as_mut(),
+                        );
                         buf[fr * 2] = nl;
                         buf[fr * 2 + 1] = nr;
                     }
@@ -6303,6 +6318,7 @@ fn start_audio_mix(
                 command_rx,
                 initial_snapshot,
                 from_seconds,
+                locate_plugin_host_binary(),
             ) {
                 Ok(m) => m,
                 Err(e) => {
@@ -7906,6 +7922,41 @@ fn locate_encoder_binary() -> Result<PathBuf, EngineError> {
 /// 1. Right next to the running `vance-app` executable (production layout).
 /// 2. Same directory under `cargo build` (`target/<profile>/`).
 /// 3. Fallback: `target/debug/vance-decoder` from a workspace-detected root.
+/// Best-effort locate the `vance-plugin-host` sidecar (out-of-process
+/// plugin sandbox). Returns `None` if it can't be found — CLAP/LV2
+/// effects then bypass rather than failing playback. Mirrors the
+/// decoder/encoder locators.
+fn locate_plugin_host_binary() -> Option<PathBuf> {
+    let exe_name = if cfg!(windows) {
+        "vance-plugin-host.exe"
+    } else {
+        "vance-plugin-host"
+    };
+    if let Ok(self_exe) = std::env::current_exe() {
+        if let Some(dir) = self_exe.parent() {
+            let candidate = dir.join(exe_name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            if let Some(parent) = dir.parent() {
+                let alt = parent.join(exe_name);
+                if alt.exists() {
+                    return Some(alt);
+                }
+            }
+        }
+    }
+    for c in [
+        PathBuf::from("target/debug").join(exe_name),
+        PathBuf::from("target/release").join(exe_name),
+    ] {
+        if c.exists() {
+            return Some(c);
+        }
+    }
+    None
+}
+
 fn locate_decoder_binary() -> Result<PathBuf, EngineError> {
     let exe_name = if cfg!(windows) {
         "vance-decoder.exe"

@@ -36,12 +36,13 @@
 #![allow(missing_docs)]
 
 use crate::client::{AudioClient, AudioClientError};
+use crate::remote_plugin::RemotePluginHost;
 use arc_swap::ArcSwap;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use parking_lot::Mutex;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::HeapRb;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -375,10 +376,18 @@ impl TrackDspState {
     /// the same position with the same variant tag are KEPT (only
     /// their params are pushed in via `set`, preserving state). Any
     /// other change rebuilds the affected slots.
-    pub fn reconcile_with(&mut self, spec: &[AudioEffectKind], sample_rate: f32) {
+    pub fn reconcile_with(
+        &mut self,
+        spec: &[AudioEffectKind],
+        sample_rate: f32,
+        mut host: Option<&mut RemotePluginHost>,
+    ) {
         if self.chain.len() != spec.len() {
             self.chain.resize_with(spec.len(), || EffectUnit::Passthrough);
         }
+        // The host's current generation (Copy) — used to detect a sidecar
+        // respawn so out-of-process slots re-instantiate.
+        let host_gen = host.as_deref().map(|h| h.generation());
         for (i, entry) in spec.iter().enumerate() {
             let needs_rebuild = match (&self.chain[i], entry) {
                 (EffectUnit::Eq6(_), AudioEffectKind::Eq6 { .. }) => false,
@@ -386,7 +395,9 @@ impl TrackDspState {
                 (EffectUnit::Limiter(_), AudioEffectKind::Limiter { .. }) => false,
                 // Rebuild a plugin only when its identity or params
                 // change — a bare enable/disable toggle keeps the warm
-                // instance (so its internal state isn't reset).
+                // instance (so its internal state isn't reset). Remote
+                // slots also rebuild when the sidecar was respawned (a new
+                // generation), so the stale instance is re-instantiated.
                 (
                     EffectUnit::Plugin(slot),
                     AudioEffectKind::Plugin {
@@ -395,11 +406,16 @@ impl TrackDspState {
                         params,
                         ..
                     },
-                ) => slot.format_str != *format_str || slot.id != *id || slot.params != *params,
+                ) => {
+                    slot.format_str != *format_str
+                        || slot.id != *id
+                        || slot.params != *params
+                        || slot.remote_stale(host_gen)
+                }
                 _ => true,
             };
             if needs_rebuild {
-                self.chain[i] = EffectUnit::new(entry, sample_rate);
+                self.chain[i] = EffectUnit::new(entry, sample_rate, host.as_deref_mut());
             }
             // Push the latest params; this updates without resetting
             // the DSP state.
@@ -429,8 +445,16 @@ impl TrackDspState {
     }
 
     /// Apply the chain to one stereo sample. Disabled entries bypass.
+    /// `host` is the out-of-process plugin connection (CLAP/LV2 slots run
+    /// through it); built-in/DSP slots ignore it.
     #[inline]
-    pub fn tick_stereo(&mut self, spec: &[AudioEffectKind], mut l: f32, mut r: f32) -> (f32, f32) {
+    pub fn tick_stereo(
+        &mut self,
+        spec: &[AudioEffectKind],
+        mut l: f32,
+        mut r: f32,
+        mut host: Option<&mut RemotePluginHost>,
+    ) -> (f32, f32) {
         for (unit, entry) in self.chain.iter_mut().zip(spec.iter()) {
             let enabled = match entry {
                 AudioEffectKind::Eq6 { enabled, .. }
@@ -463,12 +487,21 @@ impl TrackDspState {
                     r = nr;
                 }
                 (EffectUnit::Plugin(slot), AudioEffectKind::Plugin { .. }) => {
-                    if let Some(proc) = slot.proc.as_mut() {
-                        let (nl, nr) = proc.tick(l, r);
-                        l = nl;
-                        r = nr;
+                    match &mut slot.kind {
+                        SlotKind::Local(Some(proc)) => {
+                            let (nl, nr) = proc.tick(l, r);
+                            l = nl;
+                            r = nr;
+                        }
+                        SlotKind::Remote(rs) => {
+                            let (nl, nr) = rs.tick(l, r, host.as_deref_mut());
+                            l = nl;
+                            r = nr;
+                        }
+                        // Local(None) / Bypass → unknown plugin / no
+                        // sidecar → pass through unchanged.
+                        SlotKind::Local(None) | SlotKind::Bypass => {}
                     }
-                    // proc == None (unknown plugin) → bypass.
                 }
                 // Mismatched variant (e.g. spec changed but reconcile
                 // not yet called). Silently bypass — the next reconcile
@@ -486,15 +519,110 @@ impl Default for TrackDspState {
     }
 }
 
-/// A fold-thread audio plugin slot: the real in-process processor plus
-/// the inputs it was built from (for cheap rebuild detection on
-/// reconcile). `proc` is `None` when the plugin id is unknown — the
-/// slot then bypasses (audio passes through unchanged).
+/// A fold-thread audio plugin slot: the processor plus the inputs it was
+/// built from (for cheap rebuild detection on reconcile). Built-in
+/// effects run in-process; CLAP runs out-of-process in the sandbox
+/// sidecar (a crash there bypasses the slot instead of killing the
+/// editor).
 struct PluginSlot {
     format_str: String,
     id: String,
     params: Vec<(u32, f32)>,
-    proc: Option<crate::audio_plugin::BlockProcessor>,
+    kind: SlotKind,
+}
+
+/// How a [`PluginSlot`] processes audio.
+enum SlotKind {
+    /// In-process built-in effect (gain / identity). `None` = unknown id
+    /// → the slot bypasses.
+    Local(Option<crate::audio_plugin::BlockProcessor>),
+    /// Out-of-process CLAP (or LV2) via the sandbox sidecar.
+    Remote(RemoteSlot),
+    /// No processor available (no sidecar / unknown format) → bypass.
+    Bypass,
+}
+
+/// Out-of-process plugin slot: a block accumulator that ships each full
+/// block to the sidecar via [`RemotePluginHost`] and queues the result.
+/// Introduces block latency (parity with the in-process
+/// [`crate::audio_plugin::BlockProcessor`]); a sidecar crash / hang makes
+/// `process` return `None` and the block passes through unchanged.
+struct RemoteSlot {
+    /// `(instance_id, generation)` from the host; `None` if instantiate
+    /// failed (the slot then bypasses).
+    instance: Option<(Uuid, u64)>,
+    /// Host generation at which instantiate was last attempted, so we
+    /// only retry on a respawn (avoids hammering a failing bundle).
+    attempted_gen: Option<u64>,
+    block: usize,
+    in_l: Vec<f32>,
+    in_r: Vec<f32>,
+    fill: usize,
+    /// Interleaved scratch reused across blocks (no per-block alloc here).
+    scratch: Vec<f32>,
+    out_l: VecDeque<f32>,
+    out_r: VecDeque<f32>,
+}
+
+impl RemoteSlot {
+    fn new(block: usize, instance: Option<(Uuid, u64)>, attempted_gen: Option<u64>) -> Self {
+        Self {
+            instance,
+            attempted_gen,
+            block,
+            in_l: vec![0.0; block],
+            in_r: vec![0.0; block],
+            fill: 0,
+            scratch: vec![0.0; block * 2],
+            out_l: VecDeque::with_capacity(block * 2),
+            out_r: VecDeque::with_capacity(block * 2),
+        }
+    }
+
+    /// Process one stereo sample (block-buffered). `host` is the live
+    /// sidecar connection; `None` (or a dead/failed instance) → the slot
+    /// passes audio through unchanged.
+    #[inline]
+    fn tick(&mut self, l: f32, r: f32, host: Option<&mut RemotePluginHost>) -> (f32, f32) {
+        self.in_l[self.fill] = l;
+        self.in_r[self.fill] = r;
+        self.fill += 1;
+        if self.fill >= self.block {
+            self.flush(host);
+            self.fill = 0;
+        }
+        match (self.out_l.pop_front(), self.out_r.pop_front()) {
+            (Some(a), Some(b)) => (a, b),
+            _ => (0.0, 0.0), // priming silence until the first block lands
+        }
+    }
+
+    fn flush(&mut self, host: Option<&mut RemotePluginHost>) {
+        let n = self.block;
+        for i in 0..n {
+            self.scratch[2 * i] = self.in_l[i];
+            self.scratch[2 * i + 1] = self.in_r[i];
+        }
+        let processed = match (host, self.instance) {
+            (Some(h), Some((id, gen))) => h.process(id, gen, &self.scratch),
+            _ => None,
+        };
+        match processed {
+            Some(out) if out.len() == n * 2 => {
+                for i in 0..n {
+                    self.out_l.push_back(out[2 * i]);
+                    self.out_r.push_back(out[2 * i + 1]);
+                }
+            }
+            // No host / crash / wrong length → passthrough unchanged.
+            _ => {
+                for i in 0..n {
+                    self.out_l.push_back(self.in_l[i]);
+                    self.out_r.push_back(self.in_r[i]);
+                }
+            }
+        }
+    }
 }
 
 enum EffectUnit {
@@ -508,8 +636,88 @@ enum EffectUnit {
     Plugin(Box<PluginSlot>),
 }
 
+impl PluginSlot {
+    /// Build a slot for a plugin spec. Built-in formats host in-process;
+    /// CLAP/LV2 go out-of-process through `host` (or bypass when no
+    /// sidecar is available).
+    fn new(
+        format_str: &str,
+        id: &str,
+        params: &[(u32, f32)],
+        sample_rate: f32,
+        host: Option<&mut RemotePluginHost>,
+    ) -> Self {
+        let block = crate::audio_plugin::DEFAULT_BLOCK;
+        let kind = match format_str {
+            "builtin" => SlotKind::Local(crate::audio_plugin::instantiate(
+                "builtin",
+                id,
+                params,
+                sample_rate,
+                block,
+            )),
+            // Everything third-party hosts out-of-process so a plugin
+            // crash can't take down the editor.
+            "clap" | "lv2" => match host {
+                Some(h) => {
+                    let descriptor = vance_audio_plugins::PluginDescriptor {
+                        format: if format_str == "clap" {
+                            vance_audio_plugins::PluginFormat::Clap
+                        } else {
+                            vance_audio_plugins::PluginFormat::Lv2
+                        },
+                        id: id.to_string(),
+                        name: String::new(),
+                        vendor: String::new(),
+                        runnable: true,
+                    };
+                    let inst = h.instantiate(descriptor);
+                    // The generation we attempted under: the one the
+                    // instance was created at, or (on failure) the host's
+                    // current generation — so we only retry on a respawn.
+                    let attempted = Some(inst.map(|(_, g)| g).unwrap_or_else(|| h.generation()));
+                    SlotKind::Remote(RemoteSlot::new(block, inst, attempted))
+                }
+                None => {
+                    tracing::warn!(
+                        format = format_str,
+                        id,
+                        "no plugin sidecar — CLAP/LV2 effect bypassed"
+                    );
+                    SlotKind::Bypass
+                }
+            },
+            other => {
+                tracing::warn!(format = other, id, "unknown plugin format — bypassed");
+                SlotKind::Bypass
+            }
+        };
+        PluginSlot {
+            format_str: format_str.to_string(),
+            id: id.to_string(),
+            params: params.to_vec(),
+            kind,
+        }
+    }
+
+    /// Whether an out-of-process slot needs re-instantiation because the
+    /// sidecar generation changed (a respawn after a crash/hang, or a
+    /// host appearing where there was none). Local/bypass slots never go
+    /// stale this way.
+    fn remote_stale(&self, host_gen: Option<u64>) -> bool {
+        match &self.kind {
+            SlotKind::Remote(rs) => rs.attempted_gen != host_gen,
+            _ => false,
+        }
+    }
+}
+
 impl EffectUnit {
-    fn new(spec: &AudioEffectKind, sample_rate: f32) -> Self {
+    fn new(
+        spec: &AudioEffectKind,
+        sample_rate: f32,
+        host: Option<&mut RemotePluginHost>,
+    ) -> Self {
         match spec {
             AudioEffectKind::Eq6 { bands, .. } => {
                 let mut units = Box::new([crate::dsp::Biquad::identity(); 6]);
@@ -541,21 +749,13 @@ impl EffectUnit {
                 id,
                 params,
                 ..
-            } => {
-                let proc = crate::audio_plugin::instantiate(
-                    format_str,
-                    id,
-                    params,
-                    sample_rate,
-                    crate::audio_plugin::DEFAULT_BLOCK,
-                );
-                EffectUnit::Plugin(Box::new(PluginSlot {
-                    format_str: format_str.clone(),
-                    id: id.clone(),
-                    params: params.clone(),
-                    proc,
-                }))
-            }
+            } => EffectUnit::Plugin(Box::new(PluginSlot::new(
+                format_str,
+                id,
+                params,
+                sample_rate,
+                host,
+            ))),
         }
     }
 }
@@ -895,6 +1095,7 @@ impl AudioMixer {
         command_rx: mpsc::Receiver<SourceCommand>,
         initial_snapshot: MixerSnapshot,
         playback_start_timeline_seconds: f64,
+        plugin_host_bin: Option<PathBuf>,
     ) -> Result<Self, AudioMixerError> {
         // 1. Cpal output device — same shape as AudioPlayer.
         let host = cpal::default_host();
@@ -979,6 +1180,7 @@ impl AudioMixer {
                     channels,
                     sample_rate,
                     playback_start_timeline_seconds,
+                    plugin_host_bin,
                 );
             })
             .map_err(|e| AudioMixerError::Spawn {
@@ -1369,6 +1571,7 @@ impl MeterAccum {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn fold_loop(
     initial_sources: Vec<SourceStream>,
     command_rx: mpsc::Receiver<SourceCommand>,
@@ -1380,6 +1583,7 @@ fn fold_loop(
     channels: usize,
     sample_rate: u32,
     playback_start_timeline_seconds: f64,
+    plugin_host_bin: Option<PathBuf>,
 ) {
     if channels != 2 {
         tracing::error!(
@@ -1421,6 +1625,13 @@ fn fold_loop(
     // keep the map bounded.
     let mut track_dsp_states: HashMap<Uuid, TrackDspState> = HashMap::new();
     let sample_rate_f32 = sample_rate as f32;
+    // Out-of-process plugin host (CLAP/LV2). Created here but the sidecar
+    // is spawned lazily on the first plugin instantiate, so tracks with no
+    // plugins pay nothing. `None` when no sidecar binary is available —
+    // CLAP slots then bypass.
+    let mut plugin_host: Option<RemotePluginHost> = plugin_host_bin.map(|bin| {
+        RemotePluginHost::new(bin, sample_rate_f32, crate::audio_plugin::DEFAULT_BLOCK as u32)
+    });
     // Phase 7.8 — master-bus loudness + true-peak. One meter per
     // fold loop instance; the engine's playback start resets this
     // because the AudioMixer is constructed fresh on every play.
@@ -1491,7 +1702,11 @@ fn fold_loop(
                 track_dsp_states.remove(track_id);
             } else {
                 let state = track_dsp_states.entry(*track_id).or_default();
-                state.reconcile_with(&track.audio_effects, sample_rate_f32);
+                state.reconcile_with(
+                    &track.audio_effects,
+                    sample_rate_f32,
+                    plugin_host.as_mut(),
+                );
             }
         }
         track_dsp_states.retain(|id, _| snap.tracks.contains_key(id));
@@ -1597,7 +1812,8 @@ fn fold_loop(
                 if let Some(track) = snap.tracks.get(&track_id) {
                     if !track.audio_effects.is_empty() {
                         let dsp = track_dsp_states.entry(track_id).or_default();
-                        let (nl, nr) = dsp.tick_stereo(&track.audio_effects, l, r);
+                        let (nl, nr) =
+                            dsp.tick_stereo(&track.audio_effects, l, r, plugin_host.as_mut());
                         l = nl;
                         r = nr;
                     }
@@ -2311,8 +2527,8 @@ mod tests {
     #[test]
     fn track_dsp_state_passthrough_with_empty_chain() {
         let mut state = TrackDspState::new();
-        state.reconcile_with(&[], 48_000.0);
-        let (l, r) = state.tick_stereo(&[], 0.5, -0.3);
+        state.reconcile_with(&[], 48_000.0, None);
+        let (l, r) = state.tick_stereo(&[], 0.5, -0.3, None);
         assert!((l - 0.5).abs() < 1e-6);
         assert!((r - (-0.3)).abs() < 1e-6);
     }
@@ -2329,12 +2545,12 @@ mod tests {
             params: vec![(0, -6.0206)],
         }];
         let mut state = TrackDspState::new();
-        state.reconcile_with(&spec, 48_000.0);
+        state.reconcile_with(&spec, 48_000.0, None);
         // Drive a constant 1.0; after the block-priming latency the
         // output settles to ≈0.5.
         let mut last = 0.0f32;
         for _ in 0..256 {
-            last = state.tick_stereo(&spec, 1.0, 1.0).0;
+            last = state.tick_stereo(&spec, 1.0, 1.0, None).0;
         }
         assert!((last - 0.5).abs() < 1e-2, "plugin gain not applied: {last}");
     }
@@ -2349,8 +2565,8 @@ mod tests {
             params: vec![(0, -60.0)], // would be near-silent if applied
         }];
         let mut state = TrackDspState::new();
-        state.reconcile_with(&spec, 48_000.0);
-        let (l, _) = state.tick_stereo(&spec, 1.0, 1.0);
+        state.reconcile_with(&spec, 48_000.0, None);
+        let (l, _) = state.tick_stereo(&spec, 1.0, 1.0, None);
         assert!((l - 1.0).abs() < 1e-6, "disabled plugin must pass through");
     }
 
@@ -2364,48 +2580,39 @@ mod tests {
             params: vec![],
         }];
         let mut state = TrackDspState::new();
-        state.reconcile_with(&spec, 48_000.0);
+        state.reconcile_with(&spec, 48_000.0, None);
         // No CLAP plugin by that id → proc is None → bypass, not a crash.
-        let (l, r) = state.tick_stereo(&spec, 0.7, -0.4);
+        let (l, r) = state.tick_stereo(&spec, 0.7, -0.4, None);
         assert!((l - 0.7).abs() < 1e-6 && (r - (-0.4)).abs() < 1e-6);
     }
 
-    #[cfg(feature = "clap")]
+    // NOTE: CLAP now processes OUT-OF-PROCESS through the sidecar, so the
+    // real-plugin path is covered by the `tests/remote_plugin.rs`
+    // integration suite (which drives a live sidecar) rather than a
+    // unit test here. A `clap` slot with no host bypasses — see
+    // `track_dsp_state_clap_without_host_bypasses` below.
+
     #[test]
-    fn track_dsp_state_real_clap_plugin_processes_audio() {
-        // Drive the full discovery→processing contract: a `clap`-format
-        // effect whose id is the discovery-style composite
-        // `"<bundle>::<plugin-id>"` must load via clack-host and apply
-        // the fixture's fixed 0.5x gain through the mixer chain.
-        let (prefix, ext) = if cfg!(target_os = "windows") {
-            ("", "dll")
-        } else if cfg!(target_os = "macos") {
-            ("lib", "dylib")
-        } else {
-            ("lib", "so")
-        };
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/debug")
-            .join(format!("{prefix}vance_clap_testplugin.{ext}"));
-        if !path.exists() {
-            eprintln!("clap test fixture not built — skipping mixer clap test");
-            return;
-        }
-        let id = format!("{}::vance.test.gain", path.to_string_lossy());
+    fn track_dsp_state_clap_without_host_bypasses() {
+        // With no sidecar (host = None), a CLAP effect must pass audio
+        // through unchanged rather than panic or silence the track.
         let spec = vec![AudioEffectKind::Plugin {
             enabled: true,
             format_str: "clap".into(),
-            id,
-            name: "Vance Test Gain".into(),
+            id: "/some/bundle.clap::com.x".into(),
+            name: "X".into(),
             params: vec![],
         }];
         let mut state = TrackDspState::new();
-        state.reconcile_with(&spec, 48_000.0);
-        let mut last = 0.0f32;
+        state.reconcile_with(&spec, 48_000.0, None);
+        // Run enough samples to cross a block boundary; output equals
+        // input (passthrough), never silence.
+        let mut last = (0.0, 0.0);
         for _ in 0..256 {
-            last = state.tick_stereo(&spec, 1.0, 1.0).0;
+            last = state.tick_stereo(&spec, 0.7, -0.3, None);
         }
-        assert!((last - 0.5).abs() < 1e-2, "real CLAP gain not applied: {last}");
+        assert!((last.0 - 0.7).abs() < 1e-6, "L not passthrough: {}", last.0);
+        assert!((last.1 - (-0.3)).abs() < 1e-6, "R not passthrough: {}", last.1);
     }
 
     #[test]
@@ -2418,10 +2625,10 @@ mod tests {
             },
         }];
         let mut state = TrackDspState::new();
-        state.reconcile_with(&spec, 48_000.0);
+        state.reconcile_with(&spec, 48_000.0, None);
         // Even though a limiter is in the chain, `enabled = false`
         // must result in pass-through.
-        let (l, _) = state.tick_stereo(&spec, 1.0, 1.0);
+        let (l, _) = state.tick_stereo(&spec, 1.0, 1.0, None);
         assert!((l - 1.0).abs() < 1e-6);
     }
 
@@ -2435,10 +2642,10 @@ mod tests {
             },
         }];
         let mut state = TrackDspState::new();
-        state.reconcile_with(&spec, 48_000.0);
+        state.reconcile_with(&spec, 48_000.0, None);
         let mut peak = 0.0f32;
         for _ in 0..1024 {
-            let (l, _) = state.tick_stereo(&spec, 1.0, 1.0);
+            let (l, _) = state.tick_stereo(&spec, 1.0, 1.0, None);
             peak = peak.max(l.abs());
         }
         let ceiling = 10f32.powf(-3.0 / 20.0);
@@ -2464,18 +2671,18 @@ mod tests {
             },
         }];
         let mut state = TrackDspState::new();
-        state.reconcile_with(&spec, 48_000.0);
+        state.reconcile_with(&spec, 48_000.0, None);
         // Pump signal to build envelope.
         for _ in 0..2048 {
-            state.tick_stereo(&spec, 1.0, 1.0);
+            state.tick_stereo(&spec, 1.0, 1.0, None);
         }
         // Now tweak ratio — must keep variant (no rebuild), only update params.
         if let AudioEffectKind::Compressor { params, .. } = &mut spec[0] {
             params.ratio = 8.0;
         }
-        state.reconcile_with(&spec, 48_000.0);
+        state.reconcile_with(&spec, 48_000.0, None);
         // Tick once more; gain should still be reduced (envelope didn't reset).
-        let (l, _) = state.tick_stereo(&spec, 1.0, 1.0);
+        let (l, _) = state.tick_stereo(&spec, 1.0, 1.0, None);
         assert!(
             l.abs() < 0.7,
             "param-update must preserve compressor envelope (got |l|={})",
@@ -2498,7 +2705,7 @@ mod tests {
             },
         }];
         let mut state = TrackDspState::new();
-        state.reconcile_with(&spec, 48_000.0);
+        state.reconcile_with(&spec, 48_000.0, None);
         // Swap variant.
         spec = vec![AudioEffectKind::Limiter {
             enabled: true,
@@ -2507,9 +2714,9 @@ mod tests {
                 release_ms: 50.0,
             },
         }];
-        state.reconcile_with(&spec, 48_000.0);
+        state.reconcile_with(&spec, 48_000.0, None);
         // Tick — must not panic, must produce finite output.
-        let (l, r) = state.tick_stereo(&spec, 0.5, 0.5);
+        let (l, r) = state.tick_stereo(&spec, 0.5, 0.5, None);
         assert!(l.is_finite() && r.is_finite());
     }
 
