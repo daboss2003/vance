@@ -273,6 +273,13 @@ impl PluginClient {
         &self.supported_formats
     }
 
+    /// OS PID of the sidecar process, if it's still running. Used by the
+    /// out-of-process host's watchdog to kill a hung sidecar (the owning
+    /// thread is blocked in the IPC call and can't kill it via `&mut`).
+    pub fn pid(&self) -> Option<u32> {
+        self.sidecar.pid()
+    }
+
     /// Enumerate every plugin the sidecar can see.
     pub fn list_plugins(&mut self) -> Result<Vec<PluginDescriptor>, PluginClientError> {
         match self.sidecar.request(&PluginRequest::ListPlugins)? {

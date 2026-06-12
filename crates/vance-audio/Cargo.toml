@@ -57,5 +57,23 @@ default = []
 clap = ["dep:clack-host", "dep:clack-extensions"]
 lv2 = ["dep:livi"]
 
+# The out-of-process plugin watchdog kills a hung sidecar by PID (the
+# fold thread is blocked in IPC and can't kill its own client). std has
+# no portable kill-by-pid, so reach for the platform primitive.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 bincode = { version = "2", features = ["serde"] }
+# Integration tests don't inherit the lib's deps, so re-declare the few
+# the remote-plugin test drives directly.
+uuid = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

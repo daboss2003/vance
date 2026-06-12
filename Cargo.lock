@@ -5772,6 +5772,7 @@ dependencies = [
  "clack-extensions",
  "clack-host",
  "cpal",
+ "libc",
  "livi",
  "parking_lot 0.12.5",
  "ringbuf 0.4.8",
@@ -5783,6 +5784,7 @@ dependencies = [
  "vance-audio-plugins",
  "vance-core",
  "vance-ipc",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -30,6 +30,7 @@ pub mod loudness;
 pub mod mixer;
 pub mod player;
 pub mod protocol;
+pub mod remote_plugin;
 
 pub use client::{AudioClient, AudioClientError};
 pub use mixer::{
