@@ -493,6 +493,8 @@ checksum = "0f7a09059637aa2043aeaab65e1d95bc91f340da1f05512c0c00e6e0283e5d9b"
 dependencies = [
  "bitflags 2.11.1",
  "clack-common",
+ "clack-host",
+ "clack-plugin",
  "clap-sys",
 ]
 
@@ -5818,6 +5820,7 @@ dependencies = [
 name = "vance-clap-testplugin"
 version = "0.0.0"
 dependencies = [
+ "clack-extensions",
  "clack-plugin",
 ]
 
@@ -5959,6 +5962,7 @@ dependencies = [
 name = "vance-plugin-host"
 version = "0.0.0"
 dependencies = [
+ "clack-extensions",
  "clack-host",
  "serde",
  "serde_json",

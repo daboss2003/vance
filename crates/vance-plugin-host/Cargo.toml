@@ -26,6 +26,12 @@ uuid = { workspace = true }
 # (pure-Rust + dlopen). Feature-gated so the default build pulls in
 # nothing extra and runs without any plugins installed.
 clack-host = { version = "0.1", optional = true }
+# `params` extension (host side): enumerate a plugin's parameters + push
+# param-value events so the FX panel's knobs actually affect the audio.
+clack-extensions = { version = "0.1", optional = true, features = [
+    "params",
+    "clack-host",
+] }
 
 # The actual plugin runtimes are feature-gated so the binary builds
 # cleanly even when the system libraries (liblilv for LV2) aren't
@@ -33,4 +39,4 @@ clack-host = { version = "0.1", optional = true }
 [features]
 default = []
 lv2 = []
-clap = ["dep:clack-host"]
+clap = ["dep:clack-host", "dep:clack-extensions"]

@@ -13,8 +13,12 @@
 //! doesn't do it yet either); `process` runs audio with empty event
 //! streams, matching that behaviour exactly.
 
+use clack_extensions::params::{ParamInfoBuffer, PluginParams};
+use clack_host::events::event_types::ParamValueEvent;
 use clack_host::events::io::{InputEvents, OutputEvents};
+use clack_host::events::Pckn;
 use clack_host::prelude::*;
+use clack_host::utils::Cookie;
 use std::collections::HashMap;
 use uuid::Uuid;
 use vance_audio_plugins::{split_clap_id, PluginDescriptor, PluginFormat, PluginParam};
@@ -41,15 +45,24 @@ impl HostHandlers for VanceHost {
 /// for Drop: the processor must drop before the instance.
 struct Instance {
     processor: Option<StartedPluginAudioProcessor<VanceHost>>,
-    _instance: PluginInstance<VanceHost>,
+    instance: PluginInstance<VanceHost>,
     in_ports: AudioPorts,
     out_ports: AudioPorts,
     in_l: Vec<f32>,
     in_r: Vec<f32>,
     out_l: Vec<f32>,
     out_r: Vec<f32>,
+    /// Plugin output events (we don't act on them — drained + cleared).
     event_out: EventBuffer,
+    /// Parameter-value events to feed the plugin on the next `process`.
+    event_in: EventBuffer,
     max_block: usize,
+    /// Parameters enumerated at instantiate (for the FX UI).
+    params: Vec<PluginParam>,
+    /// Desired parameter values set by the host UI (param_id → value).
+    pending: HashMap<u32, f32>,
+    /// Param ids changed since the last `process`, to emit as events.
+    dirty: Vec<u32>,
 }
 
 /// Hosts CLAP instances in the sidecar process.
@@ -115,6 +128,9 @@ impl PluginBackend for ClapBackend {
             PluginInstance::<VanceHost>::new(|_| VanceHostShared, |_| (), &entry, &plugin_id, &host_info)
                 .map_err(|e| format!("instantiate `{plugin_id:?}`: {e:?}"))?;
 
+        // Enumerate parameters on the main thread (before activation).
+        let params = enumerate_params(&mut instance);
+
         let config = PluginAudioConfiguration {
             sample_rate: sample_rate as f64,
             min_frames_count: 1,
@@ -132,7 +148,7 @@ impl PluginBackend for ClapBackend {
             id,
             Instance {
                 processor: Some(started),
-                _instance: instance,
+                instance,
                 in_ports: AudioPorts::with_capacity(2, 1),
                 out_ports: AudioPorts::with_capacity(2, 1),
                 in_l: vec![0.0; max_block],
@@ -140,7 +156,11 @@ impl PluginBackend for ClapBackend {
                 out_l: vec![0.0; max_block],
                 out_r: vec![0.0; max_block],
                 event_out: EventBuffer::new(),
+                event_in: EventBuffer::new(),
                 max_block,
+                params,
+                pending: HashMap::new(),
+                dirty: Vec::new(),
             },
         );
         Ok(id)
@@ -165,6 +185,26 @@ impl PluginBackend for ClapBackend {
             inst.in_r[i] = frames_in[2 * i + 1];
         }
 
+        // Build parameter-value events for any pending changes.
+        inst.event_in.clear();
+        if !inst.dirty.is_empty() {
+            let dirty: Vec<u32> = inst.dirty.drain(..).collect();
+            for pid in dirty {
+                let (Some(clap_id), Some(&value)) = (ClapId::from_raw(pid), inst.pending.get(&pid))
+                else {
+                    continue;
+                };
+                let ev = ParamValueEvent::new(
+                    0,
+                    clap_id,
+                    Pckn::match_all(),
+                    value as f64,
+                    Cookie::empty(),
+                );
+                inst.event_in.push(&ev);
+            }
+        }
+
         let Some(proc) = inst.processor.as_mut() else {
             // No processor → passthrough (truncated to n frames).
             return Ok(frames_in[..n * 2].to_vec());
@@ -187,7 +227,7 @@ impl PluginBackend for ClapBackend {
             ),
         }]);
 
-        let input_events = InputEvents::empty();
+        let input_events = InputEvents::from_buffer(&inst.event_in);
         let mut output_events = OutputEvents::from_buffer(&mut inst.event_out);
         let res = proc.process(
             &input_audio,
@@ -213,28 +253,57 @@ impl PluginBackend for ClapBackend {
     }
 
     fn list_params(&self, instance: Uuid) -> Result<Vec<PluginParam>, String> {
-        // Parameter enumeration over the CLAP params extension is a
-        // follow-up; for now report none (matches the in-process host).
-        if self.instances.contains_key(&instance) {
-            Ok(Vec::new())
-        } else {
-            Err(format!("no such plugin instance `{instance}`"))
-        }
+        self.instances
+            .get(&instance)
+            .map(|inst| inst.params.clone())
+            .ok_or_else(|| format!("no such plugin instance `{instance}`"))
     }
 
-    fn set_param(&mut self, instance: Uuid, _param_id: u32, _value: f32) -> Result<(), String> {
-        // CLAP parameter automation needs param events on the process
-        // call; not wired yet (parity with the in-process host). Accept
-        // the call so the parent's chain stays consistent.
-        if self.instances.contains_key(&instance) {
-            Ok(())
-        } else {
-            Err(format!("no such plugin instance `{instance}`"))
+    fn set_param(&mut self, instance: Uuid, param_id: u32, value: f32) -> Result<(), String> {
+        let inst = self
+            .instances
+            .get_mut(&instance)
+            .ok_or_else(|| format!("no such plugin instance `{instance}`"))?;
+        // Store the desired value + mark it dirty so the next `process`
+        // feeds it to the plugin as a CLAP param-value event.
+        inst.pending.insert(param_id, value);
+        if !inst.dirty.contains(&param_id) {
+            inst.dirty.push(param_id);
         }
+        Ok(())
     }
 
     fn destroy(&mut self, instance: Uuid) -> Result<(), String> {
         self.instances.remove(&instance);
         Ok(())
     }
+}
+
+/// Enumerate a plugin's parameters via the CLAP `params` extension. Runs
+/// on the main thread (call before activation). Returns an empty list for
+/// plugins that don't expose the extension.
+fn enumerate_params(instance: &mut PluginInstance<VanceHost>) -> Vec<PluginParam> {
+    let mut handle = instance.plugin_handle();
+    let Some(ext) = handle.get_extension::<PluginParams>() else {
+        return Vec::new();
+    };
+    let count = ext.count(&mut handle);
+    let mut out = Vec::with_capacity(count as usize);
+    let mut buf = ParamInfoBuffer::default();
+    for index in 0..count {
+        let Some(info) = ext.get_info(&mut handle, index, &mut buf) else {
+            continue;
+        };
+        let name = String::from_utf8_lossy(info.name)
+            .trim_end_matches('\0')
+            .to_string();
+        out.push(PluginParam {
+            id: info.id.get(),
+            name,
+            min: info.min_value as f32,
+            max: info.max_value as f32,
+            default: info.default_value as f32,
+        });
+    }
+    out
 }

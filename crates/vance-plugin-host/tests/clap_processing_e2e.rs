@@ -63,6 +63,50 @@ fn processes_clap_block_out_of_process() {
 }
 
 #[test]
+fn clap_param_change_affects_audio() {
+    let Some(dylib) = fixture_dylib() else {
+        eprintln!("clap test fixture not built — skipping param e2e");
+        return;
+    };
+    let mut client = PluginClient::spawn(sidecar_exe()).expect("spawn sidecar");
+    let descriptor = PluginDescriptor {
+        format: PluginFormat::Clap,
+        id: format!("{}::vance.test.gain", dylib.to_string_lossy()),
+        name: "Vance Test Gain".into(),
+        vendor: "vance".into(),
+        runnable: true,
+    };
+    let inst = client.instantiate(descriptor, 48_000.0, 512).expect("instantiate");
+
+    // The fixture exposes a single automatable `Gain` parameter.
+    let params = client.list_params(inst).expect("list_params");
+    assert!(
+        params.iter().any(|p| p.id == 0 && p.name == "Gain"),
+        "expected a Gain param, got {params:?}"
+    );
+
+    let block = vec![1.0f32; 64 * 2];
+    let mean = |v: &[f32]| v.iter().copied().sum::<f32>() / v.len() as f32;
+
+    // Default gain 0.5.
+    let out = client.process(inst, &block).expect("process");
+    assert!((mean(&out) - 0.5).abs() < 1e-3, "default ~0.5, got {}", mean(&out));
+
+    // Set gain to 0.0 → silence.
+    client.set_param(inst, 0, 0.0).expect("set_param 0");
+    let out = client.process(inst, &block).expect("process");
+    assert!(mean(&out).abs() < 1e-3, "gain 0 → silence, got {}", mean(&out));
+
+    // Set gain to 1.0 → unity.
+    client.set_param(inst, 0, 1.0).expect("set_param 1");
+    let out = client.process(inst, &block).expect("process");
+    assert!((mean(&out) - 1.0).abs() < 1e-3, "gain 1 → unity, got {}", mean(&out));
+
+    client.destroy(inst).expect("destroy");
+    client.shutdown().expect("shutdown");
+}
+
+#[test]
 fn unknown_clap_id_errors_without_crashing() {
     let mut client = PluginClient::spawn(sidecar_exe()).expect("spawn sidecar");
     let descriptor = PluginDescriptor {

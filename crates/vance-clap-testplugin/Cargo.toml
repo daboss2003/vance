@@ -18,3 +18,6 @@ path = "src/lib.rs"
 
 [dependencies]
 clack-plugin = "0.1"
+# The `params` extension lets the fixture expose a `gain` parameter so
+# the host's CLAP param plumbing can be verified end-to-end.
+clack-extensions = { version = "0.1", features = ["params", "clack-plugin"] }
