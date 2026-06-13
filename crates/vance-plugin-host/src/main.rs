@@ -51,11 +51,13 @@ fn main() -> Result<()> {
         PluginRequest::ListPlugins => {
             let plugins = cached_plugins
                 .get_or_insert_with(|| {
-                    // Built-in stubs first, then every discovered CLAP
-                    // plugin on the system (scanned + enumerated once,
-                    // then cached for the life of the sidecar).
+                    // Built-in stubs first, then every discovered CLAP +
+                    // LV2 plugin on the system (enumerated once, cached for
+                    // the life of the sidecar).
                     let mut list = router.list_builtin();
                     list.extend(vance_plugin_host::clap_discovery::discover());
+                    #[cfg(feature = "lv2")]
+                    list.extend(vance_plugin_host::lv2_backend::discover());
                     list
                 })
                 .clone();

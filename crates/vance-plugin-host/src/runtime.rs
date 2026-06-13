@@ -190,6 +190,8 @@ enum Owner {
     Stub,
     #[cfg(feature = "clap")]
     Clap,
+    #[cfg(feature = "lv2")]
+    Lv2,
 }
 
 /// Dispatches plugin requests to the right backend by format (on
@@ -202,6 +204,8 @@ pub struct Router {
     stub: StubBackend,
     #[cfg(feature = "clap")]
     clap: crate::clap_backend::ClapBackend,
+    #[cfg(feature = "lv2")]
+    lv2: crate::lv2_backend::Lv2Backend,
     owners: HashMap<Uuid, Owner>,
 }
 
@@ -218,6 +222,8 @@ impl Router {
             stub: StubBackend::new(),
             #[cfg(feature = "clap")]
             clap: crate::clap_backend::ClapBackend::new(),
+            #[cfg(feature = "lv2")]
+            lv2: crate::lv2_backend::Lv2Backend::new(),
             owners: HashMap::new(),
         }
     }
@@ -255,7 +261,17 @@ impl Router {
                 }
             }
             PluginFormat::Lv2 => {
-                Err("LV2 hosting not compiled into this sidecar (build --features lv2)".into())
+                #[cfg(feature = "lv2")]
+                {
+                    let id = self.lv2.instantiate(descriptor, sample_rate, max_block_frames)?;
+                    self.owners.insert(id, Owner::Lv2);
+                    Ok(id)
+                }
+                #[cfg(not(feature = "lv2"))]
+                {
+                    let _ = (sample_rate, max_block_frames);
+                    Err("LV2 hosting not compiled into this sidecar (build --features lv2)".into())
+                }
             }
         }
     }
@@ -266,6 +282,8 @@ impl Router {
             Owner::Stub => self.stub.process(instance, frames_in),
             #[cfg(feature = "clap")]
             Owner::Clap => self.clap.process(instance, frames_in),
+            #[cfg(feature = "lv2")]
+            Owner::Lv2 => self.lv2.process(instance, frames_in),
         }
     }
 
@@ -275,6 +293,8 @@ impl Router {
             Owner::Stub => self.stub.list_params(instance),
             #[cfg(feature = "clap")]
             Owner::Clap => self.clap.list_params(instance),
+            #[cfg(feature = "lv2")]
+            Owner::Lv2 => self.lv2.list_params(instance),
         }
     }
 
@@ -284,6 +304,8 @@ impl Router {
             Owner::Stub => self.stub.set_param(instance, param_id, value),
             #[cfg(feature = "clap")]
             Owner::Clap => self.clap.set_param(instance, param_id, value),
+            #[cfg(feature = "lv2")]
+            Owner::Lv2 => self.lv2.set_param(instance, param_id, value),
         }
     }
 
@@ -293,6 +315,8 @@ impl Router {
             Some(Owner::Stub) => self.stub.destroy(instance),
             #[cfg(feature = "clap")]
             Some(Owner::Clap) => self.clap.destroy(instance),
+            #[cfg(feature = "lv2")]
+            Some(Owner::Lv2) => self.lv2.destroy(instance),
             None => Ok(()), // unknown / already gone → no-op
         }
     }

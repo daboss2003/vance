@@ -9,4 +9,6 @@
 #[cfg(feature = "clap")]
 pub mod clap_backend;
 pub mod clap_discovery;
+#[cfg(feature = "lv2")]
+pub mod lv2_backend;
 pub mod runtime;

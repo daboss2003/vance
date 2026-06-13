@@ -5969,6 +5969,7 @@ version = "0.0.0"
 dependencies = [
  "clack-extensions",
  "clack-host",
+ "livi",
  "serde",
  "serde_json",
  "tracing",
