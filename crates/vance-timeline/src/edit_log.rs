@@ -177,6 +177,18 @@ pub enum EditOp {
         /// Transition to remove.
         transition_id: TransitionId,
     },
+    /// Set one parameter on a transition (WASM transitions). Replaces the
+    /// stored value for `key`; recorded so undo/redo + replay are faithful.
+    SetTransitionParam {
+        /// Track holding the transition.
+        track_id: TrackId,
+        /// Transition to mutate.
+        transition_id: TransitionId,
+        /// Manifest param key.
+        key: String,
+        /// New value.
+        value: EffectValue,
+    },
     /// Move an effect to a new index in a clip's effects list
     /// (re-sequences the serial chain — used by the color page to
     /// reorder grade nodes).
@@ -485,6 +497,12 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
             track_id,
             transition_id,
         } => ops::remove_transition(seq, *track_id, *transition_id),
+        EditOp::SetTransitionParam {
+            track_id,
+            transition_id,
+            key,
+            value,
+        } => ops::set_transition_param(seq, *track_id, *transition_id, key.clone(), value.clone()),
         EditOp::MoveEffectOnClip {
             track_id,
             clip_id,

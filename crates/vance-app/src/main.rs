@@ -2413,6 +2413,31 @@ fn remove_transition(
 }
 
 #[tauri::command]
+fn set_transition_param(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    transition_id: String,
+    key: String,
+    value: vance_timeline::EffectValue,
+) -> Result<(), String> {
+    let track_uuid = track_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid track id: {e}"))?;
+    let transition_uuid = transition_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| format!("invalid transition id: {e}"))?;
+    state
+        .lock()
+        .set_transition_param(
+            vance_timeline::TrackId::from_uuid(track_uuid),
+            vance_timeline::TransitionId::from_uuid(transition_uuid),
+            key,
+            value,
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn remove_clip(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -2640,6 +2665,7 @@ fn main() {
             preview_grade_params,
             add_transition_at_cut,
             remove_transition,
+            set_transition_param,
             create_title_media,
             set_media_input_color_space,
             set_project_working_color_space,

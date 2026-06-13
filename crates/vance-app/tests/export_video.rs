@@ -245,3 +245,58 @@ fn wasm_transition_blends_into_export() {
         "wasm transition should differ from the linear dissolve"
     );
 }
+
+#[test]
+fn wasm_transition_param_override_reaches_plugin() {
+    if !tool("ffmpeg") || !tool("ffprobe") || !sidecars_present() || !video_fixture().exists() {
+        eprintln!("tools/fixture missing — skipping");
+        return;
+    }
+    if !dissolve_wasm_dir().join("vance_plugin_dissolve.wasm").exists() {
+        eprintln!("dissolve.wasm not built — skipping");
+        return;
+    }
+    std::env::set_current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")).ok();
+
+    // Same WASM transition, but override the `softness` param (the wipe's
+    // feathered-edge width). A different softness must change the blended
+    // frame — proving the param WRITE path (set_transition_param) actually
+    // reaches the plugin, not just the engine-driven progress.
+    let build = |softness: Option<f64>| -> Option<Vec<u8>> {
+        let mut e = Engine::default();
+        e.new_project("wparam".into()).ok()?;
+        let media = e
+            .import_media_file(&video_fixture().canonicalize().ok()?.to_string_lossy())
+            .ok()?;
+        let media_id = vance_timeline::MediaItemId::from_uuid(media.id.parse().ok()?);
+        let contents = e.current_sequence_contents()?;
+        let v1 = contents.tracks.iter().find(|t| t.kind == "video")?;
+        let track = vance_timeline::TrackId::from_uuid(v1.id.parse().ok()?);
+        let c1 = e.insert_clip_at(track, media_id, 0.0).ok()?;
+        let c1_id = vance_timeline::ClipId::from_uuid(c1.parse().ok()?);
+        e.insert_clip_at(track, media_id, 5.0).ok()?;
+        assert!(e.add_plugin_dir(dissolve_wasm_dir()) >= 1);
+        let tid = e
+            .add_transition_at_cut(
+                track,
+                c1_id,
+                TransitionKind::Wasm("com.vance.sample.dissolve".into()),
+                1.0,
+            )
+            .ok()?;
+        if let Some(s) = softness {
+            let tid = vance_timeline::TransitionId::from_uuid(tid.parse().ok()?);
+            e.set_transition_param(track, tid, "softness".into(), EffectValue::Number(s))
+                .ok()?;
+        }
+        export_frame(&mut e, 4.8).map(|(b, _)| b)
+    };
+
+    let default = build(None).expect("default-softness export");
+    let wide = build(Some(1.0)).expect("wide-softness export");
+    assert_eq!(default.len(), wide.len());
+    assert!(
+        mean_abs_diff(&default, &wide) > 0.5,
+        "softness override didn't change the wipe (param write path broken)"
+    );
+}

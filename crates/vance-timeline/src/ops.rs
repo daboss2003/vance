@@ -1647,6 +1647,54 @@ pub fn remove_transition(
     Ok(replace_track(seq, idx, new_track))
 }
 
+/// Set one parameter on a transition (used for WASM transitions). The
+/// stored value for `key` is replaced (or inserted). Built-in dissolve
+/// transitions ignore params but the op is still applied uniformly.
+pub fn set_transition_param(
+    seq: &Sequence,
+    track_id: TrackId,
+    transition_id: TransitionId,
+    key: String,
+    value: crate::effect::EffectValue,
+) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    let mut found = false;
+    let transitions = track
+        .transitions
+        .iter()
+        .map(|t| {
+            if t.id == transition_id {
+                found = true;
+                let mut next = (**t).clone();
+                next.params.insert(key.clone(), value.clone());
+                std::sync::Arc::new(next)
+            } else {
+                t.clone()
+            }
+        })
+        .collect();
+    if !found {
+        return Err(TimelineError::invalid("no such transition"));
+    }
+    let new_track = Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips: track.clips.clone(),
+        transitions,
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
+    };
+    Ok(replace_track(seq, idx, new_track))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

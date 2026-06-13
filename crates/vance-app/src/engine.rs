@@ -4044,6 +4044,23 @@ impl Engine {
         })
     }
 
+    /// Set one parameter on a transition (WASM transitions). Undoable.
+    pub fn set_transition_param(
+        &mut self,
+        track_id: TrackId,
+        transition_id: vance_timeline::TransitionId,
+        key: String,
+        value: EffectValue,
+    ) -> Result<(), EngineError> {
+        self.pause_for_edit();
+        self.apply_edit_op(EditOp::SetTransitionParam {
+            track_id,
+            transition_id,
+            key,
+            value,
+        })
+    }
+
     /// Update one parameter on an effect (e.g. opacity's `value`).
     pub fn update_effect_param(
         &mut self,

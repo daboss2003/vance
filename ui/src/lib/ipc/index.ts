@@ -764,6 +764,16 @@ export const addTransitionAtCut = (
 export const removeTransition = (trackId: string, transitionId: string): Promise<void> =>
   invoke('remove_transition', { trackId, transitionId });
 
+/** Set one parameter on a transition (WASM transitions). Undoable. The
+ *  engine drives the `mix`/`progress` param from the timeline; this sets
+ *  the others (e.g. a wipe's `softness`). */
+export const setTransitionParam = (
+  trackId: string,
+  transitionId: string,
+  key: string,
+  value: EffectValue
+): Promise<void> => invoke('set_transition_param', { trackId, transitionId, key, value });
+
 /** Trim a clip's in-point. `newSourceInSeconds` is the new visible
  *  start inside the source media; the clip's timeline_in shifts by
  *  the same delta so the right edge stays put on the timeline. */
