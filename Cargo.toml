@@ -28,6 +28,7 @@ members = [
     "crates/vance-ofx",
     "crates/vance-ofx-testplugin",
     "crates/vance-clap-testplugin",
+    "crates/vance-lv2-testplugin",
     "crates/vance-ai",
     "crates/vance-ai-runtime",
     "crates/vance-ipc",

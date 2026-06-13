@@ -20,10 +20,14 @@ use std::sync::Arc;
 
 /// A loaded LV2 plugin wrapped as a block-processing [`AudioPlugin`].
 pub struct Lv2Plugin {
-    // Keep the world + features alive for the instance's lifetime.
-    _world: World,
-    _features: Arc<Features>,
+    // Drop order is DECLARATION order, and it matters here: the instance
+    // borrows from the world's plugin data (lilv ties them together), so
+    // the instance MUST drop before the features and world. Declaring
+    // `_world` first (as before) freed the world first → a use-after-free
+    // in lilv/sord teardown (SIGSEGV).
     instance: Instance,
+    _features: Arc<Features>,
+    _world: World,
     n_in: usize,
     n_out: usize,
     in_bufs: Vec<Vec<f32>>,

@@ -5913,6 +5913,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vance-lv2-testplugin"
+version = "0.0.0"
+dependencies = [
+ "lv2-sys",
+]
+
+[[package]]
 name = "vance-media"
 version = "0.0.0"
 

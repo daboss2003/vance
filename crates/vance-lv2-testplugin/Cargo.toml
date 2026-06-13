@@ -1,0 +1,22 @@
+[package]
+name = "vance-lv2-testplugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# A minimal real LV2 plugin (a fixed -6 dB / 0.5x mono gain) used to
+# verify the LV2 host end-to-end without a third-party plugin installed.
+# Built as a cdylib exporting the standard `lv2_descriptor` symbol; lilv
+# dlopen()s it via the staged `.lv2` bundle (see the test).
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+# Just the LV2 C-ABI type definitions (LV2_Descriptor etc.) — patched to
+# build on macOS via the workspace [patch.crates-io]. No host (lilv) here.
+lv2-sys = "2"
