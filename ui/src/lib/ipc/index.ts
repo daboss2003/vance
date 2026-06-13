@@ -947,6 +947,18 @@ export const currentTimelineSeconds = (): Promise<number | null> =>
  *  (2 s) reuse warm sidecars. */
 export const scrubBurst = (fromPts: number): Promise<void> => invoke('scrub_burst', { fromPts });
 
+/** Begin a scrub session — warms the decoder + opens the output stream
+ *  so the first grain isn't slow. */
+export const scrubBegin = (): Promise<void> => invoke('scrub_begin');
+
+/** Play a sample-accurate grain of mixed audio at `atSeconds`. Replaces
+ *  the previous grain, so the audio follows the playhead. */
+export const scrubGrain = (atSeconds: number): Promise<void> =>
+  invoke('scrub_grain', { atSeconds });
+
+/** End the scrub session (tear down the output + warm decoder). */
+export const scrubEnd = (): Promise<void> => invoke('scrub_end');
+
 /** Phase 7.10 / 7.11 — UI descriptor for one enumerated plugin
  *  returned by `list_audio_plugins`. `format` is `"lv2"` or `"clap"`;
  *  `runnable` is false when the sidecar can see the plugin (via the

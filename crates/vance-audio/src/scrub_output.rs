@@ -193,3 +193,29 @@ fn scrub_owner_loop(
     }
     drop(stream);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_push_drop_is_clean() {
+        // Needs a real output device; skip gracefully in headless CI.
+        let out = match ScrubOutput::start() {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("no audio output ({e}) — skipping scrub smoke test");
+                return;
+            }
+        };
+        assert!(out.sample_rate() >= 8_000, "implausible sample rate");
+        // Pushing a grain + a silence + a second grain must not panic, and
+        // Drop must tear the stream + owner thread down cleanly.
+        let sr = out.sample_rate() as usize;
+        out.push_grain(vec![0.25f32; sr / 10 * 2]); // ~100 ms stereo
+        out.silence();
+        out.push_grain(vec![-0.25f32; sr / 20 * 2]);
+        std::thread::sleep(Duration::from_millis(30));
+        drop(out); // joins the owner thread
+    }
+}

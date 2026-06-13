@@ -8337,6 +8337,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn grain_window_fades_edges_keeps_middle() {
+        let sr = 48_000u32;
+        let frames = 1000usize;
+        let mut grain = vec![1.0f32; frames * 2]; // all unity
+        apply_grain_window(&mut grain, sr);
+        // First frame fully faded to 0.
+        assert!(grain[0].abs() < 1e-6 && grain[1].abs() < 1e-6, "start not faded");
+        // Last frame fully faded to 0.
+        let last = frames - 1;
+        assert!(
+            grain[last * 2].abs() < 1e-6 && grain[last * 2 + 1].abs() < 1e-6,
+            "end not faded"
+        );
+        // Middle untouched (ramp is <= frames/4, so the center is unity).
+        let mid = frames / 2;
+        assert!((grain[mid * 2] - 1.0).abs() < 1e-6, "middle changed");
+        // The fade-in is monotonically non-decreasing across the ramp.
+        let ramp = ((sr as f64 * 0.008) as usize).min(frames / 4).max(1);
+        for i in 1..ramp {
+            assert!(grain[i * 2] >= grain[(i - 1) * 2], "fade-in not monotonic");
+        }
+    }
+
+    #[test]
+    fn grain_window_handles_tiny_grains() {
+        // A 2-frame grain must not panic (ramp clamps to >= 1).
+        let mut g = vec![1.0f32; 4];
+        apply_grain_window(&mut g, 48_000);
+        let mut empty: Vec<f32> = Vec::new();
+        apply_grain_window(&mut empty, 48_000);
+    }
+
+    #[test]
     fn compute_scopes_is_noop_when_disabled() {
         // Scopes default to disabled — compute must short-circuit to the
         // cache (None) without touching render state, so it's safe to

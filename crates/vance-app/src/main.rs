@@ -1742,6 +1742,26 @@ fn scrub_burst(state: tauri::State<'_, EngineHandle>, from_pts: i64) -> Result<(
     state.lock().scrub_burst(from_pts).map_err(|e| e.to_string())
 }
 
+/// Begin a scrub session (warm up the decoder + output) on drag-start.
+#[tauri::command]
+fn scrub_begin(state: tauri::State<'_, EngineHandle>) -> Result<(), String> {
+    state.lock().scrub_begin().map_err(|e| e.to_string())
+}
+
+/// Play a sample-accurate grain of mixed audio at `at_seconds`. Replaces
+/// the previous grain so the audio tracks the playhead.
+#[tauri::command]
+fn scrub_grain(state: tauri::State<'_, EngineHandle>, at_seconds: f64) -> Result<(), String> {
+    state.lock().scrub_grain(at_seconds).map_err(|e| e.to_string())
+}
+
+/// End the scrub session (tear down the output + warm decoder).
+#[tauri::command]
+fn scrub_end(state: tauri::State<'_, EngineHandle>) -> Result<(), String> {
+    state.lock().scrub_end();
+    Ok(())
+}
+
 /// Phase 7.5 M1: read the latest mixer metering snapshot. Cheap
 /// ArcSwap load; safe to poll at 30Hz from the UI.
 #[tauri::command]
@@ -2645,6 +2665,9 @@ fn main() {
             set_master_gain_db,
             meter_snapshot,
             scrub_burst,
+            scrub_begin,
+            scrub_grain,
+            scrub_end,
             list_audio_plugins,
             list_plugin_params,
             render_sequence,
