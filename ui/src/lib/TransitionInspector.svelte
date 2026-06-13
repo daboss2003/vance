@@ -95,7 +95,7 @@
               step={(param.max - param.min) / 1000 || 0.001}
               value={currentValue(param.key, param.default)}
               class="flex-1"
-              oninput={(e) => setParam(param.key, parseFloat((e.target as HTMLInputElement).value))}
+              onchange={(e) => setParam(param.key, parseFloat((e.target as HTMLInputElement).value))}
             />
             <span class="text-vance-fg w-12 text-right">
               {currentValue(param.key, param.default).toFixed(3)}

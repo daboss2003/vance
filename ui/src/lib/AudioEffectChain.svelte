@@ -487,7 +487,7 @@
                 step={(param.max - param.min) / 1000 || 0.001}
                 value={pluginParamValue(effect, param)}
                 class="flex-1"
-                oninput={(e) =>
+                onchange={(e) =>
                   setPluginParam(
                     idx,
                     effect,
