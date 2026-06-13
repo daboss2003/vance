@@ -1153,6 +1153,10 @@ pub struct Engine {
     /// AudioMixer per Phase 7.3). Both are owned by a dedicated
     /// thread because `cpal::Stream` is `!Send`.
     audio_owner: Option<AudioBackend>,
+    /// Active scrub session: a persistent cpal output + a warm audio
+    /// decoder, so a playhead drag renders sample-accurate grains without
+    /// respawning sidecars. `None` outside a scrub.
+    scrub: Option<ScrubSession>,
     /// Phase 7.3: snapshot-bus handle to the active [`AudioMixer`]
     /// during sequence playback. The AudioMixer itself stays on its
     /// owner thread (cpal::Stream is !Send); this Send+Sync handle
@@ -1248,6 +1252,39 @@ pub struct ClipAnchor {
 /// variant — the playback loop only needs an `AudioSync` clock from
 /// either, so the variant lives at the boundary where the engine
 /// constructs / tears down the backend.
+/// Length of a scrub grain (the short slice of audio played at the
+/// playhead while dragging). Short enough to feel responsive, long
+/// enough to be audible.
+const SCRUB_GRAIN_SECONDS: f64 = 0.08;
+
+/// A live scrub session: the persistent output stream + a warm decoder
+/// that grains are rendered through without respawning.
+struct ScrubSession {
+    output: vance_audio::scrub_output::ScrubOutput,
+    audio: vance_audio::AudioClient,
+}
+
+/// Fade a grain's first/last few ms in/out so replacing grains during a
+/// drag doesn't click. Operates on interleaved stereo.
+fn apply_grain_window(grain: &mut [f32], sample_rate: u32) {
+    let frames = grain.len() / 2;
+    if frames == 0 {
+        return;
+    }
+    // ~8 ms ramps, capped at a quarter of the grain so in/out don't overlap.
+    let ramp = ((sample_rate as f64 * 0.008) as usize)
+        .min(frames / 4)
+        .max(1);
+    for i in 0..ramp {
+        let g = i as f32 / ramp as f32;
+        grain[i * 2] *= g;
+        grain[i * 2 + 1] *= g;
+        let j = frames - 1 - i;
+        grain[j * 2] *= g;
+        grain[j * 2 + 1] *= g;
+    }
+}
+
 pub enum AudioBackend {
     /// Single-file path (`AudioPlayer`). Used by Source-monitor
     /// preview and any single-clip workflow that doesn't need mixing.
@@ -1913,6 +1950,68 @@ impl Engine {
             from_pts,
             use_mixer: true,
         })
+    }
+
+    /// Begin a scrub session: stop any playback, spawn a warm audio
+    /// decoder, and open a persistent scrub output stream. Idempotent —
+    /// a second call while a session is live is a no-op.
+    pub fn scrub_begin(&mut self) -> Result<(), EngineError> {
+        if self.scrub.is_some() {
+            return Ok(());
+        }
+        let _ = self.stop_playback();
+        let output = vance_audio::scrub_output::ScrubOutput::start()
+            .map_err(|e| EngineError::Project(format!("scrub output: {e}")))?;
+        let bin = locate_audio_binary()?;
+        let audio = vance_audio::AudioClient::spawn(&bin)
+            .map_err(|e| EngineError::Project(format!("scrub decoder spawn: {e}")))?;
+        self.scrub = Some(ScrubSession { output, audio });
+        Ok(())
+    }
+
+    /// Render a short, sample-accurate, windowed grain of the mixed audio
+    /// centered at `at_seconds` and play it on the scrub output. Replaces
+    /// the previous grain, so the audio tracks the latest playhead
+    /// position. Lazily begins a session if needed. Built-in DSP applies;
+    /// out-of-process (CLAP/LV2) plugins are skipped for latency.
+    pub fn scrub_grain(&mut self, at_seconds: f64) -> Result<(), EngineError> {
+        if self.scrub.is_none() {
+            self.scrub_begin()?;
+        }
+        let sample_rate = self.scrub.as_ref().unwrap().output.sample_rate();
+        // ~80 ms grain centered on the playhead, clamped to t >= 0.
+        let half = SCRUB_GRAIN_SECONDS / 2.0;
+        let start_s = (at_seconds - half).max(0.0);
+        let end_s = start_s + SCRUB_GRAIN_SECONDS;
+
+        // Render with the warm decoder + no plugin host (built-in DSP
+        // only). Take the session out to satisfy the borrow checker while
+        // calling &mut self, then put it back.
+        let mut session = self.scrub.take().unwrap();
+        let result = self.bounce_range_with(&mut session.audio, start_s, end_s, sample_rate, None);
+        match result {
+            Ok(mut grain) => {
+                apply_grain_window(&mut grain, sample_rate);
+                session.output.push_grain(grain);
+                self.scrub = Some(session);
+                Ok(())
+            }
+            Err(e) => {
+                // Keep the session alive so the next grain can retry.
+                self.scrub = Some(session);
+                Err(e)
+            }
+        }
+    }
+
+    /// End the scrub session: stop the output stream + drop the warm
+    /// decoder. Idempotent.
+    pub fn scrub_end(&mut self) {
+        if let Some(session) = self.scrub.take() {
+            session.output.silence();
+            let _ = session.audio.shutdown();
+            // `output` drops here → stops the cpal stream + owner thread.
+        }
     }
 
     /// Phase 7.9 — start a short audio scrub burst at `from_pts`.

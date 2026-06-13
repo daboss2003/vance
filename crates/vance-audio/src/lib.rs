@@ -31,6 +31,7 @@ pub mod mixer;
 pub mod player;
 pub mod protocol;
 pub mod remote_plugin;
+pub mod scrub_output;
 
 pub use client::{AudioClient, AudioClientError};
 pub use mixer::{
