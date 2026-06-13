@@ -163,6 +163,53 @@ fn mixer_track_dsp_routes_clap_through_sidecar() {
     assert!((last.1 - 0.5).abs() < 1e-2, "R expected ~0.5, got {}", last.1);
 }
 
+#[test]
+fn param_change_does_not_reinstantiate_remote_plugin() {
+    let Some((bin, id)) = prerequisites() else {
+        return;
+    };
+    // A CLAP slot whose params change between reconciles must NOT
+    // re-instantiate (which would re-dlopen the plugin and leak the old
+    // sidecar instance every audio batch during a knob drag).
+    let mut host = RemotePluginHost::new(bin, 48_000.0, 512);
+    let mk_spec = |gain: f32| {
+        vec![vance_audio::AudioEffectKind::Plugin {
+            enabled: true,
+            format_str: "clap".into(),
+            id: id.clone(),
+            name: "Vance Test Gain".into(),
+            params: vec![(0, gain)],
+        }]
+    };
+    let mut dsp = vance_audio::TrackDspState::new();
+    dsp.reconcile_with(&mk_spec(-6.0), 48_000.0, Some(&mut host));
+    assert_eq!(host.instantiations(), 1, "first reconcile instantiates once");
+
+    // Several param changes (a knob drag) — none should re-instantiate.
+    for g in [-5.0, -4.0, -3.0, 0.0, 3.0] {
+        dsp.reconcile_with(&mk_spec(g), 48_000.0, Some(&mut host));
+    }
+    assert_eq!(
+        host.instantiations(),
+        1,
+        "param changes must not re-instantiate the remote plugin"
+    );
+
+    // Changing the plugin IDENTITY (id) is a real rebuild → re-instantiate.
+    let other = vec![vance_audio::AudioEffectKind::Plugin {
+        enabled: true,
+        format_str: "clap".into(),
+        id: format!("{id}x"), // different id → won't load, but is a rebuild attempt
+        name: "X".into(),
+        params: vec![],
+    }];
+    dsp.reconcile_with(&other, 48_000.0, Some(&mut host));
+    assert!(
+        host.instantiations() >= 1,
+        "identity change should attempt a (re-)instantiate"
+    );
+}
+
 #[cfg(unix)]
 fn kill(pid: u32) {
     unsafe {

@@ -54,6 +54,9 @@ pub struct RemotePluginHost {
     max_block: u32,
     client: Option<PluginClient>,
     generation: u64,
+    /// Count of successful instantiate calls (diagnostics/tests — a param
+    /// change must NOT bump this, only an add/swap/respawn does).
+    instantiations: u64,
     /// `true` once a spawn has failed, so we don't fork-bomb on every
     /// block when the binary is missing.
     spawn_failed: bool,
@@ -86,10 +89,16 @@ impl RemotePluginHost {
             max_block: max_block.max(1),
             client: None,
             generation: 0,
+            instantiations: 0,
             spawn_failed: false,
             watch,
             watchdog,
         }
+    }
+
+    /// Number of successful instantiate calls so far (diagnostics/tests).
+    pub fn instantiations(&self) -> u64 {
+        self.instantiations
     }
 
     /// Current sidecar generation. Bumps on every (re)spawn; callers
@@ -185,7 +194,10 @@ impl RemotePluginHost {
         }
         let (sr, mb, gen) = (self.sample_rate, self.max_block, self.generation);
         match self.guarded(move |c| c.instantiate(descriptor, sr, mb)) {
-            Some(Ok(id)) => Some((id, gen)),
+            Some(Ok(id)) => {
+                self.instantiations += 1;
+                Some((id, gen))
+            }
             Some(Err(e)) => {
                 self.note_error(e);
                 None
@@ -208,6 +220,18 @@ impl RemotePluginHost {
                 None
             }
             None => None,
+        }
+    }
+
+    /// Push one parameter value to a live instance. Best-effort: a dead
+    /// sidecar or stale generation is a silent no-op (the caller has
+    /// already stored the value and will re-apply on the next instance).
+    pub fn set_param(&mut self, instance: Uuid, gen: u64, param_id: u32, value: f32) {
+        if gen != self.generation || self.client.is_none() {
+            return;
+        }
+        if let Some(Err(e)) = self.guarded(move |c| c.set_param(instance, param_id, value)) {
+            self.note_error(e);
         }
     }
 

@@ -382,6 +382,13 @@ impl TrackDspState {
         sample_rate: f32,
         mut host: Option<&mut RemotePluginHost>,
     ) {
+        // Shrinking the chain drops tail slots — destroy any out-of-process
+        // instances they hold so the sidecar doesn't leak them.
+        if self.chain.len() > spec.len() {
+            for old in self.chain.drain(spec.len()..) {
+                Self::destroy_remote(old, host.as_deref_mut());
+            }
+        }
         if self.chain.len() != spec.len() {
             self.chain.resize_with(spec.len(), || EffectUnit::Passthrough);
         }
@@ -393,11 +400,14 @@ impl TrackDspState {
                 (EffectUnit::Eq6(_), AudioEffectKind::Eq6 { .. }) => false,
                 (EffectUnit::Compressor(_), AudioEffectKind::Compressor { .. }) => false,
                 (EffectUnit::Limiter(_), AudioEffectKind::Limiter { .. }) => false,
-                // Rebuild a plugin only when its identity or params
-                // change — a bare enable/disable toggle keeps the warm
-                // instance (so its internal state isn't reset). Remote
-                // slots also rebuild when the sidecar was respawned (a new
-                // generation), so the stale instance is re-instantiated.
+                // Rebuild a plugin on identity change or (for remote) a
+                // sidecar respawn. A bare enable/disable toggle keeps the
+                // warm instance. Param changes are NOT a rebuild for
+                // remote slots — re-spawning would re-`dlopen` the plugin
+                // and leak the old instance on every knob tick; params are
+                // pushed live via `set_param` below. Built-ins, which read
+                // params at construction and rebuild cheaply in-process,
+                // DO rebuild on a param change.
                 (
                     EffectUnit::Plugin(slot),
                     AudioEffectKind::Plugin {
@@ -407,14 +417,21 @@ impl TrackDspState {
                         ..
                     },
                 ) => {
-                    slot.format_str != *format_str
-                        || slot.id != *id
-                        || slot.params != *params
-                        || slot.remote_stale(host_gen)
+                    let identity_changed = slot.format_str != *format_str || slot.id != *id;
+                    let stale = slot.remote_stale(host_gen);
+                    match &slot.kind {
+                        SlotKind::Local(_) => {
+                            identity_changed || slot.params != *params || stale
+                        }
+                        SlotKind::Remote(_) | SlotKind::Bypass => identity_changed || stale,
+                    }
                 }
                 _ => true,
             };
             if needs_rebuild {
+                // Tear down a replaced remote instance first.
+                let old = std::mem::replace(&mut self.chain[i], EffectUnit::Passthrough);
+                Self::destroy_remote(old, host.as_deref_mut());
                 self.chain[i] = EffectUnit::new(entry, sample_rate, host.as_deref_mut());
             }
             // Push the latest params; this updates without resetting
@@ -439,8 +456,46 @@ impl TrackDspState {
                 (EffectUnit::Limiter(lim), AudioEffectKind::Limiter { params, .. }) => {
                     lim.set(params.ceiling_db, params.release_ms, sample_rate);
                 }
+                (EffectUnit::Plugin(slot), AudioEffectKind::Plugin { params, .. }) => {
+                    // Remote slots apply a param change live via set_param
+                    // (no rebuild). Built-ins already absorbed it via the
+                    // rebuild above; nothing to push.
+                    if slot.params != *params {
+                        if let SlotKind::Remote(rs) = &slot.kind {
+                            if let (Some(h), Some((inst, gen))) =
+                                (host.as_deref_mut(), rs.instance)
+                            {
+                                for (pid, val) in params.iter() {
+                                    h.set_param(inst, gen, *pid, *val);
+                                }
+                            }
+                        }
+                        slot.params = params.clone();
+                    }
+                }
                 _ => {}
             }
+        }
+    }
+
+    /// Destroy the out-of-process instance an [`EffectUnit`] holds (if
+    /// any), so dropping a slot doesn't leak it in the sidecar.
+    fn destroy_remote(unit: EffectUnit, host: Option<&mut RemotePluginHost>) {
+        if let EffectUnit::Plugin(slot) = unit {
+            if let SlotKind::Remote(rs) = slot.kind {
+                if let (Some(h), Some((inst, gen))) = (host, rs.instance) {
+                    h.destroy(inst, gen);
+                }
+            }
+        }
+    }
+
+    /// Destroy every out-of-process instance in this chain. The fold loop
+    /// calls this before dropping a track's DSP state (track removed /
+    /// effects cleared / shutdown) so the sidecar reclaims them promptly.
+    pub fn destroy_all_remote(&mut self, mut host: Option<&mut RemotePluginHost>) {
+        for unit in self.chain.drain(..) {
+            Self::destroy_remote(unit, host.as_deref_mut());
         }
     }
 
@@ -1699,7 +1754,11 @@ fn fold_loop(
         // variant) is detected here.
         for (track_id, track) in snap.tracks.iter() {
             if track.audio_effects.is_empty() {
-                track_dsp_states.remove(track_id);
+                // Effects cleared → destroy this track's out-of-process
+                // instances before dropping its DSP state.
+                if let Some(mut st) = track_dsp_states.remove(track_id) {
+                    st.destroy_all_remote(plugin_host.as_mut());
+                }
             } else {
                 let state = track_dsp_states.entry(*track_id).or_default();
                 state.reconcile_with(
@@ -1709,7 +1768,19 @@ fn fold_loop(
                 );
             }
         }
-        track_dsp_states.retain(|id, _| snap.tracks.contains_key(id));
+        // Tracks gone from the snapshot: destroy their remote instances,
+        // then drop their DSP state.
+        let live_tracks: std::collections::HashSet<Uuid> = snap.tracks.keys().copied().collect();
+        let dead_tracks: Vec<Uuid> = track_dsp_states
+            .keys()
+            .filter(|id| !live_tracks.contains(id))
+            .copied()
+            .collect();
+        for id in dead_tracks {
+            if let Some(mut st) = track_dsp_states.remove(&id) {
+                st.destroy_all_remote(plugin_host.as_mut());
+            }
+        }
         let batch_start_frame = master_frame.load(Ordering::Acquire);
         let t_batch_start =
             playback_start_timeline_seconds + batch_start_frame as f64 * inv_sample_rate;
