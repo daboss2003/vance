@@ -2371,9 +2371,14 @@ fn add_transition_at_cut(
     let clip_uuid = after_clip_id
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid clip id: {e}"))?;
-    let kind = match kind.as_str() {
-        "dissolve" => vance_timeline::TransitionKind::Dissolve,
-        other => return Err(format!("unknown transition kind: {other}")),
+    // "dissolve" → built-in GPU dissolve; "wasm:<plugin-id>" → a WASM
+    // transition plugin (same convention as wasm effects).
+    let kind = if kind == "dissolve" {
+        vance_timeline::TransitionKind::Dissolve
+    } else if let Some(id) = kind.strip_prefix("wasm:") {
+        vance_timeline::TransitionKind::Wasm(id.to_string())
+    } else {
+        return Err(format!("unknown transition kind: {kind}"));
     };
     state
         .lock()

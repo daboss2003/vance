@@ -7257,7 +7257,8 @@ impl Engine {
                 clip_source_in_seconds,
                 active_clip_id,
             ): (
-                Option<(MediaItemId, vance_timeline::ClipId, f64, f64, MediaItemId, f64, f32)>,
+                // (transition, from_src_in, to_src_in)
+                Option<(vance_timeline::ActiveTransition, f64, f64)>,
                 Option<MediaItemId>,
                 f64,
                 Vec<vance_timeline::Effect>,
@@ -7268,32 +7269,20 @@ impl Engine {
                 let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
                 let seq = project.sequence(seq_id).ok_or(EngineError::SequenceNotFound)?;
                 if let Some(tr) = vance_timeline::transition_at(seq, timeline_t) {
-                    let from_src_in = seq
-                        .tracks
-                        .iter()
-                        .find_map(|t| {
-                            t.clips
-                                .iter()
-                                .find(|cl| cl.id == tr.from.clip_id)
-                                .map(|cl| rt_to_seconds(cl.source_in))
-                        })
-                        .unwrap_or(0.0);
-                    (
-                        Some((
-                            tr.from.media,
-                            tr.from.clip_id,
-                            rt_to_seconds(tr.from.source_pts),
-                            from_src_in,
-                            tr.to.media,
-                            rt_to_seconds(tr.to.source_pts),
-                            tr.mix,
-                        )),
-                        None,
-                        0.0,
-                        Vec::new(),
-                        0.0,
-                        None,
-                    )
+                    let src_in = |clip_id: vance_timeline::ClipId| {
+                        seq.tracks
+                            .iter()
+                            .find_map(|t| {
+                                t.clips
+                                    .iter()
+                                    .find(|cl| cl.id == clip_id)
+                                    .map(|cl| rt_to_seconds(cl.source_in))
+                            })
+                            .unwrap_or(0.0)
+                    };
+                    let from_src_in = src_in(tr.from.clip_id);
+                    let to_src_in = src_in(tr.to.clip_id);
+                    (Some((tr, from_src_in, to_src_in)), None, 0.0, Vec::new(), 0.0, None)
                 } else {
                     match vance_timeline::scene_at(seq, timeline_t) {
                         vance_timeline::SceneAt::Clip(c) => {
@@ -7323,27 +7312,60 @@ impl Engine {
             };
 
             let mut rgba: Option<Vec<u8>> = None;
-            if let Some((from_media, from_clip, from_src_pts, from_src_in, to_media, to_src_pts, mix)) =
-                transition_plan
-            {
-                // Cross-dissolve: decode A → A-side, B → B-side (the B
-                // decode may swap the primary decoder's open file, but
-                // A's frame is already on the GPU), apply A's native
-                // effects, set the mix factor, read back.
-                if let Some(frame_a) = self.decode_clip_framedata(from_media, from_src_pts) {
-                    {
-                        let mut rs = render_state_arc.lock();
-                        let _ = rs.renderer.upload_frame(&frame_a);
+            if let Some((tr, from_src_in, to_src_in)) = transition_plan {
+                let from_media = tr.from.media;
+                let from_src_pts = rt_to_seconds(tr.from.source_pts);
+                let to_media = tr.to.media;
+                let to_src_pts = rt_to_seconds(tr.to.source_pts);
+                match &tr.kind {
+                    vance_timeline::TransitionKind::Dissolve => {
+                        // Cross-dissolve: decode A → A-side, B → B-side
+                        // (the B decode may swap the primary decoder's open
+                        // file, but A's frame is already on the GPU), apply
+                        // A's native effects, set the mix factor, read back.
+                        if let Some(frame_a) = self.decode_clip_framedata(from_media, from_src_pts) {
+                            {
+                                let mut rs = render_state_arc.lock();
+                                let _ = rs.renderer.upload_frame(&frame_a);
+                            }
+                            if let Some(frame_b) = self.decode_clip_framedata(to_media, to_src_pts) {
+                                let mut rs = render_state_arc.lock();
+                                let _ = rs.renderer.upload_frame_b(&frame_b);
+                            }
+                            let from_clip_t = from_src_pts - from_src_in;
+                            self.apply_clip_render_params(tr.from.clip_id, from_media, from_clip_t);
+                            let mut rs = render_state_arc.lock();
+                            rs.renderer.set_mix_factor(tr.mix);
+                            rgba = rs.renderer.render_to_rgba_buffer(width, height).ok();
+                        }
                     }
-                    if let Some(frame_b) = self.decode_clip_framedata(to_media, to_src_pts) {
-                        let mut rs = render_state_arc.lock();
-                        let _ = rs.renderer.upload_frame_b(&frame_b);
+                    vance_timeline::TransitionKind::Wasm(plugin_id) => {
+                        // Render A and B fully + independently, then let the
+                        // WASM plugin blend B into A on the CPU.
+                        let a = self.render_clip_to_rgba(
+                            tr.from.clip_id,
+                            from_media,
+                            from_src_pts,
+                            from_src_in,
+                            width,
+                            height,
+                        );
+                        let b = self.render_clip_to_rgba(
+                            tr.to.clip_id,
+                            to_media,
+                            to_src_pts,
+                            to_src_in,
+                            width,
+                            height,
+                        );
+                        if let (Some(mut a), Some(b)) = (a, b) {
+                            let to_clip_t = to_src_pts - to_src_in;
+                            self.apply_wasm_transition(
+                                &mut a, &b, width, height, plugin_id, &tr.params, tr.mix, to_clip_t,
+                            );
+                            rgba = Some(a);
+                        }
                     }
-                    let from_clip_t = from_src_pts - from_src_in;
-                    self.apply_clip_render_params(from_clip, from_media, from_clip_t);
-                    let mut rs = render_state_arc.lock();
-                    rs.renderer.set_mix_factor(mix);
-                    rgba = rs.renderer.render_to_rgba_buffer(width, height).ok();
                 }
             } else if let (Some(media_id), Some(clip_id)) = (active_media, active_clip_id) {
                 // Single clip: decode (File or Title), apply native
@@ -7763,6 +7785,101 @@ impl Engine {
         // Miss — process then cache.
         self.apply_wasm_effects(rgba, w, h, effects, clip_t);
         let _ = cache.put(&key, rgba);
+    }
+
+    /// Effects on a clip by id (cloned), or empty if not found.
+    fn clip_effects(&self, clip_id: vance_timeline::ClipId) -> Vec<vance_timeline::Effect> {
+        let Some(project) = self.current_project.as_ref() else {
+            return Vec::new();
+        };
+        let Some(seq_id) = self.current_sequence_id else {
+            return Vec::new();
+        };
+        let Some(seq) = project.sequence(seq_id) else {
+            return Vec::new();
+        };
+        seq.tracks
+            .iter()
+            .find_map(|t| t.clips.iter().find(|c| c.id == clip_id).map(|c| c.effects.clone()))
+            .unwrap_or_default()
+    }
+
+    /// Render one clip to a final RGBA buffer (decode → native GPU
+    /// effects → readback → the clip's own WASM effects). Used to produce
+    /// the A and B sides of a WASM transition INDEPENDENTLY — the GPU
+    /// dissolve blends both in a single pass, but a WASM transition needs
+    /// each side fully composited on the CPU before `process_transition`.
+    fn render_clip_to_rgba(
+        &mut self,
+        clip_id: vance_timeline::ClipId,
+        media_id: MediaItemId,
+        source_pts_sec: f64,
+        source_in_sec: f64,
+        width: u32,
+        height: u32,
+    ) -> Option<Vec<u8>> {
+        let frame = self.decode_clip_framedata(media_id, source_pts_sec)?;
+        let rs_arc = self.render_state.clone()?;
+        {
+            let mut rs = rs_arc.lock();
+            rs.renderer.upload_frame(&frame).ok()?;
+            rs.renderer.set_mix_factor(0.0); // render this clip alone
+        }
+        let clip_t = source_pts_sec - source_in_sec;
+        // Pushes opacity/transform/grades/etc. for this clip (self-locks).
+        self.apply_clip_render_params(clip_id, media_id, clip_t);
+        let mut out = {
+            let mut rs = rs_arc.lock();
+            rs.renderer.render_to_rgba_buffer(width, height).ok()?
+        };
+        let effects = self.clip_effects(clip_id);
+        if !effects.is_empty() {
+            self.apply_wasm_effects(&mut out, width, height, &effects, clip_t);
+        }
+        Some(out)
+    }
+
+    /// Blend the B clip into the A clip using a WASM transition plugin.
+    /// `progress` (0→1, the transition's linear position) is fed to the
+    /// plugin as its `mix`/`progress` param; the remaining manifest params
+    /// come from `params` (keyframed, evaluated at `t`) or the manifest
+    /// defaults. On any failure the A buffer is left unchanged (the
+    /// transition shows clip A).
+    pub fn apply_wasm_transition(
+        &mut self,
+        a_rgba: &mut [u8],
+        b_rgba: &[u8],
+        w: u32,
+        h: u32,
+        plugin_id: &str,
+        params: &std::collections::BTreeMap<String, vance_timeline::EffectValue>,
+        progress: f32,
+        t: f64,
+    ) {
+        if !self.ensure_plugin_loaded(plugin_id) {
+            return;
+        }
+        let Some((plugin, _)) = self.loaded_plugins.get_mut(plugin_id) else {
+            return;
+        };
+        let manifest = plugin.manifest().clone();
+        let packed = manifest.pack_params(&|key| {
+            // The engine drives progress via the conventional mix/progress
+            // param; everything else is a user-set (keyframed) override.
+            let lk = key.to_ascii_lowercase();
+            if lk == "mix" || lk == "progress" {
+                Some(progress)
+            } else {
+                params
+                    .get(key)
+                    .and_then(|v| v.eval_number(t))
+                    .filter(|n| n.is_finite())
+                    .map(|n| n as f32)
+            }
+        });
+        if let Err(err) = plugin.process_transition(a_rgba, b_rgba, w, h, &packed) {
+            tracing::warn!(plugin = %plugin_id, ?err, "wasm transition process failed; showing A");
+        }
     }
 
     /// Ensure the plugin with manifest `id` is loaded + fresh. Reloads

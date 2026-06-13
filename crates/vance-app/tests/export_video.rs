@@ -175,3 +175,73 @@ fn transition_blends_into_export() {
         "transition frame should differ from hard-cut frame (mean abs diff {mean_abs_diff})"
     );
 }
+
+fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {
+    let d: u64 = a
+        .iter()
+        .zip(b.iter())
+        .map(|(x, y)| (*x as i32 - *y as i32).unsigned_abs() as u64)
+        .sum();
+    d as f64 / a.len().max(1) as f64
+}
+
+fn dissolve_wasm_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/dissolve/target/wasm32-unknown-unknown/release")
+}
+
+#[test]
+fn wasm_transition_blends_into_export() {
+    if !tool("ffmpeg") || !tool("ffprobe") || !sidecars_present() || !video_fixture().exists() {
+        eprintln!("tools/fixture missing — skipping");
+        return;
+    }
+    if !dissolve_wasm_dir().join("vance_plugin_dissolve.wasm").exists() {
+        eprintln!("dissolve.wasm not built — skipping wasm transition export test");
+        return;
+    }
+    std::env::set_current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")).ok();
+
+    // Two clips of the same source with a 1 s window at the 5 s cut; a
+    // frame at 4.8 s is mid-transition (progress ≈ 0.3).
+    let build = |transition: Option<TransitionKind>| -> Option<Vec<u8>> {
+        let mut e = Engine::default();
+        e.new_project("wxfade".into()).ok()?;
+        let media = e
+            .import_media_file(&video_fixture().canonicalize().ok()?.to_string_lossy())
+            .ok()?;
+        let media_id = vance_timeline::MediaItemId::from_uuid(media.id.parse().ok()?);
+        let contents = e.current_sequence_contents()?;
+        let v1 = contents.tracks.iter().find(|t| t.kind == "video")?;
+        let track = vance_timeline::TrackId::from_uuid(v1.id.parse().ok()?);
+        let c1 = e.insert_clip_at(track, media_id, 0.0).ok()?;
+        let c1_id = vance_timeline::ClipId::from_uuid(c1.parse().ok()?);
+        e.insert_clip_at(track, media_id, 5.0).ok()?;
+        // Register the WASM transition plugin.
+        assert!(e.add_plugin_dir(dissolve_wasm_dir()) >= 1, "dissolve plugin not discovered");
+        if let Some(kind) = transition {
+            e.add_transition_at_cut(track, c1_id, kind, 1.0).ok()?;
+        }
+        export_frame(&mut e, 4.8).map(|(bytes, _)| bytes)
+    };
+
+    let hard_cut = build(None).expect("hard-cut export");
+    let wasm = build(Some(TransitionKind::Wasm("com.vance.sample.dissolve".into())))
+        .expect("wasm transition export");
+    let dissolve = build(Some(TransitionKind::Dissolve)).expect("dissolve export");
+
+    assert_eq!(wasm.len(), hard_cut.len());
+    // The WASM plugin actually blended B into A: the mid-window frame must
+    // differ from the no-transition (clip-A-only) frame. If the plugin had
+    // silently fallen through, A would be unchanged and these would match.
+    assert!(
+        mean_abs_diff(&wasm, &hard_cut) > 1.0,
+        "wasm transition didn't blend (matches hard cut)"
+    );
+    // It's a luma-wipe, NOT the linear GPU dissolve — so it must also
+    // differ from the built-in dissolve at the same frame.
+    assert!(
+        mean_abs_diff(&wasm, &dissolve) > 0.5,
+        "wasm transition should differ from the linear dissolve"
+    );
+}
