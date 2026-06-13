@@ -102,6 +102,18 @@ fn clap_param_change_affects_audio() {
     let out = client.process(inst, &block).expect("process");
     assert!((mean(&out) - 1.0).abs() < 1e-3, "gain 1 → unity, got {}", mean(&out));
 
+    // Out-of-range values are clamped to the param's [min, max] before
+    // reaching the plugin: 5.0 → 1.0 (unity), -2.0 → 0.0 (silence).
+    client.set_param(inst, 0, 5.0).expect("set_param over-range");
+    let out = client.process(inst, &block).expect("process");
+    assert!((mean(&out) - 1.0).abs() < 1e-3, "5.0 clamps to 1.0, got {}", mean(&out));
+    client.set_param(inst, 0, -2.0).expect("set_param under-range");
+    let out = client.process(inst, &block).expect("process");
+    assert!(mean(&out).abs() < 1e-3, "-2.0 clamps to 0.0, got {}", mean(&out));
+
+    // An id the plugin didn't enumerate is rejected (not silently dropped).
+    assert!(client.set_param(inst, 9999, 0.5).is_err(), "unknown param id must error");
+
     client.destroy(inst).expect("destroy");
     client.shutdown().expect("shutdown");
 }

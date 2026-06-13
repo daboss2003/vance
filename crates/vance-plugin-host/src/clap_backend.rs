@@ -185,7 +185,16 @@ impl PluginBackend for ClapBackend {
             inst.in_r[i] = frames_in[2 * i + 1];
         }
 
-        // Build parameter-value events for any pending changes.
+        let Some(proc) = inst.processor.as_mut() else {
+            // No processor → passthrough (truncated to n frames). NOTE:
+            // we must NOT drain `dirty` here, or pending param changes
+            // would be consumed without ever reaching a plugin.
+            return Ok(frames_in[..n * 2].to_vec());
+        };
+
+        // Build parameter-value events for any pending changes. Only
+        // reached once we have a live processor, so a drained dirty flag
+        // is always actually delivered.
         inst.event_in.clear();
         if !inst.dirty.is_empty() {
             let dirty: Vec<u32> = inst.dirty.drain(..).collect();
@@ -204,11 +213,6 @@ impl PluginBackend for ClapBackend {
                 inst.event_in.push(&ev);
             }
         }
-
-        let Some(proc) = inst.processor.as_mut() else {
-            // No processor → passthrough (truncated to n frames).
-            return Ok(frames_in[..n * 2].to_vec());
-        };
 
         let input_audio = inst.in_ports.with_input_buffers([AudioPortBuffer {
             latency: 0,
@@ -264,9 +268,21 @@ impl PluginBackend for ClapBackend {
             .instances
             .get_mut(&instance)
             .ok_or_else(|| format!("no such plugin instance `{instance}`"))?;
-        // Store the desired value + mark it dirty so the next `process`
-        // feeds it to the plugin as a CLAP param-value event.
-        inst.pending.insert(param_id, value);
+        // Reject ids the plugin didn't enumerate (this also drops the
+        // reserved CLAP_INVALID_ID = u32::MAX, which can't become a valid
+        // event), and clamp to the parameter's reported [min, max] before
+        // it ever reaches the plugin — the host is responsible for
+        // sending in-range values per the CLAP spec.
+        let Some((min, max)) = inst
+            .params
+            .iter()
+            .find(|p| p.id == param_id)
+            .map(|p| (p.min, p.max))
+        else {
+            return Err(format!("plugin has no parameter id {param_id}"));
+        };
+        let clamped = value.clamp(min.min(max), min.max(max));
+        inst.pending.insert(param_id, clamped);
         if !inst.dirty.contains(&param_id) {
             inst.dirty.push(param_id);
         }

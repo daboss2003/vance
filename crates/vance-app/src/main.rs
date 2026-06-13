@@ -1663,17 +1663,14 @@ fn list_plugin_params(
         "clap" => vance_audio_plugins::PluginFormat::Clap,
         other => return Err(format!("unknown plugin format `{other}`")),
     };
-    let bin = match locate_plugin_host_binary() {
-        Some(p) => p,
-        None => return Ok(Vec::new()),
-    };
-    let mut client = match vance_audio_plugins::PluginClient::spawn(&bin) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(?e, "plugin host spawn failed");
-            return Ok(Vec::new());
-        }
-    };
+    // Failure paths return Err (NOT an empty list) so the UI can tell
+    // "couldn't load this plugin" apart from "plugin has no parameters".
+    let bin = locate_plugin_host_binary()
+        .ok_or_else(|| "plugin sidecar not available".to_string())?;
+    let mut client = vance_audio_plugins::PluginClient::spawn(&bin).map_err(|e| {
+        tracing::warn!(?e, "plugin host spawn failed");
+        format!("could not start plugin sidecar: {e}")
+    })?;
     let descriptor = vance_audio_plugins::PluginDescriptor {
         format: plugin_format,
         id,
@@ -1682,17 +1679,12 @@ fn list_plugin_params(
         runnable: true,
     };
     // 48k / 512 is just for the probe; params are sample-rate-independent.
-    let params = match client.instantiate(descriptor, 48_000.0, 512) {
-        Ok(inst) => {
-            let p = client.list_params(inst).unwrap_or_default();
-            let _ = client.destroy(inst);
-            p
-        }
-        Err(e) => {
-            tracing::warn!(?e, "could not instantiate plugin to list params");
-            Vec::new()
-        }
-    };
+    let inst = client.instantiate(descriptor, 48_000.0, 512).map_err(|e| {
+        tracing::warn!(?e, "could not instantiate plugin to list params");
+        format!("could not load plugin: {e}")
+    })?;
+    let params = client.list_params(inst).map_err(|e| format!("could not list params: {e}"))?;
+    let _ = client.destroy(inst);
     let _ = client.shutdown();
     Ok(params
         .into_iter()

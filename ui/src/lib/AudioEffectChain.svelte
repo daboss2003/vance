@@ -14,7 +14,6 @@
     defaultLimiter,
     defaultPlugin,
     listAudioPlugins,
-    listPluginParams,
     type AudioEffectSpec,
     type AudioPluginDescriptor,
     type CompressorSpec,
@@ -22,6 +21,7 @@
     type LimiterSpec,
     type PluginParamInfo
   } from '$lib/ipc';
+  import { ensurePluginParams, pluginParamState } from '$lib/pluginParams.svelte';
   import { projectState } from '$lib/project.svelte';
 
   let {
@@ -36,20 +36,16 @@
     void projectState.updateAudioEffect(trackId, index, next);
   }
 
-  // Plugin parameter metadata, fetched lazily per plugin id (params are
-  // a property of the plugin class, so all instances share them).
-  // `null` = loading, `[]` = no params / not enumerable.
-  let pluginParamCache = $state<Record<string, PluginParamInfo[] | null>>({});
-
-  async function ensurePluginParams(format: string, id: string) {
-    if (id in pluginParamCache) return;
-    pluginParamCache[id] = null; // mark loading
-    try {
-      pluginParamCache[id] = await listPluginParams(format, id);
-    } catch {
-      pluginParamCache[id] = [];
+  // Fetch parameter metadata for every plugin in the chain (deduped in
+  // the module-level store). Done in an effect — never as a render-time
+  // side effect — so a re-render can't trigger a fetch storm.
+  $effect(() => {
+    for (const e of effects) {
+      if (e.kind === 'Plugin') {
+        void ensurePluginParams(e.descriptor.format, e.descriptor.id);
+      }
     }
-  }
+  });
 
   /** Current value of a plugin param: the override in the effect spec, or
    *  the param's reported default. */
@@ -463,19 +459,23 @@
           </label>
         </div>
       {:else if effect.kind === 'Plugin'}
-        {@const _ = ensurePluginParams(effect.descriptor.format, effect.descriptor.id)}
+        {@const pstate = pluginParamState(effect.descriptor.id)}
         <div class="text-vance-muted text-[10px] font-mono">
           <div class="break-all">
             <span class="text-vance-muted">{effect.descriptor.format}</span>
             <span class="text-vance-fg ml-1">{effect.descriptor.id}</span>
           </div>
         </div>
-        {#if pluginParamCache[effect.descriptor.id] === null}
+        {#if !pstate || pstate.status === 'loading'}
           <div class="text-[10px] italic text-vance-muted">Loading parameters…</div>
-        {:else if (pluginParamCache[effect.descriptor.id]?.length ?? 0) === 0}
+        {:else if pstate.status === 'error'}
+          <div class="text-[10px] italic text-red-400" title={pstate.message}>
+            Couldn't load this plugin to read its parameters.
+          </div>
+        {:else if pstate.params.length === 0}
           <div class="text-[10px] italic text-vance-muted">This plugin exposes no parameters.</div>
         {:else}
-          {#each pluginParamCache[effect.descriptor.id] ?? [] as param}
+          {#each pstate.params as param}
             <label
               class="border-vance-border mb-1 flex items-center gap-2 rounded border-l-2 py-0.5 pl-2 text-[10px] font-mono"
             >
