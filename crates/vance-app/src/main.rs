@@ -1737,11 +1737,6 @@ fn locate_plugin_host_binary() -> Option<std::path::PathBuf> {
 /// playback origin. For convenience, the UI calls with `(time_base_num,
 /// time_base_den) = (1, 48_000)` and a PTS computed from
 /// `timelineSeconds * 48000`.
-#[tauri::command]
-fn scrub_burst(state: tauri::State<'_, EngineHandle>, from_pts: i64) -> Result<(), String> {
-    state.lock().scrub_burst(from_pts).map_err(|e| e.to_string())
-}
-
 /// Begin a scrub session (warm up the decoder + output) on drag-start.
 #[tauri::command]
 fn scrub_begin(state: tauri::State<'_, EngineHandle>) -> Result<(), String> {
@@ -2664,7 +2659,6 @@ fn main() {
             update_audio_effect,
             set_master_gain_db,
             meter_snapshot,
-            scrub_burst,
             scrub_begin,
             scrub_grain,
             scrub_end,

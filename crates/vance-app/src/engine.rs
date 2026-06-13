@@ -1974,15 +1974,29 @@ impl Engine {
     /// the previous grain, so the audio tracks the latest playhead
     /// position. Lazily begins a session if needed. Built-in DSP applies;
     /// out-of-process (CLAP/LV2) plugins are skipped for latency.
+    ///
+    /// Note: this decodes the grain inline while holding the engine lock
+    /// (tens of ms — the warm decoder seeks + reads ~80 ms from the 1–2
+    /// clips under the playhead). During a drag the only frequent command
+    /// is `scrub_grain` itself (serialized regardless), so the practical
+    /// impact is low. Moving the decode onto a dedicated scrub thread (so
+    /// other commands never wait) is a future optimization; the UI
+    /// coalesces grains to one per ~40 ms to bound the work.
     pub fn scrub_grain(&mut self, at_seconds: f64) -> Result<(), EngineError> {
         if self.scrub.is_none() {
             self.scrub_begin()?;
         }
         let sample_rate = self.scrub.as_ref().unwrap().output.sample_rate();
-        // ~80 ms grain centered on the playhead, clamped to t >= 0.
+        // ~80 ms grain CENTERED on the playhead. Near t=0 we can't decode
+        // before the start, so we clamp the rendered range to [0, ..] and
+        // pre-pad the grain with that much silence — keeping the playhead
+        // at the grain's center (the flat part of the fade window) instead
+        // of letting the clamp shift the audible audio later.
         let half = SCRUB_GRAIN_SECONDS / 2.0;
-        let start_s = (at_seconds - half).max(0.0);
-        let end_s = start_s + SCRUB_GRAIN_SECONDS;
+        let raw_start = at_seconds - half;
+        let start_s = raw_start.max(0.0);
+        let end_s = at_seconds + half;
+        let pad_seconds = start_s - raw_start; // 0 except near t=0
 
         // Render with the warm decoder + no plugin host (built-in DSP
         // only). Take the session out to satisfy the borrow checker while
@@ -1990,7 +2004,15 @@ impl Engine {
         let mut session = self.scrub.take().unwrap();
         let result = self.bounce_range_with(&mut session.audio, start_s, end_s, sample_rate, None);
         match result {
-            Ok(mut grain) => {
+            Ok(grain) => {
+                let pad_frames = (pad_seconds * sample_rate as f64).round() as usize;
+                let mut grain = if pad_frames > 0 {
+                    let mut padded = vec![0.0f32; pad_frames * 2];
+                    padded.extend_from_slice(&grain);
+                    padded
+                } else {
+                    grain
+                };
                 apply_grain_window(&mut grain, sample_rate);
                 session.output.push_grain(grain);
                 self.scrub = Some(session);
@@ -2014,30 +2036,18 @@ impl Engine {
         }
     }
 
-    /// Phase 7.9 — start a short audio scrub burst at `from_pts`.
-    ///
-    /// This is a thin wrapper around `stop_playback` + `start_playback_mixed`
-    /// designed for rapid invocation during a playhead drag. The UI is
-    /// responsible for calling `stop_playback` after the desired burst
-    /// duration (typically ~80–120 ms). Consecutive bursts within the
-    /// mixer's `PRELOAD_SECONDS` window benefit from the M4 scheduler's
-    /// warm sidecars; only the first burst of a drag session pays
-    /// cold-start latency.
-    ///
-    /// Returns `Ok` even when the prior `stop_playback` fails (e.g.
-    /// when no playback was active) — only failures of the new
-    /// playback start propagate.
-    pub fn scrub_burst(&mut self, from_pts: i64) -> Result<(), EngineError> {
-        let _ = self.stop_playback();
-        self.start_playback_mixed(from_pts)
-    }
-
     /// Wraps the heavy lifting so `start_playback` and the title-mode
     /// entry point share thread setup, atomics, and join handling.
     fn start_playback_inner(
         &mut self,
         kind: StartPlaybackKind,
     ) -> Result<(), EngineError> {
+        // Scrubbing and playback both drive the default output device;
+        // they're mutually exclusive. Tear down any scrub session before
+        // starting playback (the reverse — scrub_begin → stop_playback —
+        // is handled in scrub_begin) so two streams never fight, and the
+        // scrub's warm decoder + output thread don't leak.
+        self.scrub_end();
         let viewport = self
             .viewport
             .as_ref()

@@ -939,14 +939,6 @@ export const decodeSequenceAt = (timelineSeconds: number): Promise<number> =>
 export const currentTimelineSeconds = (): Promise<number | null> =>
   invoke('current_timeline_seconds');
 
-/** Phase 7.9 — fire a single audio scrub burst at the given timeline
- *  PTS (in 1/48 000 sample units). UI is responsible for sequencing
- *  start + stop during a playhead drag (typically ~80 ms per burst).
- *  Cold-start latency on the FIRST burst is bounded by sidecar spawn
- *  (~100 ms); subsequent bursts within the M4 PRELOAD window
- *  (2 s) reuse warm sidecars. */
-export const scrubBurst = (fromPts: number): Promise<void> => invoke('scrub_burst', { fromPts });
-
 /** Begin a scrub session — warms the decoder + opens the output stream
  *  so the first grain isn't slow. */
 export const scrubBegin = (): Promise<void> => invoke('scrub_begin');

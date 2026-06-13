@@ -1667,9 +1667,9 @@
       scrollSeconds = Math.max(0, dragStart.scroll - dx / pixelsPerSecond);
       scheduleDraw();
     } else if (dragStart.kind === 'scrub-ruler' && canvas) {
-      // Phase 7.9 — emit a burst at every new cursor position. The
-      // scrub session throttles to MIN_BURST_INTERVAL_MS so very
-      // rapid drag events don't overwhelm the sidecar startup cost.
+      // Play a sample-accurate grain at every new cursor position. The
+      // scrub session coalesces rapid drag events to one grain per
+      // MIN_GRAIN_INTERVAL_MS.
       const rect = canvas.getBoundingClientRect();
       const cursorX = e.clientX - rect.left;
       const t = scrollSeconds + (cursorX - TRACK_HEADER_W) / pixelsPerSecond;
@@ -1965,6 +1965,11 @@
     return Math.max(0, bestTarget);
   }
 
+  /** Idempotent scrub teardown, used as a window-blur backstop. */
+  function endScrubBackstop() {
+    void scrubSession.end();
+  }
+
   async function onMouseUp(e: MouseEvent) {
     if (!dragStart) return;
     const moved = Math.abs(e.clientX - dragStart.clientX) + Math.abs(e.clientY - dragStart.clientY);
@@ -1974,8 +1979,8 @@
     const m = marquee;
     marquee = null;
 
-    // Phase 7.9 — release a scrub session: stop the in-flight burst
-    // and clear pending timers.
+    // Release a scrub session: tear down the grain output + warm decoder
+    // and clear any pending grain.
     if (ds.kind === 'scrub-ruler') {
       void scrubSession.end();
       return;
@@ -2387,6 +2392,9 @@
     // disables HTML5 native drag-and-drop). On mouseup we check
     // dragState and consume it if the cursor is inside our canvas.
     window.addEventListener('mouseup', onWindowMouseUp);
+    // Backstop: if the window loses focus mid-drag (alt-tab) the mouseup
+    // may never arrive — end any scrub so its decoder + output don't leak.
+    window.addEventListener('blur', endScrubBackstop);
 
     // Playhead poll: fetch the engine's running playhead ~10×/sec so
     // the canvas reflects live playback position.
@@ -2414,10 +2422,14 @@
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseup', onMouseUp);
       window.removeEventListener('mouseup', onWindowMouseUp);
+      window.removeEventListener('blur', endScrubBackstop);
       window.removeEventListener('keydown', onKeyDown);
       window.clearInterval(playheadPoll);
       window.clearInterval(meterRedraw);
       metersStore.stop();
+      // Unmounting mid-scrub must tear the session down (it would
+      // otherwise leak the decoder sidecar + output thread).
+      void scrubSession.end();
     };
   });
 </script>
