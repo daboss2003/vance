@@ -161,6 +161,101 @@ fn mixer_track_dsp_routes_clap_through_sidecar() {
     }
     assert!((last.0 - 0.5).abs() < 1e-2, "L expected ~0.5, got {}", last.0);
     assert!((last.1 - 0.5).abs() < 1e-2, "R expected ~0.5, got {}", last.1);
+    // Normal fast processing must never trip the hang watchdog.
+    assert_eq!(host.kills(), 0, "watchdog killed a healthy sidecar");
+}
+
+#[test]
+fn crash_recovers_through_reconcile_only() {
+    let Some((bin, id)) = prerequisites() else {
+        return;
+    };
+    // The REAL fold-loop recovery path: after the sidecar dies, recovery
+    // must happen purely through reconcile_with + tick_stereo on an
+    // UNCHANGED spec — no manual instantiate(). (Regression for the bug
+    // where a crashed lone plugin was bypassed forever because the
+    // generation never advanced.)
+    let mut host = RemotePluginHost::new(bin, 48_000.0, 512);
+    let spec = vec![vance_audio::AudioEffectKind::Plugin {
+        enabled: true,
+        format_str: "clap".into(),
+        id,
+        name: "Vance Test Gain".into(),
+        params: vec![],
+    }];
+    let mut dsp = vance_audio::TrackDspState::new();
+    dsp.reconcile_with(&spec, 48_000.0, Some(&mut host));
+    for _ in 0..512 {
+        dsp.tick_stereo(&spec, 1.0, 1.0, Some(&mut host));
+    }
+    assert_eq!(host.instantiations(), 1);
+
+    // Kill the sidecar out from under the host.
+    let pid = host.sidecar_pid();
+    assert!(pid != 0);
+    kill(pid);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Drive the fold-loop cycle (reconcile then a block of ticks) with the
+    // SAME spec until audio recovers — never calling instantiate directly.
+    let mut out = (0.0f32, 0.0f32);
+    let mut recovered = false;
+    for _round in 0..12 {
+        dsp.reconcile_with(&spec, 48_000.0, Some(&mut host));
+        for _ in 0..512 {
+            out = dsp.tick_stereo(&spec, 1.0, 1.0, Some(&mut host));
+        }
+        if (out.0 - 0.5).abs() < 1e-2 {
+            recovered = true;
+            break;
+        }
+    }
+    assert!(recovered, "audio did not recover after crash (got {})", out.0);
+    assert!(
+        host.instantiations() >= 2,
+        "recovery must re-instantiate via reconcile, instantiations={}",
+        host.instantiations()
+    );
+}
+
+#[test]
+fn disable_clears_remote_accumulator() {
+    let Some((bin, id)) = prerequisites() else {
+        return;
+    };
+    let mut host = RemotePluginHost::new(bin, 48_000.0, 512);
+    let on = vec![vance_audio::AudioEffectKind::Plugin {
+        enabled: true,
+        format_str: "clap".into(),
+        id: id.clone(),
+        name: "g".into(),
+        params: vec![],
+    }];
+    let off = vec![vance_audio::AudioEffectKind::Plugin {
+        enabled: false,
+        format_str: "clap".into(),
+        id: id.clone(),
+        name: "g".into(),
+        params: vec![],
+    }];
+    let mut dsp = vance_audio::TrackDspState::new();
+    dsp.reconcile_with(&on, 48_000.0, Some(&mut host));
+    // Prime past a couple block boundaries so the output queue holds 0.5s.
+    for _ in 0..200 {
+        dsp.tick_stereo(&on, 1.0, 1.0, Some(&mut host));
+    }
+    // Disable for a few ticks — this must flush the accumulator.
+    for _ in 0..5 {
+        dsp.tick_stereo(&off, 1.0, 1.0, Some(&mut host));
+    }
+    // Re-enable: the first sample must be priming silence (clean block),
+    // NOT a stale 0.5 left over from before the disable.
+    let first = dsp.tick_stereo(&on, 1.0, 1.0, Some(&mut host));
+    assert!(
+        first.0.abs() < 1e-6,
+        "stale buffered sample leaked across disable: got {}",
+        first.0
+    );
 }
 
 #[test]

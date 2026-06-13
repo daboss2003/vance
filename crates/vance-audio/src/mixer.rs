@@ -382,6 +382,14 @@ impl TrackDspState {
         sample_rate: f32,
         mut host: Option<&mut RemotePluginHost>,
     ) {
+        // Recover from a sidecar crash BEFORE computing the generation:
+        // poll_recovery respawns a dead sidecar (bumping the generation),
+        // which makes the remote slots below detect staleness and
+        // re-instantiate. Without this a crashed plugin would bypass
+        // forever (nothing else advances the generation).
+        if let Some(h) = host.as_deref_mut() {
+            h.poll_recovery();
+        }
         // Shrinking the chain drops tail slots — destroy any out-of-process
         // instances they hold so the sidecar doesn't leak them.
         if self.chain.len() > spec.len() {
@@ -502,6 +510,17 @@ impl TrackDspState {
     /// Apply the chain to one stereo sample. Disabled entries bypass.
     /// `host` is the out-of-process plugin connection (CLAP/LV2 slots run
     /// through it); built-in/DSP slots ignore it.
+    ///
+    /// Real-time note: a remote slot does a synchronous IPC round-trip to
+    /// the sidecar once per [`crate::audio_plugin::DEFAULT_BLOCK`] samples.
+    /// This runs on the fold thread — a BUFFERED producer feeding a ~250 ms
+    /// master ring, not the cpal callback — so the per-block trip (sub-ms
+    /// normally) is well within budget for a handful of plugins, and a hung
+    /// plugin is bypassed within ~135 ms (process timeout + watchdog poll),
+    /// comfortably under the ring depth. Pathologically many plugins with a
+    /// slow sidecar could still erode that headroom; the future refinement
+    /// is to move remote processing onto its own thread + ring so the fold
+    /// thread never blocks on IPC. See [`RemoteSlot`].
     #[inline]
     pub fn tick_stereo(
         &mut self,
@@ -518,6 +537,12 @@ impl TrackDspState {
                 | AudioEffectKind::Plugin { enabled, .. } => *enabled,
             };
             if !enabled {
+                // A disabled plugin must not retain a partial block or
+                // stale output across the gap — flush its accumulator so a
+                // re-enable starts clean.
+                if let EffectUnit::Plugin(slot) = unit {
+                    slot.reset();
+                }
                 continue;
             }
             match (unit, entry) {
@@ -652,6 +677,14 @@ impl RemoteSlot {
         }
     }
 
+    /// Discard buffered input/output so a re-enable starts on a clean
+    /// block boundary (no stale pre-disable samples, no mid-block resume).
+    fn reset(&mut self) {
+        self.fill = 0;
+        self.out_l.clear();
+        self.out_r.clear();
+    }
+
     fn flush(&mut self, host: Option<&mut RemotePluginHost>) {
         let n = self.block;
         for i in 0..n {
@@ -763,6 +796,17 @@ impl PluginSlot {
         match &self.kind {
             SlotKind::Remote(rs) => rs.attempted_gen != host_gen,
             _ => false,
+        }
+    }
+
+    /// Flush the slot's block accumulator (called when the effect is
+    /// disabled) so a later re-enable can't emit stale buffered samples or
+    /// resume mid-block.
+    fn reset(&mut self) {
+        match &mut self.kind {
+            SlotKind::Local(Some(proc)) => proc.reset(),
+            SlotKind::Remote(rs) => rs.reset(),
+            SlotKind::Local(None) | SlotKind::Bypass => {}
         }
     }
 }

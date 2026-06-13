@@ -27,19 +27,43 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 use vance_audio_plugins::{PluginClient, PluginClientError, PluginDescriptor};
 
-/// How long one `instantiate` / `process` IPC call may block before the
-/// watchdog assumes the plugin hung and kills the sidecar. Generous —
-/// a real block is sub-millisecond; this only fires on a true hang.
-const HANG_TIMEOUT_MS: u64 = 1_000;
+/// Per-call hang budget for a `process` block. Must stay well under the
+/// master ring depth (~250 ms) so a hung plugin is bypassed before the
+/// ring drains and cpal underruns. A real block is sub-millisecond.
+const PROCESS_TIMEOUT_MS: u64 = 120;
+
+/// Per-call hang budget for `instantiate` — generous because it runs the
+/// plugin's `dlopen` + activate inside the sidecar, which can legitimately
+/// take a while for a heavy plugin.
+const INSTANTIATE_TIMEOUT_MS: u64 = 5_000;
+
+/// Per-call hang budget for cheap control calls (set_param / destroy).
+const CONTROL_TIMEOUT_MS: u64 = 500;
+
+/// Watchdog poll interval. Kept small so the effective stall on a hang is
+/// close to the configured per-call budget rather than budget + 100 ms.
+const WATCHDOG_POLL_MS: u64 = 15;
+
+/// After this many consecutive respawn attempts without a single
+/// successful `process`, give up on the sidecar (a plugin that crashes the
+/// host on every load must not spin a respawn loop forever).
+const MAX_CONSECUTIVE_RESPAWNS: u32 = 5;
 
 /// State shared between the host (fold thread) and its watchdog thread.
 struct Watch {
     /// Monotonic epoch the timestamps below are measured against.
     epoch: Instant,
-    /// `epoch`-relative ms (+1) when the current IPC call started, or 0
-    /// when idle. The `+1` keeps a call started at t=0 distinct from idle.
-    in_flight_since: AtomicU64,
-    /// PID of the live sidecar (0 = none / already reaped).
+    /// `epoch`-relative ms deadline of the current in-flight IPC call, or
+    /// 0 when idle. The watchdog kills the sidecar once `now >= deadline`.
+    in_flight_deadline: AtomicU64,
+    /// Sequence number of the current in-flight call, bumped on each call.
+    /// The watchdog captures it with the deadline and re-validates it just
+    /// before killing, so a call that completes at the timeout boundary is
+    /// never killed (and a different, later call can't be mistaken for the
+    /// hung one).
+    in_flight_seq: AtomicU64,
+    /// PID of the live sidecar (0 = none / claimed). Killed only via an
+    /// atomic swap-to-0 so the watchdog and the reaper can never both act.
     pid: AtomicU32,
     /// Set on host drop so the watchdog exits.
     stop: AtomicBool,
@@ -57,9 +81,16 @@ pub struct RemotePluginHost {
     /// Count of successful instantiate calls (diagnostics/tests — a param
     /// change must NOT bump this, only an add/swap/respawn does).
     instantiations: u64,
-    /// `true` once a spawn has failed, so we don't fork-bomb on every
-    /// block when the binary is missing.
+    /// `true` once a spawn has failed (binary missing) or we've given up
+    /// after too many crash-respawn cycles — we then stop retrying.
     spawn_failed: bool,
+    /// Set when the sidecar dies mid-use; [`poll_recovery`] respawns it.
+    /// Distinct from "never spawned" (lazy) so we only respawn after a
+    /// genuine crash, not before first use.
+    dead: bool,
+    /// Consecutive respawns without a successful `process`. Bounds a
+    /// crash-on-load loop.
+    consecutive_respawns: u32,
     watch: Arc<Watch>,
     watchdog: Option<JoinHandle<()>>,
 }
@@ -71,7 +102,8 @@ impl RemotePluginHost {
     pub fn new(exe: PathBuf, sample_rate: f32, max_block: u32) -> Self {
         let watch = Arc::new(Watch {
             epoch: Instant::now(),
-            in_flight_since: AtomicU64::new(0),
+            in_flight_deadline: AtomicU64::new(0),
+            in_flight_seq: AtomicU64::new(0),
             pid: AtomicU32::new(0),
             stop: AtomicBool::new(false),
             kills: AtomicU64::new(0),
@@ -91,6 +123,8 @@ impl RemotePluginHost {
             generation: 0,
             instantiations: 0,
             spawn_failed: false,
+            dead: false,
+            consecutive_respawns: 0,
             watch,
             watchdog,
         }
@@ -123,6 +157,31 @@ impl RemotePluginHost {
         self.watch.pid.load(Ordering::Acquire)
     }
 
+    /// Recover from a sidecar crash. Called at the top of every reconcile:
+    /// if the sidecar died (`dead`), respawn it so the generation advances
+    /// — that makes every live remote slot stale, so reconcile rebuilds
+    /// (re-instantiates) it against the fresh sidecar. WITHOUT this, a
+    /// crashed plugin whose spec never changes would be bypassed forever
+    /// (nothing else advances the generation).
+    pub fn poll_recovery(&mut self) {
+        if !self.dead || self.spawn_failed {
+            return;
+        }
+        self.consecutive_respawns += 1;
+        if self.consecutive_respawns > MAX_CONSECUTIVE_RESPAWNS {
+            tracing::warn!(
+                attempts = self.consecutive_respawns,
+                "plugin sidecar crashed repeatedly — giving up (slots bypass)"
+            );
+            self.spawn_failed = true;
+            self.dead = false;
+            return;
+        }
+        // ensure_client respawns + bumps the generation on success.
+        self.dead = false;
+        let _ = self.ensure_client();
+    }
+
     /// Lazily (re)spawn the sidecar. Returns whether a client is now live.
     fn ensure_client(&mut self) -> bool {
         if self.client.is_some() {
@@ -149,34 +208,43 @@ impl RemotePluginHost {
     }
 
     /// Drop the current (dead) client so the next call respawns. Reaps
-    /// the child via `PluginClient`/`Sidecar` Drop.
+    /// the child via `PluginClient`/`Sidecar` Drop. Claims the PID (swap to
+    /// 0) so the watchdog can't also act on it.
     fn drop_client(&mut self) {
-        self.watch.pid.store(0, Ordering::Release);
+        self.watch.pid.swap(0, Ordering::AcqRel);
         self.client = None;
     }
 
-    /// Run one IPC call bracketed by the watchdog in-flight markers.
+    /// Run one IPC call bracketed by the watchdog in-flight markers, with a
+    /// per-call hang `timeout_ms`. The watchdog only kills the sidecar
+    /// while a call is genuinely in flight (deadline non-zero), at which
+    /// point the fold thread is blocked here and is NOT reaping — so the
+    /// kill-by-PID can't race a reap (no PID-reuse window).
     fn guarded<T>(
         &mut self,
+        timeout_ms: u64,
         f: impl FnOnce(&mut PluginClient) -> Result<T, PluginClientError>,
     ) -> Option<Result<T, PluginClientError>> {
         let watch = &self.watch;
         let client = self.client.as_mut()?;
-        let stamp = watch.epoch.elapsed().as_millis() as u64 + 1;
-        watch.in_flight_since.store(stamp, Ordering::Release);
+        // Publish seq before deadline so the watchdog, which reads deadline
+        // first, always sees a seq that belongs to this-or-a-later call.
+        watch.in_flight_seq.fetch_add(1, Ordering::AcqRel);
+        let deadline = watch.epoch.elapsed().as_millis() as u64 + timeout_ms;
+        watch.in_flight_deadline.store(deadline, Ordering::Release);
         let r = f(client);
-        watch.in_flight_since.store(0, Ordering::Release);
+        watch.in_flight_deadline.store(0, Ordering::Release);
         Some(r)
     }
 
-    /// Classify an IPC error and drop the client if the sidecar is dead.
-    /// Returns nothing useful — callers always bypass on error.
+    /// Classify an IPC error: a transport failure means the sidecar is
+    /// gone → mark it dead so `poll_recovery` respawns it.
     fn note_error(&mut self, e: PluginClientError) {
         match e {
-            // Transport failure → the sidecar process is gone.
             PluginClientError::Ipc(_) => {
-                tracing::warn!("plugin sidecar died — respawning on next use");
+                tracing::warn!("plugin sidecar died — will respawn");
                 self.drop_client();
+                self.dead = true;
             }
             // The sidecar replied with an error (e.g. unknown plugin):
             // it's alive; just this op failed.
@@ -193,7 +261,7 @@ impl RemotePluginHost {
             return None;
         }
         let (sr, mb, gen) = (self.sample_rate, self.max_block, self.generation);
-        match self.guarded(move |c| c.instantiate(descriptor, sr, mb)) {
+        match self.guarded(INSTANTIATE_TIMEOUT_MS, move |c| c.instantiate(descriptor, sr, mb)) {
             Some(Ok(id)) => {
                 self.instantiations += 1;
                 Some((id, gen))
@@ -213,8 +281,12 @@ impl RemotePluginHost {
         if gen != self.generation || self.client.is_none() {
             return None;
         }
-        match self.guarded(move |c| c.process(instance, frames_in)) {
-            Some(Ok(out)) => Some(out),
+        match self.guarded(PROCESS_TIMEOUT_MS, move |c| c.process(instance, frames_in)) {
+            Some(Ok(out)) => {
+                // A working block clears the crash-loop counter.
+                self.consecutive_respawns = 0;
+                Some(out)
+            }
             Some(Err(e)) => {
                 self.note_error(e);
                 None
@@ -230,17 +302,19 @@ impl RemotePluginHost {
         if gen != self.generation || self.client.is_none() {
             return;
         }
-        if let Some(Err(e)) = self.guarded(move |c| c.set_param(instance, param_id, value)) {
+        if let Some(Err(e)) =
+            self.guarded(CONTROL_TIMEOUT_MS, move |c| c.set_param(instance, param_id, value))
+        {
             self.note_error(e);
         }
     }
 
     /// Best-effort destroy of an instance (ignored if the sidecar is gone).
     pub fn destroy(&mut self, instance: Uuid, gen: u64) {
-        if gen != self.generation {
+        if gen != self.generation || self.client.is_none() {
             return;
         }
-        if let Some(Err(e)) = self.guarded(move |c| c.destroy(instance)) {
+        if let Some(Err(e)) = self.guarded(CONTROL_TIMEOUT_MS, move |c| c.destroy(instance)) {
             self.note_error(e);
         }
     }
@@ -263,23 +337,33 @@ fn watchdog_loop(watch: Arc<Watch>) {
         if watch.stop.load(Ordering::Acquire) {
             return;
         }
-        std::thread::sleep(Duration::from_millis(100));
-        let started = watch.in_flight_since.load(Ordering::Acquire);
-        if started == 0 {
+        std::thread::sleep(Duration::from_millis(WATCHDOG_POLL_MS));
+        // Capture the in-flight call's deadline + seq together.
+        let deadline = watch.in_flight_deadline.load(Ordering::Acquire);
+        if deadline == 0 {
             continue; // idle
         }
+        let seq = watch.in_flight_seq.load(Ordering::Acquire);
         let now = watch.epoch.elapsed().as_millis() as u64;
-        if now.saturating_sub(started - 1) >= HANG_TIMEOUT_MS {
-            let pid = watch.pid.load(Ordering::Acquire);
-            if pid != 0 {
-                tracing::warn!(pid, "plugin sidecar hung — killing");
-                kill_pid(pid);
-                watch.kills.fetch_add(1, Ordering::AcqRel);
-            }
-            // Don't re-fire on the same stuck call; the fold thread will
-            // also clear this once its IPC call returns the broken-pipe
-            // error.
-            watch.in_flight_since.store(0, Ordering::Release);
+        if now < deadline {
+            continue; // still within budget
+        }
+        // Re-validate that the SAME call is still in flight right before
+        // killing — a call that finished at the boundary (deadline now 0,
+        // or seq advanced) must not be killed.
+        if watch.in_flight_deadline.load(Ordering::Acquire) != deadline
+            || watch.in_flight_seq.load(Ordering::Acquire) != seq
+        {
+            continue;
+        }
+        // Claim the PID atomically. If the fold thread (drop_client) or a
+        // prior watchdog pass already took it, we get 0 and do nothing —
+        // so the kill and the reap can never both fire on the same PID.
+        let pid = watch.pid.swap(0, Ordering::AcqRel);
+        if pid != 0 {
+            tracing::warn!(pid, "plugin sidecar hung — killing");
+            kill_pid(pid);
+            watch.kills.fetch_add(1, Ordering::AcqRel);
         }
     }
 }

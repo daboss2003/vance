@@ -114,6 +114,13 @@ impl BlockProcessor {
         }
         self.out.pop_front().unwrap_or((0.0, 0.0))
     }
+
+    /// Discard the partial input block and queued output so a re-enable
+    /// (after the effect was bypassed) starts on a clean block boundary.
+    pub fn reset(&mut self) {
+        self.fill = 0;
+        self.out.clear();
+    }
 }
 
 /// Instantiate a plugin by `(format, id, params)`. `params` is a list
