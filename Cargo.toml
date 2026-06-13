@@ -44,6 +44,7 @@ members = [
 exclude = [
     "plugins/stylize",
     "plugins/dissolve",
+    "vendor/lv2-sys",
 ]
 
 [workspace.package]
@@ -102,6 +103,14 @@ libloading = "0.8"
 tempfile = "3"
 proptest = "1"
 libc = "0.2"
+
+# rust-lv2's `lv2-sys` gates macOS out with a compile_error, even though
+# its LV2 C-ABI bindings are platform-identical. The vendored copy lifts
+# that gate (macOS → Linux bindings) so LV2 hosting (the `lv2` feature)
+# can build on macOS. Only consulted when `lv2-sys` is in the graph
+# (i.e. when something enables the `lv2` feature → pulls `livi`).
+[patch.crates-io]
+lv2-sys = { path = "vendor/lv2-sys" }
 
 [profile.dev]
 incremental = true
