@@ -341,6 +341,96 @@ fn param_change_does_not_reinstantiate_remote_plugin() {
     );
 }
 
+// --- LV2: full mixer → sidecar → lv2_backend chain --------------------
+
+const LV2_URI: &str = "urn:vance:test:gain";
+
+fn lv2_dylib() -> Option<PathBuf> {
+    let (prefix, ext) = if cfg!(target_os = "windows") {
+        ("", "dll")
+    } else if cfg!(target_os = "macos") {
+        ("lib", "dylib")
+    } else {
+        ("lib", "so")
+    };
+    let p = workspace_target_debug().join(format!("{prefix}vance_lv2_testplugin.{ext}"));
+    p.exists().then_some(p)
+}
+
+fn sidecar_speaks_lv2(bin: &PathBuf) -> bool {
+    match PluginClient::spawn(bin) {
+        Ok(c) => c.supported_formats().contains(&PluginFormat::Lv2),
+        Err(_) => false,
+    }
+}
+
+fn stage_lv2_bundle(dylib: &PathBuf) -> std::io::Result<PathBuf> {
+    let root = std::env::temp_dir().join(format!("vance-lv2-rp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let bundle = root.join("vance-test.lv2");
+    std::fs::create_dir_all(&bundle)?;
+    let dy = dylib.file_name().unwrap().to_string_lossy().into_owned();
+    std::fs::copy(dylib, bundle.join(&dy))?;
+    std::fs::write(
+        bundle.join("manifest.ttl"),
+        format!(
+            "@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n\
+             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
+             <{LV2_URI}>\n\ta lv2:Plugin ;\n\tlv2:binary <{dy}> ;\n\trdfs:seeAlso <vance-test.ttl> .\n"
+        ),
+    )?;
+    std::fs::write(
+        bundle.join("vance-test.ttl"),
+        format!(
+            "@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n\
+             @prefix doap: <http://usefulinc.com/ns/doap#> .\n\
+             <{LV2_URI}>\n\ta lv2:Plugin ;\n\tdoap:name \"Vance Test Gain\" ;\n\
+             \tlv2:port [\n\t\ta lv2:AudioPort, lv2:InputPort ;\n\t\tlv2:index 0 ; lv2:symbol \"in\" ; lv2:name \"In\"\n\
+             \t] , [\n\t\ta lv2:AudioPort, lv2:OutputPort ;\n\t\tlv2:index 1 ; lv2:symbol \"out\" ; lv2:name \"Out\"\n\t] .\n"
+        ),
+    )?;
+    Ok(root)
+}
+
+#[test]
+fn mixer_routes_lv2_through_sidecar() {
+    let Some(bin) = sidecar_bin() else {
+        return;
+    };
+    if !sidecar_speaks_lv2(&bin) {
+        eprintln!("sidecar not built with --features lv2 — skipping mixer LV2 test");
+        return;
+    }
+    let Some(dylib) = lv2_dylib() else {
+        eprintln!("lv2 test fixture not built — skipping");
+        return;
+    };
+    let root = stage_lv2_bundle(&dylib).expect("stage .lv2 bundle");
+    // SAFETY: single-threaded test setup; the host spawns the sidecar
+    // lazily on first instantiate, inheriting this env.
+    unsafe {
+        std::env::set_var("LV2_PATH", &root);
+    }
+
+    let mut host = RemotePluginHost::new(bin, 48_000.0, 512);
+    let spec = vec![vance_audio::AudioEffectKind::Plugin {
+        enabled: true,
+        format_str: "lv2".into(),
+        id: LV2_URI.into(),
+        name: "Vance Test Gain".into(),
+        params: vec![],
+    }];
+    let mut dsp = vance_audio::TrackDspState::new();
+    dsp.reconcile_with(&spec, 48_000.0, Some(&mut host));
+    let mut out = (0.0f32, 0.0f32);
+    for _ in 0..512 {
+        out = dsp.tick_stereo(&spec, 1.0, 1.0, Some(&mut host));
+    }
+    assert!((out.0 - 0.5).abs() < 1e-2, "L expected ~0.5, got {}", out.0);
+    assert!((out.1 - 0.5).abs() < 1e-2, "R expected ~0.5, got {}", out.1);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[cfg(unix)]
 fn kill(pid: u32) {
     unsafe {
