@@ -478,7 +478,7 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
             *track_id,
             *transition_id,
             *after_clip_id,
-            *kind,
+            kind.clone(),
             *duration,
         ),
         EditOp::RemoveTransition {

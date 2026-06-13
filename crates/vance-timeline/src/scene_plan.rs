@@ -16,7 +16,7 @@ use crate::clip::Clip;
 use crate::id::{ClipId, MediaItemId, TransitionId};
 use crate::sequence::Sequence;
 use crate::track::{Track, TrackKind};
-use crate::transition::Transition;
+use crate::transition::{Transition, TransitionKind};
 
 /// What's on screen at a given timeline position.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -90,16 +90,22 @@ fn clip_at(track: &Track, t: RationalTime) -> Option<&Clip> {
 /// (A) is the one whose `timeline_out` equals the transition's
 /// position, and the incoming clip (B) is the immediately following
 /// clip on that same track.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ActiveTransition {
     /// Which transition this is — used for UI selection bookkeeping.
     pub transition_id: TransitionId,
+    /// The transition kind — drives the engine path (GPU dissolve vs a
+    /// WASM `process_transition`).
+    pub kind: TransitionKind,
     /// Outgoing clip (fading out) — the renderer's A side.
     pub from: ActiveClip,
     /// Incoming clip (fading in) — the renderer's B side.
     pub to: ActiveClip,
-    /// Linear mix factor in `[0, 1]`. 0 = pure A; 1 = pure B.
+    /// Linear mix factor in `[0, 1]`. 0 = pure A; 1 = pure B. For a WASM
+    /// transition this is fed to the plugin as its `mix`/`progress` param.
     pub mix: f32,
+    /// Plugin param overrides (WASM transitions only; empty otherwise).
+    pub params: std::collections::BTreeMap<String, crate::effect::EffectValue>,
 }
 
 /// First transition on an enabled video track whose window contains
@@ -149,6 +155,7 @@ pub fn transition_at(seq: &Sequence, timeline_t: RationalTime) -> Option<ActiveT
             );
             return Some(ActiveTransition {
                 transition_id: tr.id,
+                kind: tr.kind.clone(),
                 from: ActiveClip {
                     clip_id: from.id,
                     media: from.media,
@@ -160,6 +167,7 @@ pub fn transition_at(seq: &Sequence, timeline_t: RationalTime) -> Option<ActiveT
                     source_pts: to_src,
                 },
                 mix,
+                params: tr.params.clone(),
             });
         }
     }

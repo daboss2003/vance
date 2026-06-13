@@ -5342,8 +5342,11 @@ impl Engine {
                         .iter()
                         .map(|tr| TransitionInfo {
                             id: tr.id.to_string(),
-                            kind: match tr.kind {
+                            kind: match &tr.kind {
                                 vance_timeline::TransitionKind::Dissolve => "dissolve".into(),
+                                // WASM transitions surface as "wasm:<id>"
+                                // (same convention as wasm effects).
+                                vance_timeline::TransitionKind::Wasm(id) => format!("wasm:{id}"),
                             },
                             position_seconds: rt_to_seconds(tr.position),
                             duration_seconds: rt_to_seconds(tr.duration),

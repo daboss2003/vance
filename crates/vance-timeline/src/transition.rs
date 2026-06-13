@@ -24,18 +24,26 @@
 //!   missing frames render as the last available frame.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use vance_core::{Rational, RationalTime};
 
+use crate::effect::EffectValue;
 use crate::id::TransitionId;
 
-/// What kind of transition this is. Drives which renderer pass is
-/// used at the engine layer. v1 only ships `Dissolve` (linear
-/// cross-dissolve via the renderer's `mix_factor` uniform).
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+/// What kind of transition this is. Drives which engine path renders
+/// the transition window.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum TransitionKind {
     /// Linear cross-dissolve. Mix factor ramps 0 → 1 over the
-    /// transition's duration.
+    /// transition's duration, blended on the GPU via the renderer's
+    /// `mix_factor` uniform.
     Dissolve,
+    /// A WASM transition plugin (manifest `kind: Transition`). The string
+    /// is the plugin manifest id (e.g. `com.vance.sample.dissolve`). The
+    /// engine renders both clips to RGBA and calls the plugin's
+    /// `process_transition(a, b, ...)`, feeding the linear progress as the
+    /// `mix`/`progress` parameter.
+    Wasm(String),
 }
 
 /// A transition anchored at a cut between two clips on a track.
@@ -51,6 +59,13 @@ pub struct Transition {
     pub position: RationalTime,
     /// How long the transition lasts. Must be > 0.
     pub duration: RationalTime,
+    /// Plugin parameter overrides for a [`TransitionKind::Wasm`]
+    /// transition (keyed by manifest param key; values may be keyframed).
+    /// Empty for built-in kinds. The engine supplies the linear progress
+    /// as the `mix`/`progress` param and fills the rest from here (or the
+    /// manifest defaults).
+    #[serde(default)]
+    pub params: BTreeMap<String, EffectValue>,
 }
 
 impl Transition {
@@ -61,6 +76,19 @@ impl Transition {
             kind: TransitionKind::Dissolve,
             position,
             duration,
+            params: BTreeMap::new(),
+        }
+    }
+
+    /// New WASM-plugin transition at `position` of length `duration`,
+    /// driven by the plugin with manifest id `plugin_id`.
+    pub fn wasm(plugin_id: impl Into<String>, position: RationalTime, duration: RationalTime) -> Self {
+        Self {
+            id: TransitionId::new(),
+            kind: TransitionKind::Wasm(plugin_id.into()),
+            position,
+            duration,
+            params: BTreeMap::new(),
         }
     }
 

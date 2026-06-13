@@ -1567,6 +1567,7 @@ pub fn add_transition_at_cut_with_id(
         kind,
         position: cut,
         duration,
+        params: std::collections::BTreeMap::new(),
     };
     for existing in track.transitions.iter() {
         if new_t.window_in() < existing.window_out()
