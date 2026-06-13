@@ -1636,6 +1636,76 @@ fn list_audio_plugins(_state: tauri::State<'_, EngineHandle>) -> Result<Vec<UiPl
         .collect())
 }
 
+/// One enumerated plugin parameter, for the FX panel's knobs.
+#[derive(serde::Serialize, Clone, Debug)]
+struct UiPluginParam {
+    id: u32,
+    name: String,
+    min: f32,
+    max: f32,
+    default: f32,
+}
+
+/// Enumerate a plugin's parameters so the FX panel can render controls.
+/// Spawns a one-shot sidecar, instantiates the plugin, lists its params,
+/// then tears down — mirroring [`list_audio_plugins`]. Returns an empty
+/// list (not an error) when the sidecar / plugin can't be loaded, so the
+/// UI degrades gracefully.
+#[tauri::command]
+fn list_plugin_params(
+    format: String,
+    id: String,
+    _state: tauri::State<'_, EngineHandle>,
+) -> Result<Vec<UiPluginParam>, String> {
+    let plugin_format = match format.as_str() {
+        "builtin" => vance_audio_plugins::PluginFormat::Builtin,
+        "lv2" => vance_audio_plugins::PluginFormat::Lv2,
+        "clap" => vance_audio_plugins::PluginFormat::Clap,
+        other => return Err(format!("unknown plugin format `{other}`")),
+    };
+    let bin = match locate_plugin_host_binary() {
+        Some(p) => p,
+        None => return Ok(Vec::new()),
+    };
+    let mut client = match vance_audio_plugins::PluginClient::spawn(&bin) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(?e, "plugin host spawn failed");
+            return Ok(Vec::new());
+        }
+    };
+    let descriptor = vance_audio_plugins::PluginDescriptor {
+        format: plugin_format,
+        id,
+        name: String::new(),
+        vendor: String::new(),
+        runnable: true,
+    };
+    // 48k / 512 is just for the probe; params are sample-rate-independent.
+    let params = match client.instantiate(descriptor, 48_000.0, 512) {
+        Ok(inst) => {
+            let p = client.list_params(inst).unwrap_or_default();
+            let _ = client.destroy(inst);
+            p
+        }
+        Err(e) => {
+            tracing::warn!(?e, "could not instantiate plugin to list params");
+            Vec::new()
+        }
+    };
+    let _ = client.shutdown();
+    Ok(params
+        .into_iter()
+        .map(|p| UiPluginParam {
+            id: p.id,
+            name: p.name,
+            min: p.min,
+            max: p.max,
+            default: p.default,
+        })
+        .collect())
+}
+
 /// Locate the `vance-plugin-host` sidecar binary. Mirrors
 /// [`locate_audio_binary`] for the audio decoder.
 fn locate_plugin_host_binary() -> Option<std::path::PathBuf> {
@@ -2554,6 +2624,7 @@ fn main() {
             meter_snapshot,
             scrub_burst,
             list_audio_plugins,
+            list_plugin_params,
             render_sequence,
             render_and_replace,
             enqueue_proxy_generation,

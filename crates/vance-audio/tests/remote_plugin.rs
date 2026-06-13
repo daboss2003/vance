@@ -166,6 +166,42 @@ fn mixer_track_dsp_routes_clap_through_sidecar() {
 }
 
 #[test]
+fn mixer_applies_clap_params_via_reconcile() {
+    let Some((bin, id)) = prerequisites() else {
+        return;
+    };
+    // Setting a CLAP parameter through the mixer spec must actually
+    // change the audio: the fixture's `gain` param (id 0) at 1.0 → unity,
+    // at 0.0 → silence — both initial application and a live change.
+    let mut host = RemotePluginHost::new(bin, 48_000.0, 512);
+    let mk = |gain: f32| {
+        vec![vance_audio::AudioEffectKind::Plugin {
+            enabled: true,
+            format_str: "clap".into(),
+            id: id.clone(),
+            name: "Vance Test Gain".into(),
+            params: vec![(0, gain)],
+        }]
+    };
+    let mut dsp = vance_audio::TrackDspState::new();
+
+    // Initial param 1.0 must apply on instantiate (not just on change).
+    dsp.reconcile_with(&mk(1.0), 48_000.0, Some(&mut host));
+    let mut out = (0.0f32, 0.0f32);
+    for _ in 0..512 {
+        out = dsp.tick_stereo(&mk(1.0), 1.0, 1.0, Some(&mut host));
+    }
+    assert!((out.0 - 1.0).abs() < 1e-2, "initial gain 1.0 → unity, got {}", out.0);
+
+    // Live change to 0.0 → silence.
+    dsp.reconcile_with(&mk(0.0), 48_000.0, Some(&mut host));
+    for _ in 0..512 {
+        out = dsp.tick_stereo(&mk(0.0), 1.0, 1.0, Some(&mut host));
+    }
+    assert!(out.0.abs() < 1e-2, "gain 0.0 → silence, got {}", out.0);
+}
+
+#[test]
 fn crash_recovers_through_reconcile_only() {
     let Some((bin, id)) = prerequisites() else {
         return;

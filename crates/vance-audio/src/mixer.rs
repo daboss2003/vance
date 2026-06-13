@@ -764,6 +764,15 @@ impl PluginSlot {
                     // instance was created at, or (on failure) the host's
                     // current generation — so we only retry on a respawn.
                     let attempted = Some(inst.map(|(_, g)| g).unwrap_or_else(|| h.generation()));
+                    // Apply the INITIAL parameter values now — reconcile's
+                    // diff-push only fires on later changes, so a plugin
+                    // added with preset params (or loaded from a project)
+                    // would otherwise keep its defaults.
+                    if let Some((id_uuid, gen)) = inst {
+                        for (pid, val) in params {
+                            h.set_param(id_uuid, gen, *pid, *val);
+                        }
+                    }
                     SlotKind::Remote(RemoteSlot::new(block, inst, attempted))
                 }
                 None => {

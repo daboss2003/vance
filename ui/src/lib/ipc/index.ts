@@ -951,6 +951,22 @@ export type AudioPluginDescriptor = {
 export const listAudioPlugins = (): Promise<AudioPluginDescriptor[]> =>
   invoke('list_audio_plugins');
 
+/** One enumerated plugin parameter, for the FX panel's knobs. */
+export type PluginParamInfo = {
+  id: number;
+  name: string;
+  min: number;
+  max: number;
+  default: number;
+};
+
+/** Enumerate a plugin's parameters (spawns a one-shot sidecar probe).
+ *  Returns an empty list when the plugin can't be loaded. */
+export const listPluginParams = (
+  format: string,
+  id: string
+): Promise<PluginParamInfo[]> => invoke('list_plugin_params', { format, id });
+
 // ---- Phase 10 — WASM effect plugins ---------------------------------------
 
 /** One tunable parameter on a discovered WASM plugin. */

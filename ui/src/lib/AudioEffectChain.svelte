@@ -14,11 +14,13 @@
     defaultLimiter,
     defaultPlugin,
     listAudioPlugins,
+    listPluginParams,
     type AudioEffectSpec,
     type AudioPluginDescriptor,
     type CompressorSpec,
     type EqBandSpec,
-    type LimiterSpec
+    type LimiterSpec,
+    type PluginParamInfo
   } from '$lib/ipc';
   import { projectState } from '$lib/project.svelte';
 
@@ -32,6 +34,41 @@
 
   function commit(index: number, next: AudioEffectSpec) {
     void projectState.updateAudioEffect(trackId, index, next);
+  }
+
+  // Plugin parameter metadata, fetched lazily per plugin id (params are
+  // a property of the plugin class, so all instances share them).
+  // `null` = loading, `[]` = no params / not enumerable.
+  let pluginParamCache = $state<Record<string, PluginParamInfo[] | null>>({});
+
+  async function ensurePluginParams(format: string, id: string) {
+    if (id in pluginParamCache) return;
+    pluginParamCache[id] = null; // mark loading
+    try {
+      pluginParamCache[id] = await listPluginParams(format, id);
+    } catch {
+      pluginParamCache[id] = [];
+    }
+  }
+
+  /** Current value of a plugin param: the override in the effect spec, or
+   *  the param's reported default. */
+  function pluginParamValue(effect: AudioEffectSpec, info: PluginParamInfo): number {
+    if (effect.kind !== 'Plugin') return info.default;
+    const found = effect.params.find((p) => p.param_id === info.id);
+    return found ? found.value : info.default;
+  }
+
+  function setPluginParam(
+    index: number,
+    effect: AudioEffectSpec,
+    paramId: number,
+    value: number
+  ) {
+    if (effect.kind !== 'Plugin') return;
+    const params = effect.params.filter((p) => p.param_id !== paramId);
+    params.push({ param_id: paramId, value });
+    commit(index, { ...effect, params });
   }
 
   function toggleEnabled(index: number, effect: AudioEffectSpec) {
@@ -426,20 +463,44 @@
           </label>
         </div>
       {:else if effect.kind === 'Plugin'}
+        {@const _ = ensurePluginParams(effect.descriptor.format, effect.descriptor.id)}
         <div class="text-vance-muted text-[10px] font-mono">
-          <div>
-            <span class="text-vance-muted">format</span>
-            <span class="text-vance-fg ml-1">{effect.descriptor.format}</span>
-          </div>
           <div class="break-all">
-            <span class="text-vance-muted">id</span>
+            <span class="text-vance-muted">{effect.descriptor.format}</span>
             <span class="text-vance-fg ml-1">{effect.descriptor.id}</span>
           </div>
-          <div class="mt-1 italic">
-            Sandboxed via vance-plugin-host. Parameter editor lands when the shared-memory audio
-            path is wired up.
-          </div>
         </div>
+        {#if pluginParamCache[effect.descriptor.id] === null}
+          <div class="text-[10px] italic text-vance-muted">Loading parameters…</div>
+        {:else if (pluginParamCache[effect.descriptor.id]?.length ?? 0) === 0}
+          <div class="text-[10px] italic text-vance-muted">This plugin exposes no parameters.</div>
+        {:else}
+          {#each pluginParamCache[effect.descriptor.id] ?? [] as param}
+            <label
+              class="border-vance-border mb-1 flex items-center gap-2 rounded border-l-2 py-0.5 pl-2 text-[10px] font-mono"
+            >
+              <span class="w-24 truncate text-vance-muted" title={param.name}>{param.name}</span>
+              <input
+                type="range"
+                min={param.min}
+                max={param.max}
+                step={(param.max - param.min) / 1000 || 0.001}
+                value={pluginParamValue(effect, param)}
+                class="flex-1"
+                oninput={(e) =>
+                  setPluginParam(
+                    idx,
+                    effect,
+                    param.id,
+                    parseFloat((e.target as HTMLInputElement).value)
+                  )}
+              />
+              <span class="w-12 text-right text-vance-fg">
+                {pluginParamValue(effect, param).toFixed(3)}
+              </span>
+            </label>
+          {/each}
+        {/if}
       {/if}
     </div>
   {/each}
