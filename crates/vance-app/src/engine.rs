@@ -3485,6 +3485,37 @@ impl Engine {
         end_s: f64,
         sample_rate: u32,
     ) -> Result<Vec<f32>, EngineError> {
+        // Spawn a dedicated audio decoder sidecar + plugin host for this
+        // one bounce, then delegate to the shared range mixer.
+        let bin = locate_audio_binary()?;
+        let mut audio = vance_audio::AudioClient::spawn(&bin)
+            .map_err(|e| EngineError::Project(format!("audio decoder spawn: {e}")))?;
+        let mut plugin_host = locate_plugin_host_binary().map(|bin| {
+            vance_audio::remote_plugin::RemotePluginHost::new(
+                bin,
+                sample_rate as f32,
+                vance_audio::audio_plugin::DEFAULT_BLOCK as u32,
+            )
+        });
+        let out =
+            self.bounce_range_with(&mut audio, start_s, end_s, sample_rate, plugin_host.as_mut());
+        let _ = audio.shutdown();
+        out
+    }
+
+    /// Bounce the mixed audio for `[start_s, end_s)` using the supplied
+    /// (possibly warm) decoder `audio` and optional `plugin_host`. Shared
+    /// by the export path (fresh sidecar, plugins on) and the scrub grain
+    /// renderer (warm sidecar, plugins off). Does NOT shut down `audio`
+    /// (the caller owns its lifecycle), so it can be reused across calls.
+    fn bounce_range_with(
+        &mut self,
+        audio: &mut vance_audio::AudioClient,
+        start_s: f64,
+        end_s: f64,
+        sample_rate: u32,
+        mut plugin_host: Option<&mut vance_audio::remote_plugin::RemotePluginHost>,
+    ) -> Result<Vec<f32>, EngineError> {
         let snapshot = {
             let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
             let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
@@ -3552,11 +3583,6 @@ impl Engine {
             .iter()
             .map(|id| (*id, vec![0.0f32; total_frames * 2]))
             .collect();
-
-        // Spawn one audio decoder sidecar, reused across clips.
-        let bin = locate_audio_binary()?;
-        let mut audio = vance_audio::AudioClient::spawn(&bin)
-            .map_err(|e| EngineError::Project(format!("audio decoder spawn: {e}")))?;
 
         for job in &clip_jobs {
             // Timeline overlap with the export range.
@@ -3643,20 +3669,10 @@ impl Engine {
                 track_buf[oi * 2 + 1] += resampled[j * 2 + 1] * pre * pan[1];
             }
         }
-        let _ = audio.shutdown();
-
         // Per-track DSP (EQ / comp / limiter / plugins), then sum into
         // master. CLAP/LV2 plugins process out-of-process through the
-        // sandbox sidecar — the same path as live playback — so an export
-        // applies them too (and a plugin crash bypasses the slot rather
-        // than aborting the render). Shared across tracks; lazily spawned.
-        let mut plugin_host = locate_plugin_host_binary().map(|bin| {
-            vance_audio::remote_plugin::RemotePluginHost::new(
-                bin,
-                sample_rate as f32,
-                vance_audio::audio_plugin::DEFAULT_BLOCK as u32,
-            )
-        });
+        // caller-supplied `plugin_host` (export: on; scrub grain: None →
+        // built-in DSP only). The same path as live playback.
         for track_id in &audio_tracks {
             let Some(mut buf) = track_bufs.remove(track_id) else {
                 continue;
@@ -3664,13 +3680,17 @@ impl Engine {
             if let Some(tm) = snapshot.tracks.get(track_id) {
                 if !tm.audio_effects.is_empty() {
                     let mut dsp = vance_audio::TrackDspState::new();
-                    dsp.reconcile_with(&tm.audio_effects, sample_rate as f32, plugin_host.as_mut());
+                    dsp.reconcile_with(
+                        &tm.audio_effects,
+                        sample_rate as f32,
+                        plugin_host.as_deref_mut(),
+                    );
                     for fr in 0..total_frames {
                         let (nl, nr) = dsp.tick_stereo(
                             &tm.audio_effects,
                             buf[fr * 2],
                             buf[fr * 2 + 1],
-                            plugin_host.as_mut(),
+                            plugin_host.as_deref_mut(),
                         );
                         buf[fr * 2] = nl;
                         buf[fr * 2 + 1] = nr;
