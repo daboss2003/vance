@@ -1781,6 +1781,19 @@ impl Engine {
         //    a scrub-back to the same (frame, effects) is instant.
         self.apply_wasm_effects_cached(&mut rgba, w, h, effects, clip_t);
         // 3. Blit to the surface.
+        self.present_rgba_to_surface(render_state, viewport, &rgba, w, h)
+    }
+
+    /// Blit a finished CPU RGBA frame to the viewport surface. Shared by
+    /// the WASM-effect and WASM-transition preview paths.
+    fn present_rgba_to_surface(
+        &self,
+        render_state: &Arc<Mutex<RenderState>>,
+        viewport: &Arc<Viewport>,
+        rgba: &[u8],
+        w: u32,
+        h: u32,
+    ) -> Result<(), EngineError> {
         let mut rs = render_state.lock();
         let surface = viewport.surface();
         if rs.surface_config.is_none() {
@@ -1813,10 +1826,64 @@ impl Engine {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         rs.renderer
-            .present_rgba(&rgba, w, h, &view, format)
+            .present_rgba(rgba, w, h, &view, format)
             .map_err(|e| EngineError::Project(format!("preview blit: {e}")))?;
         surface_tex.present();
         Ok(())
+    }
+
+    /// Live-preview a WASM transition: render both clips to RGBA, let the
+    /// plugin blend B into A, and blit the result. Mirrors the export
+    /// path's WASM-transition branch. Falls back to the GPU dissolve
+    /// preview if the bounds aren't known or the renders fail.
+    fn decode_wasm_transition_at(
+        &mut self,
+        seq: &Sequence,
+        active_tr: vance_timeline::ActiveTransition,
+        plugin_id: &str,
+    ) -> Result<i64, EngineError> {
+        let bounds = self.last_bounds;
+        if bounds.is_empty() {
+            return self.decode_transition_at(seq, active_tr, 0.0);
+        }
+        let (w, h) = (bounds.w, bounds.h);
+        let from_src_pts = rt_to_seconds(active_tr.from.source_pts);
+        let to_src_pts = rt_to_seconds(active_tr.to.source_pts);
+        let from_src_in = clip_anchor_seconds(seq, active_tr.from.clip_id)
+            .map(|(_, s)| s)
+            .unwrap_or(0.0);
+        let to_src_in = clip_anchor_seconds(seq, active_tr.to.clip_id)
+            .map(|(_, s)| s)
+            .unwrap_or(0.0);
+
+        let Some((mut a, pts_a)) = self.render_clip_to_rgba(
+            active_tr.from.clip_id,
+            active_tr.from.media,
+            from_src_pts,
+            from_src_in,
+            w,
+            h,
+        ) else {
+            return self.decode_transition_at(seq, active_tr, 0.0);
+        };
+        let Some((b, _)) = self.render_clip_to_rgba(
+            active_tr.to.clip_id,
+            active_tr.to.media,
+            to_src_pts,
+            to_src_in,
+            w,
+            h,
+        ) else {
+            return self.decode_transition_at(seq, active_tr, 0.0);
+        };
+        let to_clip_t = to_src_pts - to_src_in;
+        self.apply_wasm_transition(&mut a, &b, w, h, plugin_id, &active_tr.params, active_tr.mix, to_clip_t);
+
+        let viewport = self.viewport.as_ref().ok_or(EngineError::NoViewport)?.clone();
+        let render_state = self.render_state.as_ref().ok_or(EngineError::NoViewport)?.clone();
+        self.present_rgba_to_surface(&render_state, &viewport, &a, w, h)?;
+        self.last_resume_pts = Some(pts_a);
+        Ok(pts_a)
     }
 
     /// Begin streaming playback starting at `from_pts`. The scheduler
@@ -3714,6 +3781,11 @@ impl Engine {
                     .ok_or(EngineError::SequenceNotFound)?
                     .clone()
             };
+            // A WASM transition blends on the CPU (process_transition);
+            // a dissolve blends on the GPU (mix_factor).
+            if let vance_timeline::TransitionKind::Wasm(plugin_id) = active_tr.kind.clone() {
+                return self.decode_wasm_transition_at(&seq, active_tr, &plugin_id);
+            }
             return self.decode_transition_at(&seq, active_tr, timeline_seconds);
         }
         // Not in a transition window — make sure the renderer's mix
@@ -7342,22 +7414,26 @@ impl Engine {
                     vance_timeline::TransitionKind::Wasm(plugin_id) => {
                         // Render A and B fully + independently, then let the
                         // WASM plugin blend B into A on the CPU.
-                        let a = self.render_clip_to_rgba(
-                            tr.from.clip_id,
-                            from_media,
-                            from_src_pts,
-                            from_src_in,
-                            width,
-                            height,
-                        );
-                        let b = self.render_clip_to_rgba(
-                            tr.to.clip_id,
-                            to_media,
-                            to_src_pts,
-                            to_src_in,
-                            width,
-                            height,
-                        );
+                        let a = self
+                            .render_clip_to_rgba(
+                                tr.from.clip_id,
+                                from_media,
+                                from_src_pts,
+                                from_src_in,
+                                width,
+                                height,
+                            )
+                            .map(|(r, _)| r);
+                        let b = self
+                            .render_clip_to_rgba(
+                                tr.to.clip_id,
+                                to_media,
+                                to_src_pts,
+                                to_src_in,
+                                width,
+                                height,
+                            )
+                            .map(|(r, _)| r);
                         if let (Some(mut a), Some(b)) = (a, b) {
                             let to_clip_t = to_src_pts - to_src_in;
                             self.apply_wasm_transition(
@@ -7817,8 +7893,9 @@ impl Engine {
         source_in_sec: f64,
         width: u32,
         height: u32,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<(Vec<u8>, i64)> {
         let frame = self.decode_clip_framedata(media_id, source_pts_sec)?;
+        let pts = frame.pts;
         let rs_arc = self.render_state.clone()?;
         {
             let mut rs = rs_arc.lock();
@@ -7836,7 +7913,7 @@ impl Engine {
         if !effects.is_empty() {
             self.apply_wasm_effects(&mut out, width, height, &effects, clip_t);
         }
-        Some(out)
+        Some((out, pts))
     }
 
     /// Blend the B clip into the A clip using a WASM transition plugin.

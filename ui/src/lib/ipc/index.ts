@@ -749,7 +749,8 @@ export const updateEffectParam = (
 export const addTransitionAtCut = (
   trackId: string,
   afterClipId: string,
-  kind: 'dissolve',
+  // 'dissolve' (built-in GPU) or 'wasm:<plugin-id>' (a WASM transition).
+  kind: string,
   durationSeconds: number
 ): Promise<string> =>
   invoke('add_transition_at_cut', {

@@ -59,9 +59,14 @@
     if (!trackId || !clipId) return;
     error = null;
     try {
-      await applyWasmPlugin(trackId, clipId, plugin);
+      if (plugin.kind === 'transition') {
+        // A transition is applied at the cut AFTER the selected clip.
+        await projectState.addTransitionAtCut(trackId, clipId, `wasm:${plugin.id}`, 1);
+      } else {
+        await applyWasmPlugin(trackId, clipId, plugin);
+      }
       lastApplied = plugin.name;
-      // Refresh the project so the new effect shows in the inspector.
+      // Refresh the project so the new effect / transition shows.
       await projectState.refresh();
     } catch (e) {
       error = String(e);
@@ -121,12 +126,12 @@
             type="button"
             class="bg-vance-accent text-vance-bg rounded px-1.5 py-0.5 text-[10px] disabled:opacity-40"
             onclick={() => apply(p)}
-            disabled={!canApply || p.kind !== 'effect'}
+            disabled={!canApply}
             title={p.kind === 'effect'
               ? 'Apply this effect to the selected clip'
-              : 'Transitions are applied between clips (drop on a cut)'}
+              : 'Add this transition at the cut after the selected clip'}
           >
-            Apply
+            {p.kind === 'transition' ? 'Add' : 'Apply'}
           </button>
         </li>
       {/each}

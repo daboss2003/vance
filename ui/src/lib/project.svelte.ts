@@ -1034,16 +1034,27 @@ class ProjectState {
     }
   }
 
-  /** Drop a cross-dissolve at the cut after `afterClipId`. Default
-   *  duration: 1 second. */
-  async addDissolveAtCut(trackId: string, afterClipId: string, durationSeconds = 1) {
+  /** Drop a transition at the cut after `afterClipId`. `kind` is
+   *  'dissolve' (built-in GPU) or 'wasm:<plugin-id>' (a WASM transition
+   *  plugin). Default duration: 1 second. */
+  async addTransitionAtCut(
+    trackId: string,
+    afterClipId: string,
+    kind = 'dissolve',
+    durationSeconds = 1
+  ) {
     this.error = null;
     try {
-      await ipcAddTransition(trackId, afterClipId, 'dissolve', durationSeconds);
+      await ipcAddTransition(trackId, afterClipId, kind, durationSeconds);
       await this.commitEdit();
     } catch (e) {
       this.error = String(e);
     }
+  }
+
+  /** Convenience: drop the built-in cross-dissolve. */
+  async addDissolveAtCut(trackId: string, afterClipId: string, durationSeconds = 1) {
+    await this.addTransitionAtCut(trackId, afterClipId, 'dissolve', durationSeconds);
   }
 
   /** Remove a transition from a track by ID. */
