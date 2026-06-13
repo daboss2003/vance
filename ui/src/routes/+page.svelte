@@ -35,6 +35,7 @@
   import AudioEffectChain from '$lib/AudioEffectChain.svelte';
   import ExportPanel from '$lib/ExportPanel.svelte';
   import EffectsBrowser from '$lib/EffectsBrowser.svelte';
+  import TransitionInspector from '$lib/TransitionInspector.svelte';
   import ColorWheel from '$lib/color/ColorWheel.svelte';
   import CurveEditor from '$lib/color/CurveEditor.svelte';
   import ScopeCanvas from '$lib/color/ScopeCanvas.svelte';
@@ -2454,6 +2455,10 @@
           <div class="mt-3">
             <EffectsBrowser trackId={t.id} clipId={c.id} />
           </div>
+
+          <!-- Transition at this clip's following cut (if any). Lets the
+               user edit a WASM transition's plugin parameters. -->
+          <TransitionInspector track={t} clip={c} />
 
           <!-- Phase 7.6 — pan controls. Sliders for the parent track's
                pan AND the clip's pan, since they compose additively at

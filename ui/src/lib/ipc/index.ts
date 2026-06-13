@@ -266,9 +266,12 @@ export type Fade = {
 
 export type TransitionInfo = {
   id: string;
-  kind: 'dissolve';
+  /** "dissolve" or "wasm:<plugin-id>". */
+  kind: string;
   position_seconds: number;
   duration_seconds: number;
+  /** Plugin param overrides (WASM transitions); empty for dissolve. */
+  params: Record<string, EffectValue>;
 };
 
 export type TrackContents = {

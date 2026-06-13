@@ -235,12 +235,14 @@ pub struct TrackContents {
 pub struct TransitionInfo {
     /// Transition's UUID.
     pub id: String,
-    /// Kind ("dissolve").
+    /// Kind: "dissolve" or "wasm:<plugin-id>".
     pub kind: String,
     /// Cut position in seconds (the center of the transition window).
     pub position_seconds: f64,
     /// Duration of the transition window in seconds.
     pub duration_seconds: f64,
+    /// Plugin param overrides (WASM transitions); empty for dissolve.
+    pub params: std::collections::BTreeMap<String, vance_timeline::EffectValue>,
 }
 
 /// One clip's worth of timing info for the UI.
@@ -5439,6 +5441,7 @@ impl Engine {
                             },
                             position_seconds: rt_to_seconds(tr.position),
                             duration_seconds: rt_to_seconds(tr.duration),
+                            params: tr.params.clone(),
                         })
                         .collect(),
                     mute: t.mute,
