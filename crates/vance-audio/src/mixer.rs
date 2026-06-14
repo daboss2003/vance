@@ -909,10 +909,27 @@ pub struct TrackMix {
 pub struct BusMix {
     /// Bus fader gain, linear (precomputed from dB at build time).
     pub gain_linear: f32,
+    /// Per-channel BALANCE multipliers `[L, R]` precomputed from the bus
+    /// pan via [`bus_balance`]. Center = `[1, 1]` (unity — adding a
+    /// centered bus never changes level), full-pan zeroes the opposite
+    /// channel. (A stereo submix uses balance, not the equal-power pan law
+    /// clips use.)
+    pub pan_linear: [f32; 2],
     /// Bus mute — silences everything routed through it.
     pub mute: bool,
     /// Where the bus's main output goes: another bus, or `None` = master.
     pub output_bus: Option<Uuid>,
+}
+
+/// Stereo BALANCE multipliers `[L, R]` for a bus pan in `[-1, 1]`. Center
+/// (`0`) is unity `[1, 1]`; panning right attenuates the left channel
+/// linearly (and vice-versa). Distinct from the equal-power pan law used
+/// for clips — a submix bus shouldn't lose 3 dB just for existing.
+pub fn bus_balance(pan: f32) -> [f32; 2] {
+    let p = pan.clamp(-1.0, 1.0);
+    let l = if p > 0.0 { 1.0 - p } else { 1.0 };
+    let r = if p < 0.0 { 1.0 + p } else { 1.0 };
+    [l, r]
 }
 
 /// Per-clip mixer state inside a [`MixerSnapshot`]. The fold thread
@@ -1021,6 +1038,31 @@ impl MixerSnapshot {
             bus = b.output_bus;
         }
         g
+    }
+
+    /// GOAT-4: per-channel `[L, R]` multipliers along a track/bus output
+    /// chain to master — composes each bus's fader gain AND balance pan.
+    /// `None` → `[1, 1]`. `[0, 0]` on mute / missing bus / cycle. Used by
+    /// the live fold so the console pan knob is audible.
+    pub fn bus_chain_lr(&self, mut bus: Option<Uuid>) -> [f32; 2] {
+        let mut lr = [1.0f32, 1.0];
+        let mut steps = 0u32;
+        while let Some(id) = bus {
+            steps += 1;
+            if steps > 64 {
+                return [0.0, 0.0];
+            }
+            let Some(b) = self.buses.get(&id) else {
+                return [0.0, 0.0];
+            };
+            if b.mute {
+                return [0.0, 0.0];
+            }
+            lr[0] *= b.gain_linear * b.pan_linear[0];
+            lr[1] *= b.gain_linear * b.pan_linear[1];
+            bus = b.output_bus;
+        }
+        lr
     }
 
     /// Effective linear gain for `clip_id`'s contribution to the output
@@ -1996,14 +2038,15 @@ fn fold_loop(
                 // Meter the POST-EFFECT track signal — what the user
                 // actually hears at the track row.
                 track_accums.entry(track_id).or_default().observe(l, r);
-                // GOAT-4: route through the output-bus chain (gain/mute)
-                // AFTER the track inserts, BEFORE the master fader.
-                let bus_g = snap
+                // GOAT-4: route through the output-bus chain (gain + mute
+                // + balance pan, per channel) AFTER the track inserts,
+                // BEFORE the master fader.
+                let bus_lr = snap
                     .tracks
                     .get(&track_id)
-                    .map_or(1.0, |t| snap.bus_chain_gain(t.output_bus));
-                master_pre_master[0] += l * bus_g;
-                master_pre_master[1] += r * bus_g;
+                    .map_or([1.0, 1.0], |t| snap.bus_chain_lr(t.output_bus));
+                master_pre_master[0] += l * bus_lr[0];
+                master_pre_master[1] += r * bus_lr[1];
             }
             let master_l = master_pre_master[0] * snap.master_gain_linear;
             let master_r = master_pre_master[1] * snap.master_gain_linear;
@@ -2150,6 +2193,7 @@ mod tests {
             bus,
             BusMix {
                 gain_linear: db_to_linear(-6.0),
+                pan_linear: [1.0, 1.0],
                 mute: false,
                 output_bus: None,
             },
@@ -2173,11 +2217,11 @@ mod tests {
         let mut snap = snapshot_with(&[(t, track)], &[(c, unity_clip(t))]);
         snap.buses.insert(
             a,
-            BusMix { gain_linear: db_to_linear(-6.0), mute: false, output_bus: Some(b) },
+            BusMix { gain_linear: db_to_linear(-6.0), pan_linear: [1.0, 1.0], mute: false, output_bus: Some(b) },
         );
         snap.buses.insert(
             b,
-            BusMix { gain_linear: db_to_linear(-6.0), mute: false, output_bus: None },
+            BusMix { gain_linear: db_to_linear(-6.0), pan_linear: [1.0, 1.0], mute: false, output_bus: None },
         );
         let expect = db_to_linear(-6.0) * db_to_linear(-6.0);
         let out = fold_frame(&snap, &[(c, [1.0, 0.0])]);
@@ -2191,9 +2235,40 @@ mod tests {
         assert_eq!(snap.bus_chain_gain(Some(Uuid::new_v4())), 0.0, "missing bus is silent");
         // A→B→A cycle is caught by the depth guard → 0.
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-        snap.buses.insert(a, BusMix { gain_linear: 1.0, mute: false, output_bus: Some(b) });
-        snap.buses.insert(b, BusMix { gain_linear: 1.0, mute: false, output_bus: Some(a) });
+        snap.buses.insert(a, BusMix { gain_linear: 1.0, pan_linear: [1.0, 1.0], mute: false, output_bus: Some(b) });
+        snap.buses.insert(b, BusMix { gain_linear: 1.0, pan_linear: [1.0, 1.0], mute: false, output_bus: Some(a) });
         assert_eq!(snap.bus_chain_gain(Some(a)), 0.0);
+    }
+
+    #[test]
+    fn bus_balance_and_chain_lr_pan() {
+        // Balance law: center unity, full-pan zeroes the opposite channel.
+        assert_eq!(bus_balance(0.0), [1.0, 1.0]);
+        assert_eq!(bus_balance(1.0), [0.0, 1.0]); // hard right → L=0
+        assert_eq!(bus_balance(-1.0), [1.0, 0.0]); // hard left → R=0
+        assert_eq!(bus_balance(0.5), [0.5, 1.0]);
+
+        // A hard-left bus passes only the left channel; None is unity.
+        let mut snap = MixerSnapshot::empty();
+        let bus = Uuid::new_v4();
+        snap.buses.insert(
+            bus,
+            BusMix {
+                gain_linear: 1.0,
+                pan_linear: bus_balance(-1.0),
+                mute: false,
+                output_bus: None,
+            },
+        );
+        assert_eq!(snap.bus_chain_lr(Some(bus)), [1.0, 0.0]);
+        assert_eq!(snap.bus_chain_lr(None), [1.0, 1.0]);
+
+        // Panned gain composes per channel: -6 dB bus hard-left → [~0.5, 0].
+        let g = snap.buses.get_mut(&bus).unwrap();
+        g.gain_linear = db_to_linear(-6.0);
+        let lr = snap.bus_chain_lr(Some(bus));
+        assert!((lr[0] - db_to_linear(-6.0)).abs() < 1e-6);
+        assert_eq!(lr[1], 0.0);
     }
 
     #[test]

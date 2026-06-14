@@ -6530,6 +6530,7 @@ fn build_mixer_snapshot(sequence: &vance_timeline::Sequence) -> vance_audio::Mix
             bus.id.as_uuid(),
             vance_audio::BusMix {
                 gain_linear: vance_audio::db_to_linear(bus.gain_db),
+                pan_linear: vance_audio::bus_balance(bus.pan),
                 mute: bus.mute,
                 output_bus: match bus.output {
                     vance_timeline::BusOutput::Master => None,
