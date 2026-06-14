@@ -7823,6 +7823,15 @@ impl Engine {
         self.frame_cache.as_ref().map(|c| c.stats())
     }
 
+    /// Reset the cache hit/miss counters (occupancy untouched). Lets the
+    /// UI — or a test — measure the hit ratio over a specific window (e.g.
+    /// one scrub gesture) instead of the cache's whole lifetime.
+    pub fn reset_frame_cache_stats(&self) {
+        if let Some(c) = self.frame_cache.as_ref() {
+            c.reset_hit_stats();
+        }
+    }
+
     /// Phase 9.3 — lazily spawn the prefetch worker. Uses the same
     /// decoder binary discovery path as the primary decoder.
     pub(crate) fn ensure_prefetch_worker(&mut self) -> Option<&crate::prefetch::PrefetchWorker> {
@@ -7836,13 +7845,15 @@ impl Engine {
 
     /// Phase 9.4 — enqueue a proxy generation job. Returns the
     /// assigned job id which the UI can poll via
-    /// [`Engine::proxy_jobs_snapshot`].
+    /// [`Engine::proxy_jobs_snapshot`]. `codec` chooses the proxy
+    /// intermediate (ProRes 422 or DNxHR LB).
     pub fn enqueue_proxy_generation(
         &mut self,
         source_path: String,
         output_path: String,
+        codec: crate::proxy::ProxyCodec,
     ) -> Result<String, EngineError> {
-        let preset = vance_encoder::EncoderPreset::ProRes422; // proxy default
+        let preset = codec.preset();
         let job = crate::proxy::ProxyJob {
             id: format!(
                 "proxy-{}-{}",

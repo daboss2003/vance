@@ -29,6 +29,35 @@ use vance_encoder::{
     VideoPixelFormat,
 };
 
+/// Codec for generated proxies. Both are fast-to-decode intra-frame
+/// intermediates that make heavy 6K/10-bit sources play back smoothly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ProxyCodec {
+    /// Apple ProRes 422 — broad NLE compatibility (default).
+    #[default]
+    ProRes422,
+    /// Avid DNxHR LB — low-bandwidth; the smallest proxy files.
+    DnxhrLb,
+}
+
+impl ProxyCodec {
+    /// The encoder preset this codec maps to.
+    pub fn preset(self) -> EncoderPreset {
+        match self {
+            ProxyCodec::ProRes422 => EncoderPreset::ProRes422,
+            ProxyCodec::DnxhrLb => EncoderPreset::DnxhrLb,
+        }
+    }
+
+    /// Parse a UI/IPC string (`"prores"`, `"dnxhr_lb"`); unknown → default.
+    pub fn from_ui_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "dnxhr_lb" | "dnxhr" | "dnxhrlb" | "dnxhr-lb" => ProxyCodec::DnxhrLb,
+            _ => ProxyCodec::ProRes422,
+        }
+    }
+}
+
 /// One proxy-generation job.
 #[derive(Clone, Debug)]
 pub struct ProxyJob {
@@ -359,6 +388,17 @@ fn bt709_full_range(y: f32, u: f32, v: f32) -> (u8, u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_codec_maps_and_parses() {
+        assert_eq!(ProxyCodec::default(), ProxyCodec::ProRes422);
+        assert_eq!(ProxyCodec::ProRes422.preset(), EncoderPreset::ProRes422);
+        assert_eq!(ProxyCodec::DnxhrLb.preset(), EncoderPreset::DnxhrLb);
+        assert_eq!(ProxyCodec::from_ui_str("dnxhr_lb"), ProxyCodec::DnxhrLb);
+        assert_eq!(ProxyCodec::from_ui_str("DNxHR"), ProxyCodec::DnxhrLb);
+        assert_eq!(ProxyCodec::from_ui_str("prores"), ProxyCodec::ProRes422);
+        assert_eq!(ProxyCodec::from_ui_str("nonsense"), ProxyCodec::ProRes422);
+    }
 
     #[test]
     fn bt709_grey_round_trips() {

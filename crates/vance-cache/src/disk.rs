@@ -102,6 +102,12 @@ impl DiskLru {
         Ok(s)
     }
 
+    /// Is `key` present in the index? Presence-only check — no blob read
+    /// and no LRU promotion (so it can't perturb eviction order).
+    pub fn contains(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+
     /// Read an entry, promoting it to the most-recently-used position.
     pub fn get(&mut self, key: &str) -> Result<Option<Vec<u8>>, DiskLruError> {
         if !self.entries.contains_key(key) {

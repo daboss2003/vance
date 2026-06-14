@@ -69,6 +69,11 @@ impl FrameCacheRing {
             .map(|e| e.bytes.clone())
     }
 
+    /// Is a frame present? Presence-only check — no byte copy.
+    pub fn contains(&self, pts: i64, transform_hash: u64) -> bool {
+        self.index.contains_key(&(pts, transform_hash))
+    }
+
     /// Insert (or replace) a frame's bytes. Evicts the oldest live
     /// entry until the budget is satisfied.
     pub fn put(&mut self, pts: i64, transform_hash: u64, bytes: Vec<u8>) {

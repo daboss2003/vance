@@ -1315,15 +1315,21 @@ fn render_and_replace(
 }
 
 /// Phase 9.4 — enqueue a proxy generation job. Returns the job id.
+/// `codec` is `"prores"` (default) or `"dnxhr_lb"`.
 #[tauri::command]
 fn enqueue_proxy_generation(
     state: tauri::State<'_, EngineHandle>,
     source_path: String,
     output_path: String,
+    codec: Option<String>,
 ) -> Result<String, String> {
+    let codec = codec
+        .as_deref()
+        .map(crate::proxy::ProxyCodec::from_ui_str)
+        .unwrap_or_default();
     state
         .lock()
-        .enqueue_proxy_generation(source_path, output_path)
+        .enqueue_proxy_generation(source_path, output_path, codec)
         .map_err(|e| e.to_string())
 }
 
@@ -1547,6 +1553,11 @@ struct UiCacheStats {
     ring_total_bytes: u64,
     disk_entries: u64,
     disk_bytes: u64,
+    ring_hits: u64,
+    disk_hits: u64,
+    misses: u64,
+    /// Cache hit ratio in `[0, 1]` (ring+disk hits / total lookups).
+    hit_ratio: f64,
 }
 
 #[tauri::command]
@@ -1557,6 +1568,10 @@ fn frame_cache_stats(state: tauri::State<'_, EngineHandle>) -> UiCacheStats {
             ring_total_bytes: s.ring_total_bytes as u64,
             disk_entries: s.disk_entries as u64,
             disk_bytes: s.disk_bytes,
+            ring_hits: s.ring_hits,
+            disk_hits: s.disk_hits,
+            misses: s.misses,
+            hit_ratio: s.hit_ratio(),
         }
     } else {
         UiCacheStats::default()

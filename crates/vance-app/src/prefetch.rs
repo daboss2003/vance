@@ -202,8 +202,10 @@ fn worker_loop(
             pts += req.step_pts;
             let key =
                 vance_cache::CacheKey::for_source_frame(req.source_uri.clone(), pts, 0);
-            // Skip frames the cache already has.
-            if cache.get(&key).is_some() {
+            // Skip frames the cache already has. Presence-only check so
+            // the worker doesn't (a) copy bytes it won't use or (b) pollute
+            // the user-facing scrub hit-ratio counters from this thread.
+            if cache.contains(&key) {
                 continue;
             }
             match dec.decode_at(pts) {
