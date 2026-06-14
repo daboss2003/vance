@@ -33,8 +33,10 @@ clack-extensions = { version = "0.1", optional = true, features = [
     "clack-host",
 ] }
 # LV2 hosting via `livi` (links system liblilv). On macOS the lv2-sys
-# macOS gate is lifted by the workspace [patch.crates-io].
-livi = { version = "0.7", optional = true }
+# macOS gate is lifted by the workspace [patch.crates-io]. Pinned exactly
+# so a livi bump can't change its lv2-sys requirement and slip past that
+# override (see root Cargo.toml).
+livi = { version = "=0.7.5", optional = true }
 
 # The actual plugin runtimes are feature-gated so the binary builds
 # cleanly even when the system libraries (liblilv for LV2) aren't
@@ -43,3 +45,7 @@ livi = { version = "0.7", optional = true }
 default = []
 lv2 = ["dep:livi"]
 clap = ["dep:clack-host", "dep:clack-extensions"]
+
+[dev-dependencies]
+# The LV2 fixture + its shared `.lv2`-bundle staging helper (sidecar e2e).
+vance-lv2-testplugin = { workspace = true }

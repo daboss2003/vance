@@ -1,10 +1,11 @@
 //! End-to-end out-of-process LV2 hosting (feature `lv2`).
 //!
-//! Stages the synthetic `vance-lv2-testplugin` as a real `.lv2` bundle,
-//! points `LV2_PATH` at it (inherited by the spawned sidecar), then via
-//! IPC: discovers it (ListPlugins → format Lv2), instantiates it, pushes
-//! a stereo block, and asserts the fixture's 0.5x gain came back through
-//! the sandbox. Skips when the fixture isn't built.
+//! Stages the synthetic `vance-lv2-testplugin` as a real `.lv2` bundle and
+//! hands `LV2_PATH` to the spawned sidecar via its child env (no
+//! process-global `set_var`), then via IPC: discovers it (ListPlugins →
+//! format Lv2), instantiates it, pushes a stereo block, and asserts the
+//! fixture's 0.5x gain came back through the sandbox. Skips when the
+//! fixture isn't built.
 //!
 //! Run with: `cargo test -p vance-plugin-host --features lv2`.
 
@@ -33,35 +34,6 @@ fn fixture_dylib() -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
-/// Build a `.lv2` bundle under a temp dir; return its LV2_PATH root.
-fn stage_bundle(dylib: &PathBuf) -> std::io::Result<PathBuf> {
-    let root = std::env::temp_dir().join(format!("vance-lv2-sc-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    let bundle = root.join("vance-test.lv2");
-    std::fs::create_dir_all(&bundle)?;
-    let dy = dylib.file_name().unwrap().to_string_lossy().into_owned();
-    std::fs::copy(dylib, bundle.join(&dy))?;
-    std::fs::write(
-        bundle.join("manifest.ttl"),
-        format!(
-            "@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n\
-             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
-             <{URI}>\n\ta lv2:Plugin ;\n\tlv2:binary <{dy}> ;\n\trdfs:seeAlso <vance-test.ttl> .\n"
-        ),
-    )?;
-    std::fs::write(
-        bundle.join("vance-test.ttl"),
-        format!(
-            "@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n\
-             @prefix doap: <http://usefulinc.com/ns/doap#> .\n\
-             <{URI}>\n\ta lv2:Plugin ;\n\tdoap:name \"Vance Test Gain\" ;\n\
-             \tlv2:port [\n\t\ta lv2:AudioPort, lv2:InputPort ;\n\t\tlv2:index 0 ; lv2:symbol \"in\" ; lv2:name \"In\"\n\
-             \t] , [\n\t\ta lv2:AudioPort, lv2:OutputPort ;\n\t\tlv2:index 1 ; lv2:symbol \"out\" ; lv2:name \"Out\"\n\t] .\n"
-        ),
-    )?;
-    Ok(root)
-}
-
 fn descriptor() -> PluginDescriptor {
     PluginDescriptor {
         format: PluginFormat::Lv2,
@@ -78,14 +50,16 @@ fn lv2_discovered_and_processed_out_of_process() {
         eprintln!("lv2 test fixture not built — skipping lv2 e2e");
         return;
     };
-    let root = stage_bundle(&dylib).expect("stage .lv2 bundle");
-    // The sidecar inherits this process's env (incl. LV2_PATH).
-    // SAFETY: single-threaded test setup.
-    unsafe {
-        std::env::set_var("LV2_PATH", &root);
-    }
+    // Shared staging helper: unique temp dir + RAII cleanup on drop.
+    let bundle = vance_lv2_testplugin::staging::stage_bundle(&dylib).expect("stage .lv2 bundle");
 
-    let mut client = PluginClient::spawn(sidecar_exe()).expect("spawn sidecar");
+    // Hand LV2_PATH to the sidecar via its child env (not the parent's
+    // process-global env).
+    let mut client = PluginClient::spawn_with_env(
+        sidecar_exe(),
+        std::iter::once(("LV2_PATH", bundle.root().as_os_str())),
+    )
+    .expect("spawn sidecar");
 
     // Discovery surfaces the staged plugin as an LV2 descriptor.
     let plugins = client.list_plugins().expect("list_plugins");
@@ -107,5 +81,5 @@ fn lv2_discovered_and_processed_out_of_process() {
 
     client.destroy(inst).expect("destroy");
     client.shutdown().expect("shutdown");
-    let _ = std::fs::remove_dir_all(&root);
+    drop(bundle); // keep the bundle alive until the sidecar is done with it
 }

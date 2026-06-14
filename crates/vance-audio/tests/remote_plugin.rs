@@ -364,37 +364,10 @@ fn sidecar_speaks_lv2(bin: &PathBuf) -> bool {
     }
 }
 
-fn stage_lv2_bundle(dylib: &PathBuf) -> std::io::Result<PathBuf> {
-    let root = std::env::temp_dir().join(format!("vance-lv2-rp-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    let bundle = root.join("vance-test.lv2");
-    std::fs::create_dir_all(&bundle)?;
-    let dy = dylib.file_name().unwrap().to_string_lossy().into_owned();
-    std::fs::copy(dylib, bundle.join(&dy))?;
-    std::fs::write(
-        bundle.join("manifest.ttl"),
-        format!(
-            "@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n\
-             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
-             <{LV2_URI}>\n\ta lv2:Plugin ;\n\tlv2:binary <{dy}> ;\n\trdfs:seeAlso <vance-test.ttl> .\n"
-        ),
-    )?;
-    std::fs::write(
-        bundle.join("vance-test.ttl"),
-        format!(
-            "@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n\
-             @prefix doap: <http://usefulinc.com/ns/doap#> .\n\
-             <{LV2_URI}>\n\ta lv2:Plugin ;\n\tdoap:name \"Vance Test Gain\" ;\n\
-             \tlv2:port [\n\t\ta lv2:AudioPort, lv2:InputPort ;\n\t\tlv2:index 0 ; lv2:symbol \"in\" ; lv2:name \"In\"\n\
-             \t] , [\n\t\ta lv2:AudioPort, lv2:OutputPort ;\n\t\tlv2:index 1 ; lv2:symbol \"out\" ; lv2:name \"Out\"\n\t] .\n"
-        ),
-    )?;
-    Ok(root)
-}
-
 #[test]
 fn mixer_routes_lv2_through_sidecar() {
     let Some(bin) = sidecar_bin() else {
+        eprintln!("sidecar binary not built — skipping mixer LV2 test");
         return;
     };
     if !sidecar_speaks_lv2(&bin) {
@@ -402,17 +375,23 @@ fn mixer_routes_lv2_through_sidecar() {
         return;
     }
     let Some(dylib) = lv2_dylib() else {
-        eprintln!("lv2 test fixture not built — skipping");
+        eprintln!("lv2 test fixture not built — skipping mixer LV2 test");
         return;
     };
-    let root = stage_lv2_bundle(&dylib).expect("stage .lv2 bundle");
-    // SAFETY: single-threaded test setup; the host spawns the sidecar
-    // lazily on first instantiate, inheriting this env.
-    unsafe {
-        std::env::set_var("LV2_PATH", &root);
-    }
+    // Shared staging helper: unique temp dir + RAII cleanup (the guard
+    // removes the bundle on drop, even if an assertion below panics).
+    let bundle = vance_lv2_testplugin::staging::stage_bundle(&dylib).expect("stage .lv2 bundle");
 
-    let mut host = RemotePluginHost::new(bin, 48_000.0, 512);
+    // Hand LV2_PATH to the sidecar via its child env — NOT the parent's
+    // process-global env. A `set_var` here would race with sibling tests
+    // in this same binary that spawn CLAP sidecars concurrently (and the
+    // write/read of `environ` is itself UB under parallel test threads).
+    let mut host = RemotePluginHost::new_with_env(
+        bin,
+        48_000.0,
+        512,
+        vec![("LV2_PATH".to_string(), bundle.lv2_path())],
+    );
     let spec = vec![vance_audio::AudioEffectKind::Plugin {
         enabled: true,
         format_str: "lv2".into(),
@@ -428,7 +407,11 @@ fn mixer_routes_lv2_through_sidecar() {
     }
     assert!((out.0 - 0.5).abs() < 1e-2, "L expected ~0.5, got {}", out.0);
     assert!((out.1 - 0.5).abs() < 1e-2, "R expected ~0.5, got {}", out.1);
-    let _ = std::fs::remove_dir_all(&root);
+    // A healthy fast path must never trip the hang watchdog (a kill +
+    // respawn could still re-converge to ~0.5 and mask the problem).
+    assert_eq!(host.kills(), 0, "watchdog killed a healthy LV2 sidecar");
+    // Keep the staged bundle alive until processing is done.
+    drop(bundle);
 }
 
 #[cfg(unix)]

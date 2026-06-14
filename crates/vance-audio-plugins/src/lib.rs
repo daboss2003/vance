@@ -241,8 +241,24 @@ impl PluginClient {
     /// Spawn the sidecar binary at `binary` and complete the
     /// protocol handshake.
     pub fn spawn(binary: impl AsRef<std::path::Path>) -> Result<Self, PluginClientError> {
+        Self::spawn_with_env(binary, std::iter::empty::<(&str, &str)>())
+    }
+
+    /// Like [`PluginClient::spawn`] but also sets extra environment
+    /// variables on the sidecar child process. Lets a caller hand the
+    /// sandbox e.g. `LV2_PATH` without mutating the parent's process-global
+    /// environment (which races with concurrent spawns).
+    pub fn spawn_with_env<E, K, V>(
+        binary: impl AsRef<std::path::Path>,
+        env: E,
+    ) -> Result<Self, PluginClientError>
+    where
+        E: IntoIterator<Item = (K, V)>,
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    {
         let mut sidecar: Sidecar<PluginRequest, PluginResponse> =
-            Sidecar::spawn(binary, std::iter::empty::<&str>())?;
+            Sidecar::spawn_with_env(binary, std::iter::empty::<&str>(), env)?;
         match sidecar.request(&PluginRequest::Hello {
             protocol_version: PROTOCOL_VERSION,
         })? {

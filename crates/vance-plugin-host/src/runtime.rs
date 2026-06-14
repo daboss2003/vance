@@ -334,6 +334,9 @@ impl Router {
 pub fn supported_formats() -> Vec<PluginFormat> {
     // The built-in stub backend is always present; CLAP / LV2 hosting
     // light up only when their cargo features are compiled in.
+    // `mut` is unused in a default (no-feature) build — the cfg pushes
+    // below are the only mutators — so silence the lint feature-agnostically.
+    #[allow(unused_mut)]
     let mut out = vec![PluginFormat::Builtin];
     #[cfg(feature = "clap")]
     out.push(PluginFormat::Clap);

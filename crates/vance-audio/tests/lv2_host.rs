@@ -26,65 +26,31 @@ fn fixture_dylib() -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
-/// Build a `.lv2` bundle under a temp dir and return (bundle_parent, dylib_name).
-fn stage_bundle(dylib: &PathBuf) -> std::io::Result<PathBuf> {
-    let root = std::env::temp_dir().join(format!("vance-lv2-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    let bundle = root.join("vance-test.lv2");
-    std::fs::create_dir_all(&bundle)?;
-    let dylib_name = dylib.file_name().unwrap().to_string_lossy().into_owned();
-    std::fs::copy(dylib, bundle.join(&dylib_name))?;
-    std::fs::write(
-        bundle.join("manifest.ttl"),
-        format!(
-            "@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n\
-             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
-             <urn:vance:test:gain>\n\
-             \ta lv2:Plugin ;\n\
-             \tlv2:binary <{dylib_name}> ;\n\
-             \trdfs:seeAlso <vance-test.ttl> .\n"
-        ),
-    )?;
-    std::fs::write(
-        bundle.join("vance-test.ttl"),
-        "@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n\
-         @prefix doap: <http://usefulinc.com/ns/doap#> .\n\
-         <urn:vance:test:gain>\n\
-         \ta lv2:Plugin ;\n\
-         \tdoap:name \"Vance Test Gain\" ;\n\
-         \tlv2:port [\n\
-         \t\ta lv2:AudioPort, lv2:InputPort ;\n\
-         \t\tlv2:index 0 ; lv2:symbol \"in\" ; lv2:name \"In\"\n\
-         \t] , [\n\
-         \t\ta lv2:AudioPort, lv2:OutputPort ;\n\
-         \t\tlv2:index 1 ; lv2:symbol \"out\" ; lv2:name \"Out\"\n\
-         \t] .\n",
-    )?;
-    Ok(root)
-}
-
 #[test]
 fn loads_and_processes_real_lv2_plugin() {
     let Some(dylib) = fixture_dylib() else {
         eprintln!("lv2 test fixture not built — skipping");
         return;
     };
-    let root = stage_bundle(&dylib).expect("stage .lv2 bundle");
-    // lilv reads LV2_PATH at World load time.
-    // SAFETY: single-threaded test setup; no other thread reads the env.
+    // Shared staging helper: unique temp dir + RAII cleanup on drop (so a
+    // panic below still removes the staged bundle).
+    let bundle = vance_lv2_testplugin::staging::stage_bundle(&dylib).expect("stage .lv2 bundle");
+    // lilv reads LV2_PATH at in-process World load time, so it must be set
+    // on this process's env (an in-process World can't take an override).
+    // SAFETY: this is the only test in this binary, so no sibling thread
+    // reads or writes the environment concurrently.
     unsafe {
-        std::env::set_var("LV2_PATH", &root);
+        std::env::set_var("LV2_PATH", bundle.root());
     }
 
     let block = 64usize;
-    let mut plugin =
-        match vance_audio::lv2_host::instantiate("urn:vance:test:gain", &[], 48_000.0, block) {
-            Some(p) => p,
-            None => {
-                let _ = std::fs::remove_dir_all(&root);
-                panic!("LV2 host failed to instantiate the staged plugin (LV2_PATH={root:?})");
-            }
-        };
+    let mut plugin = vance_audio::lv2_host::instantiate("urn:vance:test:gain", &[], 48_000.0, block)
+        .unwrap_or_else(|| {
+            panic!(
+                "LV2 host failed to instantiate the staged plugin (LV2_PATH={:?})",
+                bundle.root()
+            )
+        });
 
     // The fixture is a 0.5x mono gain. The host sums L+R*0.5 → mono in,
     // duplicates mono out → L/R. Feed 1.0 on both channels: mono in =
@@ -92,12 +58,11 @@ fn loads_and_processes_real_lv2_plugin() {
     let inl = vec![1.0f32; block];
     let mut outl = vec![0.0f32; block];
     let mut outr = vec![0.0f32; block];
-    use vance_audio::audio_plugin::AudioPlugin;
     plugin.process_block(&inl, &inl, &mut outl, &mut outr);
     for (i, (&l, &r)) in outl.iter().zip(outr.iter()).enumerate() {
         assert!((l - 0.5).abs() < 1e-3, "L[{i}] expected ~0.5, got {l}");
         assert!((r - 0.5).abs() < 1e-3, "R[{i}] expected ~0.5, got {r}");
     }
 
-    let _ = std::fs::remove_dir_all(&root);
+    drop(bundle); // keep the bundle alive until processing is done
 }

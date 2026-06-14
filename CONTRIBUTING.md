@@ -16,7 +16,12 @@ xcode-select --install                   # Xcode Command Line Tools
 brew install pkg-config
 brew install ffmpeg@7                    # NB: ffmpeg@7, not ffmpeg (8.x is too new for our bindings)
 brew install opencolorio                 # used by future phases
+brew install lilv                        # ONLY for `--features lv2` (LV2 plugin hosting); pulls serd
 ```
+
+`lilv` (and its `serd` dependency) are only needed if you build the plugin
+host with `--features lv2`. The default build doesn't link them, so you can
+skip `brew install lilv` unless you're working on LV2 hosting.
 
 Why `ffmpeg@7`: `ffmpeg-the-third` 3.x (our binding crate) supports FFmpeg up to 7.1. Brew's default `ffmpeg` formula now ships 8.x, which removed headers our bindings need. `.cargo/config.toml` points the build at the side-by-side `ffmpeg@7` install via `FFMPEG_DIR`, so the build "just works" once `ffmpeg@7` is present — no shell setup required.
 
@@ -35,6 +40,9 @@ sudo apt install build-essential pkg-config libssl-dev curl wget file \
   libayatana-appindicator3-dev libxdo-dev \
   libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavfilter-dev \
   libopencolorio-dev
+
+# ONLY for `--features lv2` (LV2 plugin hosting); skip for the default build:
+sudo apt install liblilv-dev libserd-dev
 ```
 
 For Fedora / Arch the package names differ; consult your distro's documentation. PRs welcome to expand this section.

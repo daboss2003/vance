@@ -1504,7 +1504,15 @@ pub struct LV2_Log_Log {
             handle: LV2_Log_Handle,
             type_: LV2_URID,
             fmt: *const ::std::os::raw::c_char,
-            ap: va_list,
+            // VANCE PATCH: upstream bindgen emits `ap: va_list`, where
+            // `va_list` is the AArch64-*Linux* register-save struct. On
+            // aarch64-apple-darwin `va_list` is `char*` instead, so reusing
+            // the Linux layout here would be an ABI mismatch. An aggregate
+            // >16 bytes is passed indirectly (by pointer) under AAPCS64, and
+            // Darwin's `char*` is already a pointer, so an opaque pointer is
+            // ABI-correct on *both* targets — and nothing in vance ever calls
+            // vprintf, so this never constructs a real va_list either way.
+            ap: *mut ::std::os::raw::c_void,
         ) -> ::std::os::raw::c_int,
     >,
 }

@@ -49,6 +49,57 @@ jobs:
       - name: Test
         run: cargo xtask test
 
+  # The default workspace build never enables `--features lv2`, so livi /
+  # lilv (and the whole point of the vendored macOS lv2-sys patch) would go
+  # untested. This lane installs the LV2 system deps and exercises the
+  # feature on Linux + macOS (the macOS leg covers the patched bindings).
+  lv2:
+    name: LV2 hosting (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LV2 deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config liblilv-dev libserd-dev
+
+      - name: Install LV2 deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install pkg-config lilv
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lv2-${{ matrix.os }}
+
+      - name: Assert lv2-sys resolves to the vendored patch
+        run: |
+          cargo tree -p vance-plugin-host --features lv2 -i lv2-sys | tee /tmp/lv2-tree
+          grep -q 'vendor/lv2-sys' /tmp/lv2-tree \
+            || { echo '::error::lv2-sys did not resolve to vendor/lv2-sys — the macOS patch is bypassed'; exit 1; }
+
+      - name: Clippy (lv2 sidecar backend)
+        # Scoped to vance-plugin-host: its dep graph carries no pre-existing
+        # deny-level lint debt, so this lints the new lv2_backend cleanly.
+        # vance-audio's lv2 module is compiled (and run) by the test step.
+        run: cargo clippy -p vance-plugin-host --features lv2 --all-targets
+
+      - name: Test (lv2)
+        run: |
+          # plugin-host first: builds the lv2 sidecar binary + fixture, so the
+          # vance-audio mixer test finds an lv2-capable sidecar (else it skips).
+          cargo test -p vance-plugin-host --features lv2
+          cargo test -p vance-audio --features lv2
+
   ui:
     name: UI
     runs-on: ubuntu-latest

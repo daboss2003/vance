@@ -86,6 +86,7 @@ vance-ai = { path = "crates/vance-ai" }
 vance-ai-runtime = { path = "crates/vance-ai-runtime" }
 vance-ipc = { path = "crates/vance-ipc" }
 vance-viewport = { path = "crates/vance-viewport" }
+vance-lv2-testplugin = { path = "crates/vance-lv2-testplugin" }
 
 # External
 serde = { version = "1", features = ["derive", "rc"] }
@@ -106,10 +107,17 @@ proptest = "1"
 libc = "0.2"
 
 # rust-lv2's `lv2-sys` gates macOS out with a compile_error, even though
-# its LV2 C-ABI bindings are platform-identical. The vendored copy lifts
-# that gate (macOS → Linux bindings) so LV2 hosting (the `lv2` feature)
-# can build on macOS. Only consulted when `lv2-sys` is in the graph
-# (i.e. when something enables the `lv2` feature → pulls `livi`).
+# its LV2 C-ABI bindings are platform-identical (the one exception, the
+# AArch64 `va_list` layout, is unused — see vendor/lv2-sys/src/lib.rs).
+# The vendored copy lifts that gate (macOS → Linux bindings) so LV2
+# hosting (the `lv2` feature) can build on macOS. Consulted whenever
+# `lv2-sys` is in the graph: always, since `vance-lv2-testplugin` depends
+# on it directly, and additionally via `livi` when `lv2` is enabled.
+#
+# The patch is `lv2-sys` 2.0.0; it only substitutes for requirements it
+# satisfies (`^2`). `livi` is pinned to `=0.7.5` (which requires `lv2-sys
+# = "2"`) so a future major bump can't silently fall back to the
+# macOS-broken registry crate; CI also asserts lv2-sys resolves here.
 [patch.crates-io]
 lv2-sys = { path = "vendor/lv2-sys" }
 

@@ -6,11 +6,17 @@
 #![allow(non_snake_case)]
 #![allow(clippy::all)]
 
-// macOS uses the Linux bindings: the LV2 C ABI (plain structs + extern
-// "C" fns) is identical on aarch64-/x86_64-darwin and -linux, so the
-// per-arch Linux modules apply unchanged. rust-lv2 upstream gates macOS
-// out with a compile_error; this vendored patch lifts that gate (the C
-// `lilv` it ultimately binds to works fine on macOS via Homebrew).
+// macOS uses the Linux bindings: every reachable LV2 C type (plain
+// structs of fixed-width fields + extern "C" fns) has an identical ABI on
+// aarch64-/x86_64-darwin and -linux, so the per-arch Linux modules apply
+// unchanged. The one type that genuinely differs — the AArch64 `va_list`
+// layout (a register-save struct on Linux vs `char*` on Darwin) — appears
+// only in `LV2_Log_Log::vprintf`, which vance never calls; `aarch64.rs`
+// additionally replaces that `ap` parameter with an opaque pointer (ABI-
+// correct on both targets) so no caller can pass a wrong-layout va_list.
+// rust-lv2 upstream gates macOS out with a compile_error; this vendored
+// patch lifts that gate (the C `lilv` it ultimately binds to works fine on
+// macOS via Homebrew).
 #[cfg_attr(any(target_os = "linux", target_os = "macos"), path = "linux/mod.rs")]
 #[cfg_attr(target_os = "windows", path = "windows.rs")]
 mod unsupported;

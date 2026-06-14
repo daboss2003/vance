@@ -50,7 +50,9 @@ clack-host = { version = "0.1", optional = true }
 clack-extensions = { version = "0.1", optional = true, features = [
     "audio-ports",
 ] }
-livi = { version = "0.7", optional = true }
+# Pinned exactly: a livi bump could change its `lv2-sys` requirement and
+# silently slip past the macOS [patch.crates-io] override (see root Cargo.toml).
+livi = { version = "=0.7.5", optional = true }
 
 [features]
 default = []
@@ -74,6 +76,8 @@ bincode = { version = "2", features = ["serde"] }
 # Integration tests don't inherit the lib's deps, so re-declare the few
 # the remote-plugin test drives directly.
 uuid = { workspace = true }
+# The LV2 fixture + its shared `.lv2`-bundle staging helper.
+vance-lv2-testplugin = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

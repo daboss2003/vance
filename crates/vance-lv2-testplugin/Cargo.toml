@@ -11,9 +11,11 @@ publish = false
 # A minimal real LV2 plugin (a fixed -6 dB / 0.5x mono gain) used to
 # verify the LV2 host end-to-end without a third-party plugin installed.
 # Built as a cdylib exporting the standard `lv2_descriptor` symbol; lilv
-# dlopen()s it via the staged `.lv2` bundle (see the test).
+# dlopen()s it via the staged `.lv2` bundle. The `rlib` output lets the
+# host crates' integration tests reuse the shared `.lv2`-bundle staging
+# helper (`staging::stage_bundle`) instead of re-deriving the TTL.
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
 [dependencies]

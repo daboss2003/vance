@@ -4,11 +4,15 @@
 //!
 //! Exports the standard `lv2_descriptor` C symbol; a host (lilv) loads
 //! it via a `.lv2` bundle (`manifest.ttl` + `vance-test.ttl`, written by
-//! the test). Two ports: 0 = audio input, 1 = audio output.
+//! [`staging::stage_bundle`]). Three ports: 0 = audio input, 1 = audio
+//! output, 2 = an (ignored) atom-sequence input — present so the host's
+//! atom/CV port wiring is exercised by a plugin that declares one.
 
 use lv2_sys::{LV2_Descriptor, LV2_Feature, LV2_Handle};
 use std::os::raw::{c_char, c_void};
 use std::ptr;
+
+pub mod staging;
 
 /// Plugin URI the host looks up.
 pub const PLUGIN_URI: &str = "urn:vance:test:gain";
@@ -38,6 +42,8 @@ unsafe extern "C" fn connect_port(instance: LV2_Handle, port: u32, data: *mut c_
     match port {
         0 => state.input = data as *const f32,
         1 => state.output = data as *mut f32,
+        // Port 2 is the atom-sequence input; this fixture ignores it (it
+        // exists only so the host's atom-port wiring is exercised).
         _ => {}
     }
 }

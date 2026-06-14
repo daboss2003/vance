@@ -5784,6 +5784,7 @@ dependencies = [
  "vance-audio-plugins",
  "vance-core",
  "vance-ipc",
+ "vance-lv2-testplugin",
  "windows-sys 0.59.0",
 ]
 
@@ -5977,6 +5978,7 @@ dependencies = [
  "uuid",
  "vance-audio-plugins",
  "vance-ipc",
+ "vance-lv2-testplugin",
 ]
 
 [[package]]

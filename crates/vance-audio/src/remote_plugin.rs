@@ -76,6 +76,10 @@ pub struct RemotePluginHost {
     exe: PathBuf,
     sample_rate: f32,
     max_block: u32,
+    /// Extra env vars to set on each spawned sidecar (e.g. `LV2_PATH`).
+    /// Empty in normal use; set by tests so they needn't mutate the
+    /// process-global environment.
+    spawn_env: Vec<(String, String)>,
     client: Option<PluginClient>,
     generation: u64,
     /// Count of successful instantiate calls (diagnostics/tests — a param
@@ -100,6 +104,19 @@ impl RemotePluginHost {
     /// sidecar is configured for `sample_rate` and a maximum process
     /// block of `max_block` frames.
     pub fn new(exe: PathBuf, sample_rate: f32, max_block: u32) -> Self {
+        Self::new_with_env(exe, sample_rate, max_block, Vec::new())
+    }
+
+    /// Like [`RemotePluginHost::new`] but sets extra environment variables
+    /// on every spawned sidecar. Used by tests to pass `LV2_PATH` to the
+    /// sandbox without a process-global `set_var` (which races with the
+    /// concurrent spawns of sibling tests in the same binary).
+    pub fn new_with_env(
+        exe: PathBuf,
+        sample_rate: f32,
+        max_block: u32,
+        spawn_env: Vec<(String, String)>,
+    ) -> Self {
         let watch = Arc::new(Watch {
             epoch: Instant::now(),
             in_flight_deadline: AtomicU64::new(0),
@@ -119,6 +136,7 @@ impl RemotePluginHost {
             exe,
             sample_rate,
             max_block: max_block.max(1),
+            spawn_env,
             client: None,
             generation: 0,
             instantiations: 0,
@@ -190,7 +208,11 @@ impl RemotePluginHost {
         if self.spawn_failed {
             return false;
         }
-        match PluginClient::spawn(&self.exe) {
+        let env = self
+            .spawn_env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()));
+        match PluginClient::spawn_with_env(&self.exe, env) {
             Ok(client) => {
                 self.watch
                     .pid
