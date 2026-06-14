@@ -26,16 +26,26 @@ fn fixture_path() -> PathBuf {
         .join("vance-decoder/tests/fixtures/testsrc_320x240_5s.mp4")
 }
 
+/// Missing prerequisite: silent skip locally, hard failure in CI when
+/// `VANCE_REQUIRE_SIDECARS=1` (so this acceptance gate can't pass without
+/// executing its body).
+fn missing_prereq(reason: &str) {
+    if std::env::var_os("VANCE_REQUIRE_SIDECARS").is_some() {
+        panic!("VANCE_REQUIRE_SIDECARS set but prerequisite missing: {reason}");
+    }
+    eprintln!("{reason} — skipping (set VANCE_REQUIRE_SIDECARS=1 to make this a failure)");
+}
+
 #[test]
 fn scrub_jog_hit_ratio_exceeds_80pct() {
     let bin = decoder_bin();
     if !bin.exists() {
-        eprintln!("decoder sidecar missing — skipping scrub hit-ratio test");
+        missing_prereq("decoder sidecar missing");
         return;
     }
     let fixture = fixture_path();
     if !fixture.exists() {
-        eprintln!("fixture missing — skipping scrub hit-ratio test");
+        missing_prereq("fixture missing");
         return;
     }
 
@@ -62,7 +72,8 @@ fn scrub_jog_hit_ratio_exceeds_80pct() {
 
     // Measure only the jog over the warmed window (typical scrubbing).
     cache.reset_hit_stats();
-    for pass in 0..8 {
+    let passes = 8usize;
+    for pass in 0..passes {
         if pass % 2 == 0 {
             for &pts in window.iter() {
                 cached_decode_at(&mut client, &cache, &uri, pts).expect("jog decode");
@@ -83,10 +94,21 @@ fn scrub_jog_hit_ratio_exceeds_80pct() {
         s.ring_hits,
         s.disk_hits,
     );
-    assert!(s.lookups() > 0, "no cache lookups recorded");
+    // Every revisited target is already cached, so the warm jog must be a
+    // PERFECT hit. Asserting exact counts (not a loose >0.80, which the
+    // working-set-fits-the-ring case pins at 1.000) flags any unexpected
+    // miss — a key mismatch, a regression in the cache-fronted path, or an
+    // eviction that shouldn't have happened.
+    let expected = (passes * window.len()) as u64;
+    assert_eq!(s.misses, 0, "warm jog should never miss (got {} misses)", s.misses);
+    assert_eq!(
+        s.ring_hits + s.disk_hits,
+        expected,
+        "expected {expected} cache hits over the warm jog"
+    );
     assert!(
         s.hit_ratio() > 0.80,
-        "scrub hit ratio {:.3} is below the 0.80 acceptance criterion",
+        "scrub hit ratio {:.3} below the 0.80 acceptance criterion",
         s.hit_ratio()
     );
 }

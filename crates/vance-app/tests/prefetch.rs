@@ -24,16 +24,25 @@ fn fixture_path() -> PathBuf {
         .join("vance-decoder/tests/fixtures/testsrc_320x240_5s.mp4")
 }
 
+/// Missing prerequisite: silent skip locally, hard failure in CI when
+/// `VANCE_REQUIRE_SIDECARS=1`.
+fn missing_prereq(reason: &str) {
+    if std::env::var_os("VANCE_REQUIRE_SIDECARS").is_some() {
+        panic!("VANCE_REQUIRE_SIDECARS set but prerequisite missing: {reason}");
+    }
+    eprintln!("{reason} — skipping (set VANCE_REQUIRE_SIDECARS=1 to make this a failure)");
+}
+
 #[test]
 fn prefetch_warms_frames_ahead_of_anchor() {
     let bin = decoder_bin();
     if !bin.exists() {
-        eprintln!("decoder sidecar missing — skipping prefetch test");
+        missing_prereq("decoder sidecar missing");
         return;
     }
     let fixture = fixture_path();
     if !fixture.exists() {
-        eprintln!("fixture missing — skipping prefetch test");
+        missing_prereq("fixture missing");
         return;
     }
     let uri = fixture.to_string_lossy().to_string();
@@ -61,6 +70,9 @@ fn prefetch_warms_frames_ahead_of_anchor() {
     });
 
     // The worker spawns its own decoder lazily, so allow a few seconds.
+    // Poll until it has walked the FULL horizon (not just one frame) — a
+    // supersession/off-by-one regression that decoded one frame and
+    // stalled would otherwise pass. Allow one frame of slack for timing.
     let expected: Vec<i64> = (1..=horizon as i64).map(|k| k * step_pts).collect();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut warmed = 0;
@@ -69,16 +81,17 @@ fn prefetch_warms_frames_ahead_of_anchor() {
             .iter()
             .filter(|&&pts| cache.contains(&CacheKey::for_source_frame(uri.clone(), pts, 0)))
             .count();
-        if warmed >= 1 {
+        if warmed >= horizon as usize {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     worker.shutdown();
 
-    assert!(
-        warmed >= 1,
-        "prefetch warmed no frames ahead of the anchor within the timeout"
-    );
     eprintln!("[prefetch] warmed {warmed}/{} frames ahead of anchor", expected.len());
+    assert!(
+        warmed >= horizon as usize - 1,
+        "prefetch warmed only {warmed}/{} frames — worker did not walk the horizon",
+        expected.len()
+    );
 }

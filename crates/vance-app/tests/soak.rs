@@ -13,11 +13,16 @@
 //!    repeat scrubs — the actual Phase 9 deliverable under soak.
 //! 3. Sample process RSS so a leak shows up as monotonic growth.
 //!
-//! After all cycles we assert: the per-source ring stayed within budget,
-//! resident memory did not grow without bound (the "no memory leaks"
-//! gate), and the cache served the repeat scrubs well.
+//! Asserts: the cache stays within its configured budgets, repeat scrubs
+//! (after a warm-up cycle) are served almost entirely from cache, and
+//! resident memory does not grow without bound (the "no memory leaks"
+//! gate). NOTE: the default small-cycle run is mainly a crash/sanity
+//! guard; the real leak gate is the long `VANCE_SOAK_CYCLES` run, where a
+//! slow leak accumulates past the headroom.
 //!
-//! Skipped when sidecars or `ffmpeg` are missing.
+//! Skipped when sidecars or `ffmpeg` are missing — unless
+//! `VANCE_REQUIRE_SIDECARS=1`, which turns a missing prerequisite into a
+//! hard failure so this gate can't silently pass without running.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -35,6 +40,16 @@ fn fixture_path() -> PathBuf {
 
 fn ffmpeg_present() -> bool {
     Command::new("ffmpeg").arg("-version").output().is_ok()
+}
+
+/// A missing prerequisite. Silent skip locally; hard failure in CI when
+/// `VANCE_REQUIRE_SIDECARS=1`, so a required gate can't pass without
+/// executing its body.
+fn missing_prereq(reason: &str) {
+    if std::env::var_os("VANCE_REQUIRE_SIDECARS").is_some() {
+        panic!("VANCE_REQUIRE_SIDECARS set but prerequisite missing: {reason}");
+    }
+    eprintln!("{reason} — skipping (set VANCE_REQUIRE_SIDECARS=1 to make this a failure)");
 }
 
 /// Resident set size of THIS process, in bytes. `None` if unavailable.
@@ -66,19 +81,19 @@ fn current_rss_bytes() -> Option<u64> {
 #[test]
 fn soak_cycle_keeps_cache_within_budget() {
     if !ffmpeg_present() {
-        eprintln!("ffmpeg missing — skipping soak");
+        missing_prereq("ffmpeg missing");
         return;
     }
     let fixture = fixture_path();
     if !fixture.exists() {
-        eprintln!("fixture missing — skipping soak");
+        missing_prereq("fixture missing");
         return;
     }
     let target_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug");
     let dec_bin = target_dir.join(if cfg!(windows) { "vance-decoder.exe" } else { "vance-decoder" });
     let enc_bin = target_dir.join(if cfg!(windows) { "vance-encoder.exe" } else { "vance-encoder" });
     if !dec_bin.exists() || !enc_bin.exists() {
-        eprintln!("sidecars missing — skipping soak");
+        missing_prereq("sidecars missing");
         return;
     }
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -105,19 +120,22 @@ fn soak_cycle_keeps_cache_within_budget() {
     };
     engine.insert_clip_at(track_id, media_id, 0.0).expect("clip");
 
-    // A persistent decoder + cache for the scrub portion. Reused across
-    // every cycle so the cache (and the long-lived sidecar) are the things
-    // actually soaked.
+    // A persistent decoder + cache for the scrub portion, reused every
+    // cycle so the cache (and the long-lived sidecar) are what's soaked.
+    // The cache dir + render output are RAII-scoped so a panic mid-run
+    // doesn't leak them on disk.
     let uri = fixture.canonicalize().unwrap().to_string_lossy().to_string();
     let mut scrub_dec = DecoderClient::spawn(&dec_bin).expect("spawn scrub decoder");
     let info = scrub_dec.open(uri.clone()).expect("open fixture");
     let dur = info.duration_pts.unwrap_or(0).max(1);
-    let cache_dir = std::env::temp_dir().join(format!("vance-soak-cache-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&cache_dir);
-    let cache = FrameCache::new(cache_dir.clone(), 64 * 1024 * 1024, 256 * 1024 * 1024).unwrap();
+    const RING_BUDGET: usize = 64 * 1024 * 1024;
+    const DISK_BUDGET: u64 = 256 * 1024 * 1024;
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache = FrameCache::new(cache_dir.path().to_path_buf(), RING_BUDGET, DISK_BUDGET).unwrap();
     let scrub_window: Vec<i64> = (0..8).map(|i| (dur * i) / 16).collect();
 
-    let out = std::env::temp_dir().join(format!("vance-soak-{}.mov", std::process::id()));
+    let out_dir = tempfile::tempdir().expect("render tempdir");
+    let out = out_dir.path().join("soak.mov");
     let mut rss_samples: Vec<u64> = Vec::new();
     for cycle in 0..cycles {
         // 1. Render a tiny half-second slice (decode + render + encode).
@@ -139,17 +157,25 @@ fn soak_cycle_keeps_cache_within_budget() {
         for &pts in scrub_window.iter().chain(scrub_window.iter().rev()) {
             cached_decode_at(&mut scrub_dec, &cache, &uri, pts).expect("scrub decode");
         }
+        // After the cold first cycle warms the cache, reset the hit/miss
+        // counters so the final hit-ratio assertion measures STEADY-STATE
+        // scrub performance (independent of cycle count) rather than a
+        // lifetime ratio dominated by the unavoidable cold first touch.
+        if cycle == 0 {
+            cache.reset_hit_stats();
+        }
 
-        // 3. Cache must stay within budget every cycle.
+        // 3. Cache must stay within its configured budgets every cycle
+        //    (both tiers self-evict on put, so this is a tight bound).
         let cs = cache.stats();
         assert!(
-            cs.ring_total_bytes < 256 * 1024 * 1024,
-            "cycle {cycle}: ring total {} bytes exceeds 256 MiB ceiling",
+            cs.ring_total_bytes <= RING_BUDGET,
+            "cycle {cycle}: ring {} bytes exceeds budget {RING_BUDGET}",
             cs.ring_total_bytes
         );
         assert!(
-            cs.disk_bytes < 512 * 1024 * 1024,
-            "cycle {cycle}: disk {} bytes exceeds 512 MiB (budget 256 MiB)",
+            cs.disk_bytes <= DISK_BUDGET,
+            "cycle {cycle}: disk {} bytes exceeds budget {DISK_BUDGET}",
             cs.disk_bytes
         );
 
@@ -163,34 +189,43 @@ fn soak_cycle_keeps_cache_within_budget() {
             cs.hit_ratio(),
         );
     }
-    let _ = std::fs::remove_file(&out);
-    let _ = std::fs::remove_dir_all(&cache_dir);
 
-    // The repeat scrubs (after the first cold cycle) should be served
-    // overwhelmingly from cache — the same frames, every cycle.
-    let cs = cache.stats();
-    assert!(
-        cs.hit_ratio() > 0.80,
-        "soak scrub hit ratio {:.3} below 0.80 — cache not serving repeat scrubs",
-        cs.hit_ratio()
-    );
-
-    // Leak gate: resident memory must not grow without bound. The frame
-    // cache fills to its ring budget early then plateaus, so compare the
-    // final sample against a post-warmup baseline. A true leak grows
-    // monotonically and blows past the (generous) headroom over a long run.
-    if rss_samples.len() >= 3 && rss_samples.iter().all(|&r| r > 0) {
-        let warmup = (rss_samples.len() / 3).max(1); // skip the ramp-up third
-        let baseline = rss_samples[warmup];
-        let final_rss = *rss_samples.last().unwrap();
-        // Allow the ring budget (64 MiB) + allocator slack on top of the
-        // post-warmup baseline.
-        let headroom = 192 * 1024 * 1024u64;
+    // Steady-state: every repeat scrub after the warm-up cycle hits the
+    // same frames, so post-reset ratio should be ~1.0. Only meaningful
+    // once there's at least one post-reset (warm) cycle.
+    if cycles >= 2 {
+        let cs = cache.stats();
         assert!(
-            final_rss <= baseline.saturating_add(headroom),
-            "RSS grew from {} MiB (post-warmup) to {} MiB — possible leak (headroom {} MiB)",
+            cs.hit_ratio() > 0.80,
+            "steady-state scrub hit ratio {:.3} below 0.80 — cache not serving repeat scrubs (hits={}, misses={})",
+            cs.hit_ratio(),
+            cs.ring_hits + cs.disk_hits,
+            cs.misses,
+        );
+    }
+
+    // Leak gate: resident memory must not grow without bound. Baseline is
+    // the first post-warmup sample; assert no later sample exceeds it by
+    // more than the headroom (ring budget + allocator slack). A real leak
+    // accumulates across cycles and trips this on a long run.
+    if rss_samples.iter().any(|&r| r == 0) {
+        // RSS sampling failed on this platform — make the SKIP loud rather
+        // than letting the leak gate pass without measuring memory.
+        eprintln!(
+            "[soak] WARNING: RSS sampling unavailable — LEAK GATE SKIPPED (samples={rss_samples:?})"
+        );
+        if std::env::var_os("VANCE_REQUIRE_SIDECARS").is_some() {
+            panic!("VANCE_REQUIRE_SIDECARS set but RSS could not be sampled — leak gate cannot run");
+        }
+    } else if rss_samples.len() >= 3 {
+        let baseline = rss_samples[1]; // first post-warmup sample
+        let peak = *rss_samples[1..].iter().max().unwrap();
+        let headroom = 128 * 1024 * 1024u64; // 64 MiB ring + slack
+        assert!(
+            peak <= baseline.saturating_add(headroom),
+            "RSS grew from {} MiB (baseline) to {} MiB (peak) — possible leak (headroom {} MiB)",
             baseline / (1024 * 1024),
-            final_rss / (1024 * 1024),
+            peak / (1024 * 1024),
             headroom / (1024 * 1024),
         );
     }

@@ -58,6 +58,22 @@ impl ProxyCodec {
     }
 }
 
+/// DNxHR's `dnxhd` encoder has a hard 256x120 floor — it accepts the
+/// geometry at spawn but rejects it once frames arrive, so a sub-256x120
+/// source would fail the proxy mid-stream with a broken pipe. ProRes has
+/// no such floor, so fall back to ProRes 422 for tiny/vertical sources.
+/// Returns the preset to actually encode with.
+pub fn resolve_proxy_preset(requested: EncoderPreset, width: u32, height: u32) -> EncoderPreset {
+    match requested {
+        EncoderPreset::DnxhrLb | EncoderPreset::DnxhrSq | EncoderPreset::DnxhrHq
+            if width < 256 || height < 120 =>
+        {
+            EncoderPreset::ProRes422
+        }
+        other => other,
+    }
+}
+
 /// One proxy-generation job.
 #[derive(Clone, Debug)]
 pub struct ProxyJob {
@@ -202,6 +218,19 @@ fn run_one(
         return Err("source has no frame rate metadata; cannot generate proxy".into());
     }
 
+    // DNxHR has a hard 256x120 minimum (see `resolve_proxy_preset`); fall
+    // back to ProRes for tiny/vertical sources so the proxy still produces
+    // a usable file instead of failing mid-stream.
+    let preset = resolve_proxy_preset(job.preset.clone(), stream.width, stream.height);
+    if preset != job.preset {
+        tracing::warn!(
+            w = stream.width,
+            h = stream.height,
+            requested = ?job.preset,
+            "DNxHR requires at least 256x120; falling back to ProRes 422 for this proxy"
+        );
+    }
+
     let mut encoder = EncoderClient::spawn(encoder_binary)
         .map_err(|e| format!("encoder spawn: {e}"))?;
     // Proxy is video-only — audio passes through untouched at use
@@ -215,7 +244,7 @@ fn run_one(
                 frame_rate_num: stream.frame_rate.0 as u32,
                 frame_rate_den: stream.frame_rate.1 as u32,
                 pixel_format: VideoPixelFormat::Rgba8,
-                preset: job.preset.clone(),
+                preset,
                 time_base_num: stream.frame_rate.1 as u32,
                 time_base_den: stream.frame_rate.0 as u32,
             }),
@@ -388,6 +417,22 @@ fn bt709_full_range(y: f32, u: f32, v: f32) -> (u8, u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dnxhr_falls_back_to_prores_below_256x120() {
+        use EncoderPreset::*;
+        // DNxHR below the floor → ProRes 422.
+        assert_eq!(resolve_proxy_preset(DnxhrLb, 200, 200), ProRes422);
+        assert_eq!(resolve_proxy_preset(DnxhrLb, 1920, 100), ProRes422); // height < 120
+        assert_eq!(resolve_proxy_preset(DnxhrLb, 255, 1080), ProRes422); // width < 256
+        assert_eq!(resolve_proxy_preset(DnxhrHq, 64, 64), ProRes422);
+        // DNxHR at/above the floor → unchanged.
+        assert_eq!(resolve_proxy_preset(DnxhrLb, 256, 120), DnxhrLb);
+        assert_eq!(resolve_proxy_preset(DnxhrLb, 1920, 1080), DnxhrLb);
+        // ProRes is never floored (no minimum).
+        assert_eq!(resolve_proxy_preset(ProRes422, 64, 64), ProRes422);
+        assert_eq!(resolve_proxy_preset(ProRes422HQ, 16, 16), ProRes422HQ);
+    }
 
     #[test]
     fn proxy_codec_maps_and_parses() {
