@@ -5827,6 +5827,7 @@ dependencies = [
  "vance-decoder",
  "vance-encoder",
  "vance-grading-cmd",
+ "vance-mograph",
  "vance-ocio",
  "vance-ofx",
  "vance-peaks",
@@ -6120,6 +6121,7 @@ dependencies = [
  "vance-color",
  "vance-core",
  "vance-decoder",
+ "vance-mograph",
  "vance-timeline",
  "wgpu",
 ]
@@ -6154,6 +6156,7 @@ dependencies = [
  "vance-color",
  "vance-core",
  "vance-expr",
+ "vance-mograph",
 ]
 
 [[package]]

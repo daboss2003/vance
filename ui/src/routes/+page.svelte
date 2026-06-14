@@ -37,6 +37,7 @@
   import EffectsBrowser from '$lib/EffectsBrowser.svelte';
   import HistoryPanel from '$lib/HistoryPanel.svelte';
   import MixerConsole from '$lib/MixerConsole.svelte';
+  import MographPanel from '$lib/MographPanel.svelte';
   import TransitionInspector from '$lib/TransitionInspector.svelte';
   import ColorWheel from '$lib/color/ColorWheel.svelte';
   import CurveEditor from '$lib/color/CurveEditor.svelte';
@@ -1975,6 +1976,11 @@
         <!-- GOAT-4 — Fairlight-class mixer console (bus channel strips). -->
         <div class="ml-2 w-72 shrink-0 max-h-48 overflow-auto">
           <MixerConsole />
+        </div>
+
+        <!-- GOAT-5 — Motion Graphics Templates (titles + graphics). -->
+        <div class="ml-2 w-72 shrink-0 max-h-48 overflow-auto">
+          <MographPanel />
         </div>
 
         <span class="text-vance-muted ml-auto">

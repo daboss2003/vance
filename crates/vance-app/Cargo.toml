@@ -63,6 +63,7 @@ vance-plugin-sdk = { workspace = true, features = ["host"] }
 vance-ofx = { workspace = true }
 tracing-chrome = { workspace = true }
 vance-render = { workspace = true }
+vance-mograph = { workspace = true }
 vance-viewport = { workspace = true }
 vance-audio = { workspace = true }
 vance-audio-plugins = { workspace = true }

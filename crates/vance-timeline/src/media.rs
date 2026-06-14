@@ -27,6 +27,10 @@ pub enum MediaKind {
     /// Synthetic title — parameter-driven, no file backing. Its
     /// `path` is empty; the engine reads `title` for rasterization.
     Title,
+    /// GOAT-5 — synthetic Motion Graphics Template instance. No file
+    /// backing; the engine reads `mograph` and rasterizes it via
+    /// `vance-mograph` at the clip-relative time (animated).
+    MoGraph,
 }
 
 /// A 32-byte content hash used for relink-by-content. We only require it
@@ -60,6 +64,11 @@ pub struct MediaItem {
     /// trip without this field.
     #[serde(default)]
     pub title: Option<TitleParams>,
+    /// GOAT-5 — the placed Motion Graphics Template instance. Set when
+    /// `kind == MoGraph`, `None` otherwise. `#[serde(default)]` so older
+    /// projects round-trip without this field.
+    #[serde(default)]
+    pub mograph: Option<vance_mograph::MographInstance>,
     /// What color space the decoded samples live in (Phase 6.2). On
     /// import we leave this `None`; the engine then falls back to
     /// `ColorSpace::Rec709Limited` — the existing pre-color-pipeline
@@ -113,6 +122,7 @@ impl MediaItem {
             frame_rate: None,
             content_hash: None,
             title: None,
+            mograph: None,
             input_color_space: None,
             has_audio_track,
             proxy_path: None,
@@ -137,10 +147,36 @@ impl MediaItem {
             frame_rate: Some(vance_core::FrameRate::FPS_24),
             content_hash: None,
             title: Some(params),
+            mograph: None,
             // Titles are rasterized in sRGB-ish space (see
             // `vance-render::title`). Tag accordingly so they round-
             // trip through the pipeline correctly when the working
             // space differs.
+            input_color_space: Some(ColorSpace::Srgb),
+            has_audio_track: false,
+            proxy_path: None,
+            metadata: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// GOAT-5 — construct a synthetic Motion Graphics Template item. Like
+    /// a title, it has no file backing; the engine rasterizes `instance`
+    /// at the clip-relative time via `vance-mograph`. Authored in sRGB.
+    pub fn new_mograph(
+        display_name: impl Into<String>,
+        duration: RationalTime,
+        instance: vance_mograph::MographInstance,
+    ) -> Self {
+        Self {
+            id: MediaItemId::new(),
+            path: PathBuf::new(),
+            display_name: display_name.into(),
+            kind: MediaKind::MoGraph,
+            duration,
+            frame_rate: Some(vance_core::FrameRate::FPS_24),
+            content_hash: None,
+            title: None,
+            mograph: Some(instance),
             input_color_space: Some(ColorSpace::Srgb),
             has_audio_track: false,
             proxy_path: None,
@@ -178,5 +214,29 @@ mod tests {
         assert_eq!(m.kind, MediaKind::Video);
         assert_eq!(m.frame_rate, Some(FrameRate::FPS_24));
         assert!(m.content_hash.is_none());
+    }
+
+    #[test]
+    fn mograph_media_round_trips_through_ron() {
+        // GOAT-5 — a placed MoGraph instance (template + control values)
+        // embeds Prop/ControlValue enums; it MUST survive the RON path the
+        // .vance bundle uses, or a project with a title becomes unopenable
+        // (the EffectValue-class data-loss bug we already fixed once).
+        let mut inst = vance_mograph::MographInstance::new(vance_mograph::builtins::lower_third());
+        inst.set("title", vance_mograph::ControlValue::Text("Ada Lovelace".into()));
+        inst.set("accent", vance_mograph::ControlValue::Color([0.1, 0.4, 0.9, 1.0]));
+        let item = MediaItem::new_mograph("Lower Third", RationalTime::new(6, 1).unwrap(), inst);
+        assert_eq!(item.kind, MediaKind::MoGraph);
+
+        let ron = ron::ser::to_string_pretty(&item, ron::ser::PrettyConfig::default())
+            .expect("serialize mograph media to RON");
+        let back: MediaItem = ron::from_str(&ron).expect("parse mograph media from RON");
+        assert_eq!(item, back, "mograph media must survive RON round-trip");
+        // The control override specifically must persist.
+        let mg = back.mograph.expect("mograph present");
+        assert_eq!(
+            mg.value("title"),
+            Some(vance_mograph::ControlValue::Text("Ada Lovelace".into()))
+        );
     }
 }

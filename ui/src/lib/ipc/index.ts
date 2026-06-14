@@ -423,7 +423,7 @@ export type MediaItemInfo = {
   id: string;
   name: string;
   path: string;
-  kind: 'video' | 'audio' | 'image' | 'title';
+  kind: 'video' | 'audio' | 'image' | 'title' | 'mograph';
   duration_seconds: number;
   frame_rate_num: number | null;
   frame_rate_den: number | null;
@@ -460,6 +460,65 @@ export const createTitleMedia = (args: {
   width: number;
   height: number;
 }): Promise<MediaItemInfo> => invoke('create_title_media', args);
+
+// ---- GOAT-5: Motion Graphics Templates (.cmgt) -----------------------
+
+/** A control value (externally-tagged, mirrors `vance_mograph::ControlValue`). */
+export type MographValue =
+  | { Text: string }
+  | { Number: number }
+  | { Color: [number, number, number, number] }
+  | { Choice: number }
+  | { Bool: boolean }
+  | { Font: string }
+  | { Point: [number, number] };
+
+/** A control's type + default (mirrors `ControlKind`). */
+export type MographControlKind =
+  | { Text: { default: string } }
+  | { Number: { default: number; min: number; max: number } }
+  | { Color: { default: [number, number, number, number] } }
+  | { Choice: { options: string[]; default: number } }
+  | { Bool: { default: boolean } }
+  | { Font: { default: string } }
+  | { Point: { default: [number, number] } };
+
+export interface MographControl {
+  id: string;
+  label: string;
+  kind: MographControlKind;
+}
+
+export interface MographInstance {
+  template: {
+    meta: { name: string; author: string; version: number; default_duration_s: number };
+    canvas: { width: number; height: number; background: [number, number, number, number] };
+    controls: MographControl[];
+    layers: unknown[];
+  };
+  values: Record<string, MographValue>;
+}
+
+/** Built-in template catalog as `[key, name]` pairs. */
+export const mographCatalog = (): Promise<[string, string][]> => invoke('mograph_catalog');
+
+/** Instantiate a built-in template as a new media item. */
+export const createMographMedia = (
+  templateKey: string,
+  displayName?: string
+): Promise<MediaItemInfo> =>
+  invoke('create_mograph_media', { templateKey, displayName: displayName ?? null });
+
+/** The placed instance (template + values) for a mograph media item. */
+export const mographInstance = (mediaId: string): Promise<MographInstance | null> =>
+  invoke('mograph_instance', { mediaId });
+
+/** Set one control value; resolves to whether it was accepted. */
+export const setMographValue = (
+  mediaId: string,
+  controlId: string,
+  value: MographValue
+): Promise<boolean> => invoke('set_mograph_value', { mediaId, controlId, value });
 
 /** Override (or clear, by passing `null`) the input color space tag
  *  for a media library item. Phase 6.2. */

@@ -12,6 +12,24 @@ pub fn all() -> Vec<MographTemplate> {
     vec![centered_title(), lower_third()]
 }
 
+/// Stable `(key, display name)` pairs for the built-in catalog, so the UI
+/// can list templates and request one by a key that survives renames.
+pub fn catalog() -> Vec<(&'static str, String)> {
+    vec![
+        ("centered_title", centered_title().meta.name),
+        ("lower_third", lower_third().meta.name),
+    ]
+}
+
+/// Look up a built-in template by its catalog key.
+pub fn by_key(key: &str) -> Option<MographTemplate> {
+    match key {
+        "centered_title" => Some(centered_title()),
+        "lower_third" => Some(lower_third()),
+        _ => None,
+    }
+}
+
 fn key(t: f64, v: f64, interp: Interp) -> Key {
     Key { t, v, interp }
 }

@@ -12,6 +12,7 @@ publish = false
 vance-core.workspace = true
 vance-color.workspace = true
 vance-expr.workspace = true
+vance-mograph.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true

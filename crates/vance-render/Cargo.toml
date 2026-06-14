@@ -13,6 +13,7 @@ vance-core = { workspace = true }
 vance-color = { workspace = true }
 vance-decoder = { workspace = true }
 vance-timeline = { workspace = true }
+vance-mograph = { workspace = true }
 wgpu = "29"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"

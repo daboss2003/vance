@@ -134,7 +134,7 @@ fn blend(under: u8, over: u8, alpha: f32) -> u8 {
     (u + (o - u) * alpha).clamp(0.0, 255.0) as u8
 }
 
-fn rgb_to_yuv420p_rec709(rgb: &[u8], w: u32, h: u32) -> Vec<u8> {
+pub(crate) fn rgb_to_yuv420p_rec709(rgb: &[u8], w: u32, h: u32) -> Vec<u8> {
     // Y plane: full size; U, V: w/2 × h/2.
     let y_size = (w * h) as usize;
     let cw = w / 2;

@@ -2642,6 +2642,53 @@ fn create_title_media(
         .map_err(|e| e.to_string())
 }
 
+/// GOAT-5 — built-in MoGraph template catalog as `[key, name]` pairs.
+#[tauri::command]
+fn mograph_catalog(state: tauri::State<'_, EngineHandle>) -> Vec<(String, String)> {
+    state.lock().mograph_catalog()
+}
+
+/// GOAT-5 — instantiate a built-in MoGraph template as a new media item.
+#[tauri::command]
+fn create_mograph_media(
+    state: tauri::State<'_, EngineHandle>,
+    template_key: String,
+    display_name: Option<String>,
+) -> Result<MediaItemInfo, String> {
+    state
+        .lock()
+        .create_mograph_media(template_key, display_name)
+        .map_err(|e| e.to_string())
+}
+
+/// GOAT-5 — the placed MoGraph instance (template + control values) for
+/// the control-editor panel.
+#[tauri::command]
+fn mograph_instance(
+    state: tauri::State<'_, EngineHandle>,
+    media_id: String,
+) -> Result<Option<vance_mograph::MographInstance>, String> {
+    let uuid: uuid::Uuid = media_id.parse().map_err(|e| format!("bad media id: {e}"))?;
+    let id = vance_timeline::MediaItemId::from_uuid(uuid);
+    Ok(state.lock().mograph_instance(id))
+}
+
+/// GOAT-5 — set one control value on a MoGraph media item.
+#[tauri::command]
+fn set_mograph_value(
+    state: tauri::State<'_, EngineHandle>,
+    media_id: String,
+    control_id: String,
+    value: vance_mograph::ControlValue,
+) -> Result<bool, String> {
+    let uuid: uuid::Uuid = media_id.parse().map_err(|e| format!("bad media id: {e}"))?;
+    let id = vance_timeline::MediaItemId::from_uuid(uuid);
+    state
+        .lock()
+        .set_mograph_value(id, control_id, value)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn add_transition_at_cut(
     state: tauri::State<'_, EngineHandle>,
@@ -2971,6 +3018,10 @@ fn main() {
             remove_transition,
             set_transition_param,
             create_title_media,
+            mograph_catalog,
+            create_mograph_media,
+            mograph_instance,
+            set_mograph_value,
             set_media_input_color_space,
             set_project_working_color_space,
             set_project_view_lut,

@@ -32,6 +32,10 @@ type LutCache = HashMap<PathBuf, Arc<vance_color::Lut3d>>;
 enum MediaResolved {
     File(String),
     Title(TitleParams),
+    /// GOAT-5 — a Motion Graphics Template instance, rasterized at the
+    /// clip-relative time via `vance_render::render_mograph_yuv420`.
+    /// Boxed because the instance embeds its template inline.
+    MoGraph(Box<vance_mograph::MographInstance>),
 }
 use vance_viewport::{HostWindowHandle, Viewport, ViewportBounds};
 
@@ -914,6 +918,7 @@ impl From<&MediaItem> for MediaItemInfo {
                 MediaKind::Audio => "audio".into(),
                 MediaKind::Image => "image".into(),
                 MediaKind::Title => "title".into(),
+                MediaKind::MoGraph => "mograph".into(),
             },
             duration_seconds: rt_to_seconds(m.duration),
             frame_rate_num: fr_n,
@@ -1230,6 +1235,12 @@ pub struct Engine {
     /// project never reopens stuck in matte view. Applied during grade
     /// evaluation by forcing `show_mask` on the matching node.
     matte_node: Option<EffectId>,
+
+    /// GOAT-5 — the Motion Graphics Template render engine (font cache +
+    /// rasterizer). Built lazily on first mograph render so projects with
+    /// no titles pay nothing (and no font scan happens at startup). Held
+    /// behind `Arc` so the playback thread can share the same font cache.
+    mograph_engine: std::cell::OnceCell<std::sync::Arc<vance_mograph::MographEngine>>,
 }
 
 /// Anchors a stream-time-base playback position back to a sequence
@@ -1331,6 +1342,19 @@ enum StartPlaybackKind {
         fps: f64,
         duration_seconds: f64,
     },
+    /// GOAT-5 — animated Motion Graphics Template; the loop re-rasterizes
+    /// per tick at the elapsed time so the rig animates during playback.
+    MoGraph {
+        instance: Box<vance_mograph::MographInstance>,
+        fps: f64,
+        duration_seconds: f64,
+    },
+}
+
+/// A synthetic (file-less) playback source — a title or a mograph.
+enum SyntheticPlayback {
+    Title(TitleParams),
+    MoGraph(Box<vance_mograph::MographInstance>),
 }
 
 /// Owned by the engine while video playback is running.
@@ -2148,6 +2172,30 @@ impl Engine {
                     0,
                 )
             }
+            StartPlaybackKind::MoGraph {
+                instance,
+                fps,
+                duration_seconds,
+            } => {
+                // GOAT-5 — share the engine's font cache with the loop and
+                // re-rasterize per tick (mograph is silent in v1, like
+                // titles).
+                let engine = self.mograph_engine();
+                let frame =
+                    vance_render::render_mograph_yuv420(&engine, &instance, 0.0, fps, duration_seconds);
+                (
+                    PlaybackPrimary::MoGraph {
+                        engine,
+                        instance,
+                        frame,
+                        fps,
+                        duration_seconds,
+                    },
+                    None,
+                    None,
+                    0,
+                )
+            }
         };
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -2805,6 +2853,75 @@ impl Engine {
         Ok(info)
     }
 
+    /// GOAT-5 — built-in MoGraph template catalog as `(key, name)` pairs
+    /// for the "New Title…" menu.
+    pub fn mograph_catalog(&self) -> Vec<(String, String)> {
+        vance_mograph::builtins::catalog()
+            .into_iter()
+            .map(|(k, n)| (k.to_string(), n))
+            .collect()
+    }
+
+    /// GOAT-5 — instantiate a built-in MoGraph template (by catalog key)
+    /// as a new synthetic media item. Returns its info for the browser.
+    pub fn create_mograph_media(
+        &mut self,
+        template_key: String,
+        display_name: Option<String>,
+    ) -> Result<MediaItemInfo, EngineError> {
+        if self.current_project.is_none() {
+            return Err(EngineError::NoProject);
+        }
+        let template = vance_mograph::builtins::by_key(&template_key)
+            .ok_or_else(|| EngineError::Project(format!("unknown template '{template_key}'")))?;
+        let name = display_name.unwrap_or_else(|| template.meta.name.clone());
+        let duration = seconds_to_rt(template.meta.default_duration_s.max(0.04));
+        let inst = vance_mograph::MographInstance::new(template);
+        let item = MediaItem::new_mograph(name, duration, inst);
+        let id = item.id;
+        let info = MediaItemInfo::from(&item);
+        let project = self.current_project.as_mut().unwrap();
+        project.media.insert(id, Arc::new(item));
+        tracing::info!(id = %id, key = %template_key, "created mograph media");
+        Ok(info)
+    }
+
+    /// GOAT-5 — the placed MoGraph instance for `media_id` (template +
+    /// current control values), for the control-editor panel. `None` if
+    /// the item isn't a mograph.
+    pub fn mograph_instance(
+        &self,
+        media_id: MediaItemId,
+    ) -> Option<vance_mograph::MographInstance> {
+        self.current_project
+            .as_ref()?
+            .media
+            .get(&media_id)?
+            .mograph
+            .clone()
+    }
+
+    /// GOAT-5 — set one control value on a mograph media item. Returns
+    /// `true` if the value was accepted (known control, type-correct).
+    pub fn set_mograph_value(
+        &mut self,
+        media_id: MediaItemId,
+        control_id: String,
+        value: vance_mograph::ControlValue,
+    ) -> Result<bool, EngineError> {
+        let project = self.current_project.as_mut().ok_or(EngineError::NoProject)?;
+        let arc = project.media.get(&media_id).ok_or(EngineError::MediaNotFound)?;
+        let mut item = (**arc).clone();
+        let Some(inst) = item.mograph.as_mut() else {
+            return Err(EngineError::Project("media is not a mograph".into()));
+        };
+        let ok = inst.set(&control_id, value);
+        if ok {
+            project.media.insert(media_id, Arc::new(item));
+        }
+        Ok(ok)
+    }
+
     /// All media items registered in the current project, for the
     /// Browser panel. Empty when no project is loaded.
     pub fn media_list(&self) -> Vec<MediaItemInfo> {
@@ -2913,22 +3030,32 @@ impl Engine {
             )
         };
 
-        // For title clips, take the title-playback branch and skip the
-        // decoder open + audio open + stream-info logic entirely.
-        if let MediaResolved::Title(params) = resolved {
-            return self.play_title_clip(
-                params,
-                anchor_clip_id,
-                anchor_timeline_in,
-                anchor_source_in,
-                source_pts_seconds,
-                anchor_opacity,
-                clip_duration_sec,
-            );
-        }
+        // For synthetic clips (title / mograph), take the synthetic-
+        // playback branch and skip the decoder/audio/stream-info logic.
         let media_path = match resolved {
+            MediaResolved::Title(params) => {
+                return self.play_synthetic_clip(
+                    SyntheticPlayback::Title(params),
+                    anchor_clip_id,
+                    anchor_timeline_in,
+                    anchor_source_in,
+                    source_pts_seconds,
+                    anchor_opacity,
+                    clip_duration_sec,
+                );
+            }
+            MediaResolved::MoGraph(inst) => {
+                return self.play_synthetic_clip(
+                    SyntheticPlayback::MoGraph(inst),
+                    anchor_clip_id,
+                    anchor_timeline_in,
+                    anchor_source_in,
+                    source_pts_seconds,
+                    anchor_opacity,
+                    clip_duration_sec,
+                );
+            }
             MediaResolved::File(p) => p,
-            MediaResolved::Title(_) => unreachable!("title handled above"),
         };
 
         // Reopen decoder onto the active clip's media. Idempotent if
@@ -3144,6 +3271,9 @@ impl Engine {
                         .map_err(|e| EngineError::Project(format!("title render: {e}")))?;
                     (frame, 0, (1, 1000))
                 }
+                MediaResolved::MoGraph(inst) => {
+                    (self.render_mograph_frame(&inst, from_clip_t), 0, (1, 1000))
+                }
             };
         self.playing_clip_anchor = Some(ClipAnchor {
             timeline_in_seconds: anchor_tl_in,
@@ -3179,6 +3309,11 @@ impl Engine {
             }
             MediaResolved::Title(params) => render_title_yuv420(&params)
                 .map_err(|e| EngineError::Project(format!("title render: {e}")))?,
+            MediaResolved::MoGraph(inst) => {
+                // B-side clip-relative time; synthetic clips start at
+                // source_in 0 so source_pts is the in-clip time.
+                self.render_mograph_frame(&inst, rt_to_seconds(active_tr.to.source_pts))
+            }
         };
 
         // Push effect uniforms + mix factor to the renderer. The
@@ -3232,9 +3367,9 @@ impl Engine {
     /// and the anchor is shifted forward so the timeline mapping
     /// lands at the correct spot.
     #[allow(clippy::too_many_arguments)]
-    fn play_title_clip(
+    fn play_synthetic_clip(
         &mut self,
-        params: TitleParams,
+        synthetic: SyntheticPlayback,
         anchor_clip_id: vance_timeline::ClipId,
         anchor_timeline_in: f64,
         anchor_source_in: f64,
@@ -3318,11 +3453,50 @@ impl Engine {
         self.playing_sequence_active = true;
         self.next_play_effects = effects;
         self.next_play_source_in_sec = anchor_source_in;
-        self.start_playback_inner(StartPlaybackKind::Title {
-            params,
-            fps: 24.0,
-            duration_seconds: remaining_dur,
-        })
+        let kind = match synthetic {
+            SyntheticPlayback::Title(params) => StartPlaybackKind::Title {
+                params,
+                fps: 24.0,
+                duration_seconds: remaining_dur,
+            },
+            SyntheticPlayback::MoGraph(instance) => StartPlaybackKind::MoGraph {
+                instance,
+                fps: self.current_sequence_fps().unwrap_or(30.0),
+                duration_seconds: remaining_dur,
+            },
+        };
+        self.start_playback_inner(kind)
+    }
+
+    /// GOAT-5 — the lazily-built MoGraph render engine (cloneable `Arc`
+    /// so the playback thread shares the font cache). The system font
+    /// scan happens once, on first mograph render, so title-free projects
+    /// pay nothing.
+    fn mograph_engine(&self) -> std::sync::Arc<vance_mograph::MographEngine> {
+        self.mograph_engine
+            .get_or_init(|| std::sync::Arc::new(vance_mograph::MographEngine::new()))
+            .clone()
+    }
+
+    /// Current sequence frame rate as fps, or `None` when no sequence.
+    fn current_sequence_fps(&self) -> Option<f64> {
+        let id = self.current_sequence_id?;
+        let seq = self.current_project.as_ref()?.sequence(id)?;
+        Some(seq.frame_rate.0.as_f64())
+    }
+
+    /// GOAT-5 — rasterize a MoGraph instance to a YUV frame at
+    /// clip-relative `clip_t` seconds (so the rig animates as the playhead
+    /// moves through the clip).
+    fn render_mograph_frame(
+        &self,
+        inst: &vance_mograph::MographInstance,
+        clip_t: f64,
+    ) -> vance_render::FrameData {
+        let fps = self.current_sequence_fps().unwrap_or(30.0);
+        let duration = inst.template.meta.default_duration_s;
+        let engine = self.mograph_engine();
+        vance_render::render_mograph_yuv420(&engine, inst, clip_t.max(0.0), fps, duration)
     }
 
     /// Single-shot title render — same role as `decode_and_render_at`
@@ -3333,15 +3507,13 @@ impl Engine {
     /// for the playhead instead of the source PTS.
     fn decode_title_scrub(
         &mut self,
-        params: TitleParams,
+        frame: vance_render::FrameData,
         clip_id: vance_timeline::ClipId,
         anchor_timeline_in: f64,
         anchor_source_in: f64,
         source_pts_seconds: f64,
         opacity: f32,
     ) -> Result<i64, EngineError> {
-        let frame = render_title_yuv420(&params)
-            .map_err(|e| EngineError::Project(format!("title render: {e}")))?;
         // Effect chain (transform / crop / color / keys) evaluated at
         // the clip-relative time. Titles aren't usually animated but
         // we honor their effects for consistency.
@@ -3577,6 +3749,9 @@ impl Engine {
                 dec.decode_at(target_pts).ok()
             }
             MediaResolved::Title(params) => render_title_yuv420(&params).ok(),
+            // Synthetic clips start at source_in 0, so `source_pts_sec` is
+            // the clip-relative time — the mograph animates across export.
+            MediaResolved::MoGraph(inst) => Some(self.render_mograph_frame(&inst, source_pts_sec)),
         }
     }
 
@@ -3961,6 +4136,12 @@ impl Engine {
             MediaKind::Title => Ok(MediaResolved::Title(
                 media.title.clone().unwrap_or_default(),
             )),
+            MediaKind::MoGraph => match media.mograph.clone() {
+                Some(inst) => Ok(MediaResolved::MoGraph(Box::new(inst))),
+                // A MoGraph item with no instance is malformed; fall back
+                // to a default title so resolution never fails hard.
+                None => Ok(MediaResolved::Title(TitleParams::default())),
+            },
             MediaKind::Video | MediaKind::Image | MediaKind::Audio => {
                 // Phase 9.5 — when the project's "use proxies" toggle
                 // is on AND this item has a generated proxy file, use
@@ -4059,20 +4240,34 @@ impl Engine {
                 active.clip_id,
             )
         };
-        // For title clips: render procedurally and bypass the decoder.
-        if let MediaResolved::Title(params) = resolved {
-            return self.decode_title_scrub(
-                params,
-                anchor_clip_id,
-                anchor_timeline_in,
-                anchor_source_in,
-                source_pts_seconds,
-                anchor_opacity,
-            );
-        }
+        // For synthetic clips (title / mograph): render procedurally at
+        // the clip-relative time and bypass the decoder.
         let media_path = match resolved {
+            MediaResolved::Title(params) => {
+                let frame = render_title_yuv420(&params)
+                    .map_err(|e| EngineError::Project(format!("title render: {e}")))?;
+                return self.decode_title_scrub(
+                    frame,
+                    anchor_clip_id,
+                    anchor_timeline_in,
+                    anchor_source_in,
+                    source_pts_seconds,
+                    anchor_opacity,
+                );
+            }
+            MediaResolved::MoGraph(inst) => {
+                let clip_t = source_pts_seconds - anchor_source_in;
+                let frame = self.render_mograph_frame(&inst, clip_t);
+                return self.decode_title_scrub(
+                    frame,
+                    anchor_clip_id,
+                    anchor_timeline_in,
+                    anchor_source_in,
+                    source_pts_seconds,
+                    anchor_opacity,
+                );
+            }
             MediaResolved::File(p) => p,
-            MediaResolved::Title(_) => unreachable!("title handled above"),
         };
         // Resolve and push the color pipeline for this clip's media
         // before opening the file — render state stays consistent if
@@ -7070,6 +7265,21 @@ pub enum PlaybackPrimary {
         /// Total duration of the title clip on the timeline.
         duration_seconds: f64,
     },
+    /// GOAT-5 — an animated Motion Graphics Template. Unlike `Title`, the
+    /// loop RE-RASTERIZES `frame` each tick at the elapsed time so the
+    /// rig animates. Shares the engine's font cache via `Arc`.
+    MoGraph {
+        /// Shared render engine (font cache + rasterizer).
+        engine: std::sync::Arc<vance_mograph::MographEngine>,
+        /// The placed template instance to render each tick.
+        instance: Box<vance_mograph::MographInstance>,
+        /// Scratch frame, re-rendered + re-pts'd every tick.
+        frame: vance_decoder::FrameData,
+        /// Playback frame rate.
+        fps: f64,
+        /// Total duration of the clip on the timeline.
+        duration_seconds: f64,
+    },
 }
 
 impl PlaybackPrimary {
@@ -7079,7 +7289,7 @@ impl PlaybackPrimary {
     fn time_base(&self) -> (i64, i64) {
         match self {
             PlaybackPrimary::Decoder { info, .. } => info.time_base,
-            PlaybackPrimary::Title { .. } => (1, 1000),
+            PlaybackPrimary::Title { .. } | PlaybackPrimary::MoGraph { .. } => (1, 1000),
         }
     }
 
@@ -7089,7 +7299,7 @@ impl PlaybackPrimary {
     fn from_pts(&self) -> i64 {
         match self {
             PlaybackPrimary::Decoder { from_pts, .. } => *from_pts,
-            PlaybackPrimary::Title { .. } => 0,
+            PlaybackPrimary::Title { .. } | PlaybackPrimary::MoGraph { .. } => 0,
         }
     }
 
@@ -7100,7 +7310,7 @@ impl PlaybackPrimary {
     fn into_decoder(self) -> Option<DecoderClient> {
         match self {
             PlaybackPrimary::Decoder { client, .. } => Some(client),
-            PlaybackPrimary::Title { .. } => None,
+            PlaybackPrimary::Title { .. } | PlaybackPrimary::MoGraph { .. } => None,
         }
     }
 }
@@ -7260,6 +7470,41 @@ fn playback_loop(
                     }
                     break;
                 }
+                frame.clone()
+            }
+            PlaybackPrimary::MoGraph {
+                engine,
+                instance,
+                frame,
+                fps,
+                duration_seconds,
+            } => {
+                // GOAT-5 — re-rasterize the rig at the elapsed clip time so
+                // the template animates, then present like a title frame.
+                let tick_dt_ms = (1000.0 / fps.max(1.0)).round() as i64;
+                let elapsed_sec = (title_tick_ms as f64) / 1000.0;
+                if elapsed_sec >= *duration_seconds {
+                    ended_at_eos.store(true, Ordering::Release);
+                    if chain_resume_micros.load(Ordering::Acquire) == i64::MIN {
+                        if let Some(ctx) = seq_ctx.as_ref() {
+                            let end_t = ctx.anchor_timeline_in
+                                + (elapsed_sec - ctx.anchor_source_in);
+                            let resume_micros =
+                                (end_t * 1_000_000.0).round() as i64 + 1000;
+                            chain_resume_micros.store(resume_micros, Ordering::Release);
+                        }
+                    }
+                    break;
+                }
+                *frame = vance_render::render_mograph_yuv420(
+                    engine,
+                    instance,
+                    elapsed_sec,
+                    *fps,
+                    *duration_seconds,
+                );
+                frame.pts = title_tick_ms;
+                title_tick_ms = title_tick_ms.saturating_add(tick_dt_ms);
                 frame.clone()
             }
         };
