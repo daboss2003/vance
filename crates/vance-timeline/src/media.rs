@@ -84,6 +84,12 @@ pub struct MediaItem {
     /// is on. `None` = no proxy generated yet.
     #[serde(default)]
     pub proxy_path: Option<PathBuf>,
+    /// GOAT-3 — user-defined "custom column" metadata (Avid-grade bins):
+    /// arbitrary `key → value` strings (Scene, Take, Rating, Camera,
+    /// Reviewed, …) that the browser shows as columns and smart bins
+    /// query over. `#[serde(default)]` so older projects round-trip.
+    #[serde(default)]
+    pub metadata: std::collections::BTreeMap<String, String>,
 }
 
 impl MediaItem {
@@ -110,6 +116,7 @@ impl MediaItem {
             input_color_space: None,
             has_audio_track,
             proxy_path: None,
+            metadata: std::collections::BTreeMap::new(),
         }
     }
 
@@ -137,6 +144,7 @@ impl MediaItem {
             input_color_space: Some(ColorSpace::Srgb),
             has_audio_track: false,
             proxy_path: None,
+            metadata: std::collections::BTreeMap::new(),
         }
     }
 

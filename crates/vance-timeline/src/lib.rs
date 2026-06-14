@@ -39,6 +39,7 @@ pub mod grade;
 pub mod id;
 pub mod marker;
 pub mod media;
+pub mod media_query;
 pub mod ops;
 pub mod project;
 pub mod scene_plan;
@@ -57,6 +58,7 @@ pub use effect::{
     eval_curve, validate_expr, Effect, EffectParams, EffectValue, Keyframe, KeyframeInterp,
 };
 pub use error::{Result, TimelineError};
+pub use media_query::{Condition, MediaField, MediaQuery, QueryOp, SmartBin};
 pub use fade::{eval_fade_in, eval_fade_out, Fade, FadeCurve};
 pub use id::{
     ClipId, EffectId, MarkerId, MediaItemId, ProjectId, SequenceId, TrackId, TransitionId,
