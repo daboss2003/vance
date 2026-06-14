@@ -876,6 +876,30 @@ fn can_redo(state: tauri::State<'_, EngineHandle>) -> bool {
     state.lock().can_redo()
 }
 
+/// The current sequence's edit-history tree (for the history / branch panel).
+#[tauri::command]
+fn edit_history(state: tauri::State<'_, EngineHandle>) -> Vec<vance_timeline::HistoryNodeView> {
+    state.lock().edit_history()
+}
+
+/// Name the current history node as a checkpoint / branch.
+#[tauri::command]
+fn checkpoint_history(
+    state: tauri::State<'_, EngineHandle>,
+    name: String,
+) -> Result<(), String> {
+    state.lock().checkpoint_history(name).map_err(|e| e.to_string())
+}
+
+/// Jump to a history node by id (switch branch / restore version).
+#[tauri::command]
+fn goto_history(
+    state: tauri::State<'_, EngineHandle>,
+    node_id: usize,
+) -> Result<bool, String> {
+    state.lock().goto_history(node_id).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn trim_clip_in(
     state: tauri::State<'_, EngineHandle>,
@@ -2721,6 +2745,9 @@ fn main() {
             redo,
             can_undo,
             can_redo,
+            edit_history,
+            checkpoint_history,
+            goto_history,
             peaks_enqueue,
             peaks_status,
             peaks_prioritize,

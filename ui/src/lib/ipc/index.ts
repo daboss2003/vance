@@ -1119,6 +1119,27 @@ export const redo = (): Promise<boolean> => invoke('redo');
 export const canUndo = (): Promise<boolean> => invoke('can_undo');
 export const canRedo = (): Promise<boolean> => invoke('can_redo');
 
+// ---- Edit history + branching ("Git for edits") --------------------------
+
+/** One node in the edit-history tree. */
+export interface HistoryNode {
+  id: number;
+  parent: number | null;
+  children: number[];
+  label: string;
+  name: string | null;
+  is_current: boolean;
+}
+
+/** Full edit-history tree for the current sequence. */
+export const editHistory = (): Promise<HistoryNode[]> => invoke('edit_history');
+/** Name the current history node as a checkpoint / branch. */
+export const checkpointHistory = (name: string): Promise<void> =>
+  invoke('checkpoint_history', { name });
+/** Jump to a history node by id (switch branch / restore version). */
+export const gotoHistory = (nodeId: number): Promise<boolean> =>
+  invoke('goto_history', { nodeId });
+
 // ---- Peaks (audio waveform cache) ----------------------------------------
 //
 // Phase 7.1. Tauri-side service does the work (vance-app/src/peaks.rs);

@@ -35,6 +35,7 @@
   import AudioEffectChain from '$lib/AudioEffectChain.svelte';
   import ExportPanel from '$lib/ExportPanel.svelte';
   import EffectsBrowser from '$lib/EffectsBrowser.svelte';
+  import HistoryPanel from '$lib/HistoryPanel.svelte';
   import TransitionInspector from '$lib/TransitionInspector.svelte';
   import ColorWheel from '$lib/color/ColorWheel.svelte';
   import CurveEditor from '$lib/color/CurveEditor.svelte';
@@ -1963,6 +1964,11 @@
              renderer-to-encoder integration lands in 8.5. -->
         <div class="ml-2 w-56 shrink-0">
           <ExportPanel />
+        </div>
+
+        <!-- GOAT-1 — edit history + branching ("Git for edits"). -->
+        <div class="ml-2 w-56 shrink-0 max-h-48 overflow-auto">
+          <HistoryPanel />
         </div>
 
         <span class="text-vance-muted ml-auto">

@@ -592,104 +592,241 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
     }
 }
 
-/// One entry in an `EditLog`. Holds the op and the sequences it sat
-/// between, both kept Arc-shared for cheap undo/redo swaps.
+/// One node in the edit-history tree. Holds the `Sequence` snapshot
+/// reached by applying `label`'s op to its parent. Snapshots are
+/// Arc-shared internally, so keeping *every* node — including abandoned
+/// branches — is cheap.
 #[derive(Clone, Debug)]
-struct Entry {
-    /// Retained for future logging / status-bar display, even though
-    /// the swap-based undo/redo doesn't need to inspect it.
-    #[allow(dead_code)]
-    op: EditOp,
-    before: Sequence,
-    after: Sequence,
+struct HistoryNode {
+    /// The sequence at this point in history.
+    snapshot: Sequence,
+    /// Parent node index. `None` only for the root.
+    parent: Option<usize>,
+    /// Child node indices in creation order. The LAST child is the
+    /// "active" redo target, so linear redo follows the most recent edit
+    /// while older siblings stay reachable as alternate branches.
+    children: Vec<usize>,
+    /// Human-readable label of the op that produced this node ("" = root).
+    label: String,
+    /// Optional user-assigned checkpoint / branch name.
+    name: Option<String>,
 }
 
-/// Linear undo/redo history for one `Sequence`.
+/// A read-only view of one history node, for the UI's history/branch panel.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct HistoryNodeView {
+    /// Stable node id (index). Pass to [`EditLog::goto`] to jump there.
+    pub id: usize,
+    /// Parent node id, or `None` for the root.
+    pub parent: Option<usize>,
+    /// Child node ids (>1 means this node is a branch point).
+    pub children: Vec<usize>,
+    /// Op label that produced this node.
+    pub label: String,
+    /// User checkpoint/branch name, if assigned.
+    pub name: Option<String>,
+    /// Whether this is the node currently being edited.
+    pub is_current: bool,
+}
+
+/// Branching undo/redo history for one `Sequence` — "Git for edits".
 ///
-/// `current` is the sequence the caller is editing. `entries[..cursor]`
-/// have been applied; `entries[cursor..]` are available for redo until
-/// a fresh `apply` truncates them.
+/// Internally a tree of `Sequence` snapshots. Linear undo/redo walk the
+/// parent / active-child edge (so they behave exactly like a flat
+/// history), but a new edit made after undoing forks a NEW branch
+/// instead of discarding the redo branch — alternate edit paths are kept
+/// and reachable via [`EditLog::goto`] / [`EditLog::branch_tips`]. Cheap
+/// because snapshots are Arc-shared.
 ///
 /// NOT PERSISTED: the log is session-only — `vance-project::save` only
 /// writes the current `Project` (which contains the current `Sequence`),
 /// and `Engine::load_project` reseeds a fresh `EditLog` from that
 /// baseline. Users cannot undo across a project reload. Persisting the
-/// history (with a Compound-aware serialization) is a separable Phase
-/// 3.5 / migrations follow-up.
+/// history is a separable migrations follow-up.
 #[derive(Clone, Debug)]
 pub struct EditLog {
-    current: Sequence,
-    entries: Vec<Entry>,
-    cursor: usize,
+    nodes: Vec<HistoryNode>,
+    current: usize,
 }
 
 impl EditLog {
-    /// Start a fresh log around `initial`.
+    /// Start a fresh log around `initial` (becomes the root node).
     pub fn new(initial: Sequence) -> Self {
         Self {
-            current: initial,
-            entries: Vec::new(),
-            cursor: 0,
+            nodes: vec![HistoryNode {
+                snapshot: initial,
+                parent: None,
+                children: Vec::new(),
+                label: String::new(),
+                name: None,
+            }],
+            current: 0,
         }
     }
 
     /// Borrow the current sequence.
     pub fn current(&self) -> &Sequence {
-        &self.current
+        &self.nodes[self.current].snapshot
     }
 
-    /// Apply `op`, advance the cursor, and drop any redo branch.
+    /// Apply `op`, forking a new history node from the current one.
+    ///
+    /// If the current node already has children (the user undid and is now
+    /// editing from mid-history), this creates a NEW branch rather than
+    /// truncating the existing one — the old branch stays reachable.
     pub fn apply(&mut self, op: EditOp) -> Result<&Sequence> {
-        let after = apply(&self.current, &op)?;
-        // Truncate the redo branch — once the user makes a new edit
-        // mid-history, the unapplied future is gone.
-        self.entries.truncate(self.cursor);
-        let before = std::mem::replace(&mut self.current, after.clone());
-        self.entries.push(Entry { op, before, after });
-        self.cursor = self.entries.len();
-        Ok(&self.current)
+        let after = {
+            let cur = &self.nodes[self.current];
+            apply(&cur.snapshot, &op)?
+        };
+        let new_idx = self.nodes.len();
+        self.nodes.push(HistoryNode {
+            snapshot: after,
+            parent: Some(self.current),
+            children: Vec::new(),
+            label: op_label(&op),
+            name: None,
+        });
+        self.nodes[self.current].children.push(new_idx);
+        self.current = new_idx;
+        Ok(&self.nodes[self.current].snapshot)
     }
 
-    /// Step back one edit. Returns the new current sequence, or `None`
-    /// if there's nothing to undo.
+    /// Step back to the parent node. `None` at the root.
     pub fn undo(&mut self) -> Option<&Sequence> {
-        if self.cursor == 0 {
-            return None;
-        }
-        self.cursor -= 1;
-        self.current = self.entries[self.cursor].before.clone();
-        Some(&self.current)
+        let parent = self.nodes[self.current].parent?;
+        self.current = parent;
+        Some(&self.nodes[self.current].snapshot)
     }
 
-    /// Step forward one edit. Returns the new current sequence, or
-    /// `None` if there's nothing to redo.
+    /// Step forward to the active (most-recent) child. `None` at a leaf.
     pub fn redo(&mut self) -> Option<&Sequence> {
-        if self.cursor >= self.entries.len() {
-            return None;
-        }
-        self.current = self.entries[self.cursor].after.clone();
-        self.cursor += 1;
-        Some(&self.current)
+        let child = *self.nodes[self.current].children.last()?;
+        self.current = child;
+        Some(&self.nodes[self.current].snapshot)
     }
 
     /// `true` if `undo()` would have an effect.
     pub fn can_undo(&self) -> bool {
-        self.cursor > 0
+        self.nodes[self.current].parent.is_some()
     }
 
     /// `true` if `redo()` would have an effect.
     pub fn can_redo(&self) -> bool {
-        self.cursor < self.entries.len()
+        !self.nodes[self.current].children.is_empty()
     }
 
-    /// Number of edits currently in the log (applied + redo branch).
+    /// Number of edits recorded (every node except the root, across all
+    /// branches).
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.nodes.len() - 1
     }
 
-    /// `true` if no edit has been recorded yet.
+    /// `true` if no edit has been recorded yet (only the root exists).
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.nodes.len() == 1
+    }
+
+    /// The id of the node currently being edited.
+    pub fn current_id(&self) -> usize {
+        self.current
+    }
+
+    /// Tag the current node with a checkpoint / branch name (e.g. "v2 —
+    /// punchier open"). Replaces any existing name on that node.
+    pub fn checkpoint(&mut self, name: impl Into<String>) {
+        self.nodes[self.current].name = Some(name.into());
+    }
+
+    /// Jump to any node by id — the core "switch branch / restore
+    /// version" operation. Returns the sequence there, or `None` if the
+    /// id is out of range.
+    pub fn goto(&mut self, id: usize) -> Option<&Sequence> {
+        if id >= self.nodes.len() {
+            return None;
+        }
+        self.current = id;
+        Some(&self.nodes[self.current].snapshot)
+    }
+
+    /// Snapshot of the whole history tree for the UI, in node-id order.
+    pub fn history(&self) -> Vec<HistoryNodeView> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(id, n)| HistoryNodeView {
+                id,
+                parent: n.parent,
+                children: n.children.clone(),
+                label: n.label.clone(),
+                name: n.name.clone(),
+                is_current: id == self.current,
+            })
+            .collect()
+    }
+
+    /// Leaf node ids — the distinct branch endings ("alternate cuts").
+    pub fn branch_tips(&self) -> Vec<usize> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.children.is_empty())
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Named checkpoints, as `(node_id, name)`, in node-id order.
+    pub fn checkpoints(&self) -> Vec<(usize, String)> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(id, n)| n.name.clone().map(|name| (id, name)))
+            .collect()
+    }
+}
+
+/// Short human label for an op, shown in the history panel.
+fn op_label(op: &EditOp) -> String {
+    match op {
+        EditOp::AddTrack { .. } => "Add track".into(),
+        EditOp::RemoveTrack { .. } => "Remove track".into(),
+        EditOp::InsertClip { .. } => "Insert clip".into(),
+        EditOp::RippleInsertClip { .. } => "Ripple insert".into(),
+        EditOp::OverwriteClip { .. } => "Overwrite clip".into(),
+        EditOp::RemoveClip { .. } => "Remove clip".into(),
+        EditOp::RippleRemoveClip { .. } => "Ripple delete".into(),
+        EditOp::Slip { .. } => "Slip".into(),
+        EditOp::Slide { .. } => "Slide".into(),
+        EditOp::TrimIn { .. } => "Trim in".into(),
+        EditOp::TrimOut { .. } => "Trim out".into(),
+        EditOp::Split { .. } => "Split".into(),
+        EditOp::AddEffectToClip { .. } => "Add effect".into(),
+        EditOp::RemoveEffectFromClip { .. } => "Remove effect".into(),
+        EditOp::UpdateEffectParam { .. } | EditOp::UpdateEffectParams { .. } => {
+            "Adjust effect".into()
+        }
+        EditOp::AddTransitionAtCut { .. } => "Add transition".into(),
+        EditOp::RemoveTransition { .. } => "Remove transition".into(),
+        EditOp::SetTransitionParam { .. } => "Adjust transition".into(),
+        EditOp::MoveEffectOnClip { .. } => "Reorder effect".into(),
+        EditOp::SetEffectEnabled { .. } => "Toggle effect".into(),
+        EditOp::SetTrackMute { .. } => "Track mute".into(),
+        EditOp::SetTrackSolo { .. } => "Track solo".into(),
+        EditOp::SetTrackGainDb { .. } | EditOp::SetTrackGainKeyframes { .. } => {
+            "Track gain".into()
+        }
+        EditOp::SetClipMute { .. } => "Clip mute".into(),
+        EditOp::SetClipGainDb { .. } | EditOp::SetClipGainKeyframes { .. } => "Clip gain".into(),
+        EditOp::SetMasterGainDb { .. } => "Master gain".into(),
+        EditOp::SetTrackPan { .. } => "Track pan".into(),
+        EditOp::SetClipPan { .. } => "Clip pan".into(),
+        EditOp::AddAudioEffect { .. } => "Add audio effect".into(),
+        EditOp::RemoveAudioEffect { .. } => "Remove audio effect".into(),
+        EditOp::MoveAudioEffect { .. } => "Reorder audio effect".into(),
+        EditOp::UpdateAudioEffect { .. } => "Adjust audio effect".into(),
+        EditOp::SetClipFadeIn { .. } => "Fade in".into(),
+        EditOp::SetClipFadeOut { .. } => "Fade out".into(),
+        EditOp::Compound { label, .. } => label.clone(),
     }
 }
 
@@ -756,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn new_apply_truncates_redo_branch() {
+    fn new_apply_mid_history_forks_instead_of_truncating() {
         let (mut log, tid, media) = seed_log();
         let a = Clip::new(media, "a", t(0), t(0), t(5)).unwrap();
         let b = Clip::new(media, "b", t(5), t(0), t(5)).unwrap();
@@ -770,6 +907,7 @@ mod tests {
             clip: b,
         })
         .unwrap();
+        let old_tip = log.current_id();
         // Step back twice, then apply a different op.
         log.undo();
         log.undo();
@@ -780,8 +918,81 @@ mod tests {
             clip: c,
         })
         .unwrap();
-        assert!(!log.can_redo()); // redo branch truncated
+        // The current leaf has no redo of its own...
+        assert!(!log.can_redo());
         assert_eq!(log.current().tracks[0].clips.len(), 1);
+        // ...but the old a→b branch is NOT discarded — it survives as a
+        // reachable tip ("Git for edits").
+        assert!(log.branch_tips().contains(&old_tip));
+        log.goto(old_tip).unwrap();
+        assert_eq!(log.current().tracks[0].clips.len(), 2);
+    }
+
+    #[test]
+    fn fork_preserves_both_branches() {
+        let (mut log, tid, media) = seed_log();
+        let a = Clip::new(media, "a", t(0), t(0), t(5)).unwrap();
+        log.apply(EditOp::InsertClip { track_id: tid, clip: a }).unwrap();
+        let a_tip = log.current_id();
+        assert_eq!(log.current().tracks[0].clips.len(), 1);
+
+        // Undo to the track node, then take a different path (two inserts).
+        log.undo().unwrap();
+        let b1 = Clip::new(media, "b1", t(0), t(0), t(5)).unwrap();
+        let b2 = Clip::new(media, "b2", t(10), t(0), t(5)).unwrap();
+        log.apply(EditOp::InsertClip { track_id: tid, clip: b1 }).unwrap();
+        log.apply(EditOp::InsertClip { track_id: tid, clip: b2 }).unwrap();
+        let b_tip = log.current_id();
+        assert_eq!(log.current().tracks[0].clips.len(), 2);
+
+        let tips = log.branch_tips();
+        assert!(tips.contains(&a_tip), "branch A tip lost");
+        assert!(tips.contains(&b_tip), "branch B tip lost");
+
+        // Jump back to branch A — its single-clip edit is intact...
+        log.goto(a_tip).unwrap();
+        assert_eq!(log.current().tracks[0].clips.len(), 1);
+        // ...and forward to branch B again.
+        log.goto(b_tip).unwrap();
+        assert_eq!(log.current().tracks[0].clips.len(), 2);
+    }
+
+    #[test]
+    fn redo_follows_most_recent_branch() {
+        let (mut log, tid, media) = seed_log();
+        let branch_point = log.current_id();
+        let a = Clip::new(media, "a", t(0), t(0), t(5)).unwrap();
+        log.apply(EditOp::InsertClip { track_id: tid, clip: a }).unwrap();
+        log.undo().unwrap();
+        let b = Clip::new(media, "b", t(0), t(0), t(5)).unwrap();
+        log.apply(EditOp::InsertClip { track_id: tid, clip: b }).unwrap();
+        let b_node = log.current_id();
+        // From the branch point, linear redo follows the newest child (B).
+        log.goto(branch_point).unwrap();
+        assert!(log.can_redo());
+        log.redo().unwrap();
+        assert_eq!(log.current_id(), b_node);
+    }
+
+    #[test]
+    fn checkpoint_names_node_and_is_listed() {
+        let (mut log, tid, media) = seed_log();
+        let a = Clip::new(media, "a", t(0), t(0), t(5)).unwrap();
+        log.apply(EditOp::InsertClip { track_id: tid, clip: a }).unwrap();
+        log.checkpoint("rough cut");
+        let id = log.current_id();
+        assert_eq!(log.checkpoints(), vec![(id, "rough cut".to_string())]);
+        let h = log.history();
+        let node = h.iter().find(|n| n.id == id).expect("node in history");
+        assert_eq!(node.name.as_deref(), Some("rough cut"));
+        assert!(node.is_current);
+        assert!(node.parent.is_some(), "an edit node has a parent");
+    }
+
+    #[test]
+    fn goto_out_of_range_is_none() {
+        let (mut log, _tid, _media) = seed_log();
+        assert!(log.goto(999).is_none());
     }
 
     #[test]

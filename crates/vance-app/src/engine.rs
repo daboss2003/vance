@@ -5479,6 +5479,53 @@ impl Engine {
             .is_some_and(|log| log.can_redo())
     }
 
+    /// The current sequence's full edit-history tree (for the history /
+    /// branch panel). Empty when there's no current sequence.
+    pub fn edit_history(&self) -> Vec<vance_timeline::HistoryNodeView> {
+        self.current_sequence_id
+            .and_then(|id| self.edit_logs.get(&id))
+            .map(|log| log.history())
+            .unwrap_or_default()
+    }
+
+    /// Tag the current edit-history node with a checkpoint / branch name
+    /// (e.g. "v2 — punchier open"), so the user can jump back to it later.
+    pub fn checkpoint_history(&mut self, name: String) -> Result<(), EngineError> {
+        let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+        let log = self
+            .edit_logs
+            .get_mut(&seq_id)
+            .ok_or(EngineError::NoCurrentSequence)?;
+        log.checkpoint(name);
+        Ok(())
+    }
+
+    /// Jump the current sequence to any history node by id — the "switch
+    /// branch / restore version" operation. Mirrors undo/redo: re-points
+    /// the project's sequence + republishes mixer state. Returns `false`
+    /// if the id is out of range.
+    pub fn goto_history(&mut self, node_id: usize) -> Result<bool, EngineError> {
+        self.pause_for_edit();
+        let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+        let log = self
+            .edit_logs
+            .get_mut(&seq_id)
+            .ok_or(EngineError::NoCurrentSequence)?;
+        if log.goto(node_id).is_none() {
+            return Ok(false);
+        }
+        let new_seq = log.current().clone();
+        let project = self
+            .current_project
+            .as_mut()
+            .ok_or(EngineError::NoProject)?;
+        if let Some(slot) = project.sequences.iter_mut().find(|s| s.id == seq_id) {
+            *slot = Arc::new(new_seq.clone());
+        }
+        self.republish_mixer_snapshot_if_active(&new_seq);
+        Ok(true)
+    }
+
     /// Save the current project. If `path` is provided it overrides the
     /// remembered bundle path (acts like Save As); otherwise the engine
     /// writes back to the path the project was loaded from.
@@ -8414,6 +8461,36 @@ mod tests {
             .compute_scopes(vance_scopes::ScopeConfig::default(), 16, 16, false)
             .expect("ok without render state");
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn edit_history_forks_and_goto_switches_branches() {
+        let mut e = Engine::default();
+        e.new_project("hist".into()).expect("project");
+        // One edit → node 1.
+        e.set_master_gain_db(-6.0).expect("edit a");
+        assert!(e.can_undo());
+        // Undo to baseline, then a DIFFERENT edit → forks node 2 (the old
+        // branch is NOT discarded).
+        assert!(e.undo().expect("undo"));
+        e.set_master_gain_db(3.0).expect("edit b");
+
+        let h = e.edit_history();
+        assert_eq!(h.len(), 3, "root + 2 forked edits");
+        let tips: Vec<usize> = h
+            .iter()
+            .filter(|n| n.children.is_empty())
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(tips.len(), 2, "two branch tips preserved");
+
+        // Name the current branch, then jump to the OTHER tip and back.
+        e.checkpoint_history("loud".into()).expect("checkpoint");
+        let other = *tips.iter().find(|&&id| !h[id].is_current).unwrap();
+        assert!(e.goto_history(other).expect("goto other branch"));
+        assert_eq!(e.edit_history()[other].is_current, true);
+        // Out-of-range goto is a clean false, not an error.
+        assert!(!e.goto_history(999).expect("goto oob is Ok(false)"));
     }
 
     // ---- Phase 7.3 mixer integration ---------------------------------
