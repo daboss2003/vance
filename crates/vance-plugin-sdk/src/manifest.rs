@@ -52,6 +52,26 @@ pub struct ParamSpec {
     pub default: f32,
 }
 
+/// GPU resources a plugin declares it needs.
+///
+/// The host runs the CPU `process` path today; a plugin that sets
+/// `requires_gpu` is rejected at load (rather than silently mis-run on the
+/// CPU path) until GPU plugin execution lands. Declaring `textures` /
+/// `shader_entry` without `requires_gpu` is a forward-compatible hint and
+/// does not change behaviour.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GpuResources {
+    /// The plugin's process runs as a GPU shader rather than the CPU path.
+    #[serde(default)]
+    pub requires_gpu: bool,
+    /// Named storage textures the plugin would bind (declaration only).
+    #[serde(default)]
+    pub textures: Vec<String>,
+    /// WGSL entry-point name for the plugin's compute/fragment stage.
+    #[serde(default)]
+    pub shader_entry: Option<String>,
+}
+
 /// Top-level plugin manifest.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PluginManifest {
@@ -70,6 +90,10 @@ pub struct PluginManifest {
     /// of the packed `f32` array the host sends to the guest.
     #[serde(default)]
     pub params: Vec<ParamSpec>,
+    /// GPU resources the plugin declares (optional). Absent for the
+    /// CPU-path plugins the host runs today.
+    #[serde(default)]
+    pub gpu: Option<GpuResources>,
 }
 
 /// Error parsing a manifest.
@@ -132,6 +156,19 @@ impl PluginManifest {
                 )));
             }
         }
+        if let Some(gpu) = &self.gpu {
+            let mut tex = std::collections::HashSet::new();
+            for name in &gpu.textures {
+                if name.trim().is_empty() {
+                    return Err(ManifestError::Invalid("empty gpu texture name".into()));
+                }
+                if !tex.insert(name.as_str()) {
+                    return Err(ManifestError::Invalid(format!(
+                        "duplicate gpu texture `{name}`"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -180,6 +217,46 @@ mod tests {
         let s = m.to_ron();
         let back = PluginManifest::from_ron(&s).unwrap();
         assert_eq!(m, back);
+    }
+
+    #[test]
+    fn gpu_resources_optional_and_default_none() {
+        // A CPU manifest (no `gpu` field) parses with gpu = None.
+        assert!(PluginManifest::from_ron(SAMPLE).unwrap().gpu.is_none());
+    }
+
+    #[test]
+    fn gpu_resources_parse_and_round_trip() {
+        let src = r#"PluginManifest(
+            id: "com.example.glow", name: "Glow", version: "1", author: "a", kind: Effect,
+            params: [],
+            gpu: Some(GpuResources(
+                requires_gpu: true,
+                textures: ["src", "bloom"],
+                shader_entry: Some("main"),
+            )),
+        )"#;
+        let m = PluginManifest::from_ron(src).expect("parse gpu manifest");
+        let gpu = m.gpu.as_ref().expect("gpu present");
+        assert!(gpu.requires_gpu);
+        assert_eq!(gpu.textures, vec!["src", "bloom"]);
+        assert_eq!(gpu.shader_entry.as_deref(), Some("main"));
+        // Round-trips through serialization.
+        assert_eq!(PluginManifest::from_ron(&m.to_ron()).unwrap(), m);
+    }
+
+    #[test]
+    fn gpu_rejects_duplicate_or_empty_textures() {
+        let dup = r#"PluginManifest(
+            id: "x", name: "X", version: "1", author: "a", kind: Effect, params: [],
+            gpu: Some(GpuResources(requires_gpu: false, textures: ["t", "t"])),
+        )"#;
+        assert!(PluginManifest::from_ron(dup).is_err());
+        let empty = r#"PluginManifest(
+            id: "x", name: "X", version: "1", author: "a", kind: Effect, params: [],
+            gpu: Some(GpuResources(requires_gpu: false, textures: [""])),
+        )"#;
+        assert!(PluginManifest::from_ron(empty).is_err());
     }
 
     #[test]

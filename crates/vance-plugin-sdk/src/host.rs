@@ -77,6 +77,11 @@ pub enum PluginError {
     /// Manifest parse / validate failed.
     #[error("plugin manifest: {0}")]
     Manifest(#[from] crate::manifest::ManifestError),
+    /// The plugin's manifest declares it requires GPU execution, which the
+    /// host does not yet support (only the CPU `process` path runs today).
+    /// Rejected at load so it isn't silently mis-run on the CPU path.
+    #[error("plugin requires GPU execution, which is not yet supported")]
+    GpuUnsupported,
     /// A guest call trapped (out-of-bounds, fuel exhausted, …).
     #[error("plugin trap: {0}")]
     Trap(String),
@@ -181,6 +186,12 @@ impl WasmPlugin {
                 "manifest not utf-8: {e}"
             )))
         })?)?;
+
+        // GPU-executed plugins aren't runnable yet (the host only drives
+        // the CPU `process` path). Reject rather than silently CPU-run one.
+        if manifest.gpu.as_ref().is_some_and(|g| g.requires_gpu) {
+            return Err(PluginError::GpuUnsupported);
+        }
 
         Ok(Self {
             store,

@@ -41,6 +41,7 @@ impl Plugin for Dissolve {
                     default: 0.25,
                 },
             ],
+            gpu: None,
         }
     }
 

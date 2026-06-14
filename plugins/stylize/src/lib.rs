@@ -40,6 +40,7 @@ impl Plugin for Stylize {
                     default: 1.2,
                 },
             ],
+            gpu: None,
         }
     }
 

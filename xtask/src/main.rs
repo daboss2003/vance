@@ -34,6 +34,10 @@ SUBCOMMANDS:
                 Fails on any drift between the Rust enum and the committed
                 schema/grading_command.schema.json so the AI tool-use spec
                 and the engine contract can't silently desync.
+    build-plugins
+                Build the sample WASM plugins under plugins/ for the
+                wasm32-unknown-unknown target (they're excluded from the
+                host workspace build).
     help        Print this message.
 "#;
 
@@ -85,6 +89,7 @@ fn main() {
             ],
             &rest,
         ),
+        "build-plugins" => build_plugins(),
         "help" | "--help" | "-h" => {
             print!("{HELP}");
             return;
@@ -117,6 +122,43 @@ fn cargo(args: &[&str], extra: &[String]) -> Result<(), String> {
     let mut c = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()));
     c.current_dir(workspace_root()).args(args).args(extra);
     run(c)
+}
+
+/// Build every sample WASM plugin under `plugins/` for
+/// `wasm32-unknown-unknown`. They're excluded from the host workspace
+/// (they only target wasm), so this builds each by manifest path.
+fn build_plugins() -> Result<(), String> {
+    let root = workspace_root();
+    let plugins_dir = root.join("plugins");
+    if !plugins_dir.exists() {
+        return Err(format!("plugins/ not found at {}", plugins_dir.display()));
+    }
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&plugins_dir)
+        .map_err(|e| format!("read plugins/: {e}"))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.join("Cargo.toml").exists())
+        .collect();
+    dirs.sort();
+    if dirs.is_empty() {
+        return Err("no plugin crates found under plugins/".into());
+    }
+    for dir in &dirs {
+        let mut c = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()));
+        c.current_dir(&root).args([
+            "build",
+            "--release",
+            "--target",
+            "wasm32-unknown-unknown",
+            "--manifest-path",
+        ]);
+        c.arg(dir.join("Cargo.toml"));
+        run(c)?;
+    }
+    eprintln!(
+        "xtask: built {} sample WASM plugin(s) for wasm32-unknown-unknown",
+        dirs.len()
+    );
+    Ok(())
 }
 
 fn pnpm(args: &[&str], extra: &[String]) -> Result<(), String> {
