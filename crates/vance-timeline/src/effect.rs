@@ -33,6 +33,15 @@ pub enum EffectValue {
     /// Animated numeric value — a list of keyframes in ascending
     /// time order, interpolated between samples.
     Keyframes(Vec<Keyframe>),
+    /// A scripted value (GOAT expression engine) — a `vance-expr` script
+    /// evaluated per frame against `time` (clip-relative seconds) etc.
+    /// Serializes as `{ expr: "..." }`, distinct from the scalar/array
+    /// shapes so the untagged enum stays unambiguous and older projects
+    /// are unaffected.
+    Expr {
+        /// The expression source (e.g. `"value + 30.0 * noise(time * 2.0)"`).
+        expr: String,
+    },
 }
 
 /// How the engine should interpolate FROM this keyframe to the next
@@ -73,15 +82,69 @@ pub struct Keyframe {
 impl EffectValue {
     /// Evaluate this parameter as a number at clip-relative time
     /// `t_seconds`. `Number` returns its constant value; `Keyframes`
-    /// linearly interpolates between the nearest neighbors,
-    /// clamping at the endpoints. `Bool`/`String` return `None`.
+    /// linearly interpolates between the nearest neighbors, clamping at
+    /// the endpoints; `Expr` evaluates the script with `time = t_seconds`
+    /// (a compile error or non-numeric result yields `None`, so a broken
+    /// expression simply falls back to the param's default rather than
+    /// crashing the render). `Bool`/`String` return `None`.
     pub fn eval_number(&self, t_seconds: f64) -> Option<f64> {
         match self {
             EffectValue::Number(v) => Some(*v),
             EffectValue::Keyframes(kfs) => Some(eval_keyframes(kfs, t_seconds)),
+            EffectValue::Expr { expr } => eval_expr_cached(expr, t_seconds),
             _ => None,
         }
     }
+
+    /// `true` if this value is a scripted expression.
+    pub fn is_expr(&self) -> bool {
+        matches!(self, EffectValue::Expr { .. })
+    }
+}
+
+thread_local! {
+    /// Per-thread expression engine + compiled-AST cache, so the render
+    /// path doesn't rebuild the engine or recompile a script every frame.
+    static EXPR_EVAL: std::cell::RefCell<ExprEvalCache> =
+        std::cell::RefCell::new(ExprEvalCache::default());
+}
+
+#[derive(Default)]
+struct ExprEvalCache {
+    engine: vance_expr::ExprEngine,
+    /// `None` value = the source failed to compile (cached so we don't
+    /// retry compiling a broken expression every frame).
+    compiled: std::collections::HashMap<String, Option<vance_expr::Expr>>,
+}
+
+/// Compile-check an expression source without evaluating it — for live
+/// UI validation as the user types. Returns the error message, or `None`
+/// when the expression is valid.
+pub fn validate_expr(src: &str) -> Option<String> {
+    EXPR_EVAL.with(|cell| cell.borrow().engine.validate(src))
+}
+
+/// Evaluate `src` at clip-relative `t_seconds`, caching the compiled AST
+/// per thread. Returns `None` on compile error or a non-numeric result.
+///
+/// NOTE: only `time` (= `t_seconds`) and the math stdlib are bound here;
+/// `value`/`fps`/`width`/`height`/`frame` default to 0 at this layer. The
+/// richer context is threaded in where the render path has it.
+fn eval_expr_cached(src: &str, t_seconds: f64) -> Option<f64> {
+    EXPR_EVAL.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if !cache.compiled.contains_key(src) {
+            let compiled = cache.engine.compile(src).ok();
+            cache.compiled.insert(src.to_string(), compiled);
+        }
+        let ExprEvalCache { engine, compiled } = &*cache;
+        let expr = compiled.get(src)?.as_ref()?;
+        let ctx = vance_expr::EvalContext {
+            time: t_seconds,
+            ..Default::default()
+        };
+        engine.eval(expr, &ctx).ok()
+    })
 }
 
 /// Evaluate a curve given as control points at input level `x`.
@@ -174,6 +237,53 @@ mod tests {
         assert!(e.enabled);
         assert!(e.params.is_empty());
         assert_eq!(e.kind, "opacity");
+    }
+
+    #[test]
+    fn expr_value_evaluates_against_time() {
+        // A time-driven expression resolves through eval_number.
+        let v = EffectValue::Expr {
+            expr: "10.0 + time * 2.0".into(),
+        };
+        assert!(v.is_expr());
+        assert_eq!(v.eval_number(0.0), Some(10.0));
+        assert_eq!(v.eval_number(5.0), Some(20.0));
+    }
+
+    #[test]
+    fn expr_value_broken_script_falls_back_to_none() {
+        // A compile error must NOT panic the render — it yields None so
+        // the caller uses the param default.
+        let v = EffectValue::Expr {
+            expr: "this is not valid +".into(),
+        };
+        assert_eq!(v.eval_number(1.0), None);
+        // A non-numeric result is also None.
+        let s = EffectValue::Expr {
+            expr: "\"text\"".into(),
+        };
+        assert_eq!(s.eval_number(1.0), None);
+    }
+
+    #[test]
+    fn expr_value_round_trips_through_serde_untagged() {
+        // The object shape `{ expr: "..." }` is distinct from the scalar /
+        // array variants, so the untagged enum stays unambiguous.
+        let v = EffectValue::Expr {
+            expr: "value + noise(time)".into(),
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        let back: EffectValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, back);
+        // A bare number / string still deserialize to their own variants.
+        assert_eq!(
+            serde_json::from_str::<EffectValue>("4.5").unwrap(),
+            EffectValue::Number(4.5)
+        );
+        assert_eq!(
+            serde_json::from_str::<EffectValue>("\"hi\"").unwrap(),
+            EffectValue::String("hi".into())
+        );
     }
 
     fn kf(x: f64, y: f64, interp: KeyframeInterp) -> Keyframe {

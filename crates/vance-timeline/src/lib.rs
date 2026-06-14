@@ -53,7 +53,9 @@ pub use audio_effect::{
 };
 pub use clip::Clip;
 pub use edit_log::{apply, EditLog, EditOp, HistoryNodeView};
-pub use effect::{eval_curve, Effect, EffectParams, EffectValue, Keyframe, KeyframeInterp};
+pub use effect::{
+    eval_curve, validate_expr, Effect, EffectParams, EffectValue, Keyframe, KeyframeInterp,
+};
 pub use error::{Result, TimelineError};
 pub use fade::{eval_fade_in, eval_fade_out, Fade, FadeCurve};
 pub use id::{

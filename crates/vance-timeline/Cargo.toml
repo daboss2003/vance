@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 vance-core.workspace = true
 vance-color.workspace = true
+vance-expr.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true

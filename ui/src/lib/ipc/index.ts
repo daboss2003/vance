@@ -1140,6 +1140,31 @@ export const checkpointHistory = (name: string): Promise<void> =>
 export const gotoHistory = (nodeId: number): Promise<boolean> =>
   invoke('goto_history', { nodeId });
 
+// ---- Parameter expressions (GOAT expression engine) ----------------------
+
+/** Live compile-check of a parameter expression. Returns the error
+ *  message, or null when valid. */
+export const validateExpression = (expr: string): Promise<string | null> =>
+  invoke('validate_expression', { expr });
+
+/** Drive an effect parameter with an expression (e.g.
+ *  "value + 30.0 * noise(time * 2.0)"), evaluated per frame. Pass a number
+ *  to updateEffectParam to revert to a static value. */
+export const setEffectParamExpr = (
+  trackId: string,
+  clipId: string,
+  effectId: string,
+  key: string,
+  expr: string
+): Promise<void> =>
+  invoke('update_effect_param', {
+    trackId,
+    clipId,
+    effectId,
+    key,
+    value: { expr }
+  });
+
 // ---- Peaks (audio waveform cache) ----------------------------------------
 //
 // Phase 7.1. Tauri-side service does the work (vance-app/src/peaks.rs);

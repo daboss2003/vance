@@ -6138,6 +6138,7 @@ dependencies = [
  "uuid",
  "vance-color",
  "vance-core",
+ "vance-expr",
 ]
 
 [[package]]

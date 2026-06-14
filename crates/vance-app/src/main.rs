@@ -971,6 +971,13 @@ fn add_effect_to_clip(
         .map_err(|e| e.to_string())
 }
 
+/// GOAT-2 — live compile-check of a parameter expression (no apply).
+/// Returns the error message, or null when valid.
+#[tauri::command]
+fn validate_expression(expr: String) -> Option<String> {
+    vance_timeline::validate_expr(&expr)
+}
+
 #[tauri::command]
 fn update_effect_param(
     state: tauri::State<'_, EngineHandle>,
@@ -2683,6 +2690,7 @@ fn main() {
             add_effect_to_clip,
             remove_effect_from_clip,
             update_effect_param,
+            validate_expression,
             move_effect_on_clip,
             set_effect_enabled,
             set_track_mute,
