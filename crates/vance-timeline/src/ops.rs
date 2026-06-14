@@ -20,7 +20,7 @@
 use std::sync::Arc;
 use vance_core::RationalTime;
 
-use crate::bus::{routing_cycle, AudioBus, BusOutput, Send};
+use crate::bus::{bus_graph_cycle, AudioBus, BusOutput, Send};
 use crate::clip::Clip;
 use crate::effect::{Effect, EffectValue};
 use crate::error::{Result, TimelineError};
@@ -1877,7 +1877,8 @@ pub fn set_bus_output(seq: &Sequence, bus_id: BusId, output: BusOutput) -> Resul
     }
     let mut buses = seq.buses.clone();
     buses[idx].output = output;
-    if routing_cycle(&buses).is_some() {
+    // Send-aware: an output change can close a loop through existing sends.
+    if bus_graph_cycle(&buses).is_some() {
         return Err(TimelineError::invalid("bus routing would create a cycle"));
     }
     Ok(with_buses(seq, buses))
@@ -1912,6 +1913,92 @@ pub fn remove_track_send(seq: &Sequence, track_id: TrackId, index: usize) -> Res
     let mut nt = (*track).clone();
     nt.sends.remove(index);
     Ok(replace_track(seq, idx, nt))
+}
+
+/// GOAT-4 — append an insert effect to a bus's chain.
+pub fn add_bus_insert(
+    seq: &Sequence,
+    bus_id: BusId,
+    effect: crate::audio_effect::AudioEffectSpec,
+) -> Result<Sequence> {
+    let idx = find_bus(seq, bus_id)?;
+    let mut buses = seq.buses.clone();
+    buses[idx].inserts.push(effect);
+    Ok(with_buses(seq, buses))
+}
+
+/// Remove the bus insert at `index`. No-op if out of range.
+pub fn remove_bus_insert(seq: &Sequence, bus_id: BusId, index: usize) -> Result<Sequence> {
+    let idx = find_bus(seq, bus_id)?;
+    if index >= seq.buses[idx].inserts.len() {
+        return Ok(seq.clone());
+    }
+    let mut buses = seq.buses.clone();
+    buses[idx].inserts.remove(index);
+    Ok(with_buses(seq, buses))
+}
+
+/// Reorder a bus insert. Out-of-range / `from == to` is a no-op.
+pub fn move_bus_insert(
+    seq: &Sequence,
+    bus_id: BusId,
+    from_index: usize,
+    to_index: usize,
+) -> Result<Sequence> {
+    let idx = find_bus(seq, bus_id)?;
+    let len = seq.buses[idx].inserts.len();
+    if from_index >= len || to_index >= len || from_index == to_index {
+        return Ok(seq.clone());
+    }
+    let mut buses = seq.buses.clone();
+    let entry = buses[idx].inserts.remove(from_index);
+    buses[idx].inserts.insert(to_index, entry);
+    Ok(with_buses(seq, buses))
+}
+
+/// Replace a bus insert's spec at `index` (the coarse param-update op,
+/// mirroring [`update_audio_effect`]). No-op on out-of-range / unchanged.
+pub fn update_bus_insert(
+    seq: &Sequence,
+    bus_id: BusId,
+    index: usize,
+    effect: crate::audio_effect::AudioEffectSpec,
+) -> Result<Sequence> {
+    let idx = find_bus(seq, bus_id)?;
+    if index >= seq.buses[idx].inserts.len() || seq.buses[idx].inserts[index] == effect {
+        return Ok(seq.clone());
+    }
+    let mut buses = seq.buses.clone();
+    buses[idx].inserts[index] = effect;
+    Ok(with_buses(seq, buses))
+}
+
+/// GOAT-4 — add an aux send from a bus to another bus. Rejects a missing
+/// target, a self-send, or a send that would create a feedback cycle
+/// (checked over the full output + send graph).
+pub fn add_bus_send(seq: &Sequence, bus_id: BusId, send: Send) -> Result<Sequence> {
+    let idx = find_bus(seq, bus_id)?;
+    if send.target == bus_id {
+        return Err(TimelineError::invalid("a bus cannot send to itself"));
+    }
+    find_bus(seq, send.target)?;
+    let mut buses = seq.buses.clone();
+    buses[idx].sends.push(send);
+    if bus_graph_cycle(&buses).is_some() {
+        return Err(TimelineError::invalid("bus send would create a feedback cycle"));
+    }
+    Ok(with_buses(seq, buses))
+}
+
+/// Remove a bus's send at `index`. No-op if out of range.
+pub fn remove_bus_send(seq: &Sequence, bus_id: BusId, index: usize) -> Result<Sequence> {
+    let idx = find_bus(seq, bus_id)?;
+    if index >= seq.buses[idx].sends.len() {
+        return Ok(seq.clone());
+    }
+    let mut buses = seq.buses.clone();
+    buses[idx].sends.remove(index);
+    Ok(with_buses(seq, buses))
 }
 
 #[cfg(test)]
@@ -1993,6 +2080,75 @@ mod tests {
         log.redo().unwrap();
         log.redo().unwrap();
         assert_eq!(log.current().tracks[0].output, BusOutput::Bus(bus));
+    }
+
+    #[test]
+    fn bus_insert_and_send_ops_round_trip() {
+        use crate::audio_effect::AudioEffectSpec;
+        use crate::bus::Send;
+        use crate::id::BusId;
+        let seq = Sequence::new("S", FrameRate::FPS_24);
+        let music = BusId::new();
+        let reverb = BusId::new();
+        let seq = add_bus_with_id(&seq, music, "Music");
+        let seq = add_bus_with_id(&seq, reverb, "Reverb");
+
+        // Bus inserts: add EQ then a compressor, reorder, update, remove.
+        let seq = add_bus_insert(&seq, music, AudioEffectSpec::default_eq6()).unwrap();
+        let seq = add_bus_insert(&seq, music, AudioEffectSpec::default_compressor()).unwrap();
+        let m = seq.buses.iter().find(|b| b.id == music).unwrap();
+        assert_eq!(m.inserts.len(), 2);
+        let seq = move_bus_insert(&seq, music, 0, 1).unwrap();
+        let m = seq.buses.iter().find(|b| b.id == music).unwrap();
+        assert!(matches!(m.inserts[0], AudioEffectSpec::Compressor { .. }));
+        let seq = update_bus_insert(&seq, music, 1, AudioEffectSpec::default_limiter()).unwrap();
+        let m = seq.buses.iter().find(|b| b.id == music).unwrap();
+        assert!(matches!(m.inserts[1], AudioEffectSpec::Limiter { .. }));
+        let seq = remove_bus_insert(&seq, music, 0).unwrap();
+        assert_eq!(seq.buses.iter().find(|b| b.id == music).unwrap().inserts.len(), 1);
+
+        // Bus send: Music → Reverb is fine; self-send + feedback rejected.
+        let seq = add_bus_send(&seq, music, Send::to(reverb)).unwrap();
+        assert_eq!(seq.buses.iter().find(|b| b.id == music).unwrap().sends.len(), 1);
+        assert!(add_bus_send(&seq, music, Send::to(music)).is_err(), "self-send");
+        // Reverb → Music would close a loop (Music already sends to Reverb).
+        assert!(add_bus_send(&seq, reverb, Send::to(music)).is_err(), "feedback");
+        let seq = remove_bus_send(&seq, music, 0).unwrap();
+        assert_eq!(seq.buses.iter().find(|b| b.id == music).unwrap().sends.len(), 0);
+    }
+
+    #[test]
+    fn bus_insert_send_edit_ops_undo_redo() {
+        use crate::audio_effect::AudioEffectSpec;
+        use crate::bus::Send;
+        use crate::edit_log::{EditLog, EditOp};
+        use crate::id::BusId;
+        let mut log = EditLog::new(Sequence::new("S", FrameRate::FPS_24));
+        let bus = BusId::new();
+        let rev = BusId::new();
+        log.apply(EditOp::AddBus { bus_id: bus, name: "Music".into() }).unwrap();
+        log.apply(EditOp::AddBus { bus_id: rev, name: "Reverb".into() }).unwrap();
+        log.apply(EditOp::AddBusInsert { bus_id: bus, effect: AudioEffectSpec::default_eq6() })
+            .unwrap();
+        log.apply(EditOp::AddBusSend { bus_id: bus, send: Send::to(rev) }).unwrap();
+        let cur = log.current();
+        let m = cur.buses.iter().find(|b| b.id == bus).unwrap();
+        assert_eq!(m.inserts.len(), 1);
+        assert_eq!(m.sends.len(), 1);
+        // Undo send + insert.
+        log.undo().unwrap();
+        log.undo().unwrap();
+        let m = log.current();
+        let m = m.buses.iter().find(|b| b.id == bus).unwrap();
+        assert_eq!(m.inserts.len(), 0);
+        assert_eq!(m.sends.len(), 0);
+        // Redo both.
+        log.redo().unwrap();
+        log.redo().unwrap();
+        let cur = log.current();
+        let m = cur.buses.iter().find(|b| b.id == bus).unwrap();
+        assert_eq!(m.inserts.len(), 1);
+        assert_eq!(m.sends.len(), 1);
     }
 
     #[test]

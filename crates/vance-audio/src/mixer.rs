@@ -900,6 +900,25 @@ pub struct TrackMix {
     /// own insert DSP (so it composes correctly with a nonlinear
     /// compressor/limiter on the track).
     pub output_bus: Option<Uuid>,
+    /// GOAT-4: aux sends — extra taps to other buses, IN ADDITION to the
+    /// main output. A `pre_fader` send taps the pre-fader sum (before the
+    /// track gain); otherwise it taps the post-fader, post-insert signal.
+    /// See [`SendMix`]. Sends to a missing bus are dropped at fold time.
+    pub sends: Vec<SendMix>,
+}
+
+/// GOAT-4 — one aux send inside a [`MixerSnapshot`], precomputed from a
+/// `vance_timeline::Send` at snapshot-build time (`level_db` → linear).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SendMix {
+    /// Destination bus uuid.
+    pub target: Uuid,
+    /// Send level, linear (precomputed from dB at build time).
+    pub level_linear: f32,
+    /// Tap point: `true` = before the source's fader (and inserts, for a
+    /// track; after inserts, before the fader, for a bus); `false` =
+    /// post-fader. See [`fold_bus_graph`] for the exact bus tap point.
+    pub pre_fader: bool,
 }
 
 /// GOAT-4 — per-bus mix state inside a [`MixerSnapshot`]. v1 models the
@@ -919,6 +938,15 @@ pub struct BusMix {
     pub mute: bool,
     /// Where the bus's main output goes: another bus, or `None` = master.
     pub output_bus: Option<Uuid>,
+    /// GOAT-4: ordered insert DSP chain for this bus (EQ / comp / limiter
+    /// / plugins) — same units as a track's. Applied to the summed bus
+    /// input BEFORE the bus fader + pan, with stateful DSP owned by the
+    /// fold thread (a knob drag doesn't reset the bus compressor).
+    pub audio_effects: Vec<AudioEffectKind>,
+    /// GOAT-4: aux sends from this bus to other buses, in addition to the
+    /// main output. A `pre_fader` send taps post-insert / pre-fader; a
+    /// post-fader send taps after the bus fader + pan. See [`SendMix`].
+    pub sends: Vec<SendMix>,
 }
 
 /// Stereo BALANCE multipliers `[L, R]` for a bus pan in `[-1, 1]`. Center
@@ -1065,6 +1093,54 @@ impl MixerSnapshot {
         lr
     }
 
+    /// GOAT-4: bus processing order for [`fold_bus_graph`] — UPSTREAM
+    /// buses first, so each bus's full input has accumulated before it
+    /// runs its inserts + fader. A bus "feeds" every bus it routes to:
+    /// its main `output_bus` AND every aux `send` target. Order is the
+    /// longest-path level (`1 + max(level over fed buses)`, master = 0)
+    /// descending — so a bus is always processed before any bus it feeds,
+    /// including a post-fader send to a same-tier return bus. Uuid breaks
+    /// ties for a deterministic frame-to-frame order; a defensive depth
+    /// cap keeps a (rejected-but-present) cycle from looping forever.
+    pub fn bus_process_order(&self) -> Vec<Uuid> {
+        fn level(
+            buses: &HashMap<Uuid, BusMix>,
+            id: Uuid,
+            depth: u32,
+            cache: &mut HashMap<Uuid, u32>,
+        ) -> u32 {
+            if depth > 64 {
+                return 0;
+            }
+            if let Some(&l) = cache.get(&id) {
+                return l;
+            }
+            let mut max_fed = 0u32;
+            if let Some(b) = buses.get(&id) {
+                if let Some(out) = b.output_bus {
+                    if buses.contains_key(&out) {
+                        max_fed = max_fed.max(level(buses, out, depth + 1, cache));
+                    }
+                }
+                for s in &b.sends {
+                    if buses.contains_key(&s.target) {
+                        max_fed = max_fed.max(level(buses, s.target, depth + 1, cache));
+                    }
+                }
+            }
+            let l = 1 + max_fed;
+            cache.insert(id, l);
+            l
+        }
+        let mut cache: HashMap<Uuid, u32> = HashMap::new();
+        let mut ids: Vec<Uuid> = self.buses.keys().copied().collect();
+        for id in &ids {
+            level(&self.buses, *id, 0, &mut cache);
+        }
+        ids.sort_by(|a, b| cache[b].cmp(&cache[a]).then_with(|| a.cmp(b)));
+        ids
+    }
+
     /// Effective linear gain for `clip_id`'s contribution to the output
     /// sum. Returns 0.0 when:
     ///
@@ -1209,6 +1285,117 @@ pub fn fold_frame_at(
 #[inline]
 pub fn fold_frame(snapshot: &MixerSnapshot, source_samples: &[(Uuid, [f32; 2])]) -> [f32; 2] {
     fold_frame_at(snapshot, source_samples, f64::NEG_INFINITY)
+}
+
+/// GOAT-4 — fold the bus graph for one frame. The caller has already
+/// summed each track's main output and each track's aux sends into
+/// `bus_in` (per-bus input accumulators) and `master` (direct-to-master
+/// sum). This walks the buses in `order` (UPSTREAM first; use
+/// [`MixerSnapshot::bus_process_order`]) and for each bus:
+///
+/// 1. runs its insert DSP via `insert(bus_id, input)` — the realtime
+///    path threads stateful per-bus DSP through this closure; tests pass
+///    identity,
+/// 2. fires its PRE-FADER sends (post-insert, independent of the bus
+///    fader / mute),
+/// 3. applies the bus fader + balance pan (skipped entirely when the bus
+///    is muted — mute silences the main output AND post-fader sends),
+/// 4. fires its POST-FADER sends, and
+/// 5. routes the main output to the bus's own `output_bus` (another bus,
+///    accumulated for a later `order` step) or to `master`.
+///
+/// Sends to a missing bus, or to a bus already processed this frame (an
+/// upstream target — only possible via a send cycle the edit layer
+/// rejects), are dropped: the re-created accumulator is never drained.
+/// On return `bus_in` is empty of processed buses and `master` holds the
+/// pre-master-fader stereo sum.
+pub fn fold_bus_graph(
+    snap: &MixerSnapshot,
+    order: &[Uuid],
+    bus_in: &mut HashMap<Uuid, [f32; 2]>,
+    master: &mut [f32; 2],
+    mut insert: impl FnMut(Uuid, [f32; 2]) -> [f32; 2],
+) {
+    // Add a stereo signal to a send/main destination: a live bus's input
+    // accumulator, or `master` for `None`. A missing target is dropped.
+    fn route(
+        snap: &MixerSnapshot,
+        bus_in: &mut HashMap<Uuid, [f32; 2]>,
+        master: &mut [f32; 2],
+        target: Option<Uuid>,
+        sig: [f32; 2],
+    ) {
+        match target {
+            Some(id) if snap.buses.contains_key(&id) => {
+                let e = bus_in.entry(id).or_insert([0.0, 0.0]);
+                e[0] += sig[0];
+                e[1] += sig[1];
+            }
+            None => {
+                master[0] += sig[0];
+                master[1] += sig[1];
+            }
+            // Missing target bus → drop (don't leak to master).
+            Some(_) => {}
+        }
+    }
+
+    for &bus_id in order {
+        let Some(bus) = snap.buses.get(&bus_id) else {
+            continue;
+        };
+        let input = bus_in.remove(&bus_id).unwrap_or([0.0, 0.0]);
+        let post_insert = insert(bus_id, input);
+        // Pre-fader sends tap post-insert, independent of fader + mute.
+        for s in &bus.sends {
+            if s.pre_fader {
+                route(
+                    snap,
+                    bus_in,
+                    master,
+                    Some(s.target),
+                    [post_insert[0] * s.level_linear, post_insert[1] * s.level_linear],
+                );
+            }
+        }
+        if bus.mute {
+            continue;
+        }
+        let out = [
+            post_insert[0] * bus.gain_linear * bus.pan_linear[0],
+            post_insert[1] * bus.gain_linear * bus.pan_linear[1],
+        ];
+        // Post-fader sends tap the post-fader output.
+        for s in &bus.sends {
+            if !s.pre_fader {
+                route(
+                    snap,
+                    bus_in,
+                    master,
+                    Some(s.target),
+                    [out[0] * s.level_linear, out[1] * s.level_linear],
+                );
+            }
+        }
+        route(snap, bus_in, master, bus.output_bus, out);
+    }
+}
+
+/// GOAT-4 — accumulate an aux-send contribution into its target bus's
+/// input. A send always targets a specific bus; a send to a bus that
+/// isn't in the snapshot is dropped (it never leaks to the master).
+#[inline]
+fn seed_bus_input(
+    snap: &MixerSnapshot,
+    bus_in: &mut HashMap<Uuid, [f32; 2]>,
+    target: Uuid,
+    sig: [f32; 2],
+) {
+    if snap.buses.contains_key(&target) {
+        let e = bus_in.entry(target).or_insert([0.0, 0.0]);
+        e[0] += sig[0];
+        e[1] += sig[1];
+    }
 }
 
 /// Mixer errors. Variants surface from sidecar spawn failure, cpal
@@ -1825,6 +2012,11 @@ fn fold_loop(
     // that have been removed are pruned on the same snapshot load to
     // keep the map bounded.
     let mut track_dsp_states: HashMap<Uuid, TrackDspState> = HashMap::new();
+    // GOAT-4 — per-bus input accumulators (reused each frame) + stateful
+    // per-bus insert DSP (same lifecycle as `track_dsp_states`). The bus
+    // processing order is recomputed once per snapshot load below.
+    let mut bus_frame_sums: HashMap<Uuid, [f32; 2]> = HashMap::new();
+    let mut bus_dsp_states: HashMap<Uuid, TrackDspState> = HashMap::new();
     let sample_rate_f32 = sample_rate as f32;
     // Out-of-process plugin host (CLAP/LV2). Created here but the sidecar
     // is spawned lazily on the first plugin instantiate, so tracks with no
@@ -1927,6 +2119,34 @@ fn fold_loop(
                 st.destroy_all_remote(plugin_host.as_mut());
             }
         }
+        // GOAT-4 — reconcile per-bus insert DSP on the same lifecycle as
+        // tracks, and recompute the upstream→downstream bus order once
+        // per snapshot load (not per frame).
+        for (bus_id, bus) in snap.buses.iter() {
+            if bus.audio_effects.is_empty() {
+                if let Some(mut st) = bus_dsp_states.remove(bus_id) {
+                    st.destroy_all_remote(plugin_host.as_mut());
+                }
+            } else {
+                bus_dsp_states.entry(*bus_id).or_default().reconcile_with(
+                    &bus.audio_effects,
+                    sample_rate_f32,
+                    plugin_host.as_mut(),
+                );
+            }
+        }
+        let live_buses: std::collections::HashSet<Uuid> = snap.buses.keys().copied().collect();
+        let dead_buses: Vec<Uuid> = bus_dsp_states
+            .keys()
+            .filter(|id| !live_buses.contains(id))
+            .copied()
+            .collect();
+        for id in dead_buses {
+            if let Some(mut st) = bus_dsp_states.remove(&id) {
+                st.destroy_all_remote(plugin_host.as_mut());
+            }
+        }
+        let bus_order = snap.bus_process_order();
         let batch_start_frame = master_frame.load(Ordering::Acquire);
         let t_batch_start =
             playback_start_timeline_seconds + batch_start_frame as f64 * inv_sample_rate;
@@ -1978,13 +2198,12 @@ fn fold_loop(
                 if snap.solo_anywhere && !track.solo {
                     continue;
                 }
-                // Compose the gain stage (mirror of effective_gain_at,
-                // minus the master multiply we'll apply once below).
-                let track_g = if track.gain_lane.is_empty() {
-                    track.gain_linear
-                } else {
-                    eval_gain_lane(&track.gain_lane, t_frame)
-                };
+                // GOAT-4: accumulate the PRE-FADER track sum (clip gain ×
+                // fades × pan, but NOT the track fader). The track fader
+                // is applied once per track in the stage below — pulling
+                // it out is mathematically identical for the main output
+                // (Σ clipᵢ·trackG = trackG·Σ clipᵢ) and gives a clean
+                // pre-fader tap point for aux sends.
                 let t_clip = t_frame - clip.timeline_in_seconds;
                 let clip_g = if clip.gain_lane.is_empty() {
                     clip.gain_linear
@@ -2002,13 +2221,13 @@ fn fold_loop(
                     clip.clip_duration_seconds,
                     t_clip,
                 );
-                let pre_master_g = track_g * clip_g * fade_in_g * fade_out_g;
+                let pre_fader_g = clip_g * fade_in_g * fade_out_g;
                 // Phase 7.6: equal-power BALANCE pan. Each output
                 // channel reads only its own input channel — preserves
                 // stereo image at center (with the standard −3 dB pad)
                 // and zeroes the opposite channel at full pan.
-                let l = samples[0] * pre_master_g * clip.pan_linear[0];
-                let r = samples[1] * pre_master_g * clip.pan_linear[1];
+                let l = samples[0] * pre_fader_g * clip.pan_linear[0];
+                let r = samples[1] * pre_fader_g * clip.pan_linear[1];
                 // Accumulate the per-track SUM in the per-frame scratch
                 // map — we observe after the inner loop so peak +
                 // sum_sq reflect the audible signal, not individual
@@ -2017,16 +2236,39 @@ fn fold_loop(
                 entry[0] += l;
                 entry[1] += r;
             }
-            // Phase 7.7: per-track DSP chain applies AFTER all clip
-            // contributions have summed into the track bus, BEFORE the
-            // master gain stage — the conventional channel-strip
-            // topology. State lives on the fold thread, not in the
-            // snapshot, so a snapshot tweak (knob drag) only updates
-            // params via `reconcile_with` without resetting the DSP
-            // internals.
-            for (track_id, sum) in track_frame_sums.drain() {
-                let (mut l, mut r) = (sum[0], sum[1]);
-                if let Some(track) = snap.tracks.get(&track_id) {
+            // Phase 7.7 / GOAT-4: per-track FADER → insert DSP → sends →
+            // output routing. The fader (track gain / lane) applies first
+            // — preserving the historical "fader then inserts" order — so
+            // a pre-fader send taps the raw `track_frame_sums` value and a
+            // post-fader send taps the post-insert signal. DSP state lives
+            // on the fold thread so a knob drag updates params via
+            // `reconcile_with` without resetting filter/compressor state.
+            bus_frame_sums.clear();
+            for (track_id, pre_fader) in track_frame_sums.drain() {
+                let track = snap.tracks.get(&track_id);
+                let track_g = track.map_or(1.0, |t| {
+                    if t.gain_lane.is_empty() {
+                        t.gain_linear
+                    } else {
+                        eval_gain_lane(&t.gain_lane, t_frame)
+                    }
+                });
+                // Pre-fader sends tap the raw track sum (before the fader).
+                if let Some(track) = track {
+                    for s in &track.sends {
+                        if s.pre_fader {
+                            seed_bus_input(
+                                &snap,
+                                &mut bus_frame_sums,
+                                s.target,
+                                [pre_fader[0] * s.level_linear, pre_fader[1] * s.level_linear],
+                            );
+                        }
+                    }
+                }
+                // Fader, then insert DSP.
+                let (mut l, mut r) = (pre_fader[0] * track_g, pre_fader[1] * track_g);
+                if let Some(track) = track {
                     if !track.audio_effects.is_empty() {
                         let dsp = track_dsp_states.entry(track_id).or_default();
                         let (nl, nr) =
@@ -2038,16 +2280,58 @@ fn fold_loop(
                 // Meter the POST-EFFECT track signal — what the user
                 // actually hears at the track row.
                 track_accums.entry(track_id).or_default().observe(l, r);
-                // GOAT-4: route through the output-bus chain (gain + mute
-                // + balance pan, per channel) AFTER the track inserts,
-                // BEFORE the master fader.
-                let bus_lr = snap
-                    .tracks
-                    .get(&track_id)
-                    .map_or([1.0, 1.0], |t| snap.bus_chain_lr(t.output_bus));
-                master_pre_master[0] += l * bus_lr[0];
-                master_pre_master[1] += r * bus_lr[1];
+                // Post-fader sends + the main output both tap the post-
+                // insert signal; the main output flows into its bus's
+                // input accumulator (or master), the buses fold below.
+                if let Some(track) = track {
+                    for s in &track.sends {
+                        if !s.pre_fader {
+                            seed_bus_input(
+                                &snap,
+                                &mut bus_frame_sums,
+                                s.target,
+                                [l * s.level_linear, r * s.level_linear],
+                            );
+                        }
+                    }
+                }
+                let out_bus = track.and_then(|t| t.output_bus);
+                match out_bus {
+                    Some(id) if snap.buses.contains_key(&id) => {
+                        let e = bus_frame_sums.entry(id).or_insert([0.0, 0.0]);
+                        e[0] += l;
+                        e[1] += r;
+                    }
+                    _ => {
+                        master_pre_master[0] += l;
+                        master_pre_master[1] += r;
+                    }
+                }
             }
+            // GOAT-4: fold the bus graph — inserts (stateful), fader, pan,
+            // sends, and onward routing — into the master sum. The insert
+            // closure threads each bus's persistent DSP state.
+            fold_bus_graph(
+                &snap,
+                &bus_order,
+                &mut bus_frame_sums,
+                &mut master_pre_master,
+                |bus_id, sig| {
+                    if let Some(bus) = snap.buses.get(&bus_id) {
+                        if !bus.audio_effects.is_empty() {
+                            let dsp = bus_dsp_states.entry(bus_id).or_default();
+                            let (l, r) = dsp.tick_stereo(
+                                &bus.audio_effects,
+                                sig[0],
+                                sig[1],
+                                plugin_host.as_mut(),
+                            );
+                            return [l, r];
+                        }
+                    }
+                    sig
+                },
+            );
             let master_l = master_pre_master[0] * snap.master_gain_linear;
             let master_r = master_pre_master[1] * snap.master_gain_linear;
             master_accum.observe(master_l, master_r);
@@ -2122,6 +2406,7 @@ mod tests {
             solo: false,
             audio_effects: Vec::new(),
             output_bus: None,
+            sends: Vec::new(),
         }
     }
 
@@ -2196,6 +2481,8 @@ mod tests {
                 pan_linear: [1.0, 1.0],
                 mute: false,
                 output_bus: None,
+                audio_effects: Vec::new(),
+                sends: Vec::new(),
             },
         );
         let out = fold_frame(&snap, &[(c, [1.0, -1.0])]);
@@ -2217,11 +2504,11 @@ mod tests {
         let mut snap = snapshot_with(&[(t, track)], &[(c, unity_clip(t))]);
         snap.buses.insert(
             a,
-            BusMix { gain_linear: db_to_linear(-6.0), pan_linear: [1.0, 1.0], mute: false, output_bus: Some(b) },
+            BusMix { gain_linear: db_to_linear(-6.0), pan_linear: [1.0, 1.0], mute: false, audio_effects: Vec::new(), sends: Vec::new(), output_bus: Some(b) },
         );
         snap.buses.insert(
             b,
-            BusMix { gain_linear: db_to_linear(-6.0), pan_linear: [1.0, 1.0], mute: false, output_bus: None },
+            BusMix { gain_linear: db_to_linear(-6.0), pan_linear: [1.0, 1.0], mute: false, audio_effects: Vec::new(), sends: Vec::new(), output_bus: None },
         );
         let expect = db_to_linear(-6.0) * db_to_linear(-6.0);
         let out = fold_frame(&snap, &[(c, [1.0, 0.0])]);
@@ -2235,8 +2522,8 @@ mod tests {
         assert_eq!(snap.bus_chain_gain(Some(Uuid::new_v4())), 0.0, "missing bus is silent");
         // A→B→A cycle is caught by the depth guard → 0.
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-        snap.buses.insert(a, BusMix { gain_linear: 1.0, pan_linear: [1.0, 1.0], mute: false, output_bus: Some(b) });
-        snap.buses.insert(b, BusMix { gain_linear: 1.0, pan_linear: [1.0, 1.0], mute: false, output_bus: Some(a) });
+        snap.buses.insert(a, BusMix { gain_linear: 1.0, pan_linear: [1.0, 1.0], mute: false, audio_effects: Vec::new(), sends: Vec::new(), output_bus: Some(b) });
+        snap.buses.insert(b, BusMix { gain_linear: 1.0, pan_linear: [1.0, 1.0], mute: false, audio_effects: Vec::new(), sends: Vec::new(), output_bus: Some(a) });
         assert_eq!(snap.bus_chain_gain(Some(a)), 0.0);
     }
 
@@ -2258,6 +2545,8 @@ mod tests {
                 pan_linear: bus_balance(-1.0),
                 mute: false,
                 output_bus: None,
+                audio_effects: Vec::new(),
+                sends: Vec::new(),
             },
         );
         assert_eq!(snap.bus_chain_lr(Some(bus)), [1.0, 0.0]);
@@ -2269,6 +2558,139 @@ mod tests {
         let lr = snap.bus_chain_lr(Some(bus));
         assert!((lr[0] - db_to_linear(-6.0)).abs() < 1e-6);
         assert_eq!(lr[1], 0.0);
+    }
+
+    // ---- GOAT-4: bus-graph fold (inserts + sends + topo routing) ----
+
+    fn bmix(gain: f32, output: Option<Uuid>) -> BusMix {
+        BusMix {
+            gain_linear: gain,
+            pan_linear: [1.0, 1.0],
+            mute: false,
+            output_bus: output,
+            audio_effects: Vec::new(),
+            sends: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn fold_bus_graph_applies_bus_fader_to_master() {
+        let mut snap = MixerSnapshot::empty();
+        let bus = Uuid::new_v4();
+        snap.buses.insert(bus, bmix(0.5, None));
+        let order = snap.bus_process_order();
+        // A track main already summed into the bus.
+        let mut bus_in = HashMap::from([(bus, [1.0, 1.0])]);
+        let mut master = [0.0f32; 2];
+        fold_bus_graph(&snap, &order, &mut bus_in, &mut master, |_, s| s);
+        assert_eq!(master, [0.5, 0.5]);
+    }
+
+    #[test]
+    fn fold_bus_graph_chains_sub_into_main_in_topo_order() {
+        // sub (×0.5) → main (×0.5) → master: a signal of 1.0 → 0.25.
+        let mut snap = MixerSnapshot::empty();
+        let (sub, main) = (Uuid::new_v4(), Uuid::new_v4());
+        snap.buses.insert(sub, bmix(0.5, Some(main)));
+        snap.buses.insert(main, bmix(0.5, None));
+        let order = snap.bus_process_order();
+        // sub feeds main, so sub must be processed first regardless of uuid.
+        assert_eq!(order[0], sub, "upstream bus must precede its output bus");
+        let mut bus_in = HashMap::from([(sub, [1.0, 0.0])]);
+        let mut master = [0.0f32; 2];
+        fold_bus_graph(&snap, &order, &mut bus_in, &mut master, |_, s| s);
+        assert!((master[0] - 0.25).abs() < 1e-6, "got {}", master[0]);
+        assert_eq!(master[1], 0.0);
+    }
+
+    #[test]
+    fn fold_bus_graph_post_fader_send_follows_source_fader() {
+        // src (fader 0.5 → master) sends post-fader at unity to a reverb
+        // return (unity → master). The send must reflect the 0.5 fader.
+        let mut snap = MixerSnapshot::empty();
+        let (src, rev) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut s = bmix(0.5, None);
+        s.sends.push(SendMix { target: rev, level_linear: 1.0, pre_fader: false });
+        snap.buses.insert(src, s);
+        snap.buses.insert(rev, bmix(1.0, None));
+        let order = snap.bus_process_order();
+        assert_eq!(order[0], src, "send source must precede its target");
+        let mut bus_in = HashMap::from([(src, [1.0, 0.0])]);
+        let mut master = [0.0f32; 2];
+        fold_bus_graph(&snap, &order, &mut bus_in, &mut master, |_, s| s);
+        // master = src main (0.5) + reverb (post-fader send 0.5) = 1.0.
+        assert!((master[0] - 1.0).abs() < 1e-6, "got {}", master[0]);
+    }
+
+    #[test]
+    fn fold_bus_graph_pre_fader_send_ignores_source_fader_and_mute() {
+        // A pre-fader send taps the post-insert signal BEFORE the fader,
+        // and fires even when the source bus is muted.
+        let mut snap = MixerSnapshot::empty();
+        let (src, cue) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut s = bmix(0.0, None); // fader fully down + muted below
+        s.mute = true;
+        s.sends.push(SendMix { target: cue, level_linear: 1.0, pre_fader: true });
+        snap.buses.insert(src, s);
+        snap.buses.insert(cue, bmix(1.0, None));
+        let order = snap.bus_process_order();
+        let mut bus_in = HashMap::from([(src, [1.0, 0.0])]);
+        let mut master = [0.0f32; 2];
+        fold_bus_graph(&snap, &order, &mut bus_in, &mut master, |_, s| s);
+        // src main is muted (0), but the pre-fader cue send passes at unity.
+        assert!((master[0] - 1.0).abs() < 1e-6, "pre-fader send lost: {}", master[0]);
+    }
+
+    #[test]
+    fn fold_bus_graph_mute_silences_main_and_post_fader_send() {
+        let mut snap = MixerSnapshot::empty();
+        let (src, rev) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut s = bmix(1.0, None);
+        s.mute = true;
+        s.sends.push(SendMix { target: rev, level_linear: 1.0, pre_fader: false });
+        snap.buses.insert(src, s);
+        snap.buses.insert(rev, bmix(1.0, None));
+        let order = snap.bus_process_order();
+        let mut bus_in = HashMap::from([(src, [1.0, 1.0])]);
+        let mut master = [0.0f32; 2];
+        fold_bus_graph(&snap, &order, &mut bus_in, &mut master, |_, s| s);
+        assert_eq!(master, [0.0, 0.0], "muted bus must drop main + post-fader send");
+    }
+
+    #[test]
+    fn fold_bus_graph_runs_insert_closure() {
+        // The insert closure halves the signal (stands in for stateful DSP).
+        let mut snap = MixerSnapshot::empty();
+        let bus = Uuid::new_v4();
+        snap.buses.insert(bus, bmix(1.0, None));
+        let order = snap.bus_process_order();
+        let mut bus_in = HashMap::from([(bus, [1.0, 1.0])]);
+        let mut master = [0.0f32; 2];
+        fold_bus_graph(&snap, &order, &mut bus_in, &mut master, |_, s| {
+            [s[0] * 0.5, s[1] * 0.5]
+        });
+        assert_eq!(master, [0.5, 0.5]);
+    }
+
+    #[test]
+    fn fold_bus_graph_drops_send_to_missing_bus() {
+        // A send whose target isn't in the snapshot is dropped, never
+        // leaking into the master sum.
+        let mut snap = MixerSnapshot::empty();
+        let src = Uuid::new_v4();
+        let mut s = bmix(1.0, None);
+        s.sends.push(SendMix {
+            target: Uuid::new_v4(),
+            level_linear: 1.0,
+            pre_fader: false,
+        });
+        snap.buses.insert(src, s);
+        let order = snap.bus_process_order();
+        let mut bus_in = HashMap::from([(src, [1.0, 0.0])]);
+        let mut master = [0.0f32; 2];
+        fold_bus_graph(&snap, &order, &mut bus_in, &mut master, |_, s| s);
+        // Only the main output reaches master; the orphan send is gone.
+        assert_eq!(master, [1.0, 0.0]);
     }
 
     #[test]

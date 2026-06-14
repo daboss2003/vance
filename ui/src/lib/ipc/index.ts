@@ -1228,7 +1228,7 @@ export interface AudioBus {
   gain_db: number;
   pan: number;
   mute: boolean;
-  inserts: unknown[];
+  inserts: AudioEffectSpec[];
   output: BusOutput;
   sends: Send[];
 }
@@ -1252,6 +1252,23 @@ export const addTrackSend = (trackId: string, send: Send): Promise<void> =>
   invoke('add_track_send', { trackId, send });
 export const removeTrackSend = (trackId: string, index: number): Promise<void> =>
   invoke('remove_track_send', { trackId, index });
+
+// Bus inserts (per-bus DSP chain) + bus sends.
+export const addBusInsert = (busId: string, effect: AudioEffectSpec): Promise<void> =>
+  invoke('add_bus_insert', { busId, effect });
+export const removeBusInsert = (busId: string, index: number): Promise<void> =>
+  invoke('remove_bus_insert', { busId, index });
+export const moveBusInsert = (busId: string, fromIndex: number, toIndex: number): Promise<void> =>
+  invoke('move_bus_insert', { busId, fromIndex, toIndex });
+export const updateBusInsert = (
+  busId: string,
+  index: number,
+  effect: AudioEffectSpec
+): Promise<void> => invoke('update_bus_insert', { busId, index, effect });
+export const addBusSend = (busId: string, send: Send): Promise<void> =>
+  invoke('add_bus_send', { busId, send });
+export const removeBusSend = (busId: string, index: number): Promise<void> =>
+  invoke('remove_bus_send', { busId, index });
 
 // ---- Parameter expressions (GOAT expression engine) ----------------------
 

@@ -98,8 +98,10 @@ impl AudioBus {
 /// revisiting a bus. Returns the id of a bus that is part of a cycle (or
 /// routes to a missing bus), or `None` when the routing is sound.
 ///
-/// Sends are NOT part of this check: they're taps, not the main path, so
-/// they cannot create a feedback loop in the summing graph.
+/// Sends are NOT part of this check — it only validates the main path. Use
+/// [`bus_graph_cycle`] when adding a send, since with bus inserts + summing
+/// a post-fader send DOES feed another bus's input and a send loop would be
+/// audio feedback.
 pub fn routing_cycle(buses: &[AudioBus]) -> Option<BusId> {
     use std::collections::HashMap;
     let by_id: HashMap<BusId, &AudioBus> = buses.iter().map(|b| (b.id, b)).collect();
@@ -124,6 +126,62 @@ pub fn routing_cycle(buses: &[AudioBus]) -> Option<BusId> {
                     }
                     cur = next;
                 }
+            }
+        }
+    }
+    None
+}
+
+/// Validate the FULL bus summing graph — main outputs AND sends — is
+/// acyclic. Unlike [`routing_cycle`], this includes send edges: with bus
+/// inserts and per-bus summing a send feeds another bus's input, so a send
+/// loop (or a send that closes a loop through main outputs) is audio
+/// feedback. Returns a bus that lies on a cycle, or `None` when sound.
+/// Missing send/output targets are ignored here (the ops validate those
+/// separately so the error is specific).
+pub fn bus_graph_cycle(buses: &[AudioBus]) -> Option<BusId> {
+    use std::collections::HashMap;
+    let by_id: HashMap<BusId, &AudioBus> = buses.iter().map(|b| (b.id, b)).collect();
+    // DFS three-colouring: absent = unvisited, 1 = on the current stack
+    // (gray), 2 = fully explored (black). A back-edge to a gray node is a
+    // cycle.
+    fn visit(
+        id: BusId,
+        by_id: &HashMap<BusId, &AudioBus>,
+        color: &mut HashMap<BusId, u8>,
+    ) -> Option<BusId> {
+        color.insert(id, 1);
+        if let Some(bus) = by_id.get(&id) {
+            let mut neighbors: Vec<BusId> = Vec::new();
+            if let BusOutput::Bus(n) = bus.output {
+                neighbors.push(n);
+            }
+            for s in &bus.sends {
+                neighbors.push(s.target);
+            }
+            for n in neighbors {
+                if !by_id.contains_key(&n) {
+                    continue;
+                }
+                match color.get(&n).copied().unwrap_or(0) {
+                    1 => return Some(n),
+                    0 => {
+                        if let Some(c) = visit(n, by_id, color) {
+                            return Some(c);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        color.insert(id, 2);
+        None
+    }
+    let mut color: HashMap<BusId, u8> = HashMap::new();
+    for b in buses {
+        if color.get(&b.id).copied().unwrap_or(0) == 0 {
+            if let Some(c) = visit(b.id, &by_id, &mut color) {
+                return Some(c);
             }
         }
     }
@@ -169,6 +227,27 @@ mod tests {
         a.output = BusOutput::Bus(BusId::new()); // nonexistent
         let id = a.id;
         assert_eq!(routing_cycle(&[a]), Some(id));
+    }
+
+    #[test]
+    fn bus_graph_cycle_detects_send_feedback() {
+        // A → B via main output, B → A via a send: a feedback loop the
+        // main-output-only check misses.
+        let mut a = AudioBus::new("A");
+        let mut b = AudioBus::new("B");
+        a.output = BusOutput::Bus(b.id);
+        b.sends.push(Send::to(a.id));
+        assert_eq!(routing_cycle(&[a.clone(), b.clone()]), None, "no main-path cycle");
+        assert!(bus_graph_cycle(&[a, b]).is_some(), "send feedback must be caught");
+    }
+
+    #[test]
+    fn bus_graph_cycle_allows_acyclic_sends() {
+        // A and B both → master; A sends to B. No cycle.
+        let mut a = AudioBus::new("A");
+        let b = AudioBus::new("B");
+        a.sends.push(Send::to(b.id));
+        assert_eq!(bus_graph_cycle(&[a, b]), None);
     }
 
     #[test]

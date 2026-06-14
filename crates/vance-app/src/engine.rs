@@ -5166,6 +5166,70 @@ impl Engine {
         self.apply_edit_op(EditOp::RemoveTrackSend { track_id, index })
     }
 
+    /// GOAT-4 — append an insert effect to a bus's chain.
+    pub fn add_bus_insert(
+        &mut self,
+        bus_id: vance_timeline::BusId,
+        effect: vance_timeline::AudioEffectSpec,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::AddBusInsert { bus_id, effect })
+    }
+
+    /// Remove a bus insert at `index`.
+    pub fn remove_bus_insert(
+        &mut self,
+        bus_id: vance_timeline::BusId,
+        index: usize,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::RemoveBusInsert { bus_id, index })
+    }
+
+    /// Reorder a bus insert.
+    pub fn move_bus_insert(
+        &mut self,
+        bus_id: vance_timeline::BusId,
+        from_index: usize,
+        to_index: usize,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::MoveBusInsert {
+            bus_id,
+            from_index,
+            to_index,
+        })
+    }
+
+    /// Replace a bus insert's spec at `index`.
+    pub fn update_bus_insert(
+        &mut self,
+        bus_id: vance_timeline::BusId,
+        index: usize,
+        effect: vance_timeline::AudioEffectSpec,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::UpdateBusInsert {
+            bus_id,
+            index,
+            effect,
+        })
+    }
+
+    /// GOAT-4 — add an aux send from a bus to another bus.
+    pub fn add_bus_send(
+        &mut self,
+        bus_id: vance_timeline::BusId,
+        send: vance_timeline::Send,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::AddBusSend { bus_id, send })
+    }
+
+    /// Remove a bus's send at `index`.
+    pub fn remove_bus_send(
+        &mut self,
+        bus_id: vance_timeline::BusId,
+        index: usize,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::RemoveBusSend { bus_id, index })
+    }
+
     /// Read-only snapshot of the current sequence's buses (for the console).
     pub fn buses(&self) -> Vec<vance_timeline::AudioBus> {
         self.current_sequence_id
@@ -6355,6 +6419,17 @@ fn track_to_mix(track: &Track) -> vance_audio::TrackMix {
             vance_timeline::BusOutput::Master => None,
             vance_timeline::BusOutput::Bus(id) => Some(id.as_uuid()),
         },
+        sends: track.sends.iter().map(translate_send).collect(),
+    }
+}
+
+/// GOAT-4 — translate a timeline `Send` into the fold-thread mirror,
+/// precomputing the linear send level from dB.
+fn translate_send(send: &vance_timeline::Send) -> vance_audio::SendMix {
+    vance_audio::SendMix {
+        target: send.target.as_uuid(),
+        level_linear: vance_audio::db_to_linear(send.level_db),
+        pre_fader: send.pre_fader,
     }
 }
 
@@ -6536,6 +6611,8 @@ fn build_mixer_snapshot(sequence: &vance_timeline::Sequence) -> vance_audio::Mix
                     vance_timeline::BusOutput::Master => None,
                     vance_timeline::BusOutput::Bus(id) => Some(id.as_uuid()),
                 },
+                audio_effects: bus.inserts.iter().map(translate_audio_effect).collect(),
+                sends: bus.sends.iter().map(translate_send).collect(),
             },
         );
     }
@@ -6818,7 +6895,13 @@ fn op_touches_mixer(op: &EditOp) -> bool {
         | EditOp::SetBusOutput { .. }
         | EditOp::RouteTrackToBus { .. }
         | EditOp::AddTrackSend { .. }
-        | EditOp::RemoveTrackSend { .. } => true,
+        | EditOp::RemoveTrackSend { .. }
+        | EditOp::AddBusInsert { .. }
+        | EditOp::RemoveBusInsert { .. }
+        | EditOp::MoveBusInsert { .. }
+        | EditOp::UpdateBusInsert { .. }
+        | EditOp::AddBusSend { .. }
+        | EditOp::RemoveBusSend { .. } => true,
         // Compound republishes once after the whole batch lands.
         EditOp::Compound { .. } => true,
         _ => false,
@@ -8774,6 +8857,35 @@ mod tests {
         a1 = vance_timeline::Track::new(TrackKind::Audio, "A1");
         seq.tracks.push(Arc::new(a1));
         assert!(!build_mixer_snapshot(&seq).solo_anywhere);
+    }
+
+    #[test]
+    fn build_mixer_snapshot_translates_bus_inserts_and_sends() {
+        let mut seq = vance_timeline::Sequence::new("S", vance_core::FrameRate::FPS_24);
+        let music = vance_timeline::BusId::new();
+        let reverb = vance_timeline::BusId::new();
+        let mut mbus = vance_timeline::AudioBus::new("Music");
+        mbus.id = music;
+        mbus.inserts.push(vance_timeline::AudioEffectSpec::default_compressor());
+        // A post-fader send from Music → Reverb at -6 dB.
+        mbus.sends.push(vance_timeline::Send {
+            target: reverb,
+            level_db: -6.0,
+            pre_fader: false,
+        });
+        let mut rbus = vance_timeline::AudioBus::new("Reverb");
+        rbus.id = reverb;
+        seq.buses.push(mbus);
+        seq.buses.push(rbus);
+
+        let snap = build_mixer_snapshot(&seq);
+        let m = snap.buses.get(&music.as_uuid()).expect("music bus in snapshot");
+        assert_eq!(m.audio_effects.len(), 1, "bus insert translated");
+        assert_eq!(m.sends.len(), 1, "bus send translated");
+        assert_eq!(m.sends[0].target, reverb.as_uuid());
+        assert!(!m.sends[0].pre_fader);
+        // -6 dB precomputed to linear (~0.501).
+        assert!((m.sends[0].level_linear - vance_audio::db_to_linear(-6.0)).abs() < 1e-6);
     }
 
     #[test]

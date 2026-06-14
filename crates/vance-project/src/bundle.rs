@@ -396,6 +396,59 @@ mod tests {
     }
 
     #[test]
+    fn bus_inserts_and_sends_round_trip_through_save_and_open() {
+        // GOAT-4 — a project with bus inserts + sends must reopen intact.
+        // (Buses persist via RON; the EffectValue bug taught us to lock the
+        // serialization of every new audio-graph field at the bundle level.)
+        let tmp = TempDir::new().unwrap();
+        let bundle = tmp.path().join("Buses.vance");
+
+        let mut p = Project::new("Buses");
+        let mut seq = Sequence::new("Seq 01", FrameRate::FPS_24);
+        let music = vance_timeline::BusId::new();
+        let reverb = vance_timeline::BusId::new();
+        let mut mbus = vance_timeline::AudioBus::new("Music");
+        mbus.id = music;
+        mbus.gain_db = -4.0;
+        mbus.pan = -0.5;
+        mbus.inserts
+            .push(vance_timeline::AudioEffectSpec::default_compressor());
+        mbus.inserts
+            .push(vance_timeline::AudioEffectSpec::default_limiter());
+        mbus.sends.push(vance_timeline::Send {
+            target: reverb,
+            level_db: -6.0,
+            pre_fader: true,
+        });
+        let mut rbus = vance_timeline::AudioBus::new("Reverb");
+        rbus.id = reverb;
+        seq.buses.push(mbus);
+        seq.buses.push(rbus);
+        p.sequences.push(Arc::new(seq));
+
+        save(&p, &bundle).unwrap();
+        let reopened = open(&bundle).unwrap();
+        let seq = &reopened.sequences[0];
+        assert_eq!(seq.buses.len(), 2, "both buses survive");
+        let m = seq.buses.iter().find(|b| b.id == music).unwrap();
+        assert!((m.gain_db - (-4.0)).abs() < 1e-6);
+        assert!((m.pan - (-0.5)).abs() < 1e-6);
+        assert_eq!(m.inserts.len(), 2, "bus inserts survive RON round-trip");
+        assert!(matches!(
+            m.inserts[0],
+            vance_timeline::AudioEffectSpec::Compressor { .. }
+        ));
+        assert!(matches!(
+            m.inserts[1],
+            vance_timeline::AudioEffectSpec::Limiter { .. }
+        ));
+        assert_eq!(m.sends.len(), 1, "bus send survives RON round-trip");
+        assert_eq!(m.sends[0].target, reverb);
+        assert!(m.sends[0].pre_fader);
+        assert!((m.sends[0].level_db - (-6.0)).abs() < 1e-6);
+    }
+
+    #[test]
     fn legacy_bundle_loads_with_unity_mixer_defaults() {
         // Build a project using ONLY the pre-7.3 surface (no SetTrack*
         // / SetClip* ops, no field literals on the new fields). After

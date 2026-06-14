@@ -18,8 +18,17 @@
     setBusPan,
     setBusMute,
     setBusOutput,
+    addBusInsert,
+    removeBusInsert,
+    addBusSend,
+    removeBusSend,
+    defaultEq6,
+    defaultCompressor,
+    defaultLimiter,
     type AudioBus,
-    type BusOutput
+    type BusOutput,
+    type AudioEffectSpec,
+    type Send
   } from '$lib/ipc';
   import { projectState } from '$lib/project.svelte';
 
@@ -63,6 +72,36 @@
   function onOutputChange(bus: AudioBus, value: string) {
     const output: BusOutput = value === 'master' ? 'Master' : { Bus: value };
     void act(() => setBusOutput(bus.id, output));
+  }
+
+  function insertLabel(e: AudioEffectSpec): string {
+    switch (e.kind) {
+      case 'Eq6':
+        return 'EQ';
+      case 'Compressor':
+        return 'Comp';
+      case 'Limiter':
+        return 'Limit';
+      case 'Plugin':
+        return e.descriptor.name || 'Plugin';
+    }
+  }
+
+  function addInsert(bus: AudioBus, kind: 'eq' | 'comp' | 'limit') {
+    const spec: AudioEffectSpec =
+      kind === 'eq' ? defaultEq6() : kind === 'comp' ? defaultCompressor() : defaultLimiter();
+    void act(() => addBusInsert(bus.id, spec));
+  }
+
+  function addSend(bus: AudioBus, targetId: string) {
+    if (!targetId) return;
+    const send: Send = { target: targetId, level_db: 0, pre_fader: false };
+    void act(() => addBusSend(bus.id, send));
+  }
+
+  function sendLabel(s: Send): string {
+    const t = strips.find((b) => b.id === s.target);
+    return `${t ? t.name : '?'} ${s.pre_fader ? '(pre)' : ''}`.trim();
   }
 </script>
 
@@ -125,6 +164,55 @@
                 <option value={t.id}>{t.name}</option>
               {/each}
             </select>
+          </div>
+          <div class="section">
+            <div class="sec-head">
+              <span>Inserts</span>
+              <span class="add-group">
+                <button disabled={busy} title="Add EQ" onclick={() => addInsert(b, 'eq')}>＋EQ</button>
+                <button disabled={busy} title="Add Compressor" onclick={() => addInsert(b, 'comp')}>＋Cmp</button>
+                <button disabled={busy} title="Add Limiter" onclick={() => addInsert(b, 'limit')}>＋Lim</button>
+              </span>
+            </div>
+            {#if b.inserts.length === 0}
+              <div class="hint">— none —</div>
+            {:else}
+              {#each b.inserts as ins, i (i)}
+                <div class="chip">
+                  <span>{insertLabel(ins)}</span>
+                  <button class="x" disabled={busy} onclick={() => act(() => removeBusInsert(b.id, i))}>✕</button>
+                </div>
+              {/each}
+            {/if}
+          </div>
+          <div class="section">
+            <div class="sec-head">
+              <span>Sends</span>
+              <select
+                disabled={busy}
+                value=""
+                onchange={(e) => {
+                  const v = (e.target as HTMLSelectElement).value;
+                  (e.target as HTMLSelectElement).value = '';
+                  addSend(b, v);
+                }}
+              >
+                <option value="">＋ Send…</option>
+                {#each strips.filter((x) => x.id !== b.id) as t (t.id)}
+                  <option value={t.id}>{t.name}</option>
+                {/each}
+              </select>
+            </div>
+            {#if b.sends.length === 0}
+              <div class="hint">— none —</div>
+            {:else}
+              {#each b.sends as s, i (i)}
+                <div class="chip">
+                  <span>→ {sendLabel(s)}</span>
+                  <button class="x" disabled={busy} onclick={() => act(() => removeBusSend(b.id, i))}>✕</button>
+                </div>
+              {/each}
+            {/if}
           </div>
           <div class="row actions">
             <button class:on={b.mute} disabled={busy} onclick={() => act(() => setBusMute(b.id, !b.mute))}>
@@ -213,6 +301,53 @@
     margin-top: 4px;
     opacity: 0.6;
     font-size: 10px;
+  }
+  .section {
+    margin-top: 5px;
+    border-top: 1px solid var(--border, #2a2a2a);
+    padding-top: 4px;
+  }
+  .sec-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    opacity: 0.7;
+    font-size: 10px;
+    margin-bottom: 2px;
+  }
+  .sec-head button {
+    font-size: 9px;
+    cursor: pointer;
+    padding: 0 3px;
+  }
+  .sec-head select {
+    font-size: 10px;
+    max-width: 84px;
+  }
+  .add-group {
+    display: flex;
+    gap: 2px;
+  }
+  .chip {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 10px;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 3px;
+    padding: 1px 4px;
+    margin: 2px 0;
+  }
+  .chip .x {
+    cursor: pointer;
+    color: var(--muted, #999);
+    background: none;
+    border: none;
+    font-size: 10px;
+  }
+  .hint {
+    font-size: 10px;
+    opacity: 0.4;
   }
   .empty,
   .err {

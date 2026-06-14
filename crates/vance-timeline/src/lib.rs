@@ -58,7 +58,7 @@ pub use edit_log::{apply, EditLog, EditOp, HistoryNodeView};
 pub use effect::{
     eval_curve, validate_expr, Effect, EffectParams, EffectValue, Keyframe, KeyframeInterp,
 };
-pub use bus::{routing_cycle, AudioBus, BusOutput, Send};
+pub use bus::{bus_graph_cycle, routing_cycle, AudioBus, BusOutput, Send};
 pub use error::{Result, TimelineError};
 pub use media_query::{Condition, MediaField, MediaQuery, QueryOp, SmartBin};
 pub use fade::{eval_fade_in, eval_fade_out, Fade, FadeCurve};

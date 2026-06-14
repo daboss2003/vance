@@ -1249,6 +1249,71 @@ fn remove_track_send(
     state.lock().remove_track_send(id, index).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn add_bus_insert(
+    state: tauri::State<'_, EngineHandle>,
+    bus_id: String,
+    effect: vance_timeline::AudioEffectSpec,
+) -> Result<(), String> {
+    let id = parse_bus_id(&bus_id)?;
+    state.lock().add_bus_insert(id, effect).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_bus_insert(
+    state: tauri::State<'_, EngineHandle>,
+    bus_id: String,
+    index: usize,
+) -> Result<(), String> {
+    let id = parse_bus_id(&bus_id)?;
+    state.lock().remove_bus_insert(id, index).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn move_bus_insert(
+    state: tauri::State<'_, EngineHandle>,
+    bus_id: String,
+    from_index: usize,
+    to_index: usize,
+) -> Result<(), String> {
+    let id = parse_bus_id(&bus_id)?;
+    state
+        .lock()
+        .move_bus_insert(id, from_index, to_index)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn update_bus_insert(
+    state: tauri::State<'_, EngineHandle>,
+    bus_id: String,
+    index: usize,
+    effect: vance_timeline::AudioEffectSpec,
+) -> Result<(), String> {
+    let id = parse_bus_id(&bus_id)?;
+    state.lock().update_bus_insert(id, index, effect).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn add_bus_send(
+    state: tauri::State<'_, EngineHandle>,
+    bus_id: String,
+    send: vance_timeline::Send,
+) -> Result<(), String> {
+    let id = parse_bus_id(&bus_id)?;
+    state.lock().add_bus_send(id, send).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_bus_send(
+    state: tauri::State<'_, EngineHandle>,
+    bus_id: String,
+    index: usize,
+) -> Result<(), String> {
+    let id = parse_bus_id(&bus_id)?;
+    state.lock().remove_bus_send(id, index).map_err(|e| e.to_string())
+}
+
 /// Phase 7.5 M1 — UI-facing track meter info.
 #[derive(serde::Serialize, Clone, Copy, Debug, Default)]
 struct UiTrackMeter {
@@ -2874,6 +2939,12 @@ fn main() {
             route_track_to_bus,
             add_track_send,
             remove_track_send,
+            add_bus_insert,
+            remove_bus_insert,
+            move_bus_insert,
+            update_bus_insert,
+            add_bus_send,
+            remove_bus_send,
             meter_snapshot,
             scrub_begin,
             scrub_grain,

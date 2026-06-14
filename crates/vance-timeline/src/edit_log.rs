@@ -470,6 +470,52 @@ pub enum EditOp {
         /// Zero-based index into `Track.sends`.
         index: usize,
     },
+    /// GOAT-4 — append an insert effect to a bus's chain.
+    AddBusInsert {
+        /// Bus to mutate.
+        bus_id: BusId,
+        /// Effect spec to append.
+        effect: crate::audio_effect::AudioEffectSpec,
+    },
+    /// GOAT-4 — remove a bus insert at `index` (no-op if out of range).
+    RemoveBusInsert {
+        /// Bus to mutate.
+        bus_id: BusId,
+        /// Zero-based index into `AudioBus.inserts`.
+        index: usize,
+    },
+    /// GOAT-4 — reorder a bus insert within its chain.
+    MoveBusInsert {
+        /// Bus to mutate.
+        bus_id: BusId,
+        /// Source index.
+        from_index: usize,
+        /// Destination index.
+        to_index: usize,
+    },
+    /// GOAT-4 — replace a bus insert's spec at `index` (coarse param update).
+    UpdateBusInsert {
+        /// Bus to mutate.
+        bus_id: BusId,
+        /// Zero-based index into `AudioBus.inserts`.
+        index: usize,
+        /// Full replacement spec.
+        effect: crate::audio_effect::AudioEffectSpec,
+    },
+    /// GOAT-4 — add an aux send from a bus to another bus.
+    AddBusSend {
+        /// Source bus.
+        bus_id: BusId,
+        /// The send (target bus + level + pre/post fader).
+        send: Send,
+    },
+    /// GOAT-4 — remove a bus's send at `index` (no-op if out of range).
+    RemoveBusSend {
+        /// Source bus.
+        bus_id: BusId,
+        /// Zero-based index into `AudioBus.sends`.
+        index: usize,
+    },
 }
 
 /// Apply a single op to a sequence, returning the new sequence.
@@ -664,6 +710,24 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
         EditOp::RemoveTrackSend { track_id, index } => {
             ops::remove_track_send(seq, *track_id, *index)
         }
+        EditOp::AddBusInsert { bus_id, effect } => {
+            ops::add_bus_insert(seq, *bus_id, effect.clone())
+        }
+        EditOp::RemoveBusInsert { bus_id, index } => {
+            ops::remove_bus_insert(seq, *bus_id, *index)
+        }
+        EditOp::MoveBusInsert {
+            bus_id,
+            from_index,
+            to_index,
+        } => ops::move_bus_insert(seq, *bus_id, *from_index, *to_index),
+        EditOp::UpdateBusInsert {
+            bus_id,
+            index,
+            effect,
+        } => ops::update_bus_insert(seq, *bus_id, *index, effect.clone()),
+        EditOp::AddBusSend { bus_id, send } => ops::add_bus_send(seq, *bus_id, *send),
+        EditOp::RemoveBusSend { bus_id, index } => ops::remove_bus_send(seq, *bus_id, *index),
     }
 }
 
@@ -947,6 +1011,12 @@ fn op_label(op: &EditOp) -> String {
         EditOp::SetBusOutput { .. } | EditOp::RouteTrackToBus { .. } => "Reroute".into(),
         EditOp::AddTrackSend { .. } => "Add send".into(),
         EditOp::RemoveTrackSend { .. } => "Remove send".into(),
+        EditOp::AddBusInsert { .. } => "Add bus insert".into(),
+        EditOp::RemoveBusInsert { .. } => "Remove bus insert".into(),
+        EditOp::MoveBusInsert { .. } => "Reorder bus insert".into(),
+        EditOp::UpdateBusInsert { .. } => "Adjust bus insert".into(),
+        EditOp::AddBusSend { .. } => "Add bus send".into(),
+        EditOp::RemoveBusSend { .. } => "Remove bus send".into(),
     }
 }
 
