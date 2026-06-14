@@ -48,6 +48,10 @@ pub struct Project {
     /// + scrub. `#[serde(default)]` so older projects open w/ `false`.
     #[serde(default)]
     pub use_proxies: bool,
+    /// GOAT-3 — saved searches ("smart bins") that auto-populate from the
+    /// media library. `#[serde(default)]` so older projects open empty.
+    #[serde(default)]
+    pub smart_bins: Vec<crate::media_query::SmartBin>,
 }
 
 /// A persisted OpenColorIO display-transform spec (Phase 6.1b). Plain
@@ -87,12 +91,39 @@ impl Project {
             view_lut_path: None,
             ocio_view: None,
             use_proxies: false,
+            smart_bins: Vec::new(),
         }
     }
 
     /// Look up a media item by ID, if registered.
     pub fn media_get(&self, id: MediaItemId) -> Option<&Arc<MediaItem>> {
         self.media.get(&id)
+    }
+
+    /// Media item ids matching `query`, in `media` (id) order. The deep
+    /// search behind a smart bin / the browser's filter box.
+    pub fn query_media(&self, query: &crate::media_query::MediaQuery) -> Vec<MediaItemId> {
+        self.media
+            .values()
+            .filter(|m| query.matches(m))
+            .map(|m| m.id)
+            .collect()
+    }
+
+    /// Resolve a smart bin (by id) to its current member ids.
+    pub fn smart_bin_members(&self, bin_id: MediaItemId) -> Option<Vec<MediaItemId>> {
+        let bin = self.smart_bins.iter().find(|b| b.id == bin_id)?;
+        Some(self.query_media(&bin.query))
+    }
+
+    /// Union of every custom-column key used across the media library,
+    /// sorted — the column set the browser renders.
+    pub fn custom_columns(&self) -> Vec<String> {
+        let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for m in self.media.values() {
+            keys.extend(m.metadata.keys().cloned());
+        }
+        keys.into_iter().collect()
     }
 
     /// Find a sequence by ID. Linear over `sequences`; this is fine while
@@ -131,6 +162,47 @@ mod tests {
         p.media.insert(id, Arc::new(m));
         assert!(p.media_get(id).is_some());
         assert_eq!(p.media_get(id).unwrap().display_name, "a");
+    }
+
+    #[test]
+    fn query_media_smart_bins_and_columns() {
+        use crate::media_query::{Condition, MediaField, MediaQuery, QueryOp, SmartBin};
+        let mut p = Project::new("p");
+        let mut a = MediaItem::new(
+            PathBuf::from("/m/hero.mov"),
+            "hero",
+            MediaKind::Video,
+            RationalTime::new(30, 1).unwrap(),
+        );
+        a.metadata.insert("Rating".into(), "5".into());
+        a.metadata.insert("Scene".into(), "12B".into());
+        let mut b = MediaItem::new(
+            PathBuf::from("/m/broll.mov"),
+            "broll",
+            MediaKind::Video,
+            RationalTime::new(8, 1).unwrap(),
+        );
+        b.metadata.insert("Rating".into(), "2".into());
+        let (a_id, b_id) = (a.id, b.id);
+        p.media.insert(a_id, Arc::new(a));
+        p.media.insert(b_id, Arc::new(b));
+
+        // Custom columns = union of metadata keys, sorted.
+        assert_eq!(p.custom_columns(), vec!["Rating".to_string(), "Scene".into()]);
+
+        // Deep query: rating >= 4 → only the hero.
+        let q = MediaQuery::Cond(Condition {
+            field: MediaField::Custom("Rating".into()),
+            op: QueryOp::Ge,
+            value: "4".into(),
+        });
+        assert_eq!(p.query_media(&q), vec![a_id]);
+
+        // Smart bin resolves to the same members.
+        let bin = SmartBin::new("Selects", q);
+        let bin_id = bin.id;
+        p.smart_bins.push(bin);
+        assert_eq!(p.smart_bin_members(bin_id), Some(vec![a_id]));
     }
 
     #[test]

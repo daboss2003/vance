@@ -1140,6 +1140,75 @@ export const checkpointHistory = (name: string): Promise<void> =>
 export const gotoHistory = (nodeId: number): Promise<boolean> =>
   invoke('goto_history', { nodeId });
 
+// ---- Avid-grade bins: custom columns + smart bins (GOAT-3) ----------------
+
+/** A media-query field. */
+export type MediaField =
+  | 'Name'
+  | 'Kind'
+  | 'DurationSeconds'
+  | 'HasAudio'
+  | 'HasProxy'
+  | 'Path'
+  | { Custom: string };
+
+/** A comparison operator. */
+export type QueryOp =
+  | 'Eq'
+  | 'Ne'
+  | 'Contains'
+  | 'StartsWith'
+  | 'EndsWith'
+  | 'Gt'
+  | 'Lt'
+  | 'Ge'
+  | 'Le'
+  | 'Exists';
+
+/** A media query (boolean filter tree). */
+export type MediaQuery =
+  | 'All'
+  | { Cond: { field: MediaField; op: QueryOp; value: string } }
+  | { And: MediaQuery[] }
+  | { Or: MediaQuery[] }
+  | { Not: MediaQuery };
+
+/** A saved search. */
+export interface SmartBin {
+  id: string;
+  name: string;
+  query: MediaQuery;
+}
+
+/** Set (or clear, value=null) a custom-column value on a media item. */
+export const setMediaMetadata = (
+  mediaId: string,
+  key: string,
+  value: string | null
+): Promise<void> => invoke('set_media_metadata', { mediaId, key, value });
+
+/** Media ids matching a query (deep search / browser filter box). */
+export const queryMedia = (query: MediaQuery): Promise<string[]> =>
+  invoke('query_media', { query });
+
+/** Union of custom-column keys across the library (browser columns). */
+export const customColumns = (): Promise<string[]> => invoke('custom_columns');
+
+/** Add a smart bin (saved search). Returns its id. */
+export const addSmartBin = (name: string, query: MediaQuery): Promise<string> =>
+  invoke('add_smart_bin', { name, query });
+
+/** Remove a smart bin by id. */
+export const removeSmartBin = (id: string): Promise<boolean> =>
+  invoke('remove_smart_bin', { id });
+
+/** All smart bins (browser sidebar). */
+export const smartBins = (): Promise<SmartBin[]> => invoke('smart_bins');
+
+/** Current member ids of a smart bin. */
+export const smartBinMembers = (id: string): Promise<string[]> =>
+  invoke('smart_bin_members', { id });
+
 // ---- Parameter expressions (GOAT expression engine) ----------------------
 
 /** Live compile-check of a parameter expression. Returns the error

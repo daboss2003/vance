@@ -8234,6 +8234,100 @@ impl Engine {
         Ok(())
     }
 
+    /// GOAT-3 — set or clear a custom-column value on a media item.
+    /// `value == None` removes the key. (Media-library metadata, like
+    /// proxy paths, lives outside the sequence EditLog.)
+    pub fn set_media_metadata(
+        &mut self,
+        media_id: MediaItemId,
+        key: String,
+        value: Option<String>,
+    ) -> Result<(), EngineError> {
+        let project = self.current_project.as_mut().ok_or(EngineError::NoProject)?;
+        let media = project
+            .media
+            .get_mut(&media_id)
+            .ok_or(EngineError::MediaNotFound)?;
+        let mut updated = (**media).clone();
+        match value {
+            Some(v) => {
+                updated.metadata.insert(key, v);
+            }
+            None => {
+                updated.metadata.remove(&key);
+            }
+        }
+        *media = Arc::new(updated);
+        Ok(())
+    }
+
+    /// GOAT-3 — media ids (uuid strings) matching `query`, the deep search
+    /// behind the browser filter box.
+    pub fn query_media(&self, query: &vance_timeline::MediaQuery) -> Vec<String> {
+        self.current_project
+            .as_ref()
+            .map(|p| {
+                p.query_media(query)
+                    .into_iter()
+                    .map(|id| id.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// GOAT-3 — the union of custom-column keys across the media library.
+    pub fn custom_columns(&self) -> Vec<String> {
+        self.current_project
+            .as_ref()
+            .map(|p| p.custom_columns())
+            .unwrap_or_default()
+    }
+
+    /// GOAT-3 — add a smart bin (saved search). Returns its id.
+    pub fn add_smart_bin(
+        &mut self,
+        name: String,
+        query: vance_timeline::MediaQuery,
+    ) -> Result<String, EngineError> {
+        let project = self.current_project.as_mut().ok_or(EngineError::NoProject)?;
+        let bin = vance_timeline::SmartBin::new(name, query);
+        let id = bin.id.to_string();
+        project.smart_bins.push(bin);
+        Ok(id)
+    }
+
+    /// GOAT-3 — remove a smart bin by id. Returns whether one was removed.
+    pub fn remove_smart_bin(&mut self, id: &str) -> Result<bool, EngineError> {
+        let uuid = uuid::Uuid::parse_str(id)
+            .map_err(|e| EngineError::Project(format!("bad smart-bin id: {e}")))?;
+        let target = MediaItemId::from_uuid(uuid);
+        let project = self.current_project.as_mut().ok_or(EngineError::NoProject)?;
+        let before = project.smart_bins.len();
+        project.smart_bins.retain(|b| b.id != target);
+        Ok(project.smart_bins.len() != before)
+    }
+
+    /// GOAT-3 — all smart bins (for the browser sidebar).
+    pub fn smart_bins(&self) -> Vec<vance_timeline::SmartBin> {
+        self.current_project
+            .as_ref()
+            .map(|p| p.smart_bins.clone())
+            .unwrap_or_default()
+    }
+
+    /// GOAT-3 — current member ids (uuid strings) of a smart bin.
+    pub fn smart_bin_members(&self, id: &str) -> Vec<String> {
+        let Ok(uuid) = uuid::Uuid::parse_str(id) else {
+            return Vec::new();
+        };
+        let target = MediaItemId::from_uuid(uuid);
+        self.current_project
+            .as_ref()
+            .and_then(|p| p.smart_bin_members(target))
+            .map(|ids| ids.into_iter().map(|i| i.to_string()).collect())
+            .unwrap_or_default()
+    }
+
     /// Phase 9.4 — snapshot of every known proxy job.
     pub fn proxy_jobs_snapshot(&self) -> Vec<crate::proxy::ProxyJobSnapshot> {
         self.proxy_worker

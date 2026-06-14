@@ -1577,6 +1577,64 @@ fn set_media_proxy_path(
     state.lock().set_media_proxy_path(id, path).map_err(|e| e.to_string())
 }
 
+// ---- GOAT-3: Avid-grade bins (custom columns + smart bins) ----------------
+
+/// Set or clear (value=null) a custom-column value on a media item.
+#[tauri::command]
+fn set_media_metadata(
+    state: tauri::State<'_, EngineHandle>,
+    media_id: String,
+    key: String,
+    value: Option<String>,
+) -> Result<(), String> {
+    let uuid: uuid::Uuid = media_id.parse().map_err(|e| format!("bad media id: {e}"))?;
+    let id = vance_timeline::MediaItemId::from_uuid(uuid);
+    state.lock().set_media_metadata(id, key, value).map_err(|e| e.to_string())
+}
+
+/// Media ids matching a query (the browser filter box / deep search).
+#[tauri::command]
+fn query_media(
+    state: tauri::State<'_, EngineHandle>,
+    query: vance_timeline::MediaQuery,
+) -> Vec<String> {
+    state.lock().query_media(&query)
+}
+
+/// Union of custom-column keys across the library (the browser's columns).
+#[tauri::command]
+fn custom_columns(state: tauri::State<'_, EngineHandle>) -> Vec<String> {
+    state.lock().custom_columns()
+}
+
+/// Add a smart bin (saved search). Returns its id.
+#[tauri::command]
+fn add_smart_bin(
+    state: tauri::State<'_, EngineHandle>,
+    name: String,
+    query: vance_timeline::MediaQuery,
+) -> Result<String, String> {
+    state.lock().add_smart_bin(name, query).map_err(|e| e.to_string())
+}
+
+/// Remove a smart bin by id. Returns whether one was removed.
+#[tauri::command]
+fn remove_smart_bin(state: tauri::State<'_, EngineHandle>, id: String) -> Result<bool, String> {
+    state.lock().remove_smart_bin(&id).map_err(|e| e.to_string())
+}
+
+/// All smart bins (for the browser sidebar).
+#[tauri::command]
+fn smart_bins(state: tauri::State<'_, EngineHandle>) -> Vec<vance_timeline::SmartBin> {
+    state.lock().smart_bins()
+}
+
+/// Current member ids of a smart bin.
+#[tauri::command]
+fn smart_bin_members(state: tauri::State<'_, EngineHandle>, id: String) -> Vec<String> {
+    state.lock().smart_bin_members(&id)
+}
+
 /// Phase 9.2 — poll frame-cache stats.
 #[derive(serde::Serialize, Clone, Copy, Debug, Default)]
 struct UiCacheStats {
@@ -2756,6 +2814,13 @@ fn main() {
             edit_history,
             checkpoint_history,
             goto_history,
+            set_media_metadata,
+            query_media,
+            custom_columns,
+            add_smart_bin,
+            remove_smart_bin,
+            smart_bins,
+            smart_bin_members,
             peaks_enqueue,
             peaks_status,
             peaks_prioritize,
