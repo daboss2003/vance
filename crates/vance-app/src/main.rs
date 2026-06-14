@@ -1148,6 +1148,107 @@ fn set_master_gain_db(
         .map_err(|e| e.to_string())
 }
 
+// ---- GOAT-4: mixer buses + sends (Fairlight console) ----------------------
+
+fn parse_bus_id(s: &str) -> Result<vance_timeline::BusId, String> {
+    s.parse::<uuid::Uuid>()
+        .map(vance_timeline::BusId::from_uuid)
+        .map_err(|e| format!("bad bus id: {e}"))
+}
+fn parse_track_id(s: &str) -> Result<vance_timeline::TrackId, String> {
+    s.parse::<uuid::Uuid>()
+        .map(vance_timeline::TrackId::from_uuid)
+        .map_err(|e| format!("bad track id: {e}"))
+}
+
+/// All buses on the current sequence (console channel strips).
+#[tauri::command]
+fn buses(state: tauri::State<'_, EngineHandle>) -> Vec<vance_timeline::AudioBus> {
+    state.lock().buses()
+}
+
+/// Add a submix bus. Returns its id.
+#[tauri::command]
+fn add_bus(state: tauri::State<'_, EngineHandle>, name: String) -> Result<String, String> {
+    state.lock().add_bus(name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_bus(state: tauri::State<'_, EngineHandle>, bus_id: String) -> Result<(), String> {
+    let id = parse_bus_id(&bus_id)?;
+    state.lock().remove_bus(id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_bus_gain_db(
+    state: tauri::State<'_, EngineHandle>,
+    bus_id: String,
+    gain_db: f32,
+) -> Result<(), String> {
+    let id = parse_bus_id(&bus_id)?;
+    state.lock().set_bus_gain_db(id, gain_db).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_bus_pan(
+    state: tauri::State<'_, EngineHandle>,
+    bus_id: String,
+    pan: f32,
+) -> Result<(), String> {
+    let id = parse_bus_id(&bus_id)?;
+    state.lock().set_bus_pan(id, pan).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_bus_mute(
+    state: tauri::State<'_, EngineHandle>,
+    bus_id: String,
+    mute: bool,
+) -> Result<(), String> {
+    let id = parse_bus_id(&bus_id)?;
+    state.lock().set_bus_mute(id, mute).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_bus_output(
+    state: tauri::State<'_, EngineHandle>,
+    bus_id: String,
+    output: vance_timeline::BusOutput,
+) -> Result<(), String> {
+    let id = parse_bus_id(&bus_id)?;
+    state.lock().set_bus_output(id, output).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn route_track_to_bus(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    output: vance_timeline::BusOutput,
+) -> Result<(), String> {
+    let id = parse_track_id(&track_id)?;
+    state.lock().route_track_to_bus(id, output).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn add_track_send(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    send: vance_timeline::Send,
+) -> Result<(), String> {
+    let id = parse_track_id(&track_id)?;
+    state.lock().add_track_send(id, send).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_track_send(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    index: usize,
+) -> Result<(), String> {
+    let id = parse_track_id(&track_id)?;
+    state.lock().remove_track_send(id, index).map_err(|e| e.to_string())
+}
+
 /// Phase 7.5 M1 — UI-facing track meter info.
 #[derive(serde::Serialize, Clone, Copy, Debug, Default)]
 struct UiTrackMeter {
@@ -2763,6 +2864,16 @@ fn main() {
             move_audio_effect,
             update_audio_effect,
             set_master_gain_db,
+            buses,
+            add_bus,
+            remove_bus,
+            set_bus_gain_db,
+            set_bus_pan,
+            set_bus_mute,
+            set_bus_output,
+            route_track_to_bus,
+            add_track_send,
+            remove_track_send,
             meter_snapshot,
             scrub_begin,
             scrub_grain,

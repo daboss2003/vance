@@ -63,7 +63,7 @@ pub use error::{Result, TimelineError};
 pub use media_query::{Condition, MediaField, MediaQuery, QueryOp, SmartBin};
 pub use fade::{eval_fade_in, eval_fade_out, Fade, FadeCurve};
 pub use id::{
-    ClipId, EffectId, MarkerId, MediaItemId, ProjectId, SequenceId, TrackId, TransitionId,
+    BusId, ClipId, EffectId, MarkerId, MediaItemId, ProjectId, SequenceId, TrackId, TransitionId,
 };
 pub use marker::{Marker, MarkerColor, MarkerKind};
 pub use media::{ContentHash, MediaItem, MediaKind};

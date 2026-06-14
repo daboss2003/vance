@@ -1209,6 +1209,50 @@ export const smartBins = (): Promise<SmartBin[]> => invoke('smart_bins');
 export const smartBinMembers = (id: string): Promise<string[]> =>
   invoke('smart_bin_members', { id });
 
+// ---- Mixer buses + sends (GOAT-4 Fairlight console) ----------------------
+
+/** Where a track/bus routes its main output. */
+export type BusOutput = 'Master' | { Bus: string };
+
+/** An aux/reverb send. */
+export interface Send {
+  target: string;
+  level_db: number;
+  pre_fader: boolean;
+}
+
+/** A mixer submix bus. */
+export interface AudioBus {
+  id: string;
+  name: string;
+  gain_db: number;
+  pan: number;
+  mute: boolean;
+  inserts: unknown[];
+  output: BusOutput;
+  sends: Send[];
+}
+
+/** All buses on the current sequence (console channel strips). */
+export const buses = (): Promise<AudioBus[]> => invoke('buses');
+/** Add a submix bus. Returns its id. */
+export const addBus = (name: string): Promise<string> => invoke('add_bus', { name });
+export const removeBus = (busId: string): Promise<void> => invoke('remove_bus', { busId });
+export const setBusGainDb = (busId: string, gainDb: number): Promise<void> =>
+  invoke('set_bus_gain_db', { busId, gainDb });
+export const setBusPan = (busId: string, pan: number): Promise<void> =>
+  invoke('set_bus_pan', { busId, pan });
+export const setBusMute = (busId: string, mute: boolean): Promise<void> =>
+  invoke('set_bus_mute', { busId, mute });
+export const setBusOutput = (busId: string, output: BusOutput): Promise<void> =>
+  invoke('set_bus_output', { busId, output });
+export const routeTrackToBus = (trackId: string, output: BusOutput): Promise<void> =>
+  invoke('route_track_to_bus', { trackId, output });
+export const addTrackSend = (trackId: string, send: Send): Promise<void> =>
+  invoke('add_track_send', { trackId, send });
+export const removeTrackSend = (trackId: string, index: number): Promise<void> =>
+  invoke('remove_track_send', { trackId, index });
+
 // ---- Parameter expressions (GOAT expression engine) ----------------------
 
 /** Live compile-check of a parameter expression. Returns the error

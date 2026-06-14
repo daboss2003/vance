@@ -5089,6 +5089,91 @@ impl Engine {
         self.apply_edit_op(EditOp::SetMasterGainDb { gain_db })
     }
 
+    // ---- GOAT-4: mixer buses + sends (Fairlight console) ----------------
+
+    /// Add a submix bus (routed to master). Returns its id.
+    pub fn add_bus(&mut self, name: String) -> Result<String, EngineError> {
+        let bus_id = vance_timeline::BusId::new();
+        self.apply_edit_op(EditOp::AddBus { bus_id, name })?;
+        Ok(bus_id.to_string())
+    }
+
+    /// Remove a bus (dangling routes fall back to master).
+    pub fn remove_bus(&mut self, bus_id: vance_timeline::BusId) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::RemoveBus { bus_id })
+    }
+
+    /// Set a bus's fader gain in dB.
+    pub fn set_bus_gain_db(
+        &mut self,
+        bus_id: vance_timeline::BusId,
+        gain_db: f32,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::SetBusGainDb { bus_id, gain_db })
+    }
+
+    /// Set a bus's stereo pan `[-1, 1]`.
+    pub fn set_bus_pan(
+        &mut self,
+        bus_id: vance_timeline::BusId,
+        pan: f32,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::SetBusPan { bus_id, pan })
+    }
+
+    /// Mute / unmute a bus.
+    pub fn set_bus_mute(
+        &mut self,
+        bus_id: vance_timeline::BusId,
+        mute: bool,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::SetBusMute { bus_id, mute })
+    }
+
+    /// Route a bus's main output (master or another bus).
+    pub fn set_bus_output(
+        &mut self,
+        bus_id: vance_timeline::BusId,
+        output: vance_timeline::BusOutput,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::SetBusOutput { bus_id, output })
+    }
+
+    /// Route a track's main output (master or a bus).
+    pub fn route_track_to_bus(
+        &mut self,
+        track_id: TrackId,
+        output: vance_timeline::BusOutput,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::RouteTrackToBus { track_id, output })
+    }
+
+    /// Add an aux send from a track to a bus.
+    pub fn add_track_send(
+        &mut self,
+        track_id: TrackId,
+        send: vance_timeline::Send,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::AddTrackSend { track_id, send })
+    }
+
+    /// Remove a track's send at `index`.
+    pub fn remove_track_send(
+        &mut self,
+        track_id: TrackId,
+        index: usize,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::RemoveTrackSend { track_id, index })
+    }
+
+    /// Read-only snapshot of the current sequence's buses (for the console).
+    pub fn buses(&self) -> Vec<vance_timeline::AudioBus> {
+        self.current_sequence_id
+            .and_then(|id| self.current_project.as_ref().and_then(|p| p.sequence(id)))
+            .map(|s| s.buses.clone())
+            .unwrap_or_default()
+    }
+
     /// Phase 7.5 M1: read the latest mixer metering snapshot. Returns
     /// `None` when the mixer backend isn't active (no playback or the
     /// single-source backend is in use instead). The returned snapshot
@@ -6704,7 +6789,17 @@ fn op_touches_mixer(op: &EditOp) -> bool {
         | EditOp::Slide { .. }
         | EditOp::TrimIn { .. }
         | EditOp::TrimOut { .. }
-        | EditOp::Split { .. } => true,
+        | EditOp::Split { .. }
+        // GOAT-4: bus/send routing changes the audio sum.
+        | EditOp::AddBus { .. }
+        | EditOp::RemoveBus { .. }
+        | EditOp::SetBusGainDb { .. }
+        | EditOp::SetBusPan { .. }
+        | EditOp::SetBusMute { .. }
+        | EditOp::SetBusOutput { .. }
+        | EditOp::RouteTrackToBus { .. }
+        | EditOp::AddTrackSend { .. }
+        | EditOp::RemoveTrackSend { .. } => true,
         // Compound republishes once after the whole batch lands.
         EditOp::Compound { .. } => true,
         _ => false,
