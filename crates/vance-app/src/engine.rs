@@ -512,7 +512,7 @@ fn read_keyframes(
     key: &str,
 ) -> Vec<vance_timeline::Keyframe> {
     match params.get(key) {
-        Some(EffectValue::Keyframes(v)) => v.clone(),
+        Some(EffectValue::Keyframes { keyframes: v }) => v.clone(),
         Some(EffectValue::Number(n)) => vec![vance_timeline::Keyframe {
             time_seconds: 0.0,
             value: *n,
@@ -531,7 +531,7 @@ fn eval_keyframes_or(kfs: &[vance_timeline::Keyframe], t: f64, default: f64) -> 
     }
     // Reuse the existing linear-interp evaluator by wrapping in an
     // EffectValue::Keyframes (cheap clone of small Vec).
-    EffectValue::Keyframes(kfs.to_vec())
+    EffectValue::Keyframes { keyframes: kfs.to_vec() }
         .eval_number(t)
         .unwrap_or(default)
 }
@@ -555,7 +555,7 @@ fn eval_clip_grades(
     // treats as the identity ramp.
     let curve = |ps: &std::collections::BTreeMap<String, EffectValue>, k: &str| -> Vec<vance_timeline::Keyframe> {
         match ps.get(k) {
-            Some(EffectValue::Keyframes(pts)) => pts.clone(),
+            Some(EffectValue::Keyframes { keyframes: pts }) => pts.clone(),
             _ => Vec::new(),
         }
     };
@@ -4457,11 +4457,11 @@ impl Engine {
             vec![
                 (
                     gk::KEY_WIN_CENTER_X.to_string(),
-                    EffectValue::Keyframes(cx_kfs),
+                    EffectValue::Keyframes { keyframes: cx_kfs },
                 ),
                 (
                     gk::KEY_WIN_CENTER_Y.to_string(),
-                    EffectValue::Keyframes(cy_kfs),
+                    EffectValue::Keyframes { keyframes: cy_kfs },
                 ),
             ],
         )?;
@@ -4572,15 +4572,16 @@ impl Engine {
         // Convert curve points -> animatable Keyframes (linear interp,
         // matching the editor's WYSIWYG model).
         let curve_kfs = |pts: &[gc::CurvePoint]| -> EffectValue {
-            EffectValue::Keyframes(
-                pts.iter()
+            EffectValue::Keyframes {
+                keyframes: pts
+                    .iter()
                     .map(|p| Keyframe {
                         time_seconds: p.x as f64,
                         value: p.y as f64,
                         interp: KeyframeInterp::Linear,
                     })
                     .collect(),
-            )
+            }
         };
         // Wheel-group → (rgb-key triple, master-key option). Primary
         // groups carry a master lane; log groups don't.

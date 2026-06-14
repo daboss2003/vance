@@ -21,8 +21,7 @@ pub type EffectParams = BTreeMap<String, EffectValue>;
 /// via a `Keyframes` list — each entry pins a value at a
 /// clip-relative time, evaluated by linear interpolation between
 /// surrounding keyframes (5.9 will add bezier).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum EffectValue {
     /// A plain number.
     Number(f64),
@@ -32,16 +31,120 @@ pub enum EffectValue {
     String(String),
     /// Animated numeric value — a list of keyframes in ascending
     /// time order, interpolated between samples.
-    Keyframes(Vec<Keyframe>),
+    Keyframes {
+        /// The keyframes in ascending time order.
+        keyframes: Vec<Keyframe>,
+    },
     /// A scripted value (GOAT expression engine) — a `vance-expr` script
-    /// evaluated per frame against `time` (clip-relative seconds) etc.
-    /// Serializes as `{ expr: "..." }`, distinct from the scalar/array
-    /// shapes so the untagged enum stays unambiguous and older projects
-    /// are unaffected.
+    /// evaluated per frame. At this layer only `time` (clip-relative
+    /// seconds) plus the math stdlib (`noise`/`clamp`/`lerp`/`sin`/…) are
+    /// bound; `value`/`fps`/`width`/`height`/`frame` are reserved for a
+    /// future render-context enrichment and currently read 0, so author
+    /// expressions against `time` for now.
     Expr {
-        /// The expression source (e.g. `"value + 30.0 * noise(time * 2.0)"`).
+        /// The expression source (e.g. `"100.0 + 30.0 * noise(time * 2.0)"`).
         expr: String,
     },
+}
+
+// EffectValue has a HAND-WRITTEN serde impl, NOT `#[serde(untagged)]`.
+//
+// It is persisted inside `project.ron` via the `ron` crate. RON's untagged
+// deserialization buffers into a self-describing `Content` value and could
+// not disambiguate the `Keyframes` variant (a sequence of `Keyframe`
+// structs) from the other variants — so keyframed params (motion tracking,
+// colour curves) silently failed to reload (project data loss). The manual
+// impl below drives the deserializer DIRECTLY (no Content buffering), which
+// RON handles correctly, while keeping scalars bare (`4.5` / `true` /
+// `"text"`) so existing project files still load. Complex variants use a
+// one-key map: `{ keyframes: [...] }` / `{ expr: "..." }`. A bare array is
+// still accepted on read for backward-compat with the old tuple form.
+impl Serialize for EffectValue {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self {
+            EffectValue::Number(v) => s.serialize_f64(*v),
+            EffectValue::Bool(b) => s.serialize_bool(*b),
+            EffectValue::String(st) => s.serialize_str(st),
+            EffectValue::Keyframes { keyframes } => {
+                let mut m = s.serialize_map(Some(1))?;
+                m.serialize_entry("keyframes", keyframes)?;
+                m.end()
+            }
+            EffectValue::Expr { expr } => {
+                let mut m = s.serialize_map(Some(1))?;
+                m.serialize_entry("expr", expr)?;
+                m.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EffectValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct Vis;
+        impl<'de> serde::de::Visitor<'de> for Vis {
+            type Value = EffectValue;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a number, bool, string, {keyframes:[..]}, or {expr:\"..\"}")
+            }
+            fn visit_bool<E>(self, v: bool) -> std::result::Result<EffectValue, E> {
+                Ok(EffectValue::Bool(v))
+            }
+            fn visit_i64<E>(self, v: i64) -> std::result::Result<EffectValue, E> {
+                Ok(EffectValue::Number(v as f64))
+            }
+            fn visit_u64<E>(self, v: u64) -> std::result::Result<EffectValue, E> {
+                Ok(EffectValue::Number(v as f64))
+            }
+            fn visit_f64<E>(self, v: f64) -> std::result::Result<EffectValue, E> {
+                Ok(EffectValue::Number(v))
+            }
+            fn visit_str<E>(self, v: &str) -> std::result::Result<EffectValue, E> {
+                Ok(EffectValue::String(v.to_string()))
+            }
+            fn visit_string<E>(self, v: String) -> std::result::Result<EffectValue, E> {
+                Ok(EffectValue::String(v))
+            }
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<EffectValue, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                // Back-compat: the old tuple form `Keyframes(Vec<Keyframe>)`
+                // serialized as a bare array.
+                let mut keyframes = Vec::new();
+                while let Some(k) = seq.next_element::<Keyframe>()? {
+                    keyframes.push(k);
+                }
+                Ok(EffectValue::Keyframes { keyframes })
+            }
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<EffectValue, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let key: Option<String> = map.next_key()?;
+                let out = match key.as_deref() {
+                    Some("keyframes") => EffectValue::Keyframes {
+                        keyframes: map.next_value()?,
+                    },
+                    Some("expr") => EffectValue::Expr {
+                        expr: map.next_value()?,
+                    },
+                    Some(other) => {
+                        return Err(serde::de::Error::unknown_field(other, &["keyframes", "expr"]))
+                    }
+                    None => return Err(serde::de::Error::custom("empty EffectValue map")),
+                };
+                // Drain any unexpected trailing entries.
+                while map
+                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .is_some()
+                {}
+                Ok(out)
+            }
+        }
+        d.deserialize_any(Vis)
+    }
 }
 
 /// How the engine should interpolate FROM this keyframe to the next
@@ -90,7 +193,7 @@ impl EffectValue {
     pub fn eval_number(&self, t_seconds: f64) -> Option<f64> {
         match self {
             EffectValue::Number(v) => Some(*v),
-            EffectValue::Keyframes(kfs) => Some(eval_keyframes(kfs, t_seconds)),
+            EffectValue::Keyframes { keyframes } => Some(eval_keyframes(keyframes, t_seconds)),
             EffectValue::Expr { expr } => eval_expr_cached(expr, t_seconds),
             _ => None,
         }
@@ -284,6 +387,68 @@ mod tests {
             serde_json::from_str::<EffectValue>("\"hi\"").unwrap(),
             EffectValue::String("hi".into())
         );
+    }
+
+    /// Regression lock for the critical RON data-loss bug: EVERY
+    /// EffectValue variant must round-trip through RON with the EXACT
+    /// config `vance-project`'s bundle save uses. The old `Keyframes(Vec)`
+    /// tuple variant serialized as a bare array, which RON's untagged
+    /// deserialization could not disambiguate — so any project with a
+    /// keyframed param (motion tracking, color curves) failed to reload.
+    #[test]
+    fn every_effect_value_variant_round_trips_through_ron() {
+        let cfg = ron::ser::PrettyConfig::new().struct_names(true);
+        let cases = vec![
+            EffectValue::Number(4.5),
+            EffectValue::Bool(true),
+            EffectValue::String("hello".into()),
+            EffectValue::Expr {
+                expr: "value + noise(time)".into(),
+            },
+            EffectValue::Keyframes {
+                keyframes: vec![
+                    Keyframe {
+                        time_seconds: 0.0,
+                        value: 1.0,
+                        interp: KeyframeInterp::Linear,
+                    },
+                    Keyframe {
+                        time_seconds: 2.0,
+                        value: 0.0,
+                        interp: KeyframeInterp::Bezier,
+                    },
+                ],
+            },
+        ];
+        for v in cases {
+            let s = ron::ser::to_string_pretty(&v, cfg.clone()).unwrap();
+            let back: EffectValue =
+                ron::from_str(&s).unwrap_or_else(|e| panic!("RON round-trip failed for {v:?}: {e}\n{s}"));
+            assert_eq!(v, back, "RON round-trip mismatch:\n{s}");
+        }
+        // A whole effect-params map (as stored on a clip) must also
+        // round-trip — this is the real save/open shape.
+        let mut params: EffectParams = std::collections::BTreeMap::new();
+        params.insert("opacity".into(), EffectValue::Number(0.5));
+        params.insert(
+            "win_x".into(),
+            EffectValue::Keyframes {
+                keyframes: vec![Keyframe {
+                    time_seconds: 0.0,
+                    value: 10.0,
+                    interp: KeyframeInterp::Linear,
+                }],
+            },
+        );
+        params.insert(
+            "scale".into(),
+            EffectValue::Expr {
+                expr: "100.0 + 5.0 * noise(time)".into(),
+            },
+        );
+        let s = ron::ser::to_string_pretty(&params, cfg).unwrap();
+        let back: EffectParams = ron::from_str(&s).expect("effect params round-trip");
+        assert_eq!(params, back);
     }
 
     fn kf(x: f64, y: f64, interp: KeyframeInterp) -> Keyframe {

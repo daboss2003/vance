@@ -34,9 +34,14 @@ pub enum MediaField {
 /// ops parse both sides as `f64`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QueryOp {
-    /// Equal (string, case-insensitive).
+    /// Equal. Numeric when both sides parse as numbers (so "30" == "30.0");
+    /// otherwise case-insensitive string equality. An ABSENT custom field
+    /// is never equal (Eq = false).
     Eq,
-    /// Not equal.
+    /// Not equal. Numeric or string like [`QueryOp::Eq`]. An ABSENT custom
+    /// field counts as "not equal" (Ne = true) — a `Reviewed != yes` bin
+    /// therefore INCLUDES items with no Reviewed column. Compose with
+    /// [`QueryOp::Exists`] to require the column be present.
     Ne,
     /// Substring match.
     Contains,
@@ -157,12 +162,12 @@ fn field_number(field: &MediaField, item: &MediaItem) -> Option<f64> {
 }
 
 fn eval_condition(c: &Condition, item: &MediaItem) -> bool {
-    if c.op == QueryOp::Exists {
-        return field_string(&c.field, item)
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
-    }
     match c.op {
+        // Field-aware presence: bool fields report their actual value;
+        // custom/name require present + non-empty; duration > 0. (A naive
+        // string-non-empty check made HasAudio/HasProxy Exists ALWAYS true,
+        // because `false` stringifies to the non-empty "false".)
+        QueryOp::Exists => field_present(&c.field, item),
         QueryOp::Gt | QueryOp::Lt | QueryOp::Ge | QueryOp::Le => {
             let (Some(lhs), Ok(rhs)) = (field_number(&c.field, item), c.value.trim().parse::<f64>())
             else {
@@ -176,21 +181,55 @@ fn eval_condition(c: &Condition, item: &MediaItem) -> bool {
                 _ => unreachable!(),
             }
         }
-        _ => {
+        QueryOp::Eq | QueryOp::Ne => {
+            // If BOTH sides are numeric, compare numerically so "30" == "30.0"
+            // and a "4" query matches a stored "4.0" — consistent with the
+            // ordered ops. Otherwise fall back to case-insensitive strings.
+            if let (Some(lhs_n), Ok(rhs_n)) =
+                (field_number(&c.field, item), c.value.trim().parse::<f64>())
+            {
+                let eq = lhs_n == rhs_n;
+                return if c.op == QueryOp::Eq { eq } else { !eq };
+            }
+            match field_string(&c.field, item) {
+                // Missing field (only a custom key can be absent): Eq is
+                // false, Ne is true (absent != any value).
+                None => c.op == QueryOp::Ne,
+                Some(lhs) => {
+                    let rhs = c.value.to_lowercase();
+                    if c.op == QueryOp::Eq {
+                        lhs == rhs
+                    } else {
+                        lhs != rhs
+                    }
+                }
+            }
+        }
+        QueryOp::Contains | QueryOp::StartsWith | QueryOp::EndsWith => {
             let Some(lhs) = field_string(&c.field, item) else {
-                // Missing field: only `Ne` is satisfied (it's != anything).
-                return c.op == QueryOp::Ne;
+                return false; // missing field never substring-matches
             };
             let rhs = c.value.to_lowercase();
             match c.op {
-                QueryOp::Eq => lhs == rhs,
-                QueryOp::Ne => lhs != rhs,
                 QueryOp::Contains => lhs.contains(&rhs),
                 QueryOp::StartsWith => lhs.starts_with(&rhs),
                 QueryOp::EndsWith => lhs.ends_with(&rhs),
                 _ => unreachable!(),
             }
         }
+    }
+}
+
+/// Field-aware presence test for [`QueryOp::Exists`].
+fn field_present(field: &MediaField, item: &MediaItem) -> bool {
+    match field {
+        MediaField::Custom(key) => item.metadata.get(key).is_some_and(|v| !v.trim().is_empty()),
+        MediaField::Name => !item.display_name.trim().is_empty(),
+        MediaField::HasAudio => item.has_audio_track,
+        MediaField::HasProxy => item.proxy_path.is_some(),
+        MediaField::Path => !item.path.as_os_str().is_empty(),
+        MediaField::Kind => true,
+        MediaField::DurationSeconds => item.duration.0.as_f64() > 0.0,
     }
 }
 
@@ -276,6 +315,48 @@ mod tests {
             value: String::new(),
         });
         assert!(!no_camera.matches(&m));
+    }
+
+    #[test]
+    fn exists_is_field_aware_not_just_string_nonempty() {
+        // A non-audio item with no proxy: Exists must be FALSE for the
+        // bool fields (regression — "false".to_string() is non-empty).
+        let m = item("x", MediaKind::Video, 5);
+        assert!(!m.has_audio_track);
+        assert!(m.proxy_path.is_none());
+        let exists = |field| {
+            MediaQuery::Cond(Condition {
+                field,
+                op: QueryOp::Exists,
+                value: String::new(),
+            })
+            .matches(&m)
+        };
+        assert!(!exists(MediaField::HasProxy), "no proxy → Exists false");
+        assert!(!exists(MediaField::HasAudio), "no audio → Exists false");
+        assert!(!exists(MediaField::Custom("Scene".into())), "no column → Exists false");
+        assert!(exists(MediaField::Name), "named item → Exists true");
+    }
+
+    #[test]
+    fn eq_ne_are_numeric_when_both_sides_parse() {
+        let mut m = item("clip", MediaKind::Video, 30);
+        m.metadata.insert("Rating".into(), "4.0".into());
+        let eq = |field, value: &str| {
+            MediaQuery::Cond(Condition { field, op: QueryOp::Eq, value: value.into() }).matches(&m)
+        };
+        // "30" (stringified duration) vs the user's "30.0" must match.
+        assert!(eq(MediaField::DurationSeconds, "30.0"));
+        assert!(eq(MediaField::DurationSeconds, "30"));
+        // Stored "4.0" vs queried "4" must match (consistent with Ge/Le).
+        assert!(eq(MediaField::Custom("Rating".into()), "4"));
+        // Ne on a missing custom column is TRUE (documented semantics).
+        assert!(MediaQuery::Cond(Condition {
+            field: MediaField::Custom("Reviewed".into()),
+            op: QueryOp::Ne,
+            value: "yes".into(),
+        })
+        .matches(&m));
     }
 
     #[test]

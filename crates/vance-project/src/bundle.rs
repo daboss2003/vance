@@ -198,6 +198,75 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_preserves_keyframed_and_expr_params() {
+        // Regression: a clip carrying a KEYFRAMED effect param (motion
+        // tracking / colour curves) plus an EXPRESSION param must survive
+        // save → open. The untagged EffectValue used to drop keyframed
+        // params on RON reload (unopenable project).
+        use vance_timeline::{Effect, EffectValue, Keyframe, KeyframeInterp};
+        let tmp = TempDir::new().unwrap();
+        let bundle = tmp.path().join("Anim.vance");
+
+        let mut p = Project::new("Anim");
+        let media =
+            MediaItem::new(PathBuf::from("/tmp/c.mov"), "c.mov", MediaKind::Video, t(30))
+                .with_frame_rate(FrameRate::FPS_24);
+        let media_id = media.id;
+        p.media.insert(media_id, Arc::new(media));
+
+        let mut log = EditLog::new(Sequence::new("S", FrameRate::FPS_24));
+        let track_id = TrackId::new();
+        log.apply(EditOp::AddTrack {
+            track_id,
+            kind: TrackKind::Video,
+            name: "V1".into(),
+        })
+        .unwrap();
+        let clip = Clip::new(media_id, "c.mov", t(0), t(0), t(5)).unwrap();
+        let clip_id = clip.id;
+        log.apply(EditOp::InsertClip { track_id, clip }).unwrap();
+
+        let mut effect = Effect::new("transform");
+        effect.params.insert(
+            "opacity".into(),
+            EffectValue::Keyframes {
+                keyframes: vec![
+                    Keyframe {
+                        time_seconds: 0.0,
+                        value: 0.0,
+                        interp: KeyframeInterp::Linear,
+                    },
+                    Keyframe {
+                        time_seconds: 1.0,
+                        value: 1.0,
+                        interp: KeyframeInterp::Bezier,
+                    },
+                ],
+            },
+        );
+        effect.params.insert(
+            "scale".into(),
+            EffectValue::Expr {
+                expr: "100.0 + 5.0 * noise(time)".into(),
+            },
+        );
+        log.apply(EditOp::AddEffectToClip {
+            track_id,
+            clip_id,
+            effect,
+        })
+        .unwrap();
+        p.sequences.push(Arc::new(log.current().clone()));
+
+        save(&p, &bundle).unwrap();
+        let reopened = open(&bundle).unwrap();
+        assert_eq!(
+            reopened, p,
+            "project with keyframed + expression params must round-trip"
+        );
+    }
+
+    #[test]
     fn open_missing_directory_errors_clearly() {
         let tmp = TempDir::new().unwrap();
         let bundle = tmp.path().join("nope.vance");

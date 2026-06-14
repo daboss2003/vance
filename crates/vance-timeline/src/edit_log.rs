@@ -1,4 +1,4 @@
-//! `EditOp` and `EditLog` — undo/redo for `Sequence` edits.
+//! `EditOp` and `EditLog` — branching undo/redo for `Sequence` edits.
 //!
 //! ## Design
 //!
@@ -6,14 +6,14 @@
 //!   `crate::ops`. It captures all arguments verbatim, including any
 //!   freshly allocated IDs (e.g. `AddTrack { track_id, ... }`), so a
 //!   logged op replays to byte-identical output.
-//! - `EditLog` keeps the active `Sequence` *plus* a flat `Vec` of past
-//!   edits. Each `Entry` stores both `before` and `after` sequences; an
-//!   undo is a pointer-swap to `before`, a redo a pointer-swap to
-//!   `after`. Cloning a `Sequence` is cheap because all internal
-//!   structure is `Arc`-shared, so this trades modest memory for the
-//!   `<1ms` undo/redo target the plan calls for.
-//! - Applying a new op while the cursor is mid-history truncates the
-//!   redo branch — the standard NLE behavior.
+//! - `EditLog` is a TREE of `Sequence` snapshots ("Git for edits"). Each
+//!   node holds the sequence reached by one op. `undo` walks to the
+//!   parent; `redo` walks to the *active child* (the branch the user last
+//!   descended). Editing after an undo FORKS a new child branch rather
+//!   than discarding the redo branch, so alternate cuts stay reachable via
+//!   [`EditLog::goto`] / [`EditLog::branch_tips`]. Snapshots share most
+//!   structure via `Arc`, so undo/redo hit the `<1ms` target; total
+//!   retained history is bounded by `MAX_HISTORY_NODES`.
 
 use serde::{Deserialize, Serialize};
 use vance_core::RationalTime;
@@ -602,10 +602,14 @@ struct HistoryNode {
     snapshot: Sequence,
     /// Parent node index. `None` only for the root.
     parent: Option<usize>,
-    /// Child node indices in creation order. The LAST child is the
-    /// "active" redo target, so linear redo follows the most recent edit
-    /// while older siblings stay reachable as alternate branches.
+    /// Child node indices in creation order. Older siblings stay reachable
+    /// as alternate branches via `goto`.
     children: Vec<usize>,
+    /// The child `redo()` follows from this node — the branch the user most
+    /// recently descended (updated by apply/undo/goto), NOT just the
+    /// newest child. Keeps redo-after-undo returning to the branch the user
+    /// is actually on, even after `goto`-ing onto an older branch.
+    active_child: Option<usize>,
     /// Human-readable label of the op that produced this node ("" = root).
     label: String,
     /// Optional user-assigned checkpoint / branch name.
@@ -629,14 +633,23 @@ pub struct HistoryNodeView {
     pub is_current: bool,
 }
 
+/// Hard cap on retained history nodes (across all branches). On overflow
+/// the log collapses to a fresh single-node history seeded at the current
+/// snapshot — the user keeps their current state but loses undo history.
+/// Generous enough that a normal session never hits it; a safety valve
+/// against unbounded memory growth over a marathon branchy session.
+const MAX_HISTORY_NODES: usize = 4096;
+
 /// Branching undo/redo history for one `Sequence` — "Git for edits".
 ///
 /// Internally a tree of `Sequence` snapshots. Linear undo/redo walk the
 /// parent / active-child edge (so they behave exactly like a flat
 /// history), but a new edit made after undoing forks a NEW branch
 /// instead of discarding the redo branch — alternate edit paths are kept
-/// and reachable via [`EditLog::goto`] / [`EditLog::branch_tips`]. Cheap
-/// because snapshots are Arc-shared.
+/// and reachable via [`EditLog::goto`] / [`EditLog::branch_tips`].
+/// Snapshots share most structure via `Arc`, but each node still owns a
+/// fresh `tracks`/`markers` Vec, so retained history grows with edit count
+/// (bounded by [`MAX_HISTORY_NODES`]).
 ///
 /// NOT PERSISTED: the log is session-only — `vance-project::save` only
 /// writes the current `Project` (which contains the current `Sequence`),
@@ -657,6 +670,7 @@ impl EditLog {
                 snapshot: initial,
                 parent: None,
                 children: Vec::new(),
+                active_child: None,
                 label: String::new(),
                 name: None,
             }],
@@ -679,15 +693,24 @@ impl EditLog {
             let cur = &self.nodes[self.current];
             apply(&cur.snapshot, &op)?
         };
+        // Safety valve: collapse to a fresh history at the current snapshot
+        // before exceeding the node cap, bounding memory.
+        if self.nodes.len() >= MAX_HISTORY_NODES {
+            let snap = self.nodes[self.current].snapshot.clone();
+            *self = EditLog::new(snap);
+        }
         let new_idx = self.nodes.len();
         self.nodes.push(HistoryNode {
             snapshot: after,
             parent: Some(self.current),
             children: Vec::new(),
+            active_child: None,
             label: op_label(&op),
             name: None,
         });
         self.nodes[self.current].children.push(new_idx);
+        // The new edit is the branch this node now redoes into.
+        self.nodes[self.current].active_child = Some(new_idx);
         self.current = new_idx;
         Ok(&self.nodes[self.current].snapshot)
     }
@@ -695,13 +718,19 @@ impl EditLog {
     /// Step back to the parent node. `None` at the root.
     pub fn undo(&mut self) -> Option<&Sequence> {
         let parent = self.nodes[self.current].parent?;
+        // Remember the branch we came down so a later redo returns HERE,
+        // not to whichever sibling happened to be created last.
+        let from = self.current;
+        self.nodes[parent].active_child = Some(from);
         self.current = parent;
         Some(&self.nodes[self.current].snapshot)
     }
 
-    /// Step forward to the active (most-recent) child. `None` at a leaf.
+    /// Step forward to the active child (the branch the user last
+    /// descended). `None` at a leaf.
     pub fn redo(&mut self) -> Option<&Sequence> {
-        let child = *self.nodes[self.current].children.last()?;
+        let node = &self.nodes[self.current];
+        let child = node.active_child.or_else(|| node.children.last().copied())?;
         self.current = child;
         Some(&self.nodes[self.current].snapshot)
     }
@@ -746,6 +775,14 @@ impl EditLog {
             return None;
         }
         self.current = id;
+        // Mark the whole root→id path active, so undo/redo from here walk
+        // the branch the user jumped onto rather than diverting to a
+        // sibling that happened to be created later.
+        let mut node = id;
+        while let Some(parent) = self.nodes[node].parent {
+            self.nodes[parent].active_child = Some(node);
+            node = parent;
+        }
         Some(&self.nodes[self.current].snapshot)
     }
 
@@ -972,6 +1009,35 @@ mod tests {
         assert!(log.can_redo());
         log.redo().unwrap();
         assert_eq!(log.current_id(), b_node);
+    }
+
+    #[test]
+    fn redo_returns_to_the_branch_you_visited_not_newest_sibling() {
+        // Regression: after goto-ing onto an OLDER branch and undoing,
+        // redo must return to that branch, not divert to the sibling that
+        // happened to be created last.
+        let (mut log, tid, media) = seed_log();
+        let branch_point = log.current_id();
+        let a = Clip::new(media, "a", t(0), t(0), t(5)).unwrap();
+        log.apply(EditOp::InsertClip { track_id: tid, clip: a }).unwrap();
+        let a_node = log.current_id();
+        log.undo().unwrap();
+        let b = Clip::new(media, "b", t(0), t(0), t(5)).unwrap();
+        log.apply(EditOp::InsertClip { track_id: tid, clip: b }).unwrap();
+        let b_node = log.current_id();
+        assert_ne!(a_node, b_node);
+
+        // Visit branch A (the older one), then undo to the branch point.
+        log.goto(a_node).unwrap();
+        log.undo().unwrap();
+        assert_eq!(log.current_id(), branch_point);
+        // Redo must land on A (where the user just was), not newest B.
+        log.redo().unwrap();
+        assert_eq!(
+            log.current_id(),
+            a_node,
+            "redo diverted to the newest sibling instead of the visited branch"
+        );
     }
 
     #[test]
