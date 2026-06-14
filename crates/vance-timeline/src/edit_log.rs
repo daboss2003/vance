@@ -18,10 +18,11 @@
 use serde::{Deserialize, Serialize};
 use vance_core::RationalTime;
 
+use crate::bus::{BusOutput, Send};
 use crate::clip::Clip;
 use crate::effect::{Effect, EffectValue};
 use crate::error::Result;
-use crate::id::{ClipId, EffectId, TrackId, TransitionId};
+use crate::id::{BusId, ClipId, EffectId, TrackId, TransitionId};
 use crate::ops;
 use crate::sequence::Sequence;
 use crate::track::TrackKind;
@@ -408,6 +409,67 @@ pub enum EditOp {
         /// Human-readable label shown in undo history.
         label: String,
     },
+    /// GOAT-4 — add a mixer submix bus (routed to master) with a stable id.
+    AddBus {
+        /// Pre-allocated bus id so replay produces stable ids.
+        bus_id: BusId,
+        /// Display name.
+        name: String,
+    },
+    /// GOAT-4 — remove a bus; dangling routes fall back to master.
+    RemoveBus {
+        /// Bus to remove.
+        bus_id: BusId,
+    },
+    /// GOAT-4 — set a bus's fader gain in dB.
+    SetBusGainDb {
+        /// Bus to mutate.
+        bus_id: BusId,
+        /// New gain in dB.
+        gain_db: f32,
+    },
+    /// GOAT-4 — set a bus's stereo pan `[-1, 1]`.
+    SetBusPan {
+        /// Bus to mutate.
+        bus_id: BusId,
+        /// New pan.
+        pan: f32,
+    },
+    /// GOAT-4 — mute / unmute a bus.
+    SetBusMute {
+        /// Bus to mutate.
+        bus_id: BusId,
+        /// New mute state.
+        mute: bool,
+    },
+    /// GOAT-4 — route a bus's main output (master or another bus).
+    SetBusOutput {
+        /// Bus to mutate.
+        bus_id: BusId,
+        /// New output target.
+        output: BusOutput,
+    },
+    /// GOAT-4 — route a track's main output (master or a bus).
+    RouteTrackToBus {
+        /// Track to mutate.
+        track_id: TrackId,
+        /// New output target.
+        output: BusOutput,
+    },
+    /// GOAT-4 — add an aux/reverb send from a track to a bus.
+    AddTrackSend {
+        /// Source track.
+        track_id: TrackId,
+        /// The send (target bus + level + pre/post fader).
+        send: Send,
+    },
+    /// GOAT-4 — remove a track's send at `index` (no-op if out of range).
+    RemoveTrackSend {
+        /// Source track.
+        track_id: TrackId,
+        /// Zero-based index into `Track.sends`.
+        index: usize,
+    },
 }
 
 /// Apply a single op to a sequence, returning the new sequence.
@@ -588,6 +650,19 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
                 cur = apply(&cur, child)?;
             }
             Ok(cur)
+        }
+        EditOp::AddBus { bus_id, name } => Ok(ops::add_bus_with_id(seq, *bus_id, name.clone())),
+        EditOp::RemoveBus { bus_id } => ops::remove_bus(seq, *bus_id),
+        EditOp::SetBusGainDb { bus_id, gain_db } => ops::set_bus_gain_db(seq, *bus_id, *gain_db),
+        EditOp::SetBusPan { bus_id, pan } => ops::set_bus_pan(seq, *bus_id, *pan),
+        EditOp::SetBusMute { bus_id, mute } => ops::set_bus_mute(seq, *bus_id, *mute),
+        EditOp::SetBusOutput { bus_id, output } => ops::set_bus_output(seq, *bus_id, *output),
+        EditOp::RouteTrackToBus { track_id, output } => {
+            ops::route_track_to_bus(seq, *track_id, *output)
+        }
+        EditOp::AddTrackSend { track_id, send } => ops::add_track_send(seq, *track_id, *send),
+        EditOp::RemoveTrackSend { track_id, index } => {
+            ops::remove_track_send(seq, *track_id, *index)
         }
     }
 }
@@ -864,6 +939,14 @@ fn op_label(op: &EditOp) -> String {
         EditOp::SetClipFadeIn { .. } => "Fade in".into(),
         EditOp::SetClipFadeOut { .. } => "Fade out".into(),
         EditOp::Compound { label, .. } => label.clone(),
+        EditOp::AddBus { .. } => "Add bus".into(),
+        EditOp::RemoveBus { .. } => "Remove bus".into(),
+        EditOp::SetBusGainDb { .. } => "Bus gain".into(),
+        EditOp::SetBusPan { .. } => "Bus pan".into(),
+        EditOp::SetBusMute { .. } => "Bus mute".into(),
+        EditOp::SetBusOutput { .. } | EditOp::RouteTrackToBus { .. } => "Reroute".into(),
+        EditOp::AddTrackSend { .. } => "Add send".into(),
+        EditOp::RemoveTrackSend { .. } => "Remove send".into(),
     }
 }
 

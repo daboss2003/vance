@@ -20,10 +20,11 @@
 use std::sync::Arc;
 use vance_core::RationalTime;
 
+use crate::bus::{routing_cycle, AudioBus, BusOutput, Send};
 use crate::clip::Clip;
 use crate::effect::{Effect, EffectValue};
 use crate::error::{Result, TimelineError};
-use crate::id::{ClipId, EffectId, TrackId, TransitionId};
+use crate::id::{BusId, ClipId, EffectId, TrackId, TransitionId};
 use crate::sequence::Sequence;
 use crate::track::{Track, TrackKind};
 use crate::transition::{Transition, TransitionKind};
@@ -1769,6 +1770,150 @@ pub fn set_transition_param(
     Ok(replace_track(seq, idx, new_track))
 }
 
+// ---- GOAT-4: mixer buses + sends --------------------------------------------
+
+/// Clone `seq` with a new bus list.
+fn with_buses(seq: &Sequence, buses: Vec<AudioBus>) -> Sequence {
+    Sequence {
+        id: seq.id,
+        name: seq.name.clone(),
+        frame_rate: seq.frame_rate,
+        tracks: seq.tracks.clone(),
+        markers: seq.markers.clone(),
+        master_gain_db: seq.master_gain_db,
+        buses,
+    }
+}
+
+fn find_bus(seq: &Sequence, bus_id: BusId) -> Result<usize> {
+    seq.buses
+        .iter()
+        .position(|b| b.id == bus_id)
+        .ok_or_else(|| TimelineError::invalid("no such bus"))
+}
+
+/// Add a new submix bus (routed to master) with the supplied id.
+pub fn add_bus_with_id(seq: &Sequence, bus_id: BusId, name: impl Into<String>) -> Sequence {
+    let mut bus = AudioBus::new(name);
+    bus.id = bus_id;
+    let mut buses = seq.buses.clone();
+    buses.push(bus);
+    with_buses(seq, buses)
+}
+
+/// Remove a bus. Anything routed to it (track/bus main outputs) falls back
+/// to master, and sends targeting it are dropped — so no dangling routes.
+pub fn remove_bus(seq: &Sequence, bus_id: BusId) -> Result<Sequence> {
+    find_bus(seq, bus_id)?;
+    let buses: Vec<AudioBus> = seq
+        .buses
+        .iter()
+        .filter(|b| b.id != bus_id)
+        .map(|b| {
+            let mut b = b.clone();
+            if b.output == BusOutput::Bus(bus_id) {
+                b.output = BusOutput::Master;
+            }
+            b.sends.retain(|s| s.target != bus_id);
+            b
+        })
+        .collect();
+    let mut out = with_buses(seq, buses);
+    // Re-route any TRACK that pointed at the removed bus + drop its sends.
+    let tracks: Vec<Arc<Track>> = out
+        .tracks
+        .iter()
+        .map(|t| {
+            if t.output == BusOutput::Bus(bus_id) || t.sends.iter().any(|s| s.target == bus_id) {
+                let mut nt = (**t).clone();
+                if nt.output == BusOutput::Bus(bus_id) {
+                    nt.output = BusOutput::Master;
+                }
+                nt.sends.retain(|s| s.target != bus_id);
+                Arc::new(nt)
+            } else {
+                t.clone()
+            }
+        })
+        .collect();
+    out.tracks = tracks;
+    Ok(out)
+}
+
+/// Set a bus's fader gain in dB.
+pub fn set_bus_gain_db(seq: &Sequence, bus_id: BusId, gain_db: f32) -> Result<Sequence> {
+    let idx = find_bus(seq, bus_id)?;
+    let g = sanitize_gain_db(gain_db)?;
+    let mut buses = seq.buses.clone();
+    buses[idx].gain_db = g;
+    Ok(with_buses(seq, buses))
+}
+
+/// Set a bus's stereo pan, clamped to `[-1, 1]`.
+pub fn set_bus_pan(seq: &Sequence, bus_id: BusId, pan: f32) -> Result<Sequence> {
+    let idx = find_bus(seq, bus_id)?;
+    let mut buses = seq.buses.clone();
+    buses[idx].pan = pan.clamp(-1.0, 1.0);
+    Ok(with_buses(seq, buses))
+}
+
+/// Mute / unmute a bus.
+pub fn set_bus_mute(seq: &Sequence, bus_id: BusId, mute: bool) -> Result<Sequence> {
+    let idx = find_bus(seq, bus_id)?;
+    let mut buses = seq.buses.clone();
+    buses[idx].mute = mute;
+    Ok(with_buses(seq, buses))
+}
+
+/// Route a bus's main output (to master or another bus). Rejects a target
+/// that doesn't exist or that would create a routing cycle.
+pub fn set_bus_output(seq: &Sequence, bus_id: BusId, output: BusOutput) -> Result<Sequence> {
+    let idx = find_bus(seq, bus_id)?;
+    if let BusOutput::Bus(target) = output {
+        if target == bus_id {
+            return Err(TimelineError::invalid("a bus cannot route to itself"));
+        }
+        find_bus(seq, target)?;
+    }
+    let mut buses = seq.buses.clone();
+    buses[idx].output = output;
+    if routing_cycle(&buses).is_some() {
+        return Err(TimelineError::invalid("bus routing would create a cycle"));
+    }
+    Ok(with_buses(seq, buses))
+}
+
+/// Route a track's main output (to master or a bus). Rejects a missing bus.
+pub fn route_track_to_bus(seq: &Sequence, track_id: TrackId, output: BusOutput) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    if let BusOutput::Bus(target) = output {
+        find_bus(seq, target)?;
+    }
+    let mut nt = (*track).clone();
+    nt.output = output;
+    Ok(replace_track(seq, idx, nt))
+}
+
+/// Add an aux send from a track to a bus. Rejects a missing target bus.
+pub fn add_track_send(seq: &Sequence, track_id: TrackId, send: Send) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    find_bus(seq, send.target)?;
+    let mut nt = (*track).clone();
+    nt.sends.push(send);
+    Ok(replace_track(seq, idx, nt))
+}
+
+/// Remove a track's send at `index`. No-op if the index is out of range.
+pub fn remove_track_send(seq: &Sequence, track_id: TrackId, index: usize) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    if index >= track.sends.len() {
+        return Ok(seq.clone());
+    }
+    let mut nt = (*track).clone();
+    nt.sends.remove(index);
+    Ok(replace_track(seq, idx, nt))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1787,6 +1932,67 @@ mod tests {
         let track_id = seq.tracks[0].id;
         let media = MediaItemId::new();
         (seq, track_id, media)
+    }
+
+    #[test]
+    fn bus_ops_route_send_and_cleanup() {
+        use crate::bus::{BusOutput, Send};
+        use crate::id::BusId;
+        let (seq, tid, _media) = seed_seq();
+
+        // Add a Music bus + a Reverb bus.
+        let music = BusId::new();
+        let reverb = BusId::new();
+        let seq = add_bus_with_id(&seq, music, "Music");
+        let seq = add_bus_with_id(&seq, reverb, "Reverb");
+        assert_eq!(seq.buses.len(), 2);
+
+        // Route the track to Music; add a reverb send.
+        let seq = route_track_to_bus(&seq, tid, BusOutput::Bus(music)).unwrap();
+        assert_eq!(seq.tracks[0].output, BusOutput::Bus(music));
+        let seq = add_track_send(&seq, tid, Send::to(reverb)).unwrap();
+        assert_eq!(seq.tracks[0].sends.len(), 1);
+
+        // Music → Reverb (submix). Then a cycle (Reverb → Music) is rejected.
+        let seq = set_bus_output(&seq, music, BusOutput::Bus(reverb)).unwrap();
+        assert!(set_bus_output(&seq, reverb, BusOutput::Bus(music)).is_err());
+        // Self-route + missing bus are rejected too.
+        assert!(set_bus_output(&seq, music, BusOutput::Bus(music)).is_err());
+        assert!(route_track_to_bus(&seq, tid, BusOutput::Bus(BusId::new())).is_err());
+
+        // Removing Reverb falls the track output / Music output back, and
+        // drops the reverb send — no dangling routes.
+        let seq = remove_bus(&seq, reverb).unwrap();
+        assert_eq!(seq.buses.len(), 1);
+        assert_eq!(seq.tracks[0].sends.len(), 0, "send to removed bus dropped");
+        let music_bus = seq.buses.iter().find(|b| b.id == music).unwrap();
+        assert_eq!(music_bus.output, BusOutput::Master, "Music re-routed to master");
+    }
+
+    #[test]
+    fn bus_edit_ops_undo_redo_round_trip() {
+        use crate::bus::BusOutput;
+        use crate::edit_log::{EditLog, EditOp};
+        use crate::id::BusId;
+        let seq = Sequence::new("S", FrameRate::FPS_24);
+        let mut log = EditLog::new(seq);
+        let tid = TrackId::new();
+        log.apply(EditOp::AddTrack { track_id: tid, kind: TrackKind::Audio, name: "A1".into() })
+            .unwrap();
+        let bus = BusId::new();
+        log.apply(EditOp::AddBus { bus_id: bus, name: "Music".into() }).unwrap();
+        log.apply(EditOp::RouteTrackToBus { track_id: tid, output: BusOutput::Bus(bus) }).unwrap();
+        assert_eq!(log.current().buses.len(), 1);
+        assert_eq!(log.current().tracks[0].output, BusOutput::Bus(bus));
+        // Undo the route, then the bus add.
+        log.undo().unwrap();
+        assert_eq!(log.current().tracks[0].output, BusOutput::Master);
+        log.undo().unwrap();
+        assert_eq!(log.current().buses.len(), 0);
+        // Redo both.
+        log.redo().unwrap();
+        log.redo().unwrap();
+        assert_eq!(log.current().tracks[0].output, BusOutput::Bus(bus));
     }
 
     #[test]
