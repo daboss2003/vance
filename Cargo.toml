@@ -19,6 +19,7 @@ members = [
     "crates/vance-render",
     "crates/vance-effects",
     "crates/vance-timeline",
+    "crates/vance-expr",
     "crates/vance-engine",
     "crates/vance-project",
     "crates/vance-otio",
@@ -75,6 +76,7 @@ vance-audio-plugins = { path = "crates/vance-audio-plugins" }
 vance-render = { path = "crates/vance-render" }
 vance-effects = { path = "crates/vance-effects" }
 vance-timeline = { path = "crates/vance-timeline" }
+vance-expr = { path = "crates/vance-expr" }
 vance-engine = { path = "crates/vance-engine" }
 vance-project = { path = "crates/vance-project" }
 vance-otio = { path = "crates/vance-otio" }
@@ -105,6 +107,8 @@ libloading = "0.8"
 tempfile = "3"
 proptest = "1"
 libc = "0.2"
+# Sandboxed scripting for the parameter expression engine (pure Rust).
+rhai = "1"
 
 # rust-lv2's `lv2-sys` gates macOS out with a compile_error, even though
 # its LV2 C-ABI bindings are platform-identical (the one exception, the

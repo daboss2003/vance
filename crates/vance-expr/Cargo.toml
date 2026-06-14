@@ -1,0 +1,18 @@
+[package]
+name = "vance-expr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# Sandboxed expression engine (After Effects-style parameter scripting).
+# Pure Rust (rhai) — no system deps, builds on every target.
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rhai = { workspace = true }
+thiserror = { workspace = true }
