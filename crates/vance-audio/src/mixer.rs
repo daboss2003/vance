@@ -1050,10 +1050,12 @@ impl MixerSnapshot {
     /// cycles). Applied AFTER track-insert DSP in the fold.
     pub fn bus_chain_gain(&self, mut bus: Option<Uuid>) -> f32 {
         let mut g = 1.0;
-        let mut steps = 0u32;
+        let mut steps = 0usize;
         while let Some(id) = bus {
             steps += 1;
-            if steps > 64 {
+            // A valid (acyclic) output chain visits at most `buses.len()`
+            // buses before reaching master; exceeding that means a cycle.
+            if steps > self.buses.len() {
                 return 0.0;
             }
             let Some(b) = self.buses.get(&id) else {
@@ -1074,10 +1076,12 @@ impl MixerSnapshot {
     /// the live fold so the console pan knob is audible.
     pub fn bus_chain_lr(&self, mut bus: Option<Uuid>) -> [f32; 2] {
         let mut lr = [1.0f32, 1.0];
-        let mut steps = 0u32;
+        let mut steps = 0usize;
         while let Some(id) = bus {
             steps += 1;
-            if steps > 64 {
+            // Bounded by the bus count (see `bus_chain_gain`): a longer
+            // walk means a cycle, so bail to silence.
+            if steps > self.buses.len() {
                 return [0.0, 0.0];
             }
             let Some(b) = self.buses.get(&id) else {
@@ -1106,10 +1110,16 @@ impl MixerSnapshot {
         fn level(
             buses: &HashMap<Uuid, BusMix>,
             id: Uuid,
-            depth: u32,
+            depth: usize,
             cache: &mut HashMap<Uuid, u32>,
         ) -> u32 {
-            if depth > 64 {
+            // A DAG's longest path is bounded by the node count; deeper
+            // recursion means a cycle (the edit layer rejects those, but
+            // the snapshot stays defensive). With memoization the live
+            // recursion depth never exceeds `buses.len()` for any acyclic
+            // graph, so this orders ANY valid depth correctly — no fixed
+            // cap that could misorder deep submix chains.
+            if depth > buses.len() {
                 return 0;
             }
             if let Some(&l) = cache.get(&id) {
@@ -1223,6 +1233,58 @@ impl MixerSnapshot {
         // master (the common case).
         let bus_g = self.bus_chain_gain(track.output_bus);
         track_g * clip_g * fade_in_g * fade_out_g * bus_g * self.master_gain_linear
+    }
+
+    /// GOAT-4 — a clip's PRE-FADER gain at `t`: `clip_gain × fade_in ×
+    /// fade_out`, with the same gating as [`Self::effective_gain_at`]
+    /// (clip enabled, parent track present/un-muted, solo) but WITHOUT the
+    /// track fader, bus chain, or master. The offline bounce builds a
+    /// pre-fader per-track sum from this so it can mirror the live fold's
+    /// fader → insert → send → bus pipeline (pre-fader sends tap here).
+    pub fn clip_pre_fader_gain_at(&self, clip_id: &Uuid, t_timeline_seconds: f64) -> f32 {
+        let Some(clip) = self.clips.get(clip_id) else {
+            return 0.0;
+        };
+        if !clip.enabled {
+            return 0.0;
+        }
+        let Some(track) = self.tracks.get(&clip.track_id) else {
+            return 0.0;
+        };
+        if track.mute {
+            return 0.0;
+        }
+        if self.solo_anywhere && !track.solo {
+            return 0.0;
+        }
+        let t_clip = t_timeline_seconds - clip.timeline_in_seconds;
+        let clip_g = if clip.gain_lane.is_empty() {
+            clip.gain_linear
+        } else {
+            eval_gain_lane(&clip.gain_lane, t_clip)
+        };
+        let fade_in_g =
+            eval_fade_in_audio(clip.fade_in_duration_seconds, clip.fade_in_curve, t_clip);
+        let fade_out_g = eval_fade_out_audio(
+            clip.fade_out_duration_seconds,
+            clip.fade_out_curve,
+            clip.clip_duration_seconds,
+            t_clip,
+        );
+        clip_g * fade_in_g * fade_out_g
+    }
+
+    /// GOAT-4 — a track's fader gain at `t` (lane-aware), or `1.0` when the
+    /// track isn't in the snapshot. The offline bounce applies this as the
+    /// per-track fader stage between the pre-fader sum and the insert DSP.
+    pub fn track_gain_at(&self, track_id: &Uuid, t_timeline_seconds: f64) -> f32 {
+        self.tracks.get(track_id).map_or(1.0, |t| {
+            if t.gain_lane.is_empty() {
+                t.gain_linear
+            } else {
+                eval_gain_lane(&t.gain_lane, t_timeline_seconds)
+            }
+        })
     }
 }
 
@@ -2691,6 +2753,67 @@ mod tests {
         fold_bus_graph(&snap, &order, &mut bus_in, &mut master, |_, s| s);
         // Only the main output reaches master; the orphan send is gone.
         assert_eq!(master, [1.0, 0.0]);
+    }
+
+    #[test]
+    fn bus_process_order_handles_deep_chain_past_old_cap() {
+        // 70-bus straight chain b0 → b1 → … → b69 → master, deeper than the
+        // former fixed depth cap (64). The order must place every bus
+        // before the bus it feeds, and the fold must carry signal end to
+        // end (the old cap silently zeroed past ~65).
+        let mut snap = MixerSnapshot::empty();
+        let ids: Vec<Uuid> = (0..70).map(|_| Uuid::new_v4()).collect();
+        for i in 0..70 {
+            let out = if i + 1 < 70 { Some(ids[i + 1]) } else { None };
+            snap.buses.insert(ids[i], bmix(1.0, out));
+        }
+        let order = snap.bus_process_order();
+        let pos: HashMap<Uuid, usize> =
+            order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        for i in 0..69 {
+            assert!(pos[&ids[i]] < pos[&ids[i + 1]], "bus {i} must precede its output");
+        }
+        // bus_chain_gain must also survive the full depth (was capped at 64).
+        assert_eq!(snap.bus_chain_gain(Some(ids[0])), 1.0);
+        let mut bus_in = HashMap::from([(ids[0], [1.0f32, 0.0])]);
+        let mut master = [0.0f32; 2];
+        fold_bus_graph(&snap, &order, &mut bus_in, &mut master, |_, s| s);
+        assert!((master[0] - 1.0).abs() < 1e-6, "deep chain lost signal: {}", master[0]);
+    }
+
+    #[test]
+    fn clip_pre_fader_gain_factors_out_track_and_bus() {
+        // The offline bounce splits effective_gain_at into pre-fader (clip
+        // only) × track fader × bus chain × master. Verify the split
+        // recomposes exactly, so the bounce mirrors the live fold.
+        let mut snap = MixerSnapshot::empty();
+        let track_id = Uuid::new_v4();
+        let clip_id = Uuid::new_v4();
+        let bus = Uuid::new_v4();
+        let mut tm = unity_track();
+        tm.gain_linear = db_to_linear(-6.0);
+        tm.output_bus = Some(bus);
+        snap.tracks.insert(track_id, tm);
+        let mut cm = unity_clip(track_id);
+        cm.gain_linear = db_to_linear(-6.0);
+        snap.clips.insert(clip_id, cm);
+        snap.buses.insert(bus, bmix(db_to_linear(-6.0), None));
+        snap.master_gain_linear = db_to_linear(-6.0);
+
+        let pre = snap.clip_pre_fader_gain_at(&clip_id, 0.0);
+        assert!(
+            (pre - db_to_linear(-6.0)).abs() < 1e-6,
+            "pre-fader is clip gain only: {pre}"
+        );
+        assert!((snap.track_gain_at(&track_id, 0.0) - db_to_linear(-6.0)).abs() < 1e-6);
+        let composed = pre
+            * snap.track_gain_at(&track_id, 0.0)
+            * snap.bus_chain_gain(Some(bus))
+            * snap.master_gain_linear;
+        assert!(
+            (composed - snap.effective_gain_at(&clip_id, 0.0)).abs() < 1e-6,
+            "factored stages must recompose into effective_gain_at"
+        );
     }
 
     #[test]

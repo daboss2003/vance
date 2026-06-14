@@ -3582,12 +3582,15 @@ impl Engine {
 
     /// Phase 8 (real export) — offline audio mixdown for the timeline
     /// range `[start_s, end_s)` at `sample_rate`, returning interleaved
-    /// stereo f32. Faithfully mirrors the live fold thread: per-clip
-    /// gain/fades/keyframes (via the SAME `effective_gain_at`),
-    /// equal-power pan, per-track DSP (EQ/comp/limiter via
-    /// `TrackDspState`), then master gain — but headless, re-decoding
-    /// each clip via a dedicated audio sidecar. Replaces the silent
-    /// audio the encoder used to receive.
+    /// stereo f32. Faithfully mirrors the live fold thread's full
+    /// channel-strip + bus graph: per-clip gain/fades/keyframes +
+    /// equal-power pan (pre-fader), per-track fader, per-track insert DSP
+    /// (EQ/comp/limiter/plugins via `TrackDspState`), GOAT-4 aux sends
+    /// (pre/post-fader) and the bus graph (per-bus inserts, fader, pan,
+    /// sends, routing via `fold_bus_graph`/`bus_process_order`), then the
+    /// master fader — but headless, re-decoding each clip via a dedicated
+    /// audio sidecar. Replaces the silent audio the encoder used to
+    /// receive.
     pub fn offline_audio_bounce(
         &mut self,
         start_s: f64,
@@ -3746,7 +3749,10 @@ impl Engine {
                 out_frames,
             );
 
-            // Place into the track buffer with pre-master gain + pan.
+            // Place into the PRE-FADER track buffer: clip gain × fades ×
+            // clip pan only. The track fader, inserts, sends, bus graph,
+            // and master are applied in the stages below (mirroring the
+            // live fold), so this buffer is the pre-fader send tap point.
             let pan = snapshot
                 .clips
                 .get(&job.clip_id)
@@ -3759,17 +3765,10 @@ impl Engine {
             };
             for j in 0..out_frames {
                 let timeline_t = clip_tl_start + j as f64 / sample_rate as f64;
-                let g_with_master = snapshot.effective_gain_at(&job.clip_id, timeline_t);
-                if g_with_master == 0.0 {
+                let pre = snapshot.clip_pre_fader_gain_at(&job.clip_id, timeline_t);
+                if pre == 0.0 {
                     continue;
                 }
-                // Master is applied once at the end (AFTER per-track DSP,
-                // matching the live order); divide it back out here.
-                let pre = if master_lin != 0.0 {
-                    g_with_master / master_lin
-                } else {
-                    0.0
-                };
                 let oi = out_start_frame + j;
                 if oi >= total_frames {
                     break;
@@ -3778,14 +3777,35 @@ impl Engine {
                 track_buf[oi * 2 + 1] += resampled[j * 2 + 1] * pre * pan[1];
             }
         }
-        // Per-track DSP (EQ / comp / limiter / plugins), then sum into
-        // master. CLAP/LV2 plugins process out-of-process through the
-        // caller-supplied `plugin_host` (export: on; scrub grain: None →
-        // built-in DSP only). The same path as live playback.
+        // Per-track FADER → insert DSP, building a post-insert buffer per
+        // track while KEEPING the pre-fader buffer (`track_bufs`) for
+        // pre-fader sends. CLAP/LV2 plugins process out-of-process through
+        // the caller-supplied `plugin_host` (export: on; scrub grain: None
+        // → built-in DSP only). Same channel-strip order as live playback.
+        let mut post_bufs: std::collections::HashMap<uuid::Uuid, Vec<f32>> =
+            std::collections::HashMap::new();
         for track_id in &audio_tracks {
-            let Some(mut buf) = track_bufs.remove(track_id) else {
+            // Skip muted / non-soloed tracks (mirrors the live fold skip);
+            // their pre-fader buffer stays available but contributes
+            // nothing (no main, no sends).
+            let gated = snapshot
+                .tracks
+                .get(track_id)
+                .map_or(true, |t| t.mute || (snapshot.solo_anywhere && !t.solo));
+            if gated {
+                continue;
+            }
+            let Some(pre_buf) = track_bufs.get(track_id) else {
                 continue;
             };
+            let mut post = pre_buf.clone();
+            // Track fader (lane-aware), applied before the inserts.
+            for fr in 0..total_frames {
+                let t = start_s + fr as f64 / sample_rate as f64;
+                let g = snapshot.track_gain_at(track_id, t);
+                post[fr * 2] *= g;
+                post[fr * 2 + 1] *= g;
+            }
             if let Some(tm) = snapshot.tracks.get(track_id) {
                 if !tm.audio_effects.is_empty() {
                     let mut dsp = vance_audio::TrackDspState::new();
@@ -3797,23 +3817,96 @@ impl Engine {
                     for fr in 0..total_frames {
                         let (nl, nr) = dsp.tick_stereo(
                             &tm.audio_effects,
-                            buf[fr * 2],
-                            buf[fr * 2 + 1],
+                            post[fr * 2],
+                            post[fr * 2 + 1],
                             plugin_host.as_deref_mut(),
                         );
-                        buf[fr * 2] = nl;
-                        buf[fr * 2 + 1] = nr;
+                        post[fr * 2] = nl;
+                        post[fr * 2 + 1] = nr;
                     }
                 }
             }
-            for i in 0..total_frames * 2 {
-                master[i] += buf[i];
-            }
+            post_bufs.insert(*track_id, post);
         }
 
-        // Master gain, applied last (mirrors the live fold order).
-        for s in master.iter_mut() {
-            *s *= master_lin;
+        // GOAT-4 — per-bus insert DSP states (stateful across frames) +
+        // the upstream→downstream processing order, then fold the bus
+        // graph per frame exactly like the live fold thread: route each
+        // track's main + sends into bus inputs, run inserts/fader/pan/
+        // sends per bus, and apply the master fader last.
+        let bus_order = snapshot.bus_process_order();
+        let mut bus_dsp: std::collections::HashMap<uuid::Uuid, vance_audio::TrackDspState> =
+            std::collections::HashMap::new();
+        for (bus_id, bm) in snapshot.buses.iter() {
+            if !bm.audio_effects.is_empty() {
+                let mut dsp = vance_audio::TrackDspState::new();
+                dsp.reconcile_with(&bm.audio_effects, sample_rate as f32, plugin_host.as_deref_mut());
+                bus_dsp.insert(*bus_id, dsp);
+            }
+        }
+        let mut bus_in: std::collections::HashMap<uuid::Uuid, [f32; 2]> =
+            std::collections::HashMap::new();
+        for fr in 0..total_frames {
+            let mut master_frame = [0.0f32; 2];
+            bus_in.clear();
+            for track_id in &audio_tracks {
+                let Some(post) = post_bufs.get(track_id) else {
+                    continue;
+                };
+                let post_s = [post[fr * 2], post[fr * 2 + 1]];
+                let pre = track_bufs
+                    .get(track_id)
+                    .map(|b| [b[fr * 2], b[fr * 2 + 1]])
+                    .unwrap_or([0.0, 0.0]);
+                let tm = snapshot.tracks.get(track_id);
+                // Aux sends: pre-fader taps the pre-fader buffer, post-
+                // fader the post-insert signal. Drop sends to a missing bus.
+                if let Some(tm) = tm {
+                    for s in &tm.sends {
+                        if !snapshot.buses.contains_key(&s.target) {
+                            continue;
+                        }
+                        let src = if s.pre_fader { pre } else { post_s };
+                        let e = bus_in.entry(s.target).or_insert([0.0, 0.0]);
+                        e[0] += src[0] * s.level_linear;
+                        e[1] += src[1] * s.level_linear;
+                    }
+                }
+                // Main output → its bus input, or straight to master.
+                match tm.and_then(|t| t.output_bus) {
+                    Some(id) if snapshot.buses.contains_key(&id) => {
+                        let e = bus_in.entry(id).or_insert([0.0, 0.0]);
+                        e[0] += post_s[0];
+                        e[1] += post_s[1];
+                    }
+                    _ => {
+                        master_frame[0] += post_s[0];
+                        master_frame[1] += post_s[1];
+                    }
+                }
+            }
+            vance_audio::fold_bus_graph(
+                &snapshot,
+                &bus_order,
+                &mut bus_in,
+                &mut master_frame,
+                |bus_id, sig| {
+                    if let (Some(dsp), Some(bm)) =
+                        (bus_dsp.get_mut(&bus_id), snapshot.buses.get(&bus_id))
+                    {
+                        let (l, r) = dsp.tick_stereo(
+                            &bm.audio_effects,
+                            sig[0],
+                            sig[1],
+                            plugin_host.as_deref_mut(),
+                        );
+                        return [l, r];
+                    }
+                    sig
+                },
+            );
+            master[fr * 2] = master_frame[0] * master_lin;
+            master[fr * 2 + 1] = master_frame[1] * master_lin;
         }
         Ok(master)
     }
