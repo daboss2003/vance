@@ -56,6 +56,7 @@ id_type!(MediaItemId, "Identifies a `MediaItem` in the project's media library."
 id_type!(MarkerId, "Identifies a `Marker` on a `Sequence` or `Clip`.");
 id_type!(EffectId, "Identifies an `Effect` instance applied to a `Clip` or `Track`.");
 id_type!(TransitionId, "Identifies a `Transition` between two clips on a `Track`.");
+id_type!(BusId, "Identifies an `AudioBus` (mixer submix) within a `Sequence`.");
 
 #[cfg(test)]
 mod tests {

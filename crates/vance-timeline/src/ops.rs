@@ -86,6 +86,7 @@ fn replace_track(seq: &Sequence, idx: usize, new_track: Track) -> Sequence {
         tracks,
         markers: seq.markers.clone(),
         master_gain_db: seq.master_gain_db,
+        buses: seq.buses.clone(),
     }
 }
 
@@ -158,6 +159,8 @@ pub fn add_track_with_id(
         gain_keyframes: Vec::new(),
         pan: 0.0,
         audio_effects: Vec::new(),
+        output: crate::bus::BusOutput::Master,
+        sends: Vec::new(),
     };
     let mut tracks = seq.tracks.clone();
     tracks.push(Arc::new(new_track));
@@ -168,6 +171,7 @@ pub fn add_track_with_id(
         tracks,
         markers: seq.markers.clone(),
         master_gain_db: seq.master_gain_db,
+        buses: seq.buses.clone(),
     }
 }
 
@@ -183,6 +187,7 @@ pub fn remove_track(seq: &Sequence, track_id: TrackId) -> Result<Sequence> {
         tracks,
         markers: seq.markers.clone(),
         master_gain_db: seq.master_gain_db,
+        buses: seq.buses.clone(),
     })
 }
 
@@ -226,6 +231,8 @@ pub fn insert_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Result<Sequ
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -277,6 +284,8 @@ pub fn ripple_insert_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Resu
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -344,6 +353,8 @@ pub fn overwrite_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Result<S
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -373,6 +384,8 @@ pub fn remove_clip(seq: &Sequence, track_id: TrackId, clip_id: ClipId) -> Result
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -417,6 +430,8 @@ pub fn ripple_remove_clip(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -460,6 +475,8 @@ pub fn slip(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -506,6 +523,8 @@ pub fn slide(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -562,6 +581,8 @@ pub fn trim_in(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -611,6 +632,8 @@ pub fn trim_out(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -649,6 +672,8 @@ pub fn add_effect_to_clip(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -693,6 +718,8 @@ pub fn update_effect_param(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -738,6 +765,8 @@ pub fn update_effect_params(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -774,6 +803,8 @@ pub fn remove_effect_from_clip(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -823,6 +854,8 @@ pub fn move_effect_on_clip(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -866,6 +899,8 @@ pub fn set_effect_enabled(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -900,6 +935,8 @@ pub fn set_track_mute(seq: &Sequence, track_id: TrackId, mute: bool) -> Result<S
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -924,6 +961,8 @@ pub fn set_track_solo(seq: &Sequence, track_id: TrackId, solo: bool) -> Result<S
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -954,6 +993,8 @@ pub fn set_track_gain_db(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -991,6 +1032,8 @@ pub fn set_clip_mute(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1027,6 +1070,8 @@ pub fn set_clip_gain_db(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1075,6 +1120,8 @@ pub fn add_audio_effect(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects,
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1108,6 +1155,8 @@ pub fn remove_audio_effect(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects,
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1143,6 +1192,8 @@ pub fn move_audio_effect(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects,
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1180,6 +1231,8 @@ pub fn update_audio_effect(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects,
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1207,6 +1260,8 @@ pub fn set_track_pan(seq: &Sequence, track_id: TrackId, pan: f32) -> Result<Sequ
         gain_keyframes: track.gain_keyframes.clone(),
         pan: sanitized,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1243,6 +1298,8 @@ pub fn set_clip_pan(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1302,6 +1359,8 @@ pub fn set_track_gain_keyframes(
         gain_keyframes: keyframes,
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1341,6 +1400,8 @@ pub fn set_clip_gain_keyframes(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1382,6 +1443,8 @@ pub fn set_clip_fade_in(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1421,6 +1484,8 @@ pub fn set_clip_fade_out(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1473,6 +1538,7 @@ pub fn set_master_gain_db(seq: &Sequence, gain_db: f32) -> Result<Sequence> {
         tracks: seq.tracks.clone(),
         markers: seq.markers.clone(),
         master_gain_db: sanitized,
+        buses: seq.buses.clone(),
     })
 }
 
@@ -1524,6 +1590,8 @@ pub fn split(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1596,6 +1664,8 @@ pub fn add_transition_at_cut_with_id(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1643,6 +1713,8 @@ pub fn remove_transition(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -1691,6 +1763,8 @@ pub fn set_transition_param(
         gain_keyframes: track.gain_keyframes.clone(),
         pan: track.pan,
         audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
     };
     Ok(replace_track(seq, idx, new_track))
 }
@@ -2015,6 +2089,8 @@ mod tests {
             gain_keyframes: t.gain_keyframes.clone(),
             pan: t.pan,
             audio_effects: t.audio_effects.clone(),
+            output: t.output,
+            sends: t.sends.clone(),
         };
         tracks[0] = Arc::new(locked_track);
         Sequence {
@@ -2024,6 +2100,7 @@ mod tests {
             tracks,
             markers: seq.markers.clone(),
         master_gain_db: seq.master_gain_db,
+        buses: seq.buses.clone(),
         }
     }
 

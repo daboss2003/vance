@@ -38,6 +38,12 @@ pub struct Sequence {
     /// `MixerSnapshot.master_gain_linear` at build time.
     #[serde(default)]
     pub master_gain_db: f32,
+    /// GOAT-4: mixer submix buses (Fairlight-class console routing). Tracks
+    /// and buses route their main output to a bus or the master, and tap
+    /// aux sends to buses. `#[serde(default)]` so older bundles open with
+    /// no buses (every track straight to master, the Phase-7 behaviour).
+    #[serde(default)]
+    pub buses: Vec<crate::bus::AudioBus>,
 }
 
 impl Sequence {
@@ -50,6 +56,7 @@ impl Sequence {
             tracks: Vec::new(),
             markers: Vec::new(),
             master_gain_db: 0.0,
+            buses: Vec::new(),
         }
     }
 
@@ -106,6 +113,8 @@ mod tests {
             gain_keyframes: Vec::new(),
             pan: 0.0,
             audio_effects: Vec::new(),
+            output: crate::bus::BusOutput::Master,
+            sends: Vec::new(),
         });
         let v2 = Arc::new(Track {
             id: TrackId::new(),
@@ -121,6 +130,8 @@ mod tests {
             gain_keyframes: Vec::new(),
             pan: 0.0,
             audio_effects: Vec::new(),
+            output: crate::bus::BusOutput::Master,
+            sends: Vec::new(),
         });
         let seq = Sequence {
             id: SequenceId::new(),
@@ -129,6 +140,7 @@ mod tests {
             tracks: vec![v1, v2],
             markers: Vec::new(),
             master_gain_db: 0.0,
+            buses: Vec::new(),
         };
         assert_eq!(seq.duration(), t(7));
         assert_eq!(seq.clip_count(), 2);

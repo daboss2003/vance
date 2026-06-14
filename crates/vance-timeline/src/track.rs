@@ -100,6 +100,13 @@ pub struct Track {
     /// `#[serde(default)]` so pre-7.7 bundles deserialize empty.
     #[serde(default)]
     pub audio_effects: Vec<crate::audio_effect::AudioEffectSpec>,
+    /// GOAT-4: where this track's main output routes — the master (default)
+    /// or a submix bus. `#[serde(default)]` → `Master` for older bundles.
+    #[serde(default)]
+    pub output: crate::bus::BusOutput,
+    /// GOAT-4: aux/reverb sends from this track to buses.
+    #[serde(default)]
+    pub sends: Vec<crate::bus::Send>,
 }
 
 impl Track {
@@ -119,6 +126,8 @@ impl Track {
             gain_keyframes: Vec::new(),
             pan: 0.0,
             audio_effects: Vec::new(),
+            output: crate::bus::BusOutput::Master,
+            sends: Vec::new(),
         }
     }
 
@@ -168,6 +177,8 @@ mod tests {
             gain_keyframes: Vec::new(),
             pan: 0.0,
             audio_effects: Vec::new(),
+            output: crate::bus::BusOutput::Master,
+            sends: Vec::new(),
         };
         assert_eq!(tr.duration(), t(7));
     }
