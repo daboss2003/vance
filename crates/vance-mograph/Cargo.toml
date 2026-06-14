@@ -1,0 +1,21 @@
+[package]
+name = "vance-mograph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Vance Motion Graphics Templates (.cmgt) — parameterized, animated title/graphic engine."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+ron = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+vance-expr = { workspace = true }
+fontdue = "0.9"
+ttf-parser = "0.21"
+
+[dev-dependencies]

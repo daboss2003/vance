@@ -6012,6 +6012,20 @@ name = "vance-media"
 version = "0.0.0"
 
 [[package]]
+name = "vance-mograph"
+version = "0.0.0"
+dependencies = [
+ "fontdue",
+ "ron",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+ "ttf-parser",
+ "vance-expr",
+]
+
+[[package]]
 name = "vance-ocio"
 version = "0.0.0"
 dependencies = [
