@@ -22,6 +22,7 @@ use vance_core::RationalTime;
 
 use crate::bus::{bus_graph_cycle, AudioBus, BusOutput, Send};
 use crate::clip::Clip;
+use crate::connection::{connected_subtree, would_cycle, Connection};
 use crate::effect::{Effect, EffectValue};
 use crate::error::{Result, TimelineError};
 use crate::id::{BusId, ClipId, EffectId, TrackId, TransitionId};
@@ -88,6 +89,8 @@ fn replace_track(seq: &Sequence, idx: usize, new_track: Track) -> Sequence {
         markers: seq.markers.clone(),
         master_gain_db: seq.master_gain_db,
         buses: seq.buses.clone(),
+        connections: seq.connections.clone(),
+        magnetic: seq.magnetic,
     }
 }
 
@@ -173,6 +176,8 @@ pub fn add_track_with_id(
         markers: seq.markers.clone(),
         master_gain_db: seq.master_gain_db,
         buses: seq.buses.clone(),
+        connections: seq.connections.clone(),
+        magnetic: seq.magnetic,
     }
 }
 
@@ -189,6 +194,8 @@ pub fn remove_track(seq: &Sequence, track_id: TrackId) -> Result<Sequence> {
         markers: seq.markers.clone(),
         master_gain_db: seq.master_gain_db,
         buses: seq.buses.clone(),
+        connections: seq.connections.clone(),
+        magnetic: seq.magnetic,
     })
 }
 
@@ -1540,6 +1547,8 @@ pub fn set_master_gain_db(seq: &Sequence, gain_db: f32) -> Result<Sequence> {
         markers: seq.markers.clone(),
         master_gain_db: sanitized,
         buses: seq.buses.clone(),
+        connections: seq.connections.clone(),
+        magnetic: seq.magnetic,
     })
 }
 
@@ -1782,6 +1791,8 @@ fn with_buses(seq: &Sequence, buses: Vec<AudioBus>) -> Sequence {
         markers: seq.markers.clone(),
         master_gain_db: seq.master_gain_db,
         buses,
+        connections: seq.connections.clone(),
+        magnetic: seq.magnetic,
     }
 }
 
@@ -1999,6 +2010,256 @@ pub fn remove_bus_send(seq: &Sequence, bus_id: BusId, index: usize) -> Result<Se
     let mut buses = seq.buses.clone();
     buses[idx].sends.remove(index);
     Ok(with_buses(seq, buses))
+}
+
+// ---- GOAT-6: clip connections + magnetic timeline ---------------------------
+
+/// Find a clip anywhere in the sequence → `(track_idx, clip_idx, clip)`.
+fn find_clip_anywhere(seq: &Sequence, clip_id: ClipId) -> Result<(usize, usize, Arc<Clip>)> {
+    for (ti, t) in seq.tracks.iter().enumerate() {
+        if let Some((ci, c)) = t.clips.iter().enumerate().find(|(_, c)| c.id == clip_id) {
+            return Ok((ti, ci, c.clone()));
+        }
+    }
+    Err(TimelineError::invalid(format!(
+        "clip {clip_id} not found in sequence"
+    )))
+}
+
+/// Clone a track with a replacement clip list (all other fields shared).
+fn rebuild_track(track: &Track, clips: Vec<Arc<Clip>>) -> Track {
+    Track {
+        id: track.id,
+        kind: track.kind,
+        name: track.name.clone(),
+        enabled: track.enabled,
+        locked: track.locked,
+        clips,
+        transitions: track.transitions.clone(),
+        mute: track.mute,
+        solo: track.solo,
+        gain_db: track.gain_db,
+        gain_keyframes: track.gain_keyframes.clone(),
+        pan: track.pan,
+        audio_effects: track.audio_effects.clone(),
+        output: track.output,
+        sends: track.sends.clone(),
+    }
+}
+
+/// GOAT-6 — connect `connected` to `anchor` so it follows the anchor under
+/// magnetic moves / ripples. Rejects missing clips, self-connection, and
+/// cycles. A clip has at most one anchor — re-connecting replaces it.
+pub fn connect_clip(seq: &Sequence, anchor: ClipId, connected: ClipId) -> Result<Sequence> {
+    find_clip_anywhere(seq, anchor)?;
+    find_clip_anywhere(seq, connected)?;
+    if would_cycle(&seq.connections, anchor, connected) {
+        return Err(TimelineError::invalid(
+            "connection would create a cycle (or self-loop)",
+        ));
+    }
+    let mut conns: Vec<Connection> = seq
+        .connections
+        .iter()
+        .copied()
+        .filter(|c| c.connected != connected)
+        .collect();
+    conns.push(Connection::new(anchor, connected));
+    let mut out = seq.clone();
+    out.connections = conns;
+    Ok(out)
+}
+
+/// Remove the connection (if any) whose `connected` clip is `connected`.
+pub fn disconnect_clip(seq: &Sequence, connected: ClipId) -> Result<Sequence> {
+    if !seq.connections.iter().any(|c| c.connected == connected) {
+        return Ok(seq.clone());
+    }
+    let mut out = seq.clone();
+    out.connections.retain(|c| c.connected != connected);
+    Ok(out)
+}
+
+/// Toggle the sequence's magnetic-timeline mode.
+pub fn set_magnetic(seq: &Sequence, magnetic: bool) -> Sequence {
+    let mut out = seq.clone();
+    out.magnetic = magnetic;
+    out
+}
+
+/// GOAT-6 — move a clip AND its connected subtree by one delta, keeping
+/// the group's internal layout. Cross-track (connected clips on other
+/// tracks move too). Clamps so no moved clip lands before t=0; rejects a
+/// move that would overlap a non-moved clip, or that touches a locked track.
+pub fn magnetic_move_clip(
+    seq: &Sequence,
+    track_id: TrackId,
+    clip_id: ClipId,
+    new_timeline_in: RationalTime,
+) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, track_id)?;
+    let (_, clip) = find_clip(&track, clip_id)?;
+    let _ = idx;
+    let mut delta = sub(new_timeline_in, clip.timeline_in);
+
+    let moved: std::collections::HashSet<ClipId> =
+        connected_subtree(&seq.connections, clip_id).into_iter().collect();
+
+    // Clamp delta so the earliest moved clip stays at or after t=0.
+    let mut earliest = clip.timeline_in;
+    for t in &seq.tracks {
+        for c in &t.clips {
+            if moved.contains(&c.id) && c.timeline_in < earliest {
+                earliest = c.timeline_in;
+            }
+        }
+    }
+    if add(earliest, delta) < RationalTime::ZERO {
+        delta = sub(RationalTime::ZERO, earliest);
+    }
+    if delta == RationalTime::ZERO {
+        return Ok(seq.clone());
+    }
+
+    let mut new_tracks: Vec<Arc<Track>> = Vec::with_capacity(seq.tracks.len());
+    for t in &seq.tracks {
+        let touches = t.clips.iter().any(|c| moved.contains(&c.id));
+        if !touches {
+            new_tracks.push(t.clone());
+            continue;
+        }
+        ensure_unlocked(t)?;
+        let mut new_clips: Vec<Arc<Clip>> = Vec::with_capacity(t.clips.len());
+        for c in &t.clips {
+            if moved.contains(&c.id) {
+                let mut nc = (**c).clone();
+                nc.timeline_in = add(nc.timeline_in, delta);
+                new_clips.push(Arc::new(nc));
+            } else {
+                new_clips.push(c.clone());
+            }
+        }
+        // A moved clip must not collide with a non-moved clip on this track.
+        for a in &new_clips {
+            if !moved.contains(&a.id) {
+                continue;
+            }
+            for b in &new_clips {
+                if a.id == b.id || moved.contains(&b.id) {
+                    continue;
+                }
+                if intervals_overlap(a.timeline_in, a.timeline_out(), b.timeline_in, b.timeline_out()) {
+                    return Err(TimelineError::invalid(
+                        "magnetic move would overlap an existing clip",
+                    ));
+                }
+            }
+        }
+        new_clips.sort_by_key(|c| c.timeline_in);
+        new_tracks.push(Arc::new(rebuild_track(t, new_clips)));
+    }
+    let mut out = seq.clone();
+    out.tracks = new_tracks;
+    Ok(out)
+}
+
+/// GOAT-6 (Cut page) — append `clip` at the track's current end (gapless),
+/// ignoring the clip's own `timeline_in`. Errors on a locked track.
+pub fn append_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Result<Sequence> {
+    let (_, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    let end = track
+        .clips
+        .iter()
+        .map(|c| c.timeline_out())
+        .max()
+        .unwrap_or(RationalTime::ZERO);
+    let mut c = clip;
+    c.timeline_in = end; // duration is source-derived, so it's preserved
+    insert_clip(seq, track_id, c)
+}
+
+/// GOAT-6 — magnetic ripple delete: remove `clip_id` and close the gap
+/// across ALL unlocked tracks (every clip starting at or after the clip's
+/// position shifts left by its duration), keeping the timeline in sync.
+/// Drops any connection that referenced the removed clip.
+pub fn magnetic_ripple_delete(
+    seq: &Sequence,
+    track_id: TrackId,
+    clip_id: ClipId,
+) -> Result<Sequence> {
+    let (ti, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    let (ci, removed) = find_clip(&track, clip_id)?;
+    let at = removed.timeline_in;
+    let dur = removed.duration();
+
+    let mut new_tracks: Vec<Arc<Track>> = Vec::with_capacity(seq.tracks.len());
+    for (idx, t) in seq.tracks.iter().enumerate() {
+        // Locked lanes (other than the edited one) don't ripple.
+        if t.locked && idx != ti {
+            new_tracks.push(t.clone());
+            continue;
+        }
+        let mut new_clips: Vec<Arc<Clip>> = Vec::with_capacity(t.clips.len());
+        for (j, c) in t.clips.iter().enumerate() {
+            if idx == ti && j == ci {
+                continue; // the removed clip
+            }
+            if c.timeline_in >= at {
+                let mut nc = (**c).clone();
+                let shifted = sub(nc.timeline_in, dur);
+                nc.timeline_in = if shifted < RationalTime::ZERO {
+                    RationalTime::ZERO
+                } else {
+                    shifted
+                };
+                new_clips.push(Arc::new(nc));
+            } else {
+                new_clips.push(c.clone());
+            }
+        }
+        new_clips.sort_by_key(|c| c.timeline_in);
+        new_tracks.push(Arc::new(rebuild_track(t, new_clips)));
+    }
+    let mut out = seq.clone();
+    out.tracks = new_tracks;
+    out.connections
+        .retain(|cn| cn.anchor != clip_id && cn.connected != clip_id);
+    Ok(out)
+}
+
+/// GOAT-6 — magnetic ripple insert: open `clip.duration()` of space across
+/// ALL unlocked tracks at `clip.timeline_in` (later clips shift right),
+/// then place `clip` on `track_id`. Errors if the open point falls inside
+/// an existing clip on the target track (pick a cut boundary).
+pub fn magnetic_ripple_insert(seq: &Sequence, track_id: TrackId, clip: Clip) -> Result<Sequence> {
+    let (_, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    let at = clip.timeline_in;
+    let dur = clip.duration();
+
+    let mut new_tracks: Vec<Arc<Track>> = Vec::with_capacity(seq.tracks.len());
+    for t in &seq.tracks {
+        if t.locked {
+            new_tracks.push(t.clone());
+            continue;
+        }
+        let mut new_clips: Vec<Arc<Clip>> = Vec::with_capacity(t.clips.len());
+        for c in &t.clips {
+            if c.timeline_in >= at {
+                let mut nc = (**c).clone();
+                nc.timeline_in = add(nc.timeline_in, dur);
+                new_clips.push(Arc::new(nc));
+            } else {
+                new_clips.push(c.clone());
+            }
+        }
+        new_tracks.push(Arc::new(rebuild_track(t, new_clips)));
+    }
+    let mut out = seq.clone();
+    out.tracks = new_tracks;
+    insert_clip(&out, track_id, clip)
 }
 
 #[cfg(test)]
@@ -2463,6 +2724,8 @@ mod tests {
             markers: seq.markers.clone(),
         master_gain_db: seq.master_gain_db,
         buses: seq.buses.clone(),
+        connections: seq.connections.clone(),
+        magnetic: seq.magnetic,
         }
     }
 
@@ -2753,5 +3016,126 @@ mod tests {
         let seq = insert_clip(&seq, tid, clip).unwrap();
         let seq = lock_first_track_for_test(&seq);
         assert!(set_clip_gain_db(&seq, tid, cid, -3.0).is_err());
+    }
+
+    // ---- GOAT-6: magnetic timeline + connections ----------------------------
+
+    /// A sequence with V1 + V2, one clip each: V1 "a" [0,5), V2 "t" [1,3).
+    fn two_track_with_clips() -> (Sequence, TrackId, TrackId, ClipId, ClipId, MediaItemId) {
+        let (seq, v1, media) = seed_seq();
+        let seq = add_track(&seq, TrackKind::Video, "V2");
+        let v2 = seq.tracks[1].id;
+        let a = Clip::new(media, "a", t(0), t(0), t(5)).unwrap();
+        let aid = a.id;
+        let tt = Clip::new(media, "t", t(1), t(0), t(2)).unwrap();
+        let tid = tt.id;
+        let seq = insert_clip(&seq, v1, a).unwrap();
+        let seq = insert_clip(&seq, v2, tt).unwrap();
+        (seq, v1, v2, aid, tid, media)
+    }
+
+    #[test]
+    fn connect_then_magnetic_move_drags_connected_clip() {
+        let (seq, v1, _v2, aid, tid, _m) = two_track_with_clips();
+        let seq = connect_clip(&seq, aid, tid).unwrap();
+        // Move the anchor "a" from 0 → 4; "t" (connected) shifts +4 too.
+        let seq = magnetic_move_clip(&seq, v1, aid, t(4)).unwrap();
+        let a = seq.tracks[0].clips.iter().find(|c| c.id == aid).unwrap();
+        let tclip = seq.tracks[1].clips.iter().find(|c| c.id == tid).unwrap();
+        assert_eq!(a.timeline_in, t(4), "anchor moved");
+        assert_eq!(tclip.timeline_in, t(5), "connected clip dragged by same delta");
+    }
+
+    #[test]
+    fn connect_rejects_cycle_and_self() {
+        let (seq, _v1, _v2, aid, tid, _m) = two_track_with_clips();
+        assert!(connect_clip(&seq, aid, aid).is_err(), "self-connection");
+        let seq = connect_clip(&seq, aid, tid).unwrap();
+        // t already connected to a; a → t back-edge would cycle.
+        assert!(connect_clip(&seq, tid, aid).is_err(), "cycle");
+    }
+
+    #[test]
+    fn magnetic_move_rejects_overlap_with_unconnected_clip() {
+        let (seq, v1, media) = seed_seq();
+        let a = Clip::new(media, "a", t(0), t(0), t(5)).unwrap();
+        let aid = a.id;
+        let b = Clip::new(media, "b", t(5), t(0), t(5)).unwrap();
+        let seq = insert_clip(&seq, v1, a).unwrap();
+        let seq = insert_clip(&seq, v1, b).unwrap();
+        // Moving "a" right by 2 → [2,7) overlaps "b" [5,10).
+        assert!(magnetic_move_clip(&seq, v1, aid, t(2)).is_err());
+    }
+
+    #[test]
+    fn append_places_at_gapless_end() {
+        let (seq, v1, media) = seed_seq();
+        let a = Clip::new(media, "a", t(0), t(0), t(5)).unwrap();
+        let seq = insert_clip(&seq, v1, a).unwrap();
+        // Append ignores the clip's own timeline_in (here 99).
+        let b = Clip::new(media, "b", t(99), t(0), t(3)).unwrap();
+        let bid = b.id;
+        let seq = append_clip(&seq, v1, b).unwrap();
+        let b = seq.tracks[0].clips.iter().find(|c| c.id == bid).unwrap();
+        assert_eq!(b.timeline_in, t(5), "appended right after the last clip");
+        assert_eq!(b.timeline_out(), t(8));
+    }
+
+    #[test]
+    fn magnetic_ripple_delete_closes_gap_on_all_tracks() {
+        let (seq, v1, v2, aid, tid, media) = two_track_with_clips();
+        // Add a second V1 clip after "a": "a2" [5,9).
+        let a2 = Clip::new(media, "a2", t(5), t(0), t(4)).unwrap();
+        let a2id = a2.id;
+        let seq = insert_clip(&seq, v1, a2).unwrap();
+        // Delete "a" (dur 5) → a2 shifts left 5 → [0,4); V2 "t" (at 1 ≥ 0)
+        // shifts left 5 but clamps to 0.
+        let _ = v2;
+        let seq = magnetic_ripple_delete(&seq, v1, aid).unwrap();
+        assert!(seq.tracks[0].clips.iter().all(|c| c.id != aid), "a removed");
+        let a2 = seq.tracks[0].clips.iter().find(|c| c.id == a2id).unwrap();
+        assert_eq!(a2.timeline_in, t(0), "later V1 clip rippled left by 5");
+        let tclip = seq.tracks[1].clips.iter().find(|c| c.id == tid).unwrap();
+        assert_eq!(tclip.timeline_in, t(0), "V2 clip rippled (clamped to 0)");
+    }
+
+    #[test]
+    fn magnetic_ripple_insert_opens_space_on_all_tracks() {
+        let (seq, v1, v2, aid, tid, media) = two_track_with_clips();
+        let _ = (aid, v2);
+        // Insert a 3s clip at t=0 on V1: everything at/after 0 shifts +3.
+        let ins = Clip::new(media, "ins", t(0), t(0), t(3)).unwrap();
+        let seq = magnetic_ripple_insert(&seq, v1, ins).unwrap();
+        // V1 "a" was [0,5) → now [3,8); V2 "t" was [1,3) → now [4,6).
+        let a = seq.tracks[0].clips.iter().find(|c| c.id == aid).unwrap();
+        assert_eq!(a.timeline_in, t(3), "V1 clip shifted right");
+        let tclip = seq.tracks[1].clips.iter().find(|c| c.id == tid).unwrap();
+        assert_eq!(tclip.timeline_in, t(4), "V2 clip shifted right too");
+    }
+
+    #[test]
+    fn magnetic_edit_ops_undo_redo() {
+        use crate::edit_log::{EditLog, EditOp};
+        let (seq, v1, _v2, aid, tid, _m) = two_track_with_clips();
+        let mut log = EditLog::new(seq);
+        log.apply(EditOp::ConnectClip { anchor: aid, connected: tid }).unwrap();
+        log.apply(EditOp::MagneticMoveClip {
+            track_id: v1,
+            clip_id: aid,
+            new_timeline_in: t(4),
+        })
+        .unwrap();
+        assert_eq!(
+            log.current().tracks[1].clips[0].timeline_in,
+            t(5),
+            "connected clip moved with anchor"
+        );
+        log.undo().unwrap();
+        assert_eq!(log.current().tracks[1].clips[0].timeline_in, t(1), "move undone");
+        log.undo().unwrap();
+        assert!(log.current().connections.is_empty(), "connect undone");
+        log.redo().unwrap();
+        log.redo().unwrap();
+        assert_eq!(log.current().tracks[1].clips[0].timeline_in, t(5), "redo");
     }
 }

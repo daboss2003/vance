@@ -516,6 +516,54 @@ pub enum EditOp {
         /// Zero-based index into `AudioBus.sends`.
         index: usize,
     },
+    /// GOAT-6 — connect `connected` to `anchor` (FCPX-style attachment).
+    ConnectClip {
+        /// The driving clip.
+        anchor: ClipId,
+        /// The clip that follows it.
+        connected: ClipId,
+    },
+    /// GOAT-6 — remove the connection whose `connected` clip is this one.
+    DisconnectClip {
+        /// The follower clip to detach.
+        connected: ClipId,
+    },
+    /// GOAT-6 — toggle the sequence's magnetic-timeline mode.
+    SetMagnetic {
+        /// New mode.
+        magnetic: bool,
+    },
+    /// GOAT-6 — move a clip + its connected subtree together.
+    MagneticMoveClip {
+        /// Track of the dragged clip.
+        track_id: TrackId,
+        /// The dragged clip.
+        clip_id: ClipId,
+        /// New timeline-in for the dragged clip (the group shifts by the
+        /// same delta).
+        new_timeline_in: RationalTime,
+    },
+    /// GOAT-6 (Cut page) — append a clip at the track's gapless end.
+    AppendClip {
+        /// Destination track.
+        track_id: TrackId,
+        /// The clip to append (its `timeline_in` is ignored).
+        clip: Clip,
+    },
+    /// GOAT-6 — ripple-delete a clip, closing the gap across all tracks.
+    MagneticRippleDelete {
+        /// Track of the clip.
+        track_id: TrackId,
+        /// The clip to delete.
+        clip_id: ClipId,
+    },
+    /// GOAT-6 — ripple-insert a clip, opening space across all tracks.
+    MagneticRippleInsert {
+        /// Destination track.
+        track_id: TrackId,
+        /// The clip (placed at its `timeline_in`).
+        clip: Clip,
+    },
 }
 
 /// Apply a single op to a sequence, returning the new sequence.
@@ -728,6 +776,21 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
         } => ops::update_bus_insert(seq, *bus_id, *index, effect.clone()),
         EditOp::AddBusSend { bus_id, send } => ops::add_bus_send(seq, *bus_id, *send),
         EditOp::RemoveBusSend { bus_id, index } => ops::remove_bus_send(seq, *bus_id, *index),
+        EditOp::ConnectClip { anchor, connected } => ops::connect_clip(seq, *anchor, *connected),
+        EditOp::DisconnectClip { connected } => ops::disconnect_clip(seq, *connected),
+        EditOp::SetMagnetic { magnetic } => Ok(ops::set_magnetic(seq, *magnetic)),
+        EditOp::MagneticMoveClip {
+            track_id,
+            clip_id,
+            new_timeline_in,
+        } => ops::magnetic_move_clip(seq, *track_id, *clip_id, *new_timeline_in),
+        EditOp::AppendClip { track_id, clip } => ops::append_clip(seq, *track_id, clip.clone()),
+        EditOp::MagneticRippleDelete { track_id, clip_id } => {
+            ops::magnetic_ripple_delete(seq, *track_id, *clip_id)
+        }
+        EditOp::MagneticRippleInsert { track_id, clip } => {
+            ops::magnetic_ripple_insert(seq, *track_id, clip.clone())
+        }
     }
 }
 
@@ -1017,6 +1080,19 @@ fn op_label(op: &EditOp) -> String {
         EditOp::UpdateBusInsert { .. } => "Adjust bus insert".into(),
         EditOp::AddBusSend { .. } => "Add bus send".into(),
         EditOp::RemoveBusSend { .. } => "Remove bus send".into(),
+        EditOp::ConnectClip { .. } => "Connect clip".into(),
+        EditOp::DisconnectClip { .. } => "Disconnect clip".into(),
+        EditOp::SetMagnetic { magnetic } => {
+            if *magnetic {
+                "Enable magnetic timeline".into()
+            } else {
+                "Disable magnetic timeline".into()
+            }
+        }
+        EditOp::MagneticMoveClip { .. } => "Move (magnetic)".into(),
+        EditOp::AppendClip { .. } => "Append clip".into(),
+        EditOp::MagneticRippleDelete { .. } => "Ripple delete (all tracks)".into(),
+        EditOp::MagneticRippleInsert { .. } => "Ripple insert (all tracks)".into(),
     }
 }
 

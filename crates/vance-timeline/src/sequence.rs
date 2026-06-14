@@ -44,6 +44,16 @@ pub struct Sequence {
     /// no buses (every track straight to master, the Phase-7 behaviour).
     #[serde(default)]
     pub buses: Vec<crate::bus::AudioBus>,
+    /// GOAT-6: clip connections (FCPX-style) — `connected` clips follow
+    /// their `anchor` under magnetic moves/ripples. `#[serde(default)]` so
+    /// older bundles open with none.
+    #[serde(default)]
+    pub connections: Vec<crate::connection::Connection>,
+    /// GOAT-6: magnetic-timeline mode. When `true`, the editor's default
+    /// edits ripple across all tracks and keep connected clips locked to
+    /// their anchors. `#[serde(default)]` = off (classic per-track model).
+    #[serde(default)]
+    pub magnetic: bool,
 }
 
 impl Sequence {
@@ -57,6 +67,8 @@ impl Sequence {
             markers: Vec::new(),
             master_gain_db: 0.0,
             buses: Vec::new(),
+            connections: Vec::new(),
+            magnetic: false,
         }
     }
 
@@ -141,6 +153,8 @@ mod tests {
             markers: Vec::new(),
             master_gain_db: 0.0,
             buses: Vec::new(),
+            connections: Vec::new(),
+            magnetic: false,
         };
         assert_eq!(seq.duration(), t(7));
         assert_eq!(seq.clip_count(), 2);
