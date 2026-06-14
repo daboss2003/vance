@@ -7,6 +7,12 @@
 
 use crate::model::{Align, Rgba};
 
+/// Hard ceiling on any rasterized dimension. Bounds memory from a
+/// degenerate or hostile canvas / layer size (an unclamped 100000²
+/// canvas would try to allocate ~40 GB). `16384²×4` fits comfortably in
+/// `usize`, so size math can't overflow once both axes are clamped here.
+pub const MAX_DIM: u32 = 16384;
+
 /// A straight-alpha RGBA8 image, row-major, 4 bytes/pixel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RgbaImage {
@@ -19,8 +25,11 @@ pub struct RgbaImage {
 }
 
 impl RgbaImage {
-    /// A fully-transparent image.
+    /// A fully-transparent image. Dimensions are clamped to `[1, MAX_DIM]`
+    /// so no caller can trigger an unbounded allocation or size overflow.
     pub fn new(width: u32, height: u32) -> Self {
+        let width = width.clamp(1, MAX_DIM);
+        let height = height.clamp(1, MAX_DIM);
         RgbaImage {
             width,
             height,
@@ -167,8 +176,10 @@ fn quantize(c: Rgba) -> [u8; 4] {
 /// `color`, into a fresh image (1px of analytic antialiasing at edges).
 pub fn rounded_rect(w: u32, h: u32, radius: f32, color: Rgba) -> RgbaImage {
     let mut img = RgbaImage::new(w.max(1), h.max(1));
-    let hw = w as f32 / 2.0;
-    let hh = h as f32 / 2.0;
+    // Derive the SDF box from the (clamped) image dims so a huge requested
+    // size stays self-consistent instead of placing the box off-canvas.
+    let hw = img.width as f32 / 2.0;
+    let hh = img.height as f32 / 2.0;
     let r = radius.clamp(0.0, hw.min(hh));
     for y in 0..img.height {
         for x in 0..img.width {
@@ -229,28 +240,90 @@ pub fn render_text(
         };
     }
 
-    // Measure.
+    // Advance-based line widths drive ALIGNMENT (the pen layout); the
+    // block itself is sized to the union glyph INK bbox below so no
+    // glyph edge is ever clipped (negative left bearing, ink above the
+    // ascent, right overhang past the advance, descenders below).
     let widths: Vec<f32> = lines.iter().map(|l| line_width(font, l, size, tracking)).collect();
-    let block_w = widths
-        .iter()
-        .cloned()
-        .fold(1.0f32, f32::max)
-        .ceil()
-        .max(1.0);
-    let block_h = (line_h * lines.len() as f32).ceil().max(1.0);
-    let mut img = RgbaImage::new(block_w as u32, block_h as u32);
+    let content_w = widths.iter().cloned().fold(1.0f32, f32::max).max(1.0);
 
+    // Pass 1 — place + rasterize every glyph, tracking the ink bbox.
+    struct Placed {
+        left: f32,
+        top: f32,
+        w: usize,
+        h: usize,
+        bitmap: Vec<u8>,
+    }
+    let mut placed: Vec<Placed> = Vec::new();
+    let (mut min_x, mut min_y, mut max_x, mut max_y) =
+        (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
     for (li, line) in lines.iter().enumerate() {
         let lw = widths[li];
         let x_start = match align {
             Align::Left => 0.0,
-            Align::Center => (block_w - lw) / 2.0,
-            Align::Right => block_w - lw,
+            Align::Center => (content_w - lw) / 2.0,
+            Align::Right => content_w - lw,
         };
         let baseline = li as f32 * line_h + ascent;
-        draw_line(&mut img, font, line, size, color, tracking, x_start, baseline);
+        let mut x = x_start;
+        let mut prev: Option<char> = None;
+        for ch in line.chars() {
+            if let Some(p) = prev {
+                x += font.horizontal_kern(p, ch, size).unwrap_or(0.0);
+            }
+            let (m, bitmap) = font.rasterize(ch, size);
+            if m.width > 0 && m.height > 0 {
+                let left = x + m.xmin as f32;
+                let top = baseline - (m.height as f32 + m.ymin as f32);
+                min_x = min_x.min(left);
+                min_y = min_y.min(top);
+                max_x = max_x.max(left + m.width as f32);
+                max_y = max_y.max(top + m.height as f32);
+                placed.push(Placed {
+                    left,
+                    top,
+                    w: m.width,
+                    h: m.height,
+                    bitmap,
+                });
+            }
+            x += m.advance_width + tracking;
+            prev = Some(ch);
+        }
+    }
+    if placed.is_empty() {
+        // Whitespace-only text has no ink.
+        return TextBlock {
+            image: RgbaImage::new(1, 1),
+        };
     }
 
+    // Pass 2 — size the block to the ink bbox (clamped to a sane max) and
+    // blit each glyph offset into it.
+    let ox = min_x.floor();
+    let oy = min_y.floor();
+    let bw = ((max_x.ceil() - ox).max(1.0) as u32).min(MAX_DIM);
+    let bh = ((max_y.ceil() - oy).max(1.0) as u32).min(MAX_DIM);
+    let mut img = RgbaImage::new(bw, bh);
+    for p in &placed {
+        let dx = p.left - ox;
+        let dy = p.top - oy;
+        for gy in 0..p.h {
+            for gx in 0..p.w {
+                let cov = p.bitmap[gy * p.w + gx] as f32 / 255.0;
+                if cov <= 0.0 {
+                    continue;
+                }
+                let px = (dx + gx as f32).floor();
+                let py = (dy + gy as f32).floor();
+                if px < 0.0 || py < 0.0 || px as u32 >= bw || py as u32 >= bh {
+                    continue;
+                }
+                img.paint(px as u32, py as u32, color, cov);
+            }
+        }
+    }
     TextBlock { image: img }
 }
 
@@ -266,44 +339,6 @@ fn line_width(font: &fontdue::Font, line: &str, size: f32, tracking: f32) -> f32
         prev = Some(ch);
     }
     w
-}
-
-fn draw_line(
-    img: &mut RgbaImage,
-    font: &fontdue::Font,
-    line: &str,
-    size: f32,
-    color: Rgba,
-    tracking: f32,
-    x_start: f32,
-    baseline: f32,
-) {
-    let mut x = x_start;
-    let mut prev: Option<char> = None;
-    for ch in line.chars() {
-        if let Some(p) = prev {
-            x += font.horizontal_kern(p, ch, size).unwrap_or(0.0);
-        }
-        let (metrics, bitmap) = font.rasterize(ch, size);
-        let glyph_left = x + metrics.xmin as f32;
-        let glyph_top = baseline - (metrics.height as f32 + metrics.ymin as f32);
-        for gy in 0..metrics.height {
-            for gx in 0..metrics.width {
-                let cov = bitmap[gy * metrics.width + gx] as f32 / 255.0;
-                if cov <= 0.0 {
-                    continue;
-                }
-                let px = (glyph_left + gx as f32).floor();
-                let py = (glyph_top + gy as f32).floor();
-                if px < 0.0 || py < 0.0 || px as u32 >= img.width || py as u32 >= img.height {
-                    continue;
-                }
-                img.paint(px as u32, py as u32, color, cov);
-            }
-        }
-        x += metrics.advance_width + tracking;
-        prev = Some(ch);
-    }
 }
 
 /// Split into display lines: hard breaks on `\n`, then greedy word-wrap
@@ -481,6 +516,45 @@ mod tests {
         composite(&mut canvas, &layer, x);
         assert!(alpha(&canvas, 30, 30) > 250, "opaque under the anchor");
         assert_eq!(alpha(&canvas, 5, 5), 0, "far from the layer is empty");
+    }
+
+    #[test]
+    fn text_block_captures_full_glyph_ink() {
+        // Regression (GOAT-5 review): the block is sized to the union glyph
+        // ink bbox, so leading negative-bearing glyphs, ink above the
+        // ascent, and right overhang are NOT clipped. We can't assume a
+        // specific font, so assert the structural invariant: the leftmost
+        // AND topmost AND rightmost AND bottommost ink rows/cols all carry
+        // coverage (the bbox is tight), for a glyph set spanning extremes.
+        let candidates = [
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/Library/Fonts/Arial.ttf",
+        ];
+        let Some(bytes) = candidates.iter().find_map(|p| std::fs::read(p).ok()) else {
+            return; // no font on this host — skip
+        };
+        let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).unwrap();
+        // 'jÉf' exercises left bearing (j), tall ink (É), right overhang (f).
+        let block = render_text(&font, "jÉf", 120.0, [1.0, 1.0, 1.0, 1.0], Align::Left, 1.2, 0.0, None);
+        let img = &block.image;
+        let has_ink_col = |x: u32| (0..img.height).any(|y| alpha(img, x, y) > 0);
+        let has_ink_row = |y: u32| (0..img.width).any(|x| alpha(img, x, y) > 0);
+        assert!(img.width >= 2 && img.height >= 2);
+        // Left bearing + top ascent are the genuine old clip bugs: ink must
+        // reach the very first column/row.
+        assert!(has_ink_col(0), "leftmost column must carry ink (left bearing not clipped)");
+        assert!(has_ink_row(0), "topmost row must carry ink (ink above ascent not clipped)");
+        // Right overhang + descender: ink must reach the last column/row
+        // (allowing the ≤1px ceil pad on the far edge).
+        assert!(
+            has_ink_col(img.width - 1) || has_ink_col(img.width - 2),
+            "right overhang must be present (not clipped)"
+        );
+        assert!(
+            has_ink_row(img.height - 1) || has_ink_row(img.height - 2),
+            "descender must be present (not clipped)"
+        );
     }
 
     #[test]

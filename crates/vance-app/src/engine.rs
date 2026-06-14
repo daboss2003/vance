@@ -1348,6 +1348,9 @@ enum StartPlaybackKind {
         instance: Box<vance_mograph::MographInstance>,
         fps: f64,
         duration_seconds: f64,
+        /// Clip-relative time playback resumed at (so animation continues
+        /// from where the playhead was, not from the rig's start).
+        start_offset_sec: f64,
     },
 }
 
@@ -2176,13 +2179,19 @@ impl Engine {
                 instance,
                 fps,
                 duration_seconds,
+                start_offset_sec,
             } => {
                 // GOAT-5 — share the engine's font cache with the loop and
                 // re-rasterize per tick (mograph is silent in v1, like
-                // titles).
+                // titles). The first frame is at the resume offset.
                 let engine = self.mograph_engine();
-                let frame =
-                    vance_render::render_mograph_yuv420(&engine, &instance, 0.0, fps, duration_seconds);
+                let frame = vance_render::render_mograph_yuv420(
+                    &engine,
+                    &instance,
+                    start_offset_sec,
+                    fps,
+                    duration_seconds,
+                );
                 (
                     PlaybackPrimary::MoGraph {
                         engine,
@@ -2190,6 +2199,7 @@ impl Engine {
                         frame,
                         fps,
                         duration_seconds,
+                        start_offset_sec,
                     },
                     None,
                     None,
@@ -3236,6 +3246,10 @@ impl Engine {
         let (anchor_tl_in, anchor_src_in) =
             clip_anchor_seconds(seq, from_clip_id).unwrap_or((0.0, 0.0));
         let from_clip_t = rt_to_seconds(active_tr.from.source_pts) - anchor_src_in;
+        // B-side clip-relative time, for an animated mograph on the incoming
+        // side (source_pts − its own source_in; a trimmed B has source_in>0).
+        let (_, to_src_in) = clip_anchor_seconds(seq, active_tr.to.clip_id).unwrap_or((0.0, 0.0));
+        let to_clip_t = rt_to_seconds(active_tr.to.source_pts) - to_src_in;
         let op = clip_opacity_at(seq, from_clip_id, from_clip_t);
         let xform = clip_transform_at(seq, from_clip_id, from_clip_t);
         let crop = clip_crop_at(seq, from_clip_id, from_clip_t);
@@ -3309,11 +3323,7 @@ impl Engine {
             }
             MediaResolved::Title(params) => render_title_yuv420(&params)
                 .map_err(|e| EngineError::Project(format!("title render: {e}")))?,
-            MediaResolved::MoGraph(inst) => {
-                // B-side clip-relative time; synthetic clips start at
-                // source_in 0 so source_pts is the in-clip time.
-                self.render_mograph_frame(&inst, rt_to_seconds(active_tr.to.source_pts))
-            }
+            MediaResolved::MoGraph(inst) => self.render_mograph_frame(&inst, to_clip_t),
         };
 
         // Push effect uniforms + mix factor to the renderer. The
@@ -3463,6 +3473,7 @@ impl Engine {
                 instance,
                 fps: self.current_sequence_fps().unwrap_or(30.0),
                 duration_seconds: remaining_dur,
+                start_offset_sec: entry_offset,
             },
         };
         self.start_playback_inner(kind)
@@ -3723,6 +3734,7 @@ impl Engine {
         &mut self,
         media_id: MediaItemId,
         source_pts_sec: f64,
+        source_in_sec: f64,
     ) -> Option<vance_decoder::FrameData> {
         let resolved = self.media_for_active(media_id).ok()?;
         match resolved {
@@ -3749,9 +3761,12 @@ impl Engine {
                 dec.decode_at(target_pts).ok()
             }
             MediaResolved::Title(params) => render_title_yuv420(&params).ok(),
-            // Synthetic clips start at source_in 0, so `source_pts_sec` is
-            // the clip-relative time — the mograph animates across export.
-            MediaResolved::MoGraph(inst) => Some(self.render_mograph_frame(&inst, source_pts_sec)),
+            // Clip-relative time = source_pts − source_in (a trimmed/split
+            // mograph clip has source_in > 0), so the exported animation
+            // phase matches the live preview.
+            MediaResolved::MoGraph(inst) => {
+                Some(self.render_mograph_frame(&inst, source_pts_sec - source_in_sec))
+            }
         }
     }
 
@@ -7277,8 +7292,11 @@ pub enum PlaybackPrimary {
         frame: vance_decoder::FrameData,
         /// Playback frame rate.
         fps: f64,
-        /// Total duration of the clip on the timeline.
+        /// Remaining duration to play from the resume offset.
         duration_seconds: f64,
+        /// Clip-relative time playback resumed at; added to the loop's
+        /// elapsed time so the rig animates from the playhead, not t=0.
+        start_offset_sec: f64,
     },
 }
 
@@ -7478,6 +7496,7 @@ fn playback_loop(
                 frame,
                 fps,
                 duration_seconds,
+                start_offset_sec,
             } => {
                 // GOAT-5 — re-rasterize the rig at the elapsed clip time so
                 // the template animates, then present like a title frame.
@@ -7496,10 +7515,12 @@ fn playback_loop(
                     }
                     break;
                 }
+                // Render at the ABSOLUTE clip time = resume offset + elapsed,
+                // so starting playback mid-clip continues the animation.
                 *frame = vance_render::render_mograph_yuv420(
                     engine,
                     instance,
-                    elapsed_sec,
+                    *start_offset_sec + elapsed_sec,
                     *fps,
                     *duration_seconds,
                 );
@@ -8127,12 +8148,16 @@ impl Engine {
                         // (the B decode may swap the primary decoder's open
                         // file, but A's frame is already on the GPU), apply
                         // A's native effects, set the mix factor, read back.
-                        if let Some(frame_a) = self.decode_clip_framedata(from_media, from_src_pts) {
+                        if let Some(frame_a) =
+                            self.decode_clip_framedata(from_media, from_src_pts, from_src_in)
+                        {
                             {
                                 let mut rs = render_state_arc.lock();
                                 let _ = rs.renderer.upload_frame(&frame_a);
                             }
-                            if let Some(frame_b) = self.decode_clip_framedata(to_media, to_src_pts) {
+                            if let Some(frame_b) =
+                                self.decode_clip_framedata(to_media, to_src_pts, to_src_in)
+                            {
                                 let mut rs = render_state_arc.lock();
                                 let _ = rs.renderer.upload_frame_b(&frame_b);
                             }
@@ -8179,7 +8204,11 @@ impl Engine {
                 // Single clip: decode (File or Title), apply native
                 // effects, read back.
                 let entry_clip_t = active_source_pts_seconds - clip_source_in_seconds;
-                if let Some(frame) = self.decode_clip_framedata(media_id, active_source_pts_seconds) {
+                if let Some(frame) = self.decode_clip_framedata(
+                    media_id,
+                    active_source_pts_seconds,
+                    clip_source_in_seconds,
+                ) {
                     {
                         let mut rs = render_state_arc.lock();
                         let _ = rs.renderer.upload_frame(&frame);
@@ -8637,7 +8666,7 @@ impl Engine {
         width: u32,
         height: u32,
     ) -> Option<(Vec<u8>, i64)> {
-        let frame = self.decode_clip_framedata(media_id, source_pts_sec)?;
+        let frame = self.decode_clip_framedata(media_id, source_pts_sec, source_in_sec)?;
         let pts = frame.pts;
         let rs_arc = self.render_state.clone()?;
         {
