@@ -6351,6 +6351,10 @@ fn track_to_mix(track: &Track) -> vance_audio::TrackMix {
             .iter()
             .map(translate_audio_effect)
             .collect(),
+        output_bus: match track.output {
+            vance_timeline::BusOutput::Master => None,
+            vance_timeline::BusOutput::Bus(id) => Some(id.as_uuid()),
+        },
     }
 }
 
@@ -6520,6 +6524,20 @@ fn build_mixer_snapshot(sequence: &vance_timeline::Sequence) -> vance_audio::Mix
         }
     }
     snap.solo_anywhere = solo_anywhere;
+    // GOAT-4: per-bus fader gain + routing for the output-bus chain.
+    for bus in &sequence.buses {
+        snap.buses.insert(
+            bus.id.as_uuid(),
+            vance_audio::BusMix {
+                gain_linear: vance_audio::db_to_linear(bus.gain_db),
+                mute: bus.mute,
+                output_bus: match bus.output {
+                    vance_timeline::BusOutput::Master => None,
+                    vance_timeline::BusOutput::Bus(id) => Some(id.as_uuid()),
+                },
+            },
+        );
+    }
     // Phase 7.4: the master fader value lives on the Sequence. Empty
     // / freshly-deserialized pre-7.4 sequences default to 0 dB →
     // unity, so behavior is unchanged for old bundles.

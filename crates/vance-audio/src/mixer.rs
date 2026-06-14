@@ -895,6 +895,24 @@ pub struct TrackMix {
     /// mid-signal without resetting the compressor envelope or
     /// flushing the biquad delay lines.
     pub audio_effects: Vec<AudioEffectKind>,
+    /// GOAT-4: the submix bus this track's main output routes to, or
+    /// `None` for the master. Applied as a gain chain AFTER the track's
+    /// own insert DSP (so it composes correctly with a nonlinear
+    /// compressor/limiter on the track).
+    pub output_bus: Option<Uuid>,
+}
+
+/// GOAT-4 — per-bus mix state inside a [`MixerSnapshot`]. v1 models the
+/// bus FADER (gain), mute, and main-output routing; bus pan + bus insert
+/// DSP are a follow-up.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BusMix {
+    /// Bus fader gain, linear (precomputed from dB at build time).
+    pub gain_linear: f32,
+    /// Bus mute — silences everything routed through it.
+    pub mute: bool,
+    /// Where the bus's main output goes: another bus, or `None` = master.
+    pub output_bus: Option<Uuid>,
 }
 
 /// Per-clip mixer state inside a [`MixerSnapshot`]. The fold thread
@@ -954,6 +972,9 @@ pub struct MixerSnapshot {
     pub tracks: HashMap<Uuid, TrackMix>,
     /// Per-clip mix params, keyed by clip uuid.
     pub clips: HashMap<Uuid, ClipMix>,
+    /// GOAT-4: per-bus mix params, keyed by bus uuid. Empty = no buses
+    /// (every track straight to master, the Phase-7 topology).
+    pub buses: HashMap<Uuid, BusMix>,
     /// True iff at least one track has `solo == true`. Precomputed at
     /// snapshot build time so the fold thread doesn't sweep the tracks
     /// map per frame.
@@ -971,9 +992,35 @@ impl MixerSnapshot {
         Self {
             tracks: HashMap::new(),
             clips: HashMap::new(),
+            buses: HashMap::new(),
             solo_anywhere: false,
             master_gain_linear: 1.0,
         }
+    }
+
+    /// GOAT-4: product of bus fader gains along a track/bus output chain
+    /// to the master. `None` (route to master) returns 1.0. Returns 0.0 if
+    /// any bus on the path is muted, missing, or the chain exceeds a sane
+    /// depth (defensive cycle guard — the edit layer already rejects
+    /// cycles). Applied AFTER track-insert DSP in the fold.
+    pub fn bus_chain_gain(&self, mut bus: Option<Uuid>) -> f32 {
+        let mut g = 1.0;
+        let mut steps = 0u32;
+        while let Some(id) = bus {
+            steps += 1;
+            if steps > 64 {
+                return 0.0;
+            }
+            let Some(b) = self.buses.get(&id) else {
+                return 0.0;
+            };
+            if b.mute {
+                return 0.0;
+            }
+            g *= b.gain_linear;
+            bus = b.output_bus;
+        }
+        g
     }
 
     /// Effective linear gain for `clip_id`'s contribution to the output
@@ -1053,7 +1100,11 @@ impl MixerSnapshot {
             clip.clip_duration_seconds,
             t_clip,
         );
-        track_g * clip_g * fade_in_g * fade_out_g * self.master_gain_linear
+        // GOAT-4: route through the track's output-bus chain (gain/mute)
+        // before the master fader. 1.0 when the track goes straight to
+        // master (the common case).
+        let bus_g = self.bus_chain_gain(track.output_bus);
+        track_g * clip_g * fade_in_g * fade_out_g * bus_g * self.master_gain_linear
     }
 }
 
@@ -1945,8 +1996,14 @@ fn fold_loop(
                 // Meter the POST-EFFECT track signal — what the user
                 // actually hears at the track row.
                 track_accums.entry(track_id).or_default().observe(l, r);
-                master_pre_master[0] += l;
-                master_pre_master[1] += r;
+                // GOAT-4: route through the output-bus chain (gain/mute)
+                // AFTER the track inserts, BEFORE the master fader.
+                let bus_g = snap
+                    .tracks
+                    .get(&track_id)
+                    .map_or(1.0, |t| snap.bus_chain_gain(t.output_bus));
+                master_pre_master[0] += l * bus_g;
+                master_pre_master[1] += r * bus_g;
             }
             let master_l = master_pre_master[0] * snap.master_gain_linear;
             let master_r = master_pre_master[1] * snap.master_gain_linear;
@@ -2021,6 +2078,7 @@ mod tests {
             mute: false,
             solo: false,
             audio_effects: Vec::new(),
+            output_bus: None,
         }
     }
 
@@ -2077,6 +2135,65 @@ mod tests {
         let out = fold_frame(&snap, &[(ca, [0.4, -0.4]), (cb, [0.3, -0.3])]);
         assert!((out[0] - 0.7).abs() < 1e-6);
         assert!((out[1] - (-0.7)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fold_frame_routes_through_bus_gain_and_mute() {
+        // GOAT-4: a track routed to a -6 dB bus halves its contribution.
+        let t = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let bus = Uuid::new_v4();
+        let mut track = unity_track();
+        track.output_bus = Some(bus);
+        let mut snap = snapshot_with(&[(t, track)], &[(c, unity_clip(t))]);
+        snap.buses.insert(
+            bus,
+            BusMix {
+                gain_linear: db_to_linear(-6.0),
+                mute: false,
+                output_bus: None,
+            },
+        );
+        let out = fold_frame(&snap, &[(c, [1.0, -1.0])]);
+        assert!((out[0] - db_to_linear(-6.0)).abs() < 1e-4, "bus gain not applied: {}", out[0]);
+
+        // Muting the bus silences everything routed through it.
+        snap.buses.get_mut(&bus).unwrap().mute = true;
+        assert_eq!(fold_frame(&snap, &[(c, [1.0, -1.0])]), [0.0, 0.0]);
+    }
+
+    #[test]
+    fn fold_frame_chains_bus_gains_to_master() {
+        // track → busA(-6 dB) → busB(-6 dB) → master ⇒ ×0.25.
+        let t = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut track = unity_track();
+        track.output_bus = Some(a);
+        let mut snap = snapshot_with(&[(t, track)], &[(c, unity_clip(t))]);
+        snap.buses.insert(
+            a,
+            BusMix { gain_linear: db_to_linear(-6.0), mute: false, output_bus: Some(b) },
+        );
+        snap.buses.insert(
+            b,
+            BusMix { gain_linear: db_to_linear(-6.0), mute: false, output_bus: None },
+        );
+        let expect = db_to_linear(-6.0) * db_to_linear(-6.0);
+        let out = fold_frame(&snap, &[(c, [1.0, 0.0])]);
+        assert!((out[0] - expect).abs() < 1e-4, "chained bus gain: {} vs {expect}", out[0]);
+    }
+
+    #[test]
+    fn bus_chain_gain_is_defensive() {
+        let mut snap = MixerSnapshot::empty();
+        assert_eq!(snap.bus_chain_gain(None), 1.0, "route-to-master is unity");
+        assert_eq!(snap.bus_chain_gain(Some(Uuid::new_v4())), 0.0, "missing bus is silent");
+        // A→B→A cycle is caught by the depth guard → 0.
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        snap.buses.insert(a, BusMix { gain_linear: 1.0, mute: false, output_bus: Some(b) });
+        snap.buses.insert(b, BusMix { gain_linear: 1.0, mute: false, output_bus: Some(a) });
+        assert_eq!(snap.bus_chain_gain(Some(a)), 0.0);
     }
 
     #[test]
