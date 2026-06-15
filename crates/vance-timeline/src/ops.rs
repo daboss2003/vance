@@ -364,7 +364,9 @@ pub fn overwrite_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Result<S
         output: track.output,
         sends: track.sends.clone(),
     };
-    Ok(replace_track(seq, idx, new_track))
+    // Overwriting re-IDs trimmed survivors / removes covered clips, so any
+    // connection to a vanished id is pruned (GOAT-6 integrity).
+    Ok(prune_dangling_connections(replace_track(seq, idx, new_track)))
 }
 
 // ---- clip removal -----------------------------------------------------------
@@ -395,7 +397,7 @@ pub fn remove_clip(seq: &Sequence, track_id: TrackId, clip_id: ClipId) -> Result
         output: track.output,
         sends: track.sends.clone(),
     };
-    Ok(replace_track(seq, idx, new_track))
+    Ok(prune_dangling_connections(replace_track(seq, idx, new_track)))
 }
 
 /// Remove `clip_id` from `track_id` and shift every later clip on the
@@ -441,7 +443,7 @@ pub fn ripple_remove_clip(
         output: track.output,
         sends: track.sends.clone(),
     };
-    Ok(replace_track(seq, idx, new_track))
+    Ok(prune_dangling_connections(replace_track(seq, idx, new_track)))
 }
 
 // ---- per-clip edits ---------------------------------------------------------
@@ -1578,7 +1580,8 @@ pub fn split(
     left.source_out = split_source;
 
     let mut right = (*c).clone();
-    right.id = ClipId::new();
+    let right_id = ClipId::new();
+    right.id = right_id;
     right.source_in = split_source;
     right.timeline_in = at_timeline;
 
@@ -1603,7 +1606,18 @@ pub fn split(
         output: track.output,
         sends: track.sends.clone(),
     };
-    Ok(replace_track(seq, idx, new_track))
+    let mut out = replace_track(seq, idx, new_track);
+    // GOAT-6: splitting a CONNECTED clip should keep BOTH halves attached to
+    // their anchor (else the right half tears free under a magnetic move).
+    // Duplicate every inbound connection onto the right half's new id.
+    let inherited: Vec<Connection> = out
+        .connections
+        .iter()
+        .filter(|c| c.connected == clip_id)
+        .map(|c| Connection::new(c.anchor, right_id))
+        .collect();
+    out.connections.extend(inherited);
+    Ok(out)
 }
 
 // ---- Transitions (Phase 5.4) -----------------------------------------------
@@ -2014,6 +2028,34 @@ pub fn remove_bus_send(seq: &Sequence, bus_id: BusId, index: usize) -> Result<Se
 
 // ---- GOAT-6: clip connections + magnetic timeline ---------------------------
 
+/// Drop connections referencing a clip id that no longer exists anywhere
+/// in the sequence (so removing / re-IDing a clip never leaves a dangling
+/// FCPX attachment). Returns the sequence unchanged when nothing dangles.
+fn prune_dangling_connections(mut seq: Sequence) -> Sequence {
+    if seq.connections.is_empty() {
+        return seq;
+    }
+    let live: std::collections::HashSet<ClipId> = seq
+        .tracks
+        .iter()
+        .flat_map(|t| t.clips.iter().map(|c| c.id))
+        .collect();
+    seq.connections
+        .retain(|c| live.contains(&c.anchor) && live.contains(&c.connected));
+    seq
+}
+
+/// Does a clip list (any order) contain a pair of overlapping clips?
+/// Used to validate cross-track ripple results against the no-overlap
+/// invariant before committing.
+fn track_has_overlap(clips: &[Arc<Clip>]) -> bool {
+    let mut sorted: Vec<&Arc<Clip>> = clips.iter().collect();
+    sorted.sort_by_key(|c| c.timeline_in);
+    sorted
+        .windows(2)
+        .any(|w| w[0].timeline_out() > w[1].timeline_in)
+}
+
 /// Find a clip anywhere in the sequence → `(track_idx, clip_idx, clip)`.
 fn find_clip_anywhere(seq: &Sequence, clip_id: ClipId) -> Result<(usize, usize, Arc<Clip>)> {
     for (ti, t) in seq.tracks.iter().enumerate() {
@@ -2220,6 +2262,14 @@ pub fn magnetic_ripple_delete(
             }
         }
         new_clips.sort_by_key(|c| c.timeline_in);
+        // The cross-track left-shift can run a later clip onto an earlier
+        // one that stayed put (the gap being closed isn't free on every
+        // track). Reject rather than silently break the no-overlap invariant.
+        if track_has_overlap(&new_clips) {
+            return Err(TimelineError::invalid(
+                "ripple delete would overlap clips on another track — align cuts or use plain delete",
+            ));
+        }
         new_tracks.push(Arc::new(rebuild_track(t, new_clips)));
     }
     let mut out = seq.clone();
@@ -2232,12 +2282,31 @@ pub fn magnetic_ripple_delete(
 /// GOAT-6 — magnetic ripple insert: open `clip.duration()` of space across
 /// ALL unlocked tracks at `clip.timeline_in` (later clips shift right),
 /// then place `clip` on `track_id`. Errors if the open point falls inside
-/// an existing clip on the target track (pick a cut boundary).
+/// an existing clip on ANY unlocked track (pick a cut boundary so every
+/// rippled lane stays in sync — matching the target-track requirement).
 pub fn magnetic_ripple_insert(seq: &Sequence, track_id: TrackId, clip: Clip) -> Result<Sequence> {
     let (_, track) = find_track(seq, track_id)?;
     ensure_unlocked(&track)?;
     let at = clip.timeline_in;
     let dur = clip.duration();
+
+    // A clip that STRADDLES `at` on an unlocked track can't be rippled
+    // without splitting it; shifting only its successors would desync it.
+    // Require a cut boundary at `at` on every rippled lane.
+    for t in &seq.tracks {
+        if t.locked {
+            continue;
+        }
+        if t
+            .clips
+            .iter()
+            .any(|c| c.timeline_in < at && c.timeline_out() > at)
+        {
+            return Err(TimelineError::invalid(
+                "ripple insert needs a cut at the insertion point on every track — split the spanning clip first",
+            ));
+        }
+    }
 
     let mut new_tracks: Vec<Arc<Track>> = Vec::with_capacity(seq.tracks.len());
     for t in &seq.tracks {
@@ -3111,6 +3180,89 @@ mod tests {
         assert_eq!(a.timeline_in, t(3), "V1 clip shifted right");
         let tclip = seq.tracks[1].clips.iter().find(|c| c.id == tid).unwrap();
         assert_eq!(tclip.timeline_in, t(4), "V2 clip shifted right too");
+    }
+
+    #[test]
+    fn magnetic_ripple_delete_rejects_cross_track_overlap() {
+        // GOAT-6 review fix: closing the gap on a non-target track must not
+        // run a later clip onto an earlier one.
+        let (seq, v1, media) = seed_seq();
+        let seq = add_track(&seq, TrackKind::Video, "V2");
+        let v2 = seq.tracks[1].id;
+        let x = Clip::new(media, "x", t(0), t(0), t(2)).unwrap();
+        let del = Clip::new(media, "del", t(2), t(0), t(8)).unwrap();
+        let delid = del.id;
+        let p = Clip::new(media, "p", t(1), t(0), t(2)).unwrap();
+        let q = Clip::new(media, "q", t(9), t(0), t(3)).unwrap();
+        let seq = insert_clip(&seq, v1, x).unwrap();
+        let seq = insert_clip(&seq, v1, del).unwrap();
+        let seq = insert_clip(&seq, v2, p).unwrap();
+        let seq = insert_clip(&seq, v2, q).unwrap();
+        // Deleting "del" (dur 8) would shift q [9,12)→[1,4) onto p [1,3).
+        assert!(magnetic_ripple_delete(&seq, v1, delid).is_err());
+    }
+
+    #[test]
+    fn magnetic_ripple_insert_rejects_straddling_clip() {
+        let (seq, v1, media) = seed_seq();
+        let seq = add_track(&seq, TrackKind::Video, "V2");
+        let v2 = seq.tracks[1].id;
+        let a = Clip::new(media, "a", t(0), t(0), t(2)).unwrap();
+        let s = Clip::new(media, "s", t(0), t(0), t(10)).unwrap(); // spans at=5
+        let seq = insert_clip(&seq, v1, a).unwrap();
+        let seq = insert_clip(&seq, v2, s).unwrap();
+        let ins = Clip::new(media, "ins", t(5), t(0), t(3)).unwrap();
+        assert!(magnetic_ripple_insert(&seq, v1, ins).is_err());
+    }
+
+    #[test]
+    fn classic_remove_prunes_dangling_connection() {
+        let (seq, _v1, _v2, aid, tid, _m) = two_track_with_clips();
+        let seq = connect_clip(&seq, aid, tid).unwrap();
+        assert_eq!(seq.connections.len(), 1);
+        // Classic remove of the connected clip (on V2) drops the connection.
+        let v2 = seq.tracks[1].id;
+        let seq = remove_clip(&seq, v2, tid).unwrap();
+        assert!(seq.connections.is_empty(), "dangling connection pruned");
+    }
+
+    #[test]
+    fn overwrite_prunes_connection_to_covered_clip() {
+        let (seq, v1, media) = seed_seq();
+        let seq = add_track(&seq, TrackKind::Video, "V2");
+        let v2 = seq.tracks[1].id;
+        let anchor = Clip::new(media, "anchor", t(0), t(0), t(5)).unwrap();
+        let aid = anchor.id;
+        let lower = Clip::new(media, "lower", t(1), t(0), t(2)).unwrap(); // [1,3)
+        let lid = lower.id;
+        let seq = insert_clip(&seq, v1, anchor).unwrap();
+        let seq = insert_clip(&seq, v2, lower).unwrap();
+        let seq = connect_clip(&seq, aid, lid).unwrap();
+        // Overwrite the whole "lower" clip on V2 → its id vanishes.
+        let x = Clip::new(media, "x", t(0), t(0), t(4)).unwrap();
+        let seq = overwrite_clip(&seq, v2, x).unwrap();
+        assert!(
+            seq.connections.is_empty(),
+            "connection to the overwritten clip is pruned"
+        );
+    }
+
+    #[test]
+    fn split_keeps_both_halves_of_connected_clip_attached() {
+        // GOAT-6 review fix: splitting a connected clip attaches BOTH halves
+        // to the anchor (no tearing under magnetic move).
+        let (seq, _v1, v2, aid, tid, _m) = two_track_with_clips();
+        // "t" is [1,3) on V2, connected to anchor "a".
+        let seq = connect_clip(&seq, aid, tid).unwrap();
+        let seq = split(&seq, v2, tid, t(2)).unwrap();
+        // Both halves of "t" must be connected to "a".
+        let v2_clips = &seq.tracks[1].clips;
+        assert_eq!(v2_clips.len(), 2, "split produced two halves");
+        let connected: std::collections::HashSet<ClipId> =
+            seq.connections.iter().map(|c| c.connected).collect();
+        for c in v2_clips {
+            assert!(connected.contains(&c.id), "each half is connected to the anchor");
+        }
     }
 
     #[test]
