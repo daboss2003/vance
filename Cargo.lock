@@ -5822,6 +5822,7 @@ dependencies = [
  "vance-audio",
  "vance-audio-plugins",
  "vance-cache",
+ "vance-captions",
  "vance-color",
  "vance-core",
  "vance-decoder",
@@ -5893,6 +5894,15 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+]
+
+[[package]]
+name = "vance-captions"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]
@@ -6153,6 +6163,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "uuid",
+ "vance-captions",
  "vance-color",
  "vance-core",
  "vance-expr",

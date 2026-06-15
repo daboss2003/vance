@@ -781,6 +781,50 @@ export const magneticRippleInsert = (
   timelineSeconds: number
 ): Promise<string> => invoke('magnetic_ripple_insert', { trackId, mediaId, timelineSeconds });
 
+// ---- GOAT-7: captions / subtitles + transcription --------------------------
+
+/** A subtitle/caption cue (mirrors `vance_captions::Cue`). */
+export interface Cue {
+  id: string;
+  start_ms: number;
+  end_ms: number;
+  text: string;
+  speaker: string;
+}
+
+/** The current sequence's caption cues (sorted by start). */
+export const captions = (): Promise<Cue[]> => invoke('captions');
+/** Add a cue; returns its id. */
+export const addCaption = (startMs: number, endMs: number, text: string): Promise<string> =>
+  invoke('add_caption', { startMs, endMs, text });
+export const removeCaption = (cueId: string): Promise<void> =>
+  invoke('remove_caption', { cueId });
+export const setCaptionText = (cueId: string, text: string): Promise<void> =>
+  invoke('set_caption_text', { cueId, text });
+export const setCaptionTiming = (cueId: string, startMs: number, endMs: number): Promise<void> =>
+  invoke('set_caption_timing', { cueId, startMs, endMs });
+export const splitCaption = (cueId: string, atMs: number): Promise<void> =>
+  invoke('split_caption', { cueId, atMs });
+export const mergeCaptionWithNext = (cueId: string): Promise<void> =>
+  invoke('merge_caption_with_next', { cueId });
+export const shiftAllCaptions = (deltaMs: number): Promise<void> =>
+  invoke('shift_all_captions', { deltaMs });
+/** Import captions from an .srt/.vtt file (by extension). Returns the count. */
+export const importCaptions = (path: string): Promise<number> =>
+  invoke('import_captions', { path });
+/** Export captions to .srt (vtt=false) or .vtt (vtt=true). */
+export const exportCaptions = (path: string, vtt: boolean): Promise<void> =>
+  invoke('export_captions', { path, vtt });
+/** Whether a local Whisper CLI is installed. */
+export const transcriptionAvailable = (): Promise<boolean> =>
+  invoke('transcription_available');
+/** Auto-transcribe a media item (slow). Returns the cue count. */
+export const transcribeMedia = (
+  mediaId: string,
+  model: string,
+  language: string | null
+): Promise<number> => invoke('transcribe_media', { mediaId, model, language });
+
 /** Attach an effect to a clip. Returns the new effect's UUID. */
 export const addEffectToClip = (
   trackId: string,

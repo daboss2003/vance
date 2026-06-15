@@ -5917,6 +5917,132 @@ impl Engine {
         .map_err(|e| EngineError::Project(e.to_string()))
     }
 
+    // ---- GOAT-7: captions / subtitles ---------------------------------------
+
+    /// The current sequence's caption cues (sorted by start), for the editor.
+    pub fn captions(&self) -> Vec<vance_captions::Cue> {
+        self.current_sequence_ref()
+            .map(|s| s.captions.clone())
+            .unwrap_or_default()
+    }
+
+    /// Add a caption cue; returns its id.
+    pub fn add_caption(
+        &mut self,
+        start_ms: i64,
+        end_ms: i64,
+        text: String,
+    ) -> Result<String, EngineError> {
+        let cue = vance_captions::Cue::new(start_ms, end_ms, text);
+        let id = cue.id.to_string();
+        self.apply_edit_op(EditOp::AddCaption { cue })?;
+        Ok(id)
+    }
+
+    /// Remove a caption cue.
+    pub fn remove_caption(&mut self, cue_id: vance_captions::CueId) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::RemoveCaption { cue_id })
+    }
+
+    /// Edit a caption cue's text.
+    pub fn set_caption_text(
+        &mut self,
+        cue_id: vance_captions::CueId,
+        text: String,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::SetCaptionText { cue_id, text })
+    }
+
+    /// Set a caption cue's `[start_ms, end_ms)`.
+    pub fn set_caption_timing(
+        &mut self,
+        cue_id: vance_captions::CueId,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::SetCaptionTiming {
+            cue_id,
+            start_ms,
+            end_ms,
+        })
+    }
+
+    /// Split a caption cue at `at_ms`.
+    pub fn split_caption(
+        &mut self,
+        cue_id: vance_captions::CueId,
+        at_ms: i64,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::SplitCaption { cue_id, at_ms })
+    }
+
+    /// Merge a caption cue with the one that follows it.
+    pub fn merge_caption_with_next(
+        &mut self,
+        cue_id: vance_captions::CueId,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::MergeCaptionWithNext { cue_id })
+    }
+
+    /// Shift every caption cue by `delta_ms`.
+    pub fn shift_all_captions(&mut self, delta_ms: i64) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::ShiftAllCaptions { delta_ms })
+    }
+
+    /// Replace the whole caption list (import / transcription result).
+    pub fn set_captions(&mut self, cues: Vec<vance_captions::Cue>) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::SetCaptions { cues })
+    }
+
+    /// Import captions from an `.srt` / `.vtt` file (by extension), replacing
+    /// the current list. Returns the imported cue count.
+    pub fn import_captions(&mut self, path: &str) -> Result<usize, EngineError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| EngineError::Project(format!("read captions: {e}")))?;
+        let is_vtt = std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("vtt"))
+            .unwrap_or(false);
+        let cues = if is_vtt {
+            vance_captions::vtt::from_vtt(&text)
+        } else {
+            vance_captions::srt::from_srt(&text)
+        }
+        .map_err(|e| EngineError::Project(format!("parse captions: {e}")))?;
+        let n = cues.len();
+        self.set_captions(cues)?;
+        Ok(n)
+    }
+
+    /// Export the current captions to an `.srt` / `.vtt` file (by `vtt`).
+    pub fn export_captions(&self, path: &str, vtt: bool) -> Result<(), EngineError> {
+        let cues = self.captions();
+        let text = if vtt {
+            vance_captions::vtt::to_vtt(&cues)
+        } else {
+            vance_captions::srt::to_srt(&cues)
+        };
+        std::fs::write(path, text).map_err(|e| EngineError::Project(format!("write captions: {e}")))
+    }
+
+    /// The on-disk path of a media item (for transcription). `None` for
+    /// synthetic / missing media.
+    pub fn media_path_for(&self, media_id: MediaItemId) -> Option<std::path::PathBuf> {
+        let p = self
+            .current_project
+            .as_ref()?
+            .media
+            .get(&media_id)?
+            .path
+            .clone();
+        if p.as_os_str().is_empty() {
+            None
+        } else {
+            Some(p)
+        }
+    }
+
     // ---- Edit-log plumbing --------------------------------------------------
 
     /// Borrow the current sequence from the project. Errors when no

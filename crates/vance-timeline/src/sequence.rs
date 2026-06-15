@@ -54,6 +54,11 @@ pub struct Sequence {
     /// their anchors. `#[serde(default)]` = off (classic per-track model).
     #[serde(default)]
     pub magnetic: bool,
+    /// GOAT-7: subtitle / caption cues (sorted by start), in sequence
+    /// milliseconds. Exported as a sidecar .srt/.vtt and/or burned in.
+    /// `#[serde(default)]` so older bundles open with none.
+    #[serde(default)]
+    pub captions: Vec<vance_captions::Cue>,
 }
 
 impl Sequence {
@@ -69,6 +74,7 @@ impl Sequence {
             buses: Vec::new(),
             connections: Vec::new(),
             magnetic: false,
+            captions: Vec::new(),
         }
     }
 
@@ -116,11 +122,15 @@ mod tests {
             crate::id::ClipId::new(),
             crate::id::ClipId::new(),
         ));
+        // GOAT-7: captions ride the same RON path.
+        s.captions.push(vance_captions::Cue::new(1000, 3000, "hello"));
         let ron = ron::ser::to_string_pretty(&s, ron::ser::PrettyConfig::default()).unwrap();
         let back: Sequence = ron::from_str(&ron).unwrap();
-        assert_eq!(s, back, "connections + magnetic survive RON round-trip");
+        assert_eq!(s, back, "connections + magnetic + captions survive RON round-trip");
         assert!(back.magnetic);
         assert_eq!(back.connections.len(), 1);
+        assert_eq!(back.captions.len(), 1);
+        assert_eq!(back.captions[0].text, "hello");
     }
 
     #[test]
@@ -172,6 +182,7 @@ mod tests {
             buses: Vec::new(),
             connections: Vec::new(),
             magnetic: false,
+            captions: Vec::new(),
         };
         assert_eq!(seq.duration(), t(7));
         assert_eq!(seq.clip_count(), 2);

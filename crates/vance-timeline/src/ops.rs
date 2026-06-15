@@ -91,6 +91,7 @@ fn replace_track(seq: &Sequence, idx: usize, new_track: Track) -> Sequence {
         buses: seq.buses.clone(),
         connections: seq.connections.clone(),
         magnetic: seq.magnetic,
+        captions: seq.captions.clone(),
     }
 }
 
@@ -178,6 +179,7 @@ pub fn add_track_with_id(
         buses: seq.buses.clone(),
         connections: seq.connections.clone(),
         magnetic: seq.magnetic,
+        captions: seq.captions.clone(),
     }
 }
 
@@ -196,6 +198,7 @@ pub fn remove_track(seq: &Sequence, track_id: TrackId) -> Result<Sequence> {
         buses: seq.buses.clone(),
         connections: seq.connections.clone(),
         magnetic: seq.magnetic,
+        captions: seq.captions.clone(),
     })
 }
 
@@ -1551,6 +1554,7 @@ pub fn set_master_gain_db(seq: &Sequence, gain_db: f32) -> Result<Sequence> {
         buses: seq.buses.clone(),
         connections: seq.connections.clone(),
         magnetic: seq.magnetic,
+        captions: seq.captions.clone(),
     })
 }
 
@@ -1807,6 +1811,7 @@ fn with_buses(seq: &Sequence, buses: Vec<AudioBus>) -> Sequence {
         buses,
         connections: seq.connections.clone(),
         magnetic: seq.magnetic,
+        captions: seq.captions.clone(),
     }
 }
 
@@ -2331,6 +2336,77 @@ pub fn magnetic_ripple_insert(seq: &Sequence, track_id: TrackId, clip: Clip) -> 
     insert_clip(&out, track_id, clip)
 }
 
+// ---- GOAT-7: captions / subtitles -------------------------------------------
+
+/// Clone `seq` after mutating its caption list via `f`.
+fn with_captions(seq: &Sequence, f: impl FnOnce(&mut Vec<vance_captions::Cue>)) -> Sequence {
+    let mut out = seq.clone();
+    f(&mut out.captions);
+    out
+}
+
+/// GOAT-7 — add a caption cue, keeping the list sorted by start.
+pub fn add_caption(seq: &Sequence, cue: vance_captions::Cue) -> Sequence {
+    with_captions(seq, |cues| {
+        vance_captions::ops::add_cue(cues, cue);
+    })
+}
+
+/// Remove the caption cue with `cue_id`.
+pub fn remove_caption(seq: &Sequence, cue_id: vance_captions::CueId) -> Sequence {
+    with_captions(seq, |cues| {
+        vance_captions::ops::remove_cue(cues, cue_id);
+    })
+}
+
+/// Replace a caption cue's text.
+pub fn set_caption_text(seq: &Sequence, cue_id: vance_captions::CueId, text: String) -> Sequence {
+    with_captions(seq, |cues| {
+        vance_captions::ops::set_text(cues, cue_id, text);
+    })
+}
+
+/// Set a caption cue's `[start_ms, end_ms)`.
+pub fn set_caption_timing(
+    seq: &Sequence,
+    cue_id: vance_captions::CueId,
+    start_ms: i64,
+    end_ms: i64,
+) -> Sequence {
+    with_captions(seq, |cues| {
+        vance_captions::ops::set_timing(cues, cue_id, start_ms, end_ms);
+    })
+}
+
+/// Split a caption cue at `at_ms`.
+pub fn split_caption(seq: &Sequence, cue_id: vance_captions::CueId, at_ms: i64) -> Sequence {
+    with_captions(seq, |cues| {
+        vance_captions::ops::split_cue(cues, cue_id, at_ms);
+    })
+}
+
+/// Merge a caption cue with the cue that follows it.
+pub fn merge_caption_with_next(seq: &Sequence, cue_id: vance_captions::CueId) -> Sequence {
+    with_captions(seq, |cues| {
+        vance_captions::ops::merge_with_next(cues, cue_id);
+    })
+}
+
+/// Shift every caption cue by `delta_ms` (re-sync an imported track).
+pub fn shift_all_captions(seq: &Sequence, delta_ms: i64) -> Sequence {
+    with_captions(seq, |cues| {
+        vance_captions::ops::shift_all(cues, delta_ms);
+    })
+}
+
+/// Replace the whole caption list (bulk import / transcription result).
+pub fn set_captions(seq: &Sequence, mut cues: Vec<vance_captions::Cue>) -> Sequence {
+    vance_captions::ops::sort_cues(&mut cues);
+    let mut out = seq.clone();
+    out.captions = cues;
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2795,6 +2871,7 @@ mod tests {
         buses: seq.buses.clone(),
         connections: seq.connections.clone(),
         magnetic: seq.magnetic,
+        captions: seq.captions.clone(),
         }
     }
 
@@ -3289,5 +3366,32 @@ mod tests {
         log.redo().unwrap();
         log.redo().unwrap();
         assert_eq!(log.current().tracks[1].clips[0].timeline_in, t(5), "redo");
+    }
+
+    #[test]
+    fn caption_edit_ops_undo_redo() {
+        use crate::edit_log::{EditLog, EditOp};
+        let mut log = EditLog::new(Sequence::new("S", FrameRate::FPS_24));
+        let cue = vance_captions::Cue::new(1000, 3000, "hello");
+        let cid = cue.id;
+        log.apply(EditOp::AddCaption { cue }).unwrap();
+        assert_eq!(log.current().captions.len(), 1);
+        log.apply(EditOp::SetCaptionText {
+            cue_id: cid,
+            text: "hello world".into(),
+        })
+        .unwrap();
+        assert_eq!(log.current().captions[0].text, "hello world");
+        log.apply(EditOp::SplitCaption { cue_id: cid, at_ms: 2000 }).unwrap();
+        assert_eq!(log.current().captions.len(), 2, "split");
+        // Undo split + edit + add.
+        log.undo().unwrap();
+        assert_eq!(log.current().captions.len(), 1);
+        log.undo().unwrap();
+        assert_eq!(log.current().captions[0].text, "hello");
+        log.undo().unwrap();
+        assert!(log.current().captions.is_empty());
+        log.redo().unwrap();
+        assert_eq!(log.current().captions.len(), 1, "redo add");
     }
 }

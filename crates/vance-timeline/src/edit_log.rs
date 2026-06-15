@@ -564,6 +564,54 @@ pub enum EditOp {
         /// The clip (placed at its `timeline_in`).
         clip: Clip,
     },
+    /// GOAT-7 — add a caption/subtitle cue.
+    AddCaption {
+        /// The cue (placed by start time).
+        cue: vance_captions::Cue,
+    },
+    /// GOAT-7 — remove a caption cue.
+    RemoveCaption {
+        /// Cue id.
+        cue_id: vance_captions::CueId,
+    },
+    /// GOAT-7 — edit a caption cue's text.
+    SetCaptionText {
+        /// Cue id.
+        cue_id: vance_captions::CueId,
+        /// New text.
+        text: String,
+    },
+    /// GOAT-7 — set a caption cue's `[start_ms, end_ms)`.
+    SetCaptionTiming {
+        /// Cue id.
+        cue_id: vance_captions::CueId,
+        /// New start (ms).
+        start_ms: i64,
+        /// New end (ms).
+        end_ms: i64,
+    },
+    /// GOAT-7 — split a caption cue at `at_ms`.
+    SplitCaption {
+        /// Cue id.
+        cue_id: vance_captions::CueId,
+        /// Split time (ms).
+        at_ms: i64,
+    },
+    /// GOAT-7 — merge a caption cue with the cue that follows it.
+    MergeCaptionWithNext {
+        /// Cue id.
+        cue_id: vance_captions::CueId,
+    },
+    /// GOAT-7 — shift every caption cue by `delta_ms`.
+    ShiftAllCaptions {
+        /// Signed shift (ms).
+        delta_ms: i64,
+    },
+    /// GOAT-7 — replace the whole caption list (import / transcription).
+    SetCaptions {
+        /// New cue list (will be sorted).
+        cues: Vec<vance_captions::Cue>,
+    },
 }
 
 /// Apply a single op to a sequence, returning the new sequence.
@@ -791,6 +839,22 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
         EditOp::MagneticRippleInsert { track_id, clip } => {
             ops::magnetic_ripple_insert(seq, *track_id, clip.clone())
         }
+        EditOp::AddCaption { cue } => Ok(ops::add_caption(seq, cue.clone())),
+        EditOp::RemoveCaption { cue_id } => Ok(ops::remove_caption(seq, *cue_id)),
+        EditOp::SetCaptionText { cue_id, text } => {
+            Ok(ops::set_caption_text(seq, *cue_id, text.clone()))
+        }
+        EditOp::SetCaptionTiming {
+            cue_id,
+            start_ms,
+            end_ms,
+        } => Ok(ops::set_caption_timing(seq, *cue_id, *start_ms, *end_ms)),
+        EditOp::SplitCaption { cue_id, at_ms } => Ok(ops::split_caption(seq, *cue_id, *at_ms)),
+        EditOp::MergeCaptionWithNext { cue_id } => {
+            Ok(ops::merge_caption_with_next(seq, *cue_id))
+        }
+        EditOp::ShiftAllCaptions { delta_ms } => Ok(ops::shift_all_captions(seq, *delta_ms)),
+        EditOp::SetCaptions { cues } => Ok(ops::set_captions(seq, cues.clone())),
     }
 }
 
@@ -1093,6 +1157,14 @@ fn op_label(op: &EditOp) -> String {
         EditOp::AppendClip { .. } => "Append clip".into(),
         EditOp::MagneticRippleDelete { .. } => "Ripple delete (all tracks)".into(),
         EditOp::MagneticRippleInsert { .. } => "Ripple insert (all tracks)".into(),
+        EditOp::AddCaption { .. } => "Add caption".into(),
+        EditOp::RemoveCaption { .. } => "Remove caption".into(),
+        EditOp::SetCaptionText { .. } => "Edit caption".into(),
+        EditOp::SetCaptionTiming { .. } => "Retime caption".into(),
+        EditOp::SplitCaption { .. } => "Split caption".into(),
+        EditOp::MergeCaptionWithNext { .. } => "Merge caption".into(),
+        EditOp::ShiftAllCaptions { .. } => "Shift captions".into(),
+        EditOp::SetCaptions { .. } => "Import captions".into(),
     }
 }
 

@@ -16,6 +16,7 @@ mod peaks;
 mod prefetch;
 mod profiling;
 mod proxy;
+mod transcribe;
 
 use engine::{EngineHandle, MediaItemInfo, ProjectInfo, SequenceContents, SourceState, TrackSummary};
 use parking_lot::Mutex as PMutex;
@@ -2954,6 +2955,126 @@ fn magnetic_ripple_insert(
         .map_err(|e| e.to_string())
 }
 
+// ---- GOAT-7: captions / subtitles + transcription --------------------------
+
+fn parse_cue_id(s: &str) -> Result<vance_captions::CueId, String> {
+    s.parse::<uuid::Uuid>().map_err(|e| format!("bad cue id: {e}"))
+}
+
+#[tauri::command]
+fn captions(state: tauri::State<'_, EngineHandle>) -> Vec<vance_captions::Cue> {
+    state.lock().captions()
+}
+
+#[tauri::command]
+fn add_caption(
+    state: tauri::State<'_, EngineHandle>,
+    start_ms: i64,
+    end_ms: i64,
+    text: String,
+) -> Result<String, String> {
+    state.lock().add_caption(start_ms, end_ms, text).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_caption(state: tauri::State<'_, EngineHandle>, cue_id: String) -> Result<(), String> {
+    let id = parse_cue_id(&cue_id)?;
+    state.lock().remove_caption(id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_caption_text(
+    state: tauri::State<'_, EngineHandle>,
+    cue_id: String,
+    text: String,
+) -> Result<(), String> {
+    let id = parse_cue_id(&cue_id)?;
+    state.lock().set_caption_text(id, text).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_caption_timing(
+    state: tauri::State<'_, EngineHandle>,
+    cue_id: String,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<(), String> {
+    let id = parse_cue_id(&cue_id)?;
+    state.lock().set_caption_timing(id, start_ms, end_ms).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn split_caption(
+    state: tauri::State<'_, EngineHandle>,
+    cue_id: String,
+    at_ms: i64,
+) -> Result<(), String> {
+    let id = parse_cue_id(&cue_id)?;
+    state.lock().split_caption(id, at_ms).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn merge_caption_with_next(
+    state: tauri::State<'_, EngineHandle>,
+    cue_id: String,
+) -> Result<(), String> {
+    let id = parse_cue_id(&cue_id)?;
+    state.lock().merge_caption_with_next(id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn shift_all_captions(state: tauri::State<'_, EngineHandle>, delta_ms: i64) -> Result<(), String> {
+    state.lock().shift_all_captions(delta_ms).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn import_captions(state: tauri::State<'_, EngineHandle>, path: String) -> Result<usize, String> {
+    state.lock().import_captions(&path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn export_captions(
+    state: tauri::State<'_, EngineHandle>,
+    path: String,
+    vtt: bool,
+) -> Result<(), String> {
+    state.lock().export_captions(&path, vtt).map_err(|e| e.to_string())
+}
+
+/// Whether a local Whisper CLI is installed (enables the Transcribe button).
+#[tauri::command]
+fn transcription_available() -> bool {
+    transcribe::available()
+}
+
+/// Auto-transcribe a media item into captions. Runs the Whisper subprocess
+/// WITHOUT holding the engine lock (it can take minutes), then applies the
+/// result. Returns the cue count.
+#[tauri::command]
+fn transcribe_media(
+    state: tauri::State<'_, EngineHandle>,
+    media_id: String,
+    model: String,
+    language: Option<String>,
+) -> Result<usize, String> {
+    let uuid: uuid::Uuid = media_id.parse().map_err(|e| format!("bad media id: {e}"))?;
+    let mid = vance_timeline::MediaItemId::from_uuid(uuid);
+    // Read the media path under a brief lock, then DROP it for the subprocess.
+    let path = {
+        let eng = state.lock();
+        eng.media_path_for(mid)
+            .ok_or_else(|| "media has no file to transcribe".to_string())?
+    };
+    let cfg = transcribe::TranscribeConfig {
+        model: if model.is_empty() { "base".into() } else { model },
+        language: language.filter(|l| !l.is_empty()),
+    };
+    let cues = transcribe::transcribe_file(&path, &cfg).map_err(|e| e.to_string())?;
+    let n = cues.len();
+    state.lock().set_captions(cues).map_err(|e| e.to_string())?;
+    Ok(n)
+}
+
 #[tauri::command]
 fn project_info(state: tauri::State<'_, EngineHandle>) -> Option<ProjectInfo> {
     state.lock().project_info()
@@ -3083,6 +3204,18 @@ fn main() {
             append_clip,
             magnetic_ripple_delete,
             magnetic_ripple_insert,
+            captions,
+            add_caption,
+            remove_caption,
+            set_caption_text,
+            set_caption_timing,
+            split_caption,
+            merge_caption_with_next,
+            shift_all_captions,
+            import_captions,
+            export_captions,
+            transcription_available,
+            transcribe_media,
             move_clip_to,
             remove_clip,
             add_effect_to_clip,
