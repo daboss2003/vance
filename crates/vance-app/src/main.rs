@@ -2836,6 +2836,124 @@ fn insert_clip_at(
         .map_err(|e| e.to_string())
 }
 
+// ---- GOAT-6: magnetic timeline + clip connections --------------------------
+
+#[tauri::command]
+fn is_magnetic(state: tauri::State<'_, EngineHandle>) -> bool {
+    state.lock().is_magnetic()
+}
+
+#[tauri::command]
+fn set_magnetic(state: tauri::State<'_, EngineHandle>, magnetic: bool) -> Result<(), String> {
+    state.lock().set_magnetic(magnetic).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn clip_connections(state: tauri::State<'_, EngineHandle>) -> Vec<(String, String)> {
+    state.lock().connections()
+}
+
+#[tauri::command]
+fn connect_clip(
+    state: tauri::State<'_, EngineHandle>,
+    anchor_id: String,
+    connected_id: String,
+) -> Result<(), String> {
+    let a = anchor_id.parse::<uuid::Uuid>().map_err(|e| format!("bad anchor id: {e}"))?;
+    let c = connected_id.parse::<uuid::Uuid>().map_err(|e| format!("bad connected id: {e}"))?;
+    state
+        .lock()
+        .connect_clip(
+            vance_timeline::ClipId::from_uuid(a),
+            vance_timeline::ClipId::from_uuid(c),
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn disconnect_clip(
+    state: tauri::State<'_, EngineHandle>,
+    connected_id: String,
+) -> Result<(), String> {
+    let c = connected_id.parse::<uuid::Uuid>().map_err(|e| format!("bad clip id: {e}"))?;
+    state
+        .lock()
+        .disconnect_clip(vance_timeline::ClipId::from_uuid(c))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn magnetic_move_clip(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    clip_id: String,
+    timeline_seconds: f64,
+) -> Result<(), String> {
+    let t = track_id.parse::<uuid::Uuid>().map_err(|e| format!("bad track id: {e}"))?;
+    let c = clip_id.parse::<uuid::Uuid>().map_err(|e| format!("bad clip id: {e}"))?;
+    state
+        .lock()
+        .magnetic_move_clip(
+            vance_timeline::TrackId::from_uuid(t),
+            vance_timeline::ClipId::from_uuid(c),
+            timeline_seconds,
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn append_clip(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    media_id: String,
+) -> Result<String, String> {
+    let t = track_id.parse::<uuid::Uuid>().map_err(|e| format!("bad track id: {e}"))?;
+    let m = media_id.parse::<uuid::Uuid>().map_err(|e| format!("bad media id: {e}"))?;
+    state
+        .lock()
+        .append_clip(
+            vance_timeline::TrackId::from_uuid(t),
+            vance_timeline::MediaItemId::from_uuid(m),
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn magnetic_ripple_delete(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    clip_id: String,
+) -> Result<(), String> {
+    let t = track_id.parse::<uuid::Uuid>().map_err(|e| format!("bad track id: {e}"))?;
+    let c = clip_id.parse::<uuid::Uuid>().map_err(|e| format!("bad clip id: {e}"))?;
+    state
+        .lock()
+        .magnetic_ripple_delete(
+            vance_timeline::TrackId::from_uuid(t),
+            vance_timeline::ClipId::from_uuid(c),
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn magnetic_ripple_insert(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    media_id: String,
+    timeline_seconds: f64,
+) -> Result<String, String> {
+    let t = track_id.parse::<uuid::Uuid>().map_err(|e| format!("bad track id: {e}"))?;
+    let m = media_id.parse::<uuid::Uuid>().map_err(|e| format!("bad media id: {e}"))?;
+    state
+        .lock()
+        .magnetic_ripple_insert(
+            vance_timeline::TrackId::from_uuid(t),
+            vance_timeline::MediaItemId::from_uuid(m),
+            timeline_seconds,
+        )
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn project_info(state: tauri::State<'_, EngineHandle>) -> Option<ProjectInfo> {
     state.lock().project_info()
@@ -2956,6 +3074,15 @@ fn main() {
             import_media_file,
             media_list,
             insert_clip_at,
+            is_magnetic,
+            set_magnetic,
+            clip_connections,
+            connect_clip,
+            disconnect_clip,
+            magnetic_move_clip,
+            append_clip,
+            magnetic_ripple_delete,
+            magnetic_ripple_insert,
             move_clip_to,
             remove_clip,
             add_effect_to_clip,

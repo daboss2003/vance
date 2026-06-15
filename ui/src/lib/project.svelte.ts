@@ -58,6 +58,13 @@ import {
   loadSource as ipcLoadSource,
   mediaList,
   moveClipTo,
+  isMagnetic,
+  setMagnetic as ipcSetMagnetic,
+  connectClip as ipcConnectClip,
+  disconnectClip as ipcDisconnectClip,
+  magneticMoveClip,
+  appendClip as ipcAppendClip,
+  magneticRippleDelete,
   removeClip as ipcRemoveClip,
   newProject as ipcNew,
   projectInfo,
@@ -156,6 +163,7 @@ class ProjectState {
     this.editTick++;
     await this.refreshSequence();
     await this.refreshUndoState();
+    await this.refreshMagnetic();
   }
 
   /** Replace the current project with a freshly created empty one. */
@@ -721,15 +729,97 @@ class ProjectState {
     }
   }
 
-  /** Move an existing clip. */
+  /** GOAT-6: magnetic-timeline mode (clips ripple + connected clips move
+   *  with their anchor). Mirrors the engine's per-sequence flag. */
+  magnetic = $state<boolean>(false);
+
+  /** Move an existing clip. In magnetic mode the drag also carries the
+   *  clip's connected subtree; otherwise it's a plain single-clip slide. */
   async moveClip(trackId: string, clipId: string, timelineSeconds: number) {
     this.error = null;
     try {
-      await moveClipTo(trackId, clipId, timelineSeconds);
+      if (this.magnetic) {
+        await magneticMoveClip(trackId, clipId, timelineSeconds);
+      } else {
+        await moveClipTo(trackId, clipId, timelineSeconds);
+      }
       await this.commitEdit();
     } catch (e) {
       this.error = String(e);
     }
+  }
+
+  /** Toggle magnetic-timeline mode (persisted on the sequence, undoable). */
+  async setMagnetic(on: boolean) {
+    this.error = null;
+    try {
+      await ipcSetMagnetic(on);
+      this.magnetic = on;
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Refresh the magnetic flag from the engine (after open/undo). */
+  async refreshMagnetic() {
+    try {
+      this.magnetic = await isMagnetic();
+    } catch {
+      this.magnetic = false;
+    }
+  }
+
+  /** Connect `connectedId` to `anchorId` (FCPX-style attachment). */
+  async connectClip(anchorId: string, connectedId: string) {
+    this.error = null;
+    try {
+      await ipcConnectClip(anchorId, connectedId);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Detach a connected clip. */
+  async disconnectClip(connectedId: string) {
+    this.error = null;
+    try {
+      await ipcDisconnectClip(connectedId);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Cut-page append: add a media item at a track's gapless end. */
+  async appendClip(trackId: string, mediaId: string) {
+    this.error = null;
+    try {
+      await ipcAppendClip(trackId, mediaId);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Ripple delete: remove a clip + close the gap across all tracks. */
+  async rippleDeleteClip(trackId: string, clipId: string) {
+    this.error = null;
+    try {
+      await magneticRippleDelete(trackId, clipId);
+      await this.commitEdit();
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** The track id that owns `clipId` in the current sequence, or null. */
+  trackOfClip(clipId: string): string | null {
+    for (const tr of this.sequence?.tracks ?? []) {
+      if (tr.clips.some((c) => c.id === clipId)) return tr.id;
+    }
+    return null;
   }
 
   /** Remove a clip from its track. */

@@ -38,6 +38,7 @@
   import HistoryPanel from '$lib/HistoryPanel.svelte';
   import MixerConsole from '$lib/MixerConsole.svelte';
   import MographPanel from '$lib/MographPanel.svelte';
+  import MagneticPanel from '$lib/MagneticPanel.svelte';
   import TransitionInspector from '$lib/TransitionInspector.svelte';
   import ColorWheel from '$lib/color/ColorWheel.svelte';
   import CurveEditor from '$lib/color/CurveEditor.svelte';
@@ -1981,6 +1982,11 @@
         <!-- GOAT-5 — Motion Graphics Templates (titles + graphics). -->
         <div class="ml-2 w-72 shrink-0 max-h-48 overflow-auto">
           <MographPanel />
+        </div>
+
+        <!-- GOAT-6 — magnetic timeline + clip connections. -->
+        <div class="ml-2 w-56 shrink-0 max-h-48 overflow-auto">
+          <MagneticPanel />
         </div>
 
         <span class="text-vance-muted ml-auto">

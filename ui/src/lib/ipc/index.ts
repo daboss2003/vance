@@ -747,6 +747,40 @@ export const moveClipTo = (
 export const removeClip = (trackId: string, clipId: string): Promise<void> =>
   invoke('remove_clip', { trackId, clipId });
 
+// ---- GOAT-6: magnetic timeline + clip connections --------------------------
+
+/** Whether the current sequence is in magnetic-timeline mode. */
+export const isMagnetic = (): Promise<boolean> => invoke('is_magnetic');
+/** Toggle magnetic-timeline mode. */
+export const setMagnetic = (magnetic: boolean): Promise<void> =>
+  invoke('set_magnetic', { magnetic });
+/** Current `[anchorClipId, connectedClipId]` connection pairs. */
+export const clipConnections = (): Promise<[string, string][]> => invoke('clip_connections');
+/** Connect `connectedId` to `anchorId` (it follows under magnetic edits). */
+export const connectClip = (anchorId: string, connectedId: string): Promise<void> =>
+  invoke('connect_clip', { anchorId, connectedId });
+/** Detach a connected clip. */
+export const disconnectClip = (connectedId: string): Promise<void> =>
+  invoke('disconnect_clip', { connectedId });
+/** Magnetic move: drag a clip + its connected subtree together. */
+export const magneticMoveClip = (
+  trackId: string,
+  clipId: string,
+  timelineSeconds: number
+): Promise<void> => invoke('magnetic_move_clip', { trackId, clipId, timelineSeconds });
+/** Cut-page append: add a media item's full range at the track's end. */
+export const appendClip = (trackId: string, mediaId: string): Promise<string> =>
+  invoke('append_clip', { trackId, mediaId });
+/** Ripple delete: remove a clip + close the gap across all tracks. */
+export const magneticRippleDelete = (trackId: string, clipId: string): Promise<void> =>
+  invoke('magnetic_ripple_delete', { trackId, clipId });
+/** Ripple insert: open space across all tracks, then place the clip. */
+export const magneticRippleInsert = (
+  trackId: string,
+  mediaId: string,
+  timelineSeconds: number
+): Promise<string> => invoke('magnetic_ripple_insert', { trackId, mediaId, timelineSeconds });
+
 /** Attach an effect to a clip. Returns the new effect's UUID. */
 export const addEffectToClip = (
   trackId: string,

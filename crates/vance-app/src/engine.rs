@@ -5805,6 +5805,118 @@ impl Engine {
         Ok(new_clip_id.to_string())
     }
 
+    // ---- GOAT-6: magnetic timeline + connections ----------------------------
+
+    /// Whether the current sequence is in magnetic-timeline mode.
+    pub fn is_magnetic(&self) -> bool {
+        self.current_sequence_ref().map(|s| s.magnetic).unwrap_or(false)
+    }
+
+    /// Toggle magnetic-timeline mode on the current sequence.
+    pub fn set_magnetic(&mut self, magnetic: bool) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::SetMagnetic { magnetic })
+    }
+
+    /// The current sequence's connections as `(anchor, connected)` id pairs.
+    pub fn connections(&self) -> Vec<(String, String)> {
+        self.current_sequence_ref()
+            .map(|s| {
+                s.connections
+                    .iter()
+                    .map(|c| (c.anchor.to_string(), c.connected.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Connect `connected` to `anchor` (FCPX-style attachment).
+    pub fn connect_clip(
+        &mut self,
+        anchor: vance_timeline::ClipId,
+        connected: vance_timeline::ClipId,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::ConnectClip { anchor, connected })
+    }
+
+    /// Detach `connected` from whatever it's connected to.
+    pub fn disconnect_clip(
+        &mut self,
+        connected: vance_timeline::ClipId,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::DisconnectClip { connected })
+    }
+
+    /// Magnetic move: drag a clip + its connected subtree together.
+    pub fn magnetic_move_clip(
+        &mut self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+        new_timeline_seconds: f64,
+    ) -> Result<(), EngineError> {
+        self.pause_for_edit();
+        self.apply_edit_op(EditOp::MagneticMoveClip {
+            track_id,
+            clip_id,
+            new_timeline_in: seconds_to_rt(new_timeline_seconds.max(0.0)),
+        })
+    }
+
+    /// Cut-page append: add `media_id`'s full range at the track's end.
+    pub fn append_clip(
+        &mut self,
+        track_id: TrackId,
+        media_id: MediaItemId,
+    ) -> Result<String, EngineError> {
+        self.pause_for_edit();
+        let clip = self.clip_from_media(media_id, vance_core::RationalTime::ZERO)?;
+        let id = clip.id;
+        self.apply_edit_op(EditOp::AppendClip { track_id, clip })?;
+        Ok(id.to_string())
+    }
+
+    /// Magnetic ripple delete: remove a clip + close the gap on all tracks.
+    pub fn magnetic_ripple_delete(
+        &mut self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+    ) -> Result<(), EngineError> {
+        self.pause_for_edit();
+        self.apply_edit_op(EditOp::MagneticRippleDelete { track_id, clip_id })
+    }
+
+    /// Magnetic ripple insert: open space on all tracks, then place the clip.
+    pub fn magnetic_ripple_insert(
+        &mut self,
+        track_id: TrackId,
+        media_id: MediaItemId,
+        timeline_seconds: f64,
+    ) -> Result<String, EngineError> {
+        self.pause_for_edit();
+        let clip = self.clip_from_media(media_id, seconds_to_rt(timeline_seconds.max(0.0)))?;
+        let id = clip.id;
+        self.apply_edit_op(EditOp::MagneticRippleInsert { track_id, clip })?;
+        Ok(id.to_string())
+    }
+
+    /// Build a `Clip` spanning a media item's full visible range, placed at
+    /// `timeline_in`. Shared by append / magnetic insert.
+    fn clip_from_media(
+        &self,
+        media_id: MediaItemId,
+        timeline_in: vance_core::RationalTime,
+    ) -> Result<Clip, EngineError> {
+        let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
+        let media = project.media.get(&media_id).ok_or(EngineError::MediaNotFound)?;
+        Clip::new(
+            media.id,
+            media.display_name.clone(),
+            timeline_in,
+            vance_core::RationalTime::ZERO,
+            media.duration,
+        )
+        .map_err(|e| EngineError::Project(e.to_string()))
+    }
+
     // ---- Edit-log plumbing --------------------------------------------------
 
     /// Borrow the current sequence from the project. Errors when no
@@ -7189,6 +7301,11 @@ fn op_touches_mixer(op: &EditOp) -> bool {
         | EditOp::TrimIn { .. }
         | EditOp::TrimOut { .. }
         | EditOp::Split { .. }
+        // GOAT-6: magnetic edits move/add/remove clips → audio re-schedules.
+        | EditOp::MagneticMoveClip { .. }
+        | EditOp::AppendClip { .. }
+        | EditOp::MagneticRippleDelete { .. }
+        | EditOp::MagneticRippleInsert { .. }
         // GOAT-4: bus/send routing changes the audio sum.
         | EditOp::AddBus { .. }
         | EditOp::RemoveBus { .. }

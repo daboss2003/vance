@@ -107,6 +107,23 @@ mod tests {
     }
 
     #[test]
+    fn connections_and_magnetic_round_trip_through_ron() {
+        // GOAT-6 — the new Sequence fields must survive the .vance bundle's
+        // RON path (and old bundles open via serde-default).
+        let mut s = Sequence::new("Seq 01", FrameRate::FPS_24);
+        s.magnetic = true;
+        s.connections.push(crate::connection::Connection::new(
+            crate::id::ClipId::new(),
+            crate::id::ClipId::new(),
+        ));
+        let ron = ron::ser::to_string_pretty(&s, ron::ser::PrettyConfig::default()).unwrap();
+        let back: Sequence = ron::from_str(&ron).unwrap();
+        assert_eq!(s, back, "connections + magnetic survive RON round-trip");
+        assert!(back.magnetic);
+        assert_eq!(back.connections.len(), 1);
+    }
+
+    #[test]
     fn duration_is_longest_track() {
         let media = MediaItemId::new();
         let c_short = Arc::new(Clip::new(media, "s", t(0), t(0), t(3)).unwrap());
