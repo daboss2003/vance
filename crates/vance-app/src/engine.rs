@@ -6026,6 +6026,12 @@ impl Engine {
         std::fs::write(path, text).map_err(|e| EngineError::Project(format!("write captions: {e}")))
     }
 
+    /// The current sequence id as a string (for capturing the transcription
+    /// target across the off-lock subprocess window).
+    pub fn current_sequence_id_string(&self) -> Option<String> {
+        self.current_sequence_id.map(|id| id.to_string())
+    }
+
     /// The on-disk path of a media item (for transcription). `None` for
     /// synthetic / missing media.
     pub fn media_path_for(&self, media_id: MediaItemId) -> Option<std::path::PathBuf> {

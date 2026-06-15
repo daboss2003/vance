@@ -101,15 +101,23 @@ pub fn transcribe_file(
     config: &TranscribeConfig,
 ) -> Result<Vec<Cue>, TranscribeError> {
     let kind = detect().ok_or(TranscribeError::NotInstalled)?;
+    // Absolutize so a relative / dash-leading path can't be parsed as a CLI
+    // flag by the Whisper argparse front-end.
+    let media = std::fs::canonicalize(media_path).unwrap_or_else(|_| media_path.to_path_buf());
+    // Fresh per-run temp dir (keyed by stem + the file's mtime-ish length) so
+    // a stale `.srt` from a previous run of the same media is never picked up.
     let tmp = std::env::temp_dir().join(format!(
-        "vance-whisper-{}",
-        media_path.file_stem().and_then(|s| s.to_str()).unwrap_or("out")
+        "vance-whisper-{}-{}",
+        media.file_stem().and_then(|s| s.to_str()).unwrap_or("out"),
+        std::fs::metadata(&media).map(|m| m.len()).unwrap_or(0)
     ));
+    // Clear any previous output so read_first_srt can't return a stale file.
+    let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
 
     let srt_text = match kind {
-        WhisperKind::OpenAi(bin) => run_openai(&bin, media_path, &tmp, config)?,
-        WhisperKind::Cpp(bin) => run_cpp(&bin, media_path, &tmp, config)?,
+        WhisperKind::OpenAi(bin) => run_openai(&bin, &media, &tmp, config)?,
+        WhisperKind::Cpp(bin) => run_cpp(&bin, &media, &tmp, config)?,
     };
     let cues = vance_captions::srt::from_srt(&srt_text)?;
     Ok(cues)
@@ -122,8 +130,7 @@ fn run_openai(
     config: &TranscribeConfig,
 ) -> Result<String, TranscribeError> {
     let mut cmd = Command::new(bin);
-    cmd.arg(media)
-        .arg("--model")
+    cmd.arg("--model")
         .arg(&config.model)
         .arg("--output_format")
         .arg("srt")
@@ -134,6 +141,9 @@ fn run_openai(
     if let Some(lang) = &config.language {
         cmd.arg("--language").arg(lang);
     }
+    // `--` ends options so a (non-canonicalizable) dash-leading media path
+    // is still treated as the positional input, not a flag.
+    cmd.arg("--").arg(media);
     run_and_collect(cmd)?;
     // OpenAI writes `<media stem>.srt` into out_dir.
     read_first_srt(out_dir)

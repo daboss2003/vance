@@ -3059,11 +3059,14 @@ fn transcribe_media(
 ) -> Result<usize, String> {
     let uuid: uuid::Uuid = media_id.parse().map_err(|e| format!("bad media id: {e}"))?;
     let mid = vance_timeline::MediaItemId::from_uuid(uuid);
-    // Read the media path under a brief lock, then DROP it for the subprocess.
-    let path = {
+    // Read the media path + capture the TARGET sequence under a brief lock,
+    // then DROP it for the (slow) subprocess.
+    let (path, target_seq) = {
         let eng = state.lock();
-        eng.media_path_for(mid)
-            .ok_or_else(|| "media has no file to transcribe".to_string())?
+        let path = eng
+            .media_path_for(mid)
+            .ok_or_else(|| "media has no file to transcribe".to_string())?;
+        (path, eng.current_sequence_id_string())
     };
     let cfg = transcribe::TranscribeConfig {
         model: if model.is_empty() { "base".into() } else { model },
@@ -3071,7 +3074,19 @@ fn transcribe_media(
     };
     let cues = transcribe::transcribe_file(&path, &cfg).map_err(|e| e.to_string())?;
     let n = cues.len();
-    state.lock().set_captions(cues).map_err(|e| e.to_string())?;
+    // Re-lock and only apply if the SAME sequence is still current — else the
+    // user switched sequences / loaded a project mid-run and the cues would
+    // overwrite the wrong timeline.
+    {
+        let mut eng = state.lock();
+        if eng.current_sequence_id_string() != target_seq {
+            return Err(
+                "the current sequence changed during transcription; captions were not applied"
+                    .into(),
+            );
+        }
+        eng.set_captions(cues).map_err(|e| e.to_string())?;
+    }
     Ok(n)
 }
 

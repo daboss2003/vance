@@ -97,29 +97,59 @@ pub fn format_timestamp(ms: i64, comma: bool) -> String {
 /// Parse an `HH:MM:SS[,.]mmm` (or `MM:SS.mmm`) timestamp to milliseconds.
 /// Accepts either `,` or `.` as the millisecond separator.
 pub fn parse_timestamp(s: &str) -> Option<i64> {
-    let s = s.trim();
-    let (hms, milli) = if let Some((a, b)) = s.split_once([',', '.']) {
-        (a, b)
-    } else {
-        (s, "0")
+    // Strip surrounding whitespace AND a leading UTF-8 BOM (common from
+    // Windows editors; `trim()` alone leaves U+FEFF, which then poisons
+    // the hours field).
+    let s = s.trim().trim_start_matches('\u{FEFF}').trim();
+    let (hms, milli_src) = match s.split_once([',', '.']) {
+        Some((a, b)) => (a, b),
+        None => (s, ""),
     };
-    let parts: Vec<&str> = hms.split(':').collect();
-    let (h, m, sec) = match parts.as_slice() {
-        [h, m, s] => (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?, s.parse::<i64>().ok()?),
-        [m, s] => (0, m.parse::<i64>().ok()?, s.parse::<i64>().ok()?),
-        _ => return None,
-    };
-    // Pad/truncate the fractional part to exactly 3 digits.
-    let mut frac = milli.trim().to_string();
+    // Fractional part: ASCII digits only (reject `+`/`-`/junk), pad or
+    // truncate to exactly 3.
+    let milli_src = milli_src.trim();
+    if !milli_src.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let mut frac = milli_src.to_string();
     frac.truncate(3);
     while frac.len() < 3 {
         frac.push('0');
     }
     let milli: i64 = frac.parse().ok()?;
+    // Each H/M/S field must be a bare non-negative integer (no sign).
+    let field = |tok: &str| -> Option<i64> {
+        let t = tok.trim();
+        if t.is_empty() || !t.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        t.parse::<i64>().ok()
+    };
+    let parts: Vec<&str> = hms.split(':').collect();
+    let (h, m, sec) = match parts.as_slice() {
+        [h, m, s] => (field(h)?, field(m)?, field(s)?),
+        [m, s] => (0, field(m)?, field(s)?),
+        _ => return None,
+    };
     if m >= 60 || sec >= 60 {
         return None;
     }
-    Some(((h * 3600 + m * 60 + sec) * 1000) + milli)
+    // Checked arithmetic so a huge (but i64-parseable) hour field can't
+    // overflow-panic the whole import.
+    h.checked_mul(3600)?
+        .checked_add(m * 60 + sec)?
+        .checked_mul(1000)?
+        .checked_add(milli)
+}
+
+/// Normalize cue text for serialization: drop interior blank lines (which
+/// would terminate the cue block on re-parse) and trailing whitespace,
+/// keeping single line breaks. Round-trip-safe for SRT/VTT.
+pub fn sanitize_cue_text(text: &str) -> String {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -141,6 +171,23 @@ mod tests {
         assert_eq!(parse_timestamp("1:02:03"), Some(3_723_000));
         assert_eq!(parse_timestamp("bad"), None);
         assert_eq!(parse_timestamp("00:70:00,000"), None, "minutes >= 60 rejected");
+    }
+
+    #[test]
+    fn parse_is_robust_to_hostile_input() {
+        // Review fixes: overflow must NOT panic, BOM is stripped, signed /
+        // non-digit fields are rejected.
+        assert_eq!(parse_timestamp("9999999999999999:00:00,000"), None, "no overflow panic");
+        assert_eq!(parse_timestamp("\u{FEFF}00:00:01,000"), Some(1000), "BOM stripped");
+        assert_eq!(parse_timestamp("00:00:01,-50"), None, "signed fraction rejected");
+        assert_eq!(parse_timestamp("00:00:01,+5"), None, "signed fraction rejected");
+        assert_eq!(parse_timestamp("-1:00:00,000"), None, "negative hour rejected");
+    }
+
+    #[test]
+    fn sanitize_drops_interior_blank_lines() {
+        assert_eq!(sanitize_cue_text("line1\n\nline2"), "line1\nline2");
+        assert_eq!(sanitize_cue_text("a\nb"), "a\nb", "single breaks preserved");
     }
 
     #[test]

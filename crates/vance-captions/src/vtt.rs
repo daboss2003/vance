@@ -8,7 +8,7 @@
 //! / NOTE / identifier lines are naturally dropped.
 
 use crate::srt;
-use crate::{format_timestamp, CaptionError, Cue};
+use crate::{format_timestamp, sanitize_cue_text, CaptionError, Cue};
 
 /// Serialize cues to a WebVTT document (header + `.` separators).
 pub fn to_vtt(cues: &[Cue]) -> String {
@@ -22,7 +22,7 @@ pub fn to_vtt(cues: &[Cue]) -> String {
             // VTT voice span — renders as the speaker in compliant players.
             out.push_str(&format!("<v {}>", c.speaker));
         }
-        out.push_str(c.text.trim_end());
+        out.push_str(&sanitize_cue_text(&c.text));
         out.push_str("\n\n");
     }
     out
@@ -45,15 +45,36 @@ pub fn from_vtt(text: &str) -> Result<Vec<Cue>, CaptionError> {
     Ok(cues.into_iter().map(split_voice_tag).collect())
 }
 
-/// Extract a leading `<v Speaker>text` voice tag into `speaker`.
+/// Extract a leading voice tag — `<v Speaker>`, classed `<v.loud Speaker>`,
+/// with or without a closing `</v>` — into `speaker`, leaving clean text.
 fn split_voice_tag(mut cue: Cue) -> Cue {
     let t = cue.text.trim_start();
-    if let Some(rest) = t.strip_prefix("<v ") {
-        if let Some((name, body)) = rest.split_once('>') {
-            cue.speaker = name.trim().to_string();
-            cue.text = body.trim_start().to_string();
-        }
+    let Some(rest) = t.strip_prefix("<v") else {
+        return cue;
+    };
+    // The char after `<v` must begin a tag (classes `.`, the name space, or
+    // an immediate `>`); otherwise it's not a voice tag (e.g. `<video>`).
+    if !rest.starts_with(['.', ' ', '\t', '>']) {
+        return cue;
     }
+    let Some((inner, body)) = rest.split_once('>') else {
+        return cue;
+    };
+    // `inner` is like `.loud Bob` or ` Bob`: the speaker is whatever follows
+    // the first whitespace (classes, if any, precede it).
+    let name = inner
+        .split_once(char::is_whitespace)
+        .map(|(_, n)| n)
+        .unwrap_or(inner)
+        .trim();
+    cue.speaker = name.to_string();
+    // Strip a trailing `</v>` from the body so it doesn't leak into text.
+    cue.text = body
+        .trim_start()
+        .trim_end()
+        .trim_end_matches("</v>")
+        .trim_end()
+        .to_string();
     cue
 }
 
@@ -84,5 +105,14 @@ mod tests {
         let cues = from_vtt(src).unwrap();
         assert_eq!(cues[0].speaker, "Alice");
         assert_eq!(cues[0].text, "Hi there");
+    }
+
+    #[test]
+    fn voice_tag_handles_classes_and_closing_tag() {
+        // Review fix: classed voice tag + closing </v>.
+        let src = "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\n<v.loud Bob>Hey</v>\n";
+        let cues = from_vtt(src).unwrap();
+        assert_eq!(cues[0].speaker, "Bob", "classed tag → speaker extracted");
+        assert_eq!(cues[0].text, "Hey", "closing </v> stripped");
     }
 }
