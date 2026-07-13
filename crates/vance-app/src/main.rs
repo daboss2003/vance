@@ -18,6 +18,7 @@ mod prefetch;
 mod profiling;
 mod magicmask;
 mod proxy;
+mod publish;
 mod separate;
 mod transcribe;
 
@@ -40,6 +41,8 @@ use vance_viewport::{HostWindowHandle, ViewportBounds};
 type PeaksHandle = Arc<PMutex<Option<Arc<PeaksService>>>>;
 /// GOAT-10 — shared control-surface hub (OSC + MIDI listeners → action queue).
 type ControlHandle = Arc<PMutex<control::ControlHub>>;
+/// GOAT-11 — shared direct-publish hub (OAuth + upload state).
+type PublishHandle = Arc<PMutex<publish::PublishHub>>;
 
 #[derive(Serialize)]
 struct PeaksStatusResponse {
@@ -3313,6 +3316,110 @@ fn poll_control_actions(hub: tauri::State<'_, ControlHandle>) -> Vec<vance_contr
     hub.lock().drain()
 }
 
+// ---- GOAT-11: direct publish (YouTube / Vimeo / TikTok) --------------------
+
+fn parse_platform(s: &str) -> Result<vance_publish::Platform, String> {
+    match s {
+        "YouTube" => Ok(vance_publish::Platform::YouTube),
+        "Vimeo" => Ok(vance_publish::Platform::Vimeo),
+        "TikTok" => Ok(vance_publish::Platform::TikTok),
+        _ => Err(format!("unknown platform '{s}'")),
+    }
+}
+
+fn parse_privacy(s: &str) -> vance_publish::Privacy {
+    match s {
+        "public" => vance_publish::Privacy::Public,
+        "private" => vance_publish::Privacy::Private,
+        _ => vance_publish::Privacy::Unlisted,
+    }
+}
+
+/// Whether a platform is currently authorized (has an access token).
+#[tauri::command]
+fn publish_authorized(hub: tauri::State<'_, PublishHandle>, platform: String) -> bool {
+    match parse_platform(&platform) {
+        Ok(p) => hub.lock().is_authorized(p),
+        Err(_) => false,
+    }
+}
+
+/// Begin OAuth for a platform: spawns the loopback redirect listener, opens
+/// the consent page, and returns the authorize URL (also shown in-UI).
+#[tauri::command]
+fn start_oauth(
+    hub: tauri::State<'_, PublishHandle>,
+    platform: String,
+    client_id: String,
+    client_secret: Option<String>,
+    redirect_uri: String,
+) -> Result<String, String> {
+    let p = parse_platform(&platform)?;
+    hub.lock()
+        .start_oauth(p, client_id, client_secret, redirect_uri)
+        .map_err(|e| e.to_string())
+}
+
+/// Wait for the browser callback + exchange the code for a token. Blocks up
+/// to 3 min (off the hub lock during the HTTP round-trip). Returns true when
+/// authorized.
+#[tauri::command]
+fn await_oauth(hub: tauri::State<'_, PublishHandle>) -> Result<bool, String> {
+    // Snapshot the redirect slot + exchange context under a brief lock.
+    let (slot, state, ctx) = {
+        let h = hub.lock();
+        let (slot, state) = h
+            .pending_slot()
+            .ok_or_else(|| "no OAuth flow in progress".to_string())?;
+        let ctx = h
+            .exchange_ctx()
+            .ok_or_else(|| "no OAuth flow in progress".to_string())?;
+        (slot, state, ctx)
+    };
+    let (platform, cfg, verifier) = ctx;
+    // Poll + exchange with the lock DROPPED.
+    let token = publish::await_and_exchange(&slot, &state, platform, &cfg, &verifier)
+        .map_err(|e| e.to_string())?;
+    hub.lock().finish(token);
+    Ok(true)
+}
+
+/// Publish a rendered file to a platform. Reads the token under a brief
+/// lock, uploads with the lock dropped. Returns the resulting URL.
+#[tauri::command]
+fn publish_video(
+    hub: tauri::State<'_, PublishHandle>,
+    platform: String,
+    file_path: String,
+    title: String,
+    description: String,
+    tags: Vec<String>,
+    privacy: String,
+) -> Result<String, String> {
+    let p = parse_platform(&platform)?;
+    let token = hub
+        .lock()
+        .token(p)
+        .ok_or_else(|| "not authorized — connect the account first".to_string())?;
+    let meta = vance_publish::UploadMeta {
+        title,
+        description,
+        tags,
+        privacy: parse_privacy(&privacy),
+    };
+    match p {
+        vance_publish::Platform::YouTube => {
+            publish::upload_youtube(&token, &file_path, &meta).map_err(|e| e.to_string())
+        }
+        // OAuth is wired for all three; the platform-specific upload for
+        // Vimeo/TikTok (their chunked/tus APIs) is the next step.
+        other => Err(format!(
+            "{}: OAuth is connected, but Vance's uploader for it isn't wired yet — YouTube is fully supported.",
+            other.label()
+        )),
+    }
+}
+
 #[tauri::command]
 fn project_info(state: tauri::State<'_, EngineHandle>) -> Option<ProjectInfo> {
     state.lock().project_info()
@@ -3344,12 +3451,14 @@ fn main() {
     let engine = EngineHandle::new();
     let peaks_handle: PeaksHandle = Arc::new(PMutex::new(None));
     let control_hub: ControlHandle = Arc::new(PMutex::new(control::ControlHub::default()));
+    let publish_hub: PublishHandle = Arc::new(PMutex::new(publish::PublishHub::default()));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(engine.clone())
         .manage(peaks_handle.clone())
         .manage(control_hub.clone())
+        .manage(publish_hub.clone())
         .setup(move |app| {
             let window = app
                 .get_webview_window("main")
@@ -3469,6 +3578,10 @@ fn main() {
             start_midi_control,
             stop_midi_control,
             poll_control_actions,
+            publish_authorized,
+            start_oauth,
+            await_oauth,
+            publish_video,
             move_clip_to,
             remove_clip,
             add_effect_to_clip,

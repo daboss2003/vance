@@ -23,6 +23,7 @@ members = [
     "crates/vance-mograph",
     "crates/vance-captions",
     "crates/vance-control",
+    "crates/vance-publish",
     "crates/vance-engine",
     "crates/vance-project",
     "crates/vance-otio",
@@ -83,6 +84,7 @@ vance-expr = { path = "crates/vance-expr" }
 vance-mograph = { path = "crates/vance-mograph" }
 vance-captions = { path = "crates/vance-captions" }
 vance-control = { path = "crates/vance-control" }
+vance-publish = { path = "crates/vance-publish" }
 vance-engine = { path = "crates/vance-engine" }
 vance-project = { path = "crates/vance-project" }
 vance-otio = { path = "crates/vance-otio" }

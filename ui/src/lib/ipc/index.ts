@@ -1364,6 +1364,32 @@ export const stopMidiControl = (): Promise<void> => invoke('stop_midi_control');
 /** Drain queued control-surface actions (poll on a timer while enabled). */
 export const pollControlActions = (): Promise<ControlAction[]> =>
   invoke('poll_control_actions');
+
+// ---- GOAT-11: direct publish (YouTube / Vimeo / TikTok) ---------------------
+
+/** Is the platform authorized (has a stored access token)? */
+export const publishAuthorized = (platform: string): Promise<boolean> =>
+  invoke('publish_authorized', { platform });
+/** Begin OAuth (spawns a loopback listener, opens the browser). Returns the
+ *  authorize URL (also opened automatically). */
+export const startOauth = (args: {
+  platform: string;
+  clientId: string;
+  clientSecret: string | null;
+  redirectUri: string;
+}): Promise<string> => invoke('start_oauth', args);
+/** Wait for the browser callback + exchange the code for a token (blocks up
+ *  to ~3 min). Resolves true when authorized. */
+export const awaitOauth = (): Promise<boolean> => invoke('await_oauth');
+/** Publish a rendered file to the platform. Returns the resulting URL. */
+export const publishVideo = (args: {
+  platform: string;
+  filePath: string;
+  title: string;
+  description: string;
+  tags: string[];
+  privacy: string;
+}): Promise<string> => invoke('publish_video', args);
 export const canUndo = (): Promise<boolean> => invoke('can_undo');
 export const canRedo = (): Promise<boolean> => invoke('can_redo');
 
