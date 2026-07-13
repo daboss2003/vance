@@ -69,8 +69,7 @@ pub fn isolate_subject(media_path: &Path) -> Result<PathBuf, MagicMaskError> {
         .arg(&out_file);
     let out = cmd.output()?;
     if !out.status.success() {
-        let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        stderr.truncate(2000);
+        let stderr: String = String::from_utf8_lossy(&out.stderr).chars().take(2000).collect();
         return Err(MagicMaskError::Failed {
             code: out.status.code(),
             stderr,

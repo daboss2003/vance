@@ -5001,12 +5001,41 @@ impl Engine {
                 interp: vance_timeline::KeyframeInterp::Linear,
             });
         }
+        // Idempotent: reframe writes an ABSOLUTE transform, so re-running
+        // must REPLACE the prior reframe (not stack another "transform" that
+        // eval_clip_transform would multiply/add). Remove any transform this
+        // reframe previously authored (tagged with a "reframe" marker param),
+        // leaving the user's own manual transforms untouched.
+        let prior: Vec<EffectId> = {
+            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
+            let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+            let seq = project.sequence(seq_id).ok_or(EngineError::SequenceNotFound)?;
+            seq.tracks
+                .iter()
+                .find(|t| t.id == track_id)
+                .and_then(|t| t.clips.iter().find(|c| c.id == clip_id))
+                .map(|c| {
+                    c.effects
+                        .iter()
+                        .filter(|e| e.kind == "transform" && e.params.contains_key("reframe"))
+                        .map(|e| e.id)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for eid in prior {
+            self.remove_effect_from_clip(track_id, clip_id, eid)?;
+        }
+
         let mut params: std::collections::BTreeMap<String, EffectValue> = Default::default();
         params.insert("translate_x".into(), EffectValue::Keyframes { keyframes: tx_kfs });
         params.insert("translate_y".into(), EffectValue::Keyframes { keyframes: ty_kfs });
         params.insert("scale_x".into(), EffectValue::Number(scale[0] as f64));
         params.insert("scale_y".into(), EffectValue::Number(scale[1] as f64));
         params.insert("rotation".into(), EffectValue::Number(0.0));
+        // Marker so a re-run can find + replace this reframe (inert to
+        // eval_clip_transform, which reads only translate/scale/rotation).
+        params.insert("reframe".into(), EffectValue::Number(1.0));
         self.add_effect_to_clip(track_id, clip_id, "transform".into(), params)?;
 
         let start_t = trail.first().map(|(t, _)| *t).unwrap_or(0.0);
