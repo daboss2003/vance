@@ -6441,6 +6441,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "vance-fusion"
+version = "0.0.0"
+dependencies = [
+ "ron",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+ "vance-expr",
+ "vance-mograph",
+]
+
+[[package]]
 name = "vance-grading-cmd"
 version = "0.0.0"
 dependencies = [

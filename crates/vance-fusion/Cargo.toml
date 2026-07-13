@@ -1,0 +1,22 @@
+[package]
+name = "vance-fusion"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Vance Fusion — a node-graph image compositor (.vfc): DAG of generators, filters, merges, masks, rasterized on the CPU."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+ron = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+vance-expr = { workspace = true }
+# Reuses the tested CPU raster core (RgbaImage, composite, rounded_rect,
+# render_text, FontDb) + the keyframe lane + the color/align types.
+vance-mograph = { workspace = true }
+
+[dev-dependencies]

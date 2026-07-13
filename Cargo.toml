@@ -21,6 +21,7 @@ members = [
     "crates/vance-timeline",
     "crates/vance-expr",
     "crates/vance-mograph",
+    "crates/vance-fusion",
     "crates/vance-captions",
     "crates/vance-control",
     "crates/vance-publish",
@@ -82,6 +83,7 @@ vance-effects = { path = "crates/vance-effects" }
 vance-timeline = { path = "crates/vance-timeline" }
 vance-expr = { path = "crates/vance-expr" }
 vance-mograph = { path = "crates/vance-mograph" }
+vance-fusion = { path = "crates/vance-fusion" }
 vance-captions = { path = "crates/vance-captions" }
 vance-control = { path = "crates/vance-control" }
 vance-publish = { path = "crates/vance-publish" }
