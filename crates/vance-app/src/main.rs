@@ -11,6 +11,7 @@
 
 mod audio_bounce;
 mod cached_decode;
+mod control;
 mod engine;
 mod peaks;
 mod prefetch;
@@ -37,6 +38,8 @@ use vance_viewport::{HostWindowHandle, ViewportBounds};
 /// Wrapped in a `Mutex<Option<…>>` rather than directly behind an Arc
 /// so M6 can swap the service when the active project bundle changes.
 type PeaksHandle = Arc<PMutex<Option<Arc<PeaksService>>>>;
+/// GOAT-10 — shared control-surface hub (OSC + MIDI listeners → action queue).
+type ControlHandle = Arc<PMutex<control::ControlHub>>;
 
 #[derive(Serialize)]
 struct PeaksStatusResponse {
@@ -3256,6 +3259,60 @@ fn isolate_voice(
     state.lock().import_audio_file(&dest_str).map_err(|e| e.to_string())
 }
 
+// ---- GOAT-10: control surfaces (OSC / MIDI) --------------------------------
+
+/// `(osc_running, osc_port, midi_running, midi_name)`.
+#[derive(serde::Serialize)]
+struct ControlStatus {
+    osc_running: bool,
+    osc_port: Option<u16>,
+    midi_running: bool,
+    midi_name: Option<String>,
+}
+
+#[tauri::command]
+fn control_status(hub: tauri::State<'_, ControlHandle>) -> ControlStatus {
+    let (osc_running, osc_port, midi_running, midi_name) = hub.lock().status();
+    ControlStatus {
+        osc_running,
+        osc_port,
+        midi_running,
+        midi_name,
+    }
+}
+
+#[tauri::command]
+fn start_osc_control(hub: tauri::State<'_, ControlHandle>, port: u16) -> Result<(), String> {
+    hub.lock().start_osc(port).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn stop_osc_control(hub: tauri::State<'_, ControlHandle>) {
+    hub.lock().stop_osc();
+}
+
+#[tauri::command]
+fn midi_ports() -> Vec<String> {
+    control::ControlHub::midi_ports()
+}
+
+#[tauri::command]
+fn start_midi_control(hub: tauri::State<'_, ControlHandle>, port_index: usize) -> Result<(), String> {
+    hub.lock().start_midi(port_index)
+}
+
+#[tauri::command]
+fn stop_midi_control(hub: tauri::State<'_, ControlHandle>) {
+    hub.lock().stop_midi();
+}
+
+/// Drain queued control-surface actions (the UI polls this and dispatches
+/// each through the normal, thread-correct command path).
+#[tauri::command]
+fn poll_control_actions(hub: tauri::State<'_, ControlHandle>) -> Vec<vance_control::ControlAction> {
+    hub.lock().drain()
+}
+
 #[tauri::command]
 fn project_info(state: tauri::State<'_, EngineHandle>) -> Option<ProjectInfo> {
     state.lock().project_info()
@@ -3286,11 +3343,13 @@ fn main() {
 
     let engine = EngineHandle::new();
     let peaks_handle: PeaksHandle = Arc::new(PMutex::new(None));
+    let control_hub: ControlHandle = Arc::new(PMutex::new(control::ControlHub::default()));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(engine.clone())
         .manage(peaks_handle.clone())
+        .manage(control_hub.clone())
         .setup(move |app| {
             let window = app
                 .get_webview_window("main")
@@ -3403,6 +3462,13 @@ fn main() {
             isolate_voice,
             magic_mask_available,
             magic_mask,
+            control_status,
+            start_osc_control,
+            stop_osc_control,
+            midi_ports,
+            start_midi_control,
+            stop_midi_control,
+            poll_control_actions,
             move_clip_to,
             remove_clip,
             add_effect_to_clip,

@@ -4,6 +4,7 @@
   import {
     backendVersion,
     currentTimelineSeconds,
+    scrubGrain,
     evalNumber,
     isKeyframes,
     COLOR_SPACE_OPTIONS,
@@ -42,6 +43,7 @@
   import CaptionsPanel from '$lib/CaptionsPanel.svelte';
   import AiAudioPanel from '$lib/AiAudioPanel.svelte';
   import ReframePanel from '$lib/ReframePanel.svelte';
+  import ControlPanel from '$lib/ControlPanel.svelte';
   import TransitionInspector from '$lib/TransitionInspector.svelte';
   import ColorWheel from '$lib/color/ColorWheel.svelte';
   import CurveEditor from '$lib/color/CurveEditor.svelte';
@@ -112,6 +114,8 @@
     window.addEventListener('resize', reportBounds);
     window.addEventListener('scroll', reportBounds, true);
     window.addEventListener('keydown', handleKeydown);
+    // GOAT-10 — transport actions dispatched by the control-surface panel.
+    window.addEventListener('vance:control', onControlAction as EventListener);
     // Poll the engine for playback state — covers natural EOS / errors.
     // On a true→false transition we also fetch the engine's last resume
     // PTS so the next Play can detect end-of-file and rewind to 0.
@@ -154,11 +158,46 @@
       window.removeEventListener('resize', reportBounds);
       window.removeEventListener('scroll', reportBounds, true);
       window.removeEventListener('keydown', handleKeydown);
+      window.removeEventListener('vance:control', onControlAction as EventListener);
       window.removeEventListener('mousemove', onMouseMoveDrag);
       window.removeEventListener('mouseup', onMouseUpDrag);
       window.clearInterval(pollId);
     };
   });
+
+  /** GOAT-10 — apply a transport control-surface action (mixer/undo are
+   *  handled in ControlPanel; here we own play/jog/seek). */
+  async function onControlAction(e: Event) {
+    const a = (e as CustomEvent).detail;
+    try {
+      if (a && typeof a === 'object' && 'JogFrames' in a) {
+        const seq = projectState.sequence;
+        const fps = seq && seq.frame_rate_den !== 0 ? seq.frame_rate_num / seq.frame_rate_den : 24;
+        const cur = (await currentTimelineSeconds()) ?? 0;
+        await scrubGrain(Math.max(0, cur + a.JogFrames / (fps || 24)));
+        return;
+      }
+      switch (a) {
+        case 'PlayPause':
+          await togglePlayback();
+          break;
+        case 'Stop':
+          playing = false;
+          break;
+        case 'GoToStart':
+          await scrubGrain(0);
+          break;
+        case 'GoToEnd': {
+          const d = projectState.sequence?.duration_seconds ?? 0;
+          await scrubGrain(Math.max(0, d - 0.05));
+          break;
+        }
+        // AddMarker / Split have no IPC command yet — no-op.
+      }
+    } catch {
+      // ignore transient control errors
+    }
+  }
 
   /** PTS units per video frame: time_base_den / (frame_rate_num/den). */
   function ptsPerFrame(): number | null {
@@ -2005,6 +2044,11 @@
         <!-- GOAT-9 — smart reframe (subject-tracking auto-reframe). -->
         <div class="ml-2 w-60 shrink-0 max-h-48 overflow-auto">
           <ReframePanel />
+        </div>
+
+        <!-- GOAT-10 — control surfaces (OSC / MIDI). -->
+        <div class="ml-2 w-60 shrink-0 max-h-48 overflow-auto">
+          <ControlPanel />
         </div>
 
         <span class="text-vance-muted ml-auto">

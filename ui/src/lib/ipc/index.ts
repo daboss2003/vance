@@ -1329,6 +1329,41 @@ export const renderAndReplace = (req: RenderAndReplaceRequest): Promise<RenderAn
 
 export const undo = (): Promise<boolean> => invoke('undo');
 export const redo = (): Promise<boolean> => invoke('redo');
+
+// ---- GOAT-10: control surfaces (OSC / MIDI) --------------------------------
+
+/** A mapped editor action from a control surface (mirrors
+ *  `vance_control::ControlAction`; externally-tagged serde). */
+export type ControlAction =
+  | 'PlayPause'
+  | 'Stop'
+  | 'GoToStart'
+  | 'GoToEnd'
+  | 'AddMarker'
+  | 'Split'
+  | 'Undo'
+  | 'Redo'
+  | { JogFrames: number }
+  | { SetMasterGainDb: number };
+
+export type ControlStatus = {
+  osc_running: boolean;
+  osc_port: number | null;
+  midi_running: boolean;
+  midi_name: string | null;
+};
+
+export const controlStatus = (): Promise<ControlStatus> => invoke('control_status');
+export const startOscControl = (port: number): Promise<void> =>
+  invoke('start_osc_control', { port });
+export const stopOscControl = (): Promise<void> => invoke('stop_osc_control');
+export const midiPorts = (): Promise<string[]> => invoke('midi_ports');
+export const startMidiControl = (portIndex: number): Promise<void> =>
+  invoke('start_midi_control', { portIndex });
+export const stopMidiControl = (): Promise<void> => invoke('stop_midi_control');
+/** Drain queued control-surface actions (poll on a timer while enabled). */
+export const pollControlActions = (): Promise<ControlAction[]> =>
+  invoke('poll_control_actions');
 export const canUndo = (): Promise<boolean> => invoke('can_undo');
 export const canRedo = (): Promise<boolean> => invoke('can_redo');
 

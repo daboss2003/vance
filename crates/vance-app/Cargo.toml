@@ -65,7 +65,10 @@ tracing-chrome = { workspace = true }
 vance-render = { workspace = true }
 vance-mograph = { workspace = true }
 vance-captions = { workspace = true }
+vance-control = { workspace = true }
 vance-viewport = { workspace = true }
+# GOAT-10 — MIDI control-surface input (CoreMIDI / ALSA / WinMM).
+midir = "0.10"
 vance-audio = { workspace = true }
 vance-audio-plugins = { workspace = true }
 # Linked only so the app's `clap`/`lv2` features can forward to the

@@ -1,0 +1,13 @@
+[package]
+name = "vance-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Control surfaces for Vance — OSC / MIDI / HID decoders + action mapping."
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
