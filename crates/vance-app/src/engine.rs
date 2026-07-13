@@ -36,6 +36,10 @@ enum MediaResolved {
     /// clip-relative time via `vance_render::render_mograph_yuv420`.
     /// Boxed because the instance embeds its template inline.
     MoGraph(Box<vance_mograph::MographInstance>),
+    /// GOAT-12 — a Fusion node-graph composition, rasterized at the
+    /// clip-relative time via `vance_render::render_fusion_yuv420`.
+    /// Boxed because the comp embeds its whole node graph inline.
+    Fusion(Box<vance_fusion::Comp>),
 }
 use vance_viewport::{HostWindowHandle, Viewport, ViewportBounds};
 
@@ -959,6 +963,7 @@ impl From<&MediaItem> for MediaItemInfo {
                 MediaKind::Image => "image".into(),
                 MediaKind::Title => "title".into(),
                 MediaKind::MoGraph => "mograph".into(),
+                MediaKind::Fusion => "fusion".into(),
             },
             duration_seconds: rt_to_seconds(m.duration),
             frame_rate_num: fr_n,
@@ -1281,6 +1286,11 @@ pub struct Engine {
     /// no titles pay nothing (and no font scan happens at startup). Held
     /// behind `Arc` so the playback thread can share the same font cache.
     mograph_engine: std::cell::OnceCell<std::sync::Arc<vance_mograph::MographEngine>>,
+
+    /// GOAT-12 — the Fusion node-graph compositor (font cache + rasterizer).
+    /// Built lazily on first Fusion render (same rationale as
+    /// `mograph_engine`); shared with the playback thread via `Arc`.
+    fusion_compositor: std::cell::OnceCell<std::sync::Arc<vance_fusion::Compositor>>,
 }
 
 /// Anchors a stream-time-base playback position back to a sequence
@@ -1392,12 +1402,23 @@ enum StartPlaybackKind {
         /// from where the playhead was, not from the rig's start).
         start_offset_sec: f64,
     },
+    /// GOAT-12 — animated Fusion composition; the loop re-rasterizes the
+    /// node graph per tick at the elapsed time so it animates during
+    /// playback.
+    Fusion {
+        comp: Box<vance_fusion::Comp>,
+        fps: f64,
+        duration_seconds: f64,
+        /// Clip-relative time playback resumed at.
+        start_offset_sec: f64,
+    },
 }
 
-/// A synthetic (file-less) playback source — a title or a mograph.
+/// A synthetic (file-less) playback source — a title, mograph, or Fusion.
 enum SyntheticPlayback {
     Title(TitleParams),
     MoGraph(Box<vance_mograph::MographInstance>),
+    Fusion(Box<vance_fusion::Comp>),
 }
 
 /// Owned by the engine while video playback is running.
@@ -2246,6 +2267,36 @@ impl Engine {
                     0,
                 )
             }
+            StartPlaybackKind::Fusion {
+                comp,
+                fps,
+                duration_seconds,
+                start_offset_sec,
+            } => {
+                // GOAT-12 — share the compositor's font cache with the loop
+                // and re-rasterize the node graph per tick (Fusion is silent
+                // in v1, like titles). The first frame is at the resume offset.
+                let compositor = self.fusion_compositor();
+                let frame = vance_render::render_fusion_yuv420(
+                    &compositor,
+                    &comp,
+                    start_offset_sec,
+                    &std::collections::HashMap::new(),
+                );
+                (
+                    PlaybackPrimary::Fusion {
+                        compositor,
+                        comp,
+                        frame,
+                        fps,
+                        duration_seconds,
+                        start_offset_sec,
+                    },
+                    None,
+                    None,
+                    0,
+                )
+            }
         };
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -3016,6 +3067,63 @@ impl Engine {
         Ok(ok)
     }
 
+    /// GOAT-12 — create a new Fusion composition media item seeded with a
+    /// starter graph (title over a gradient background) at the given canvas
+    /// size. Returns its info for the browser.
+    pub fn create_fusion_media(
+        &mut self,
+        display_name: Option<String>,
+        width: u32,
+        height: u32,
+        duration_seconds: f64,
+    ) -> Result<MediaItemInfo, EngineError> {
+        if self.current_project.is_none() {
+            return Err(EngineError::NoProject);
+        }
+        let mut comp = vance_fusion::starter(width.max(2), height.max(2));
+        comp.duration_s = duration_seconds.max(0.04);
+        comp.fps = self.current_sequence_fps().unwrap_or(30.0);
+        let name = display_name.unwrap_or_else(|| "Fusion Composition".to_string());
+        let duration = seconds_to_rt(comp.duration_s);
+        let item = MediaItem::new_fusion(name, duration, comp);
+        let id = item.id;
+        let info = MediaItemInfo::from(&item);
+        let project = self.current_project.as_mut().unwrap();
+        project.media.insert(id, Arc::new(item));
+        tracing::info!(id = %id, "created fusion media");
+        Ok(info)
+    }
+
+    /// GOAT-12 — the Fusion composition for `media_id` (the whole node
+    /// graph), for the node editor. `None` if the item isn't a Fusion comp.
+    pub fn fusion_comp(&self, media_id: MediaItemId) -> Option<vance_fusion::Comp> {
+        self.current_project
+            .as_ref()?
+            .media
+            .get(&media_id)?
+            .fusion
+            .clone()
+    }
+
+    /// GOAT-12 — replace the Fusion composition on a media item (the editor
+    /// edits the graph and pushes the whole comp back). Errors if the item
+    /// isn't a Fusion comp.
+    pub fn set_fusion_comp(
+        &mut self,
+        media_id: MediaItemId,
+        comp: vance_fusion::Comp,
+    ) -> Result<(), EngineError> {
+        let project = self.current_project.as_mut().ok_or(EngineError::NoProject)?;
+        let arc = project.media.get(&media_id).ok_or(EngineError::MediaNotFound)?;
+        let mut item = (**arc).clone();
+        if item.fusion.is_none() {
+            return Err(EngineError::Project("media is not a fusion comp".into()));
+        }
+        item.fusion = Some(comp);
+        project.media.insert(media_id, Arc::new(item));
+        Ok(())
+    }
+
     /// All media items registered in the current project, for the
     /// Browser panel. Empty when no project is loaded.
     pub fn media_list(&self) -> Vec<MediaItemInfo> {
@@ -3141,6 +3249,17 @@ impl Engine {
             MediaResolved::MoGraph(inst) => {
                 return self.play_synthetic_clip(
                     SyntheticPlayback::MoGraph(inst),
+                    anchor_clip_id,
+                    anchor_timeline_in,
+                    anchor_source_in,
+                    source_pts_seconds,
+                    anchor_opacity,
+                    clip_duration_sec,
+                );
+            }
+            MediaResolved::Fusion(comp) => {
+                return self.play_synthetic_clip(
+                    SyntheticPlayback::Fusion(comp),
                     anchor_clip_id,
                     anchor_timeline_in,
                     anchor_source_in,
@@ -3372,6 +3491,9 @@ impl Engine {
                 MediaResolved::MoGraph(inst) => {
                     (self.render_mograph_frame(&inst, from_clip_t), 0, (1, 1000))
                 }
+                MediaResolved::Fusion(comp) => {
+                    (self.render_fusion_frame(&comp, from_clip_t), 0, (1, 1000))
+                }
             };
         self.playing_clip_anchor = Some(ClipAnchor {
             timeline_in_seconds: anchor_tl_in,
@@ -3408,6 +3530,7 @@ impl Engine {
             MediaResolved::Title(params) => render_title_yuv420(&params)
                 .map_err(|e| EngineError::Project(format!("title render: {e}")))?,
             MediaResolved::MoGraph(inst) => self.render_mograph_frame(&inst, to_clip_t),
+            MediaResolved::Fusion(comp) => self.render_fusion_frame(&comp, to_clip_t),
         };
 
         // Push effect uniforms + mix factor to the renderer. The
@@ -3559,6 +3682,12 @@ impl Engine {
                 duration_seconds: remaining_dur,
                 start_offset_sec: entry_offset,
             },
+            SyntheticPlayback::Fusion(comp) => StartPlaybackKind::Fusion {
+                comp,
+                fps: self.current_sequence_fps().unwrap_or(30.0),
+                duration_seconds: remaining_dur,
+                start_offset_sec: entry_offset,
+            },
         };
         self.start_playback_inner(kind)
     }
@@ -3592,6 +3721,32 @@ impl Engine {
         let duration = inst.template.meta.default_duration_s;
         let engine = self.mograph_engine();
         vance_render::render_mograph_yuv420(&engine, inst, clip_t.max(0.0), fps, duration)
+    }
+
+    /// GOAT-12 — the lazily-built Fusion compositor (cloneable `Arc` so the
+    /// playback thread shares the font cache). The system font scan happens
+    /// once, on first Fusion render.
+    fn fusion_compositor(&self) -> std::sync::Arc<vance_fusion::Compositor> {
+        self.fusion_compositor
+            .get_or_init(|| std::sync::Arc::new(vance_fusion::Compositor::new()))
+            .clone()
+    }
+
+    /// GOAT-12 — rasterize a Fusion comp to a YUV frame at clip-relative
+    /// `clip_t` seconds (so the graph animates as the playhead moves). The
+    /// standalone comp media takes no host inputs.
+    fn render_fusion_frame(
+        &self,
+        comp: &vance_fusion::Comp,
+        clip_t: f64,
+    ) -> vance_render::FrameData {
+        let compositor = self.fusion_compositor();
+        vance_render::render_fusion_yuv420(
+            &compositor,
+            comp,
+            clip_t.max(0.0),
+            &std::collections::HashMap::new(),
+        )
     }
 
     /// Single-shot title render — same role as `decode_and_render_at`
@@ -3850,6 +4005,11 @@ impl Engine {
             // phase matches the live preview.
             MediaResolved::MoGraph(inst) => {
                 Some(self.render_mograph_frame(&inst, source_pts_sec - source_in_sec))
+            }
+            // Clip-relative time = source_pts − source_in, so a trimmed/split
+            // Fusion clip exports the same animation phase as live preview.
+            MediaResolved::Fusion(comp) => {
+                Some(self.render_fusion_frame(&comp, source_pts_sec - source_in_sec))
             }
         }
     }
@@ -4241,6 +4401,12 @@ impl Engine {
                 // to a default title so resolution never fails hard.
                 None => Ok(MediaResolved::Title(TitleParams::default())),
             },
+            MediaKind::Fusion => match media.fusion.clone() {
+                Some(comp) => Ok(MediaResolved::Fusion(Box::new(comp))),
+                // A Fusion item with no comp is malformed; fall back to a
+                // default title so resolution never fails hard.
+                None => Ok(MediaResolved::Title(TitleParams::default())),
+            },
             MediaKind::Video | MediaKind::Image | MediaKind::Audio => {
                 // Phase 9.5 — when the project's "use proxies" toggle
                 // is on AND this item has a generated proxy file, use
@@ -4357,6 +4523,18 @@ impl Engine {
             MediaResolved::MoGraph(inst) => {
                 let clip_t = source_pts_seconds - anchor_source_in;
                 let frame = self.render_mograph_frame(&inst, clip_t);
+                return self.decode_title_scrub(
+                    frame,
+                    anchor_clip_id,
+                    anchor_timeline_in,
+                    anchor_source_in,
+                    source_pts_seconds,
+                    anchor_opacity,
+                );
+            }
+            MediaResolved::Fusion(comp) => {
+                let clip_t = source_pts_seconds - anchor_source_in;
+                let frame = self.render_fusion_frame(&comp, clip_t);
                 return self.decode_title_scrub(
                     frame,
                     anchor_clip_id,
@@ -7944,6 +8122,24 @@ pub enum PlaybackPrimary {
         /// elapsed time so the rig animates from the playhead, not t=0.
         start_offset_sec: f64,
     },
+    /// GOAT-12 — an animated Fusion composition. Like `MoGraph`, the loop
+    /// RE-RASTERIZES the node graph each tick at the elapsed time. Shares
+    /// the compositor's font cache via `Arc`.
+    Fusion {
+        /// Shared compositor (font cache + rasterizer).
+        compositor: std::sync::Arc<vance_fusion::Compositor>,
+        /// The composition to render each tick.
+        comp: Box<vance_fusion::Comp>,
+        /// Scratch frame, re-rendered + re-pts'd every tick.
+        frame: vance_decoder::FrameData,
+        /// Playback frame rate.
+        fps: f64,
+        /// Remaining duration to play from the resume offset.
+        duration_seconds: f64,
+        /// Clip-relative time playback resumed at; added to the loop's
+        /// elapsed time so the graph animates from the playhead, not t=0.
+        start_offset_sec: f64,
+    },
 }
 
 impl PlaybackPrimary {
@@ -7953,7 +8149,9 @@ impl PlaybackPrimary {
     fn time_base(&self) -> (i64, i64) {
         match self {
             PlaybackPrimary::Decoder { info, .. } => info.time_base,
-            PlaybackPrimary::Title { .. } | PlaybackPrimary::MoGraph { .. } => (1, 1000),
+            PlaybackPrimary::Title { .. }
+            | PlaybackPrimary::MoGraph { .. }
+            | PlaybackPrimary::Fusion { .. } => (1, 1000),
         }
     }
 
@@ -7963,7 +8161,9 @@ impl PlaybackPrimary {
     fn from_pts(&self) -> i64 {
         match self {
             PlaybackPrimary::Decoder { from_pts, .. } => *from_pts,
-            PlaybackPrimary::Title { .. } | PlaybackPrimary::MoGraph { .. } => 0,
+            PlaybackPrimary::Title { .. }
+            | PlaybackPrimary::MoGraph { .. }
+            | PlaybackPrimary::Fusion { .. } => 0,
         }
     }
 
@@ -7974,7 +8174,9 @@ impl PlaybackPrimary {
     fn into_decoder(self) -> Option<DecoderClient> {
         match self {
             PlaybackPrimary::Decoder { client, .. } => Some(client),
-            PlaybackPrimary::Title { .. } | PlaybackPrimary::MoGraph { .. } => None,
+            PlaybackPrimary::Title { .. }
+            | PlaybackPrimary::MoGraph { .. }
+            | PlaybackPrimary::Fusion { .. } => None,
         }
     }
 }
@@ -8169,6 +8371,41 @@ fn playback_loop(
                     *start_offset_sec + elapsed_sec,
                     *fps,
                     *duration_seconds,
+                );
+                frame.pts = title_tick_ms;
+                title_tick_ms = title_tick_ms.saturating_add(tick_dt_ms);
+                frame.clone()
+            }
+            PlaybackPrimary::Fusion {
+                compositor,
+                comp,
+                frame,
+                fps,
+                duration_seconds,
+                start_offset_sec,
+            } => {
+                // GOAT-12 — re-rasterize the node graph at the elapsed clip
+                // time so the comp animates, then present like a title frame.
+                let tick_dt_ms = (1000.0 / fps.max(1.0)).round() as i64;
+                let elapsed_sec = (title_tick_ms as f64) / 1000.0;
+                if elapsed_sec >= *duration_seconds {
+                    ended_at_eos.store(true, Ordering::Release);
+                    if chain_resume_micros.load(Ordering::Acquire) == i64::MIN {
+                        if let Some(ctx) = seq_ctx.as_ref() {
+                            let end_t = ctx.anchor_timeline_in
+                                + (elapsed_sec - ctx.anchor_source_in);
+                            let resume_micros =
+                                (end_t * 1_000_000.0).round() as i64 + 1000;
+                            chain_resume_micros.store(resume_micros, Ordering::Release);
+                        }
+                    }
+                    break;
+                }
+                *frame = vance_render::render_fusion_yuv420(
+                    compositor,
+                    comp,
+                    *start_offset_sec + elapsed_sec,
+                    &std::collections::HashMap::new(),
                 );
                 frame.pts = title_tick_ms;
                 title_tick_ms = title_tick_ms.saturating_add(tick_dt_ms);

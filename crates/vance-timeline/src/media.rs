@@ -31,6 +31,10 @@ pub enum MediaKind {
     /// backing; the engine reads `mograph` and rasterizes it via
     /// `vance-mograph` at the clip-relative time (animated).
     MoGraph,
+    /// GOAT-12 — synthetic Fusion node-graph composition. No file
+    /// backing; the engine reads `fusion` and rasterizes the graph via
+    /// `vance-fusion` at the clip-relative time (animated).
+    Fusion,
 }
 
 /// A 32-byte content hash used for relink-by-content. We only require it
@@ -69,6 +73,11 @@ pub struct MediaItem {
     /// projects round-trip without this field.
     #[serde(default)]
     pub mograph: Option<vance_mograph::MographInstance>,
+    /// GOAT-12 — the Fusion node-graph composition. Set when `kind ==
+    /// Fusion`, `None` otherwise. `#[serde(default)]` so older projects
+    /// round-trip without this field.
+    #[serde(default)]
+    pub fusion: Option<vance_fusion::Comp>,
     /// What color space the decoded samples live in (Phase 6.2). On
     /// import we leave this `None`; the engine then falls back to
     /// `ColorSpace::Rec709Limited` — the existing pre-color-pipeline
@@ -123,6 +132,7 @@ impl MediaItem {
             content_hash: None,
             title: None,
             mograph: None,
+            fusion: None,
             input_color_space: None,
             has_audio_track,
             proxy_path: None,
@@ -148,6 +158,7 @@ impl MediaItem {
             content_hash: None,
             title: Some(params),
             mograph: None,
+            fusion: None,
             // Titles are rasterized in sRGB-ish space (see
             // `vance-render::title`). Tag accordingly so they round-
             // trip through the pipeline correctly when the working
@@ -177,6 +188,33 @@ impl MediaItem {
             content_hash: None,
             title: None,
             mograph: Some(instance),
+            fusion: None,
+            input_color_space: Some(ColorSpace::Srgb),
+            has_audio_track: false,
+            proxy_path: None,
+            metadata: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// GOAT-12 — construct a synthetic Fusion composition item. Like a
+    /// mograph, it has no file backing; the engine rasterizes `comp` at the
+    /// clip-relative time via `vance-fusion`. Authored in sRGB.
+    pub fn new_fusion(
+        display_name: impl Into<String>,
+        duration: RationalTime,
+        comp: vance_fusion::Comp,
+    ) -> Self {
+        Self {
+            id: MediaItemId::new(),
+            path: PathBuf::new(),
+            display_name: display_name.into(),
+            kind: MediaKind::Fusion,
+            duration,
+            frame_rate: Some(vance_core::FrameRate::FPS_24),
+            content_hash: None,
+            title: None,
+            mograph: None,
+            fusion: Some(comp),
             input_color_space: Some(ColorSpace::Srgb),
             has_audio_track: false,
             proxy_path: None,

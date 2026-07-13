@@ -16,10 +16,12 @@
 
 #![warn(missing_docs)]
 
+pub mod fusion;
 pub mod mograph;
 mod renderer;
 pub mod title;
 
+pub use fusion::render_fusion_yuv420;
 pub use mograph::render_mograph_yuv420;
 pub use renderer::{
     CurveSet, GradeMode, GradeNodeParams, Qualifier, RenderError, Renderer, RendererConfig, Window,

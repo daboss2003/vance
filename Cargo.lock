@@ -6273,6 +6273,7 @@ dependencies = [
  "vance-core",
  "vance-decoder",
  "vance-encoder",
+ "vance-fusion",
  "vance-grading-cmd",
  "vance-mograph",
  "vance-ocio",
@@ -6610,6 +6611,7 @@ dependencies = [
  "vance-color",
  "vance-core",
  "vance-decoder",
+ "vance-fusion",
  "vance-mograph",
  "vance-timeline",
  "wgpu",
@@ -6646,6 +6648,7 @@ dependencies = [
  "vance-color",
  "vance-core",
  "vance-expr",
+ "vance-fusion",
  "vance-mograph",
 ]
 

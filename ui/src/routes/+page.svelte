@@ -45,6 +45,7 @@
   import ReframePanel from '$lib/ReframePanel.svelte';
   import ControlPanel from '$lib/ControlPanel.svelte';
   import PublishPanel from '$lib/PublishPanel.svelte';
+  import FusionPanel from '$lib/FusionPanel.svelte';
   import TransitionInspector from '$lib/TransitionInspector.svelte';
   import ColorWheel from '$lib/color/ColorWheel.svelte';
   import CurveEditor from '$lib/color/CurveEditor.svelte';
@@ -2055,6 +2056,11 @@
         <!-- GOAT-11 — direct publish (YouTube / Vimeo / TikTok). -->
         <div class="ml-2 w-64 shrink-0 max-h-48 overflow-auto">
           <PublishPanel />
+        </div>
+
+        <!-- GOAT-12 — Fusion node-graph compositor. -->
+        <div class="ml-2 w-72 shrink-0 max-h-48 overflow-auto">
+          <FusionPanel />
         </div>
 
         <span class="text-vance-muted ml-auto">

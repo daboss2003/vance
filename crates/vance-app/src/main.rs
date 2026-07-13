@@ -2736,6 +2736,48 @@ fn set_mograph_value(
         .map_err(|e| e.to_string())
 }
 
+/// GOAT-12 — create a new Fusion composition media item (starter graph).
+#[tauri::command]
+fn create_fusion_media(
+    state: tauri::State<'_, EngineHandle>,
+    display_name: Option<String>,
+    width: u32,
+    height: u32,
+    duration_seconds: f64,
+) -> Result<MediaItemInfo, String> {
+    state
+        .lock()
+        .create_fusion_media(display_name, width, height, duration_seconds)
+        .map_err(|e| e.to_string())
+}
+
+/// GOAT-12 — the Fusion composition (whole node graph) for the node editor.
+#[tauri::command]
+fn fusion_comp(
+    state: tauri::State<'_, EngineHandle>,
+    media_id: String,
+) -> Result<Option<vance_fusion::Comp>, String> {
+    let uuid: uuid::Uuid = media_id.parse().map_err(|e| format!("bad media id: {e}"))?;
+    let id = vance_timeline::MediaItemId::from_uuid(uuid);
+    Ok(state.lock().fusion_comp(id))
+}
+
+/// GOAT-12 — replace the Fusion composition on a media item (the editor
+/// pushes the whole edited graph back).
+#[tauri::command]
+fn set_fusion_comp(
+    state: tauri::State<'_, EngineHandle>,
+    media_id: String,
+    comp: vance_fusion::Comp,
+) -> Result<(), String> {
+    let uuid: uuid::Uuid = media_id.parse().map_err(|e| format!("bad media id: {e}"))?;
+    let id = vance_timeline::MediaItemId::from_uuid(uuid);
+    state
+        .lock()
+        .set_fusion_comp(id, comp)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn add_transition_at_cut(
     state: tauri::State<'_, EngineHandle>,
@@ -3657,6 +3699,9 @@ fn main() {
             create_mograph_media,
             mograph_instance,
             set_mograph_value,
+            create_fusion_media,
+            fusion_comp,
+            set_fusion_comp,
             set_media_input_color_space,
             set_project_working_color_space,
             set_project_view_lut,

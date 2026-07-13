@@ -482,7 +482,7 @@ export type MediaItemInfo = {
   id: string;
   name: string;
   path: string;
-  kind: 'video' | 'audio' | 'image' | 'title' | 'mograph';
+  kind: 'video' | 'audio' | 'image' | 'title' | 'mograph' | 'fusion';
   duration_seconds: number;
   frame_rate_num: number | null;
   frame_rate_den: number | null;
@@ -578,6 +578,83 @@ export const setMographValue = (
   controlId: string,
   value: MographValue
 ): Promise<boolean> => invoke('set_mograph_value', { mediaId, controlId, value });
+
+// ---- GOAT-12: Fusion node-graph compositor (.vfc) --------------------
+
+/** An animatable scalar (mirrors `vance_fusion::Anim`). */
+export type FusionAnim =
+  | { Const: number }
+  | { Keys: { t: number; v: number; interp?: 'Linear' | 'Hold' | 'Smooth' }[] }
+  | { Expr: string };
+
+/** RGBA in straight alpha, components in [0,1]. */
+export type FusionRgba = [number, number, number, number];
+
+/** A node's computation (externally-tagged, mirrors `NodeKind`). Only the
+ *  fields the editor reads/writes are typed strongly; specs are kept as
+ *  records so the whole comp round-trips losslessly through set/get. */
+export type FusionNodeKind =
+  | { Background: { color: FusionRgba; gradient_to?: FusionRgba | null } }
+  | { MediaIn: { name: string; fit?: 'None' | 'Stretch' | 'Contain' | 'Cover' } }
+  | { Rectangle: { width: FusionAnim; height: FusionAnim; radius?: FusionAnim; color: FusionRgba } }
+  | {
+      Text: {
+        text: string;
+        font: string;
+        size_px: FusionAnim;
+        color: FusionRgba;
+        align?: 'Left' | 'Center' | 'Right';
+        line_height?: number;
+        tracking?: number;
+        max_width?: number | null;
+      };
+    }
+  | { Transform: Record<string, unknown> }
+  | { Blur: { radius: FusionAnim; mode?: 'Box' | 'Gaussian' } }
+  | { ColorCorrect: Record<string, unknown> }
+  | { Crop: Record<string, unknown> }
+  | { Merge: { mode?: 'Over' | 'Add' | 'Multiply' | 'Screen'; opacity?: FusionAnim } }
+  | { Mask: { channel?: 'Alpha' | 'Luminance'; invert?: boolean } };
+
+export interface FusionNode {
+  id: string;
+  name: string;
+  kind: FusionNodeKind;
+  inputs: Record<string, string>;
+  ui_pos: [number, number];
+}
+
+export interface FusionComp {
+  width: number;
+  height: number;
+  fps: number;
+  duration_s: number;
+  background: FusionRgba;
+  nodes: FusionNode[];
+  output: string;
+}
+
+/** Create a new Fusion composition media item (starter graph). */
+export const createFusionMedia = (args: {
+  displayName?: string | null;
+  width: number;
+  height: number;
+  durationSeconds: number;
+}): Promise<MediaItemInfo> =>
+  invoke('create_fusion_media', {
+    displayName: args.displayName ?? null,
+    width: args.width,
+    height: args.height,
+    durationSeconds: args.durationSeconds
+  });
+
+/** The whole node graph for a Fusion media item (for the node editor). */
+export const fusionComp = (mediaId: string): Promise<FusionComp | null> =>
+  invoke('fusion_comp', { mediaId });
+
+/** Replace the whole node graph on a Fusion media item. */
+export const setFusionComp = (mediaId: string, comp: FusionComp): Promise<void> =>
+  invoke('set_fusion_comp', { mediaId, comp });
 
 /** Override (or clear, by passing `null`) the input color space tag
  *  for a media library item. Phase 6.2. */

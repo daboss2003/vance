@@ -240,6 +240,7 @@ fn kind_str(kind: MediaKind) -> &'static str {
         MediaKind::Image => "image",
         MediaKind::Title => "title",
         MediaKind::MoGraph => "mograph",
+        MediaKind::Fusion => "fusion",
     }
 }
 

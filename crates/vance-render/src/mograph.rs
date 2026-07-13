@@ -42,7 +42,7 @@ pub fn render_mograph_yuv420(
 /// the bytes the source actually has — a 1-px-wide/tall canvas (which
 /// `MographEngine::render` permits via its `.max(1)` clamp) is padded
 /// with a zero column/row rather than reading out of bounds.
-fn crop_even(rgb: &[u8], w: u32, h: u32) -> (u32, u32, Vec<u8>) {
+pub(crate) fn crop_even(rgb: &[u8], w: u32, h: u32) -> (u32, u32, Vec<u8>) {
     let ew = (w & !1).max(2);
     let eh = (h & !1).max(2);
     if ew == w && eh == h {
