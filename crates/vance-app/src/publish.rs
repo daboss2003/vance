@@ -11,16 +11,31 @@
 //! Concurrency: the long HTTP round-trips run WITHOUT the hub lock held —
 //! commands lock only to read config / store the resulting token.
 
-use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use vance_publish::{
     authorize_url, pkce_from_bytes, token_exchange_form, youtube_resumable_init, OAuthConfig,
     Pkce, Platform, TokenResponse, UploadMeta,
 };
+
+/// How long we wait for the browser callback. The redirect listener and the
+/// polling loop share this deadline so a late callback can't be captured
+/// after we've already given up (which would strand a one-time code and show
+/// a misleading "authorized" page).
+const OAUTH_TIMEOUT_SECS: u64 = 180;
+
+/// Resumable-upload chunk size. Must be a multiple of 256 KiB per the
+/// YouTube resumable protocol (except the final chunk). 8 MiB keeps the
+/// in-flight allocation tiny regardless of the export size.
+const UPLOAD_CHUNK: u64 = 8 * 1024 * 1024;
+
+/// Bounded retries for a single chunk before the whole upload fails.
+const UPLOAD_MAX_RETRIES: u32 = 5;
 
 /// Errors from the publish pipeline.
 #[derive(Debug, thiserror::Error)]
@@ -49,6 +64,22 @@ struct Pending {
     /// Filled by the redirect listener with `(code, state)`.
     slot: Arc<Mutex<Option<(String, String)>>>,
     stop: Arc<AtomicBool>,
+    /// The redirect-listener thread. Joined on teardown so its loopback
+    /// socket is released BEFORE any subsequent flow rebinds the same port.
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for Pending {
+    /// Deterministically stop and join the redirect listener so the port is
+    /// freed synchronously — otherwise a restart on the same port races the
+    /// old (still-bound) socket and fails with `AddrInUse`, and on shutdown
+    /// the thread would linger to its own deadline.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 /// The publish hub (Tauri-managed state).
@@ -70,10 +101,10 @@ impl PublishHub {
         client_secret: Option<String>,
         redirect_uri: String,
     ) -> Result<String, PublishError> {
-        // Cancel any previous flow.
-        if let Some(p) = self.pending.take() {
-            p.stop.store(true, Ordering::Release);
-        }
+        // Cancel any previous flow SYNCHRONOUSLY: dropping the old `Pending`
+        // stops + joins its listener thread, guaranteeing the old loopback
+        // socket is closed before we rebind the (fixed) redirect port below.
+        drop(self.pending.take());
         let cfg = OAuthConfig {
             client_id,
             client_secret: client_secret.filter(|s| !s.is_empty()),
@@ -88,7 +119,7 @@ impl PublishHub {
 
         let port = redirect_port(&redirect_uri)
             .ok_or_else(|| PublishError::State("redirect_uri must be http://127.0.0.1:PORT/...".into()))?;
-        let (slot, stop) = spawn_redirect_listener(port)?;
+        let (slot, stop, handle) = spawn_redirect_listener(port)?;
 
         let url = authorize_url(platform, &cfg, &pkce.challenge, &state);
         open_browser(&url);
@@ -99,6 +130,7 @@ impl PublishHub {
             state,
             slot,
             stop,
+            handle: Some(handle),
         });
         Ok(url)
     }
@@ -110,12 +142,20 @@ impl PublishHub {
             .map(|p| (p.slot.clone(), p.state.clone()))
     }
 
-    /// After the code is captured + exchanged, store the token.
+    /// After the code is captured + exchanged, store the token. Dropping the
+    /// `Pending` here stops + joins the (already-finished) listener thread.
     pub fn finish(&mut self, access_token: String) {
         if let Some(p) = self.pending.take() {
             self.tokens.insert(p.platform.label().into(), access_token);
-            p.stop.store(true, Ordering::Release);
+            // `p` dropped here → stop + join the redirect listener.
         }
+    }
+
+    /// Abandon the in-flight flow (e.g. the poll timed out). Dropping the
+    /// `Pending` stops + joins the listener so its port is freed immediately
+    /// and no late callback can be captured after we've given up.
+    pub fn cancel(&mut self) {
+        drop(self.pending.take());
     }
 
     /// Consume the exchange context (platform, cfg, verifier) for the
@@ -147,8 +187,8 @@ pub fn await_and_exchange(
     cfg: &OAuthConfig,
     verifier: &str,
 ) -> Result<String, PublishError> {
-    // Poll up to 3 minutes for the browser callback.
-    let deadline = Instant::now() + Duration::from_secs(180);
+    // Poll for the browser callback, sharing the listener's deadline.
+    let deadline = Instant::now() + Duration::from_secs(OAUTH_TIMEOUT_SECS);
     let (code, got_state) = loop {
         if let Some(pair) = slot.lock().ok().and_then(|mut s| s.take()) {
             break pair;
@@ -183,19 +223,29 @@ pub fn await_and_exchange(
 
 /// Upload a rendered file to YouTube via the resumable protocol. Runs OFF
 /// the hub lock. Returns the watch URL.
+///
+/// The file is streamed in fixed-size chunks (never read whole into RAM, so
+/// a multi-GB export uploads in a bounded footprint), each sent with a
+/// `Content-Range`. A transient network failure retries the current chunk —
+/// re-querying the server's committed offset first — instead of restarting
+/// the whole transfer.
 pub fn upload_youtube(
     access_token: &str,
     file_path: &str,
     meta: &UploadMeta,
 ) -> Result<String, PublishError> {
-    let bytes = std::fs::read(file_path)?;
+    let file_len = std::fs::metadata(file_path)?.len();
+    if file_len == 0 {
+        return Err(PublishError::Api("cannot upload an empty file".into()));
+    }
     let client = http_client()?;
-    // 1. Initiate the resumable session.
+    // 1. Initiate the resumable session (declaring the total length up front,
+    //    read cheaply from the file's metadata — not the bytes).
     let init = youtube_resumable_init(meta);
     let mut rb = client
         .post(&init.url)
         .bearer_auth(access_token)
-        .header("X-Upload-Content-Length", bytes.len().to_string());
+        .header("X-Upload-Content-Length", file_len.to_string());
     for (k, v) in &init.headers {
         rb = rb.header(k, v);
     }
@@ -214,21 +264,122 @@ pub fn upload_youtube(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .ok_or_else(|| PublishError::Api("youtube init returned no upload session URI".into()))?;
-    // 2. PUT the whole file to the session URI.
-    let put = client
-        .put(&session)
-        .header("Content-Type", "video/*")
-        .body(bytes)
-        .send()
-        .map_err(|e| PublishError::Http(e.to_string()))?;
-    if !put.status().is_success() {
-        let s = put.status();
-        let body = put.text().unwrap_or_default();
-        return Err(PublishError::Api(format!("youtube upload {s}: {}", truncate(&body))));
+
+    // 2. Stream the file to the session URI in chunks.
+    let mut file = std::fs::File::open(file_path)?;
+    let mut offset: u64 = 0;
+    let mut attempts: u32 = 0;
+    loop {
+        let this_len = UPLOAD_CHUNK.min(file_len - offset);
+        let end = offset + this_len - 1;
+        let mut chunk = vec![0u8; this_len as usize];
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut chunk)?;
+        let range = format!("bytes {offset}-{end}/{file_len}");
+        let resp = client
+            .put(&session)
+            .header("Content-Type", "video/*")
+            .header("Content-Range", &range)
+            .body(chunk)
+            .send();
+        match resp {
+            Ok(r) => {
+                let status = r.status().as_u16();
+                if status == 200 || status == 201 {
+                    // Final chunk committed — the body carries the video id.
+                    let v: serde_json::Value =
+                        r.json().map_err(|e| PublishError::Http(e.to_string()))?;
+                    let id = v["id"].as_str().unwrap_or_default();
+                    return Ok(format!("https://youtu.be/{id}"));
+                } else if status == 308 {
+                    // Resume Incomplete — advance to the server's committed end.
+                    offset = committed_end(&r).map(|n| n + 1).unwrap_or(end + 1);
+                    attempts = 0;
+                } else {
+                    let s = r.status();
+                    let body = r.text().unwrap_or_default();
+                    return Err(PublishError::Api(format!(
+                        "youtube upload {s}: {}",
+                        truncate(&body)
+                    )));
+                }
+            }
+            Err(e) => {
+                // Transient network failure: retry the current position after
+                // re-syncing with the server's committed offset.
+                attempts += 1;
+                if attempts > UPLOAD_MAX_RETRIES {
+                    return Err(PublishError::Http(format!(
+                        "youtube upload failed after {UPLOAD_MAX_RETRIES} retries: {e}"
+                    )));
+                }
+                match query_committed_offset(&client, &session, file_len) {
+                    // The whole file already landed but we lost the final
+                    // response — probe for the resulting video id.
+                    Some(n) if n >= file_len => {
+                        if let Some(url) = fetch_uploaded_url(&client, access_token) {
+                            return Ok(url);
+                        }
+                        offset = file_len.saturating_sub(1);
+                    }
+                    Some(n) => offset = n,
+                    None => { /* keep `offset`, retry the same chunk */ }
+                }
+            }
+        }
     }
-    let v: serde_json::Value = put.json().map_err(|e| PublishError::Http(e.to_string()))?;
-    let id = v["id"].as_str().unwrap_or_default();
-    Ok(format!("https://youtu.be/{id}"))
+}
+
+/// Parse the committed byte end from a resumable response's `Range: bytes=0-N`.
+fn committed_end(resp: &reqwest::blocking::Response) -> Option<u64> {
+    parse_range_end(resp.headers().get("range")?.to_str().ok()?)
+}
+
+/// Parse the trailing byte index from a `bytes=0-N` (or `bytes 0-N`) range.
+fn parse_range_end(range: &str) -> Option<u64> {
+    range.rsplit('-').next()?.trim().parse().ok()
+}
+
+/// Query the resumable session for how many bytes it has committed. Sends a
+/// zero-length `PUT` with `Content-Range: bytes * /total`; a 308 carries the
+/// committed range, a 2xx means the upload already completed.
+fn query_committed_offset(
+    client: &reqwest::blocking::Client,
+    session: &str,
+    total: u64,
+) -> Option<u64> {
+    let r = client
+        .put(session)
+        .header("Content-Range", format!("bytes */{total}"))
+        .body(Vec::<u8>::new())
+        .send()
+        .ok()?;
+    let status = r.status().as_u16();
+    if status == 308 {
+        // Next byte to send = committed_end + 1. No Range header ⇒ nothing
+        // committed yet ⇒ resume from 0.
+        Some(committed_end(&r).map(|n| n + 1).unwrap_or(0))
+    } else if r.status().is_success() {
+        Some(total)
+    } else {
+        None
+    }
+}
+
+/// Best-effort lookup of the most recently uploaded video's watch URL, used
+/// only to recover the id when the final upload response was lost.
+fn fetch_uploaded_url(client: &reqwest::blocking::Client, access_token: &str) -> Option<String> {
+    let r = client
+        .get("https://www.googleapis.com/youtube/v3/search?part=id&forMine=true&type=video&maxResults=1")
+        .bearer_auth(access_token)
+        .send()
+        .ok()?;
+    if !r.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = r.json().ok()?;
+    let id = v["items"][0]["id"]["videoId"].as_str()?;
+    Some(format!("https://youtu.be/{id}"))
 }
 
 fn http_client() -> Result<reqwest::blocking::Client, PublishError> {
@@ -250,29 +401,36 @@ fn redirect_port(uri: &str) -> Option<u16> {
 }
 
 /// Bind a loopback listener that captures ONE OAuth redirect's `code` +
-/// `state`. Returns the shared slot + a stop flag.
+/// `state`. Returns the shared slot, a stop flag, and the thread handle (so
+/// the caller can join it and free the port deterministically).
 fn spawn_redirect_listener(
     port: u16,
-) -> std::io::Result<(Arc<Mutex<Option<(String, String)>>>, Arc<AtomicBool>)> {
+) -> std::io::Result<(
+    Arc<Mutex<Option<(String, String)>>>,
+    Arc<AtomicBool>,
+    JoinHandle<()>,
+)> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     listener.set_nonblocking(true)?;
     let slot = Arc::new(Mutex::new(None));
     let stop = Arc::new(AtomicBool::new(false));
     let slot_t = slot.clone();
     let stop_t = stop.clone();
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("vance.oauth-redirect".into())
         .spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(300);
+            let deadline = Instant::now() + Duration::from_secs(OAUTH_TIMEOUT_SECS);
             loop {
                 if stop_t.load(Ordering::Acquire) || Instant::now() >= deadline {
                     break;
                 }
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut buf = [0u8; 4096];
-                        let n = stream.read(&mut buf).unwrap_or(0);
-                        let req = String::from_utf8_lossy(&buf[..n]);
+                        // Read the request fully (it may arrive across several
+                        // TCP segments, and the accepted socket's blocking mode
+                        // is platform-dependent), bounded so a silent peer
+                        // can't wedge the single-threaded accept loop.
+                        let req = read_http_request(&mut stream);
                         if let Some(pair) = parse_callback(&req) {
                             if let Ok(mut s) = slot_t.lock() {
                                 *s = Some(pair);
@@ -284,13 +442,61 @@ fn spawn_redirect_listener(
                         }
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(80));
+                        std::thread::sleep(Duration::from_millis(50));
                     }
                     Err(_) => break,
                 }
             }
         })?;
-    Ok((slot, stop))
+    Ok((slot, stop, handle))
+}
+
+/// Read an HTTP request from an accepted redirect connection until the whole
+/// request line is in hand (or headers end / a cap / a timeout is hit).
+///
+/// The single-`read` approach is unsound: `accept()` returns as soon as the
+/// handshake completes — possibly BEFORE the browser's bytes arrive — and the
+/// accepted socket inherits the listener's non-blocking flag on some
+/// platforms (so one read can return `WouldBlock` → 0 bytes and silently drop
+/// the code) yet is blocking on others (so a peer that sends nothing would
+/// block forever). Normalising to a blocking socket with a bounded read
+/// timeout and looping until the request line is complete handles both.
+fn read_http_request(stream: &mut TcpStream) -> String {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(4)));
+    let mut data: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 2048];
+    let overall = Instant::now() + Duration::from_secs(4);
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break, // peer closed
+            Ok(n) => {
+                data.extend_from_slice(&buf[..n]);
+                // The request target (with the query) lives on the first line,
+                // so a single complete line is all `parse_callback` needs.
+                if data.contains(&b'\n') {
+                    break;
+                }
+                // Full header block, or an over-long line: stop reading.
+                if data.windows(4).any(|w| w == b"\r\n\r\n") || data.len() >= 64 * 1024 {
+                    break;
+                }
+            }
+            // Timed out / would-block with a partial (or empty) request: give
+            // up on this connection rather than blocking the accept loop.
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break
+            }
+            Err(_) => break,
+        }
+        if Instant::now() >= overall {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&data).into_owned()
 }
 
 const RESPONSE_OK: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<!doctype html><html><body style=\"font-family:sans-serif;background:#111;color:#ddd;text-align:center;padding-top:20vh\"><h2>Vance is authorized</h2><p>You can close this tab and return to Vance.</p></body></html>";
@@ -375,5 +581,52 @@ mod tests {
         assert_eq!(url_decode("a%20b+c"), "a b c");
         assert_eq!(redirect_port("http://127.0.0.1:8723/callback"), Some(8723));
         assert_eq!(redirect_port("nonsense"), None);
+        // A trailing bare `%` (or `%X`) must not panic — it is emitted as-is.
+        assert_eq!(url_decode("a%"), "a%");
+        assert_eq!(url_decode("a%2"), "a%2");
+        assert_eq!(url_decode("%41"), "A");
+    }
+
+    #[test]
+    fn parses_resumable_range() {
+        assert_eq!(parse_range_end("bytes=0-262143"), Some(262143));
+        assert_eq!(parse_range_end("bytes 0-100"), Some(100));
+        assert_eq!(parse_range_end("garbage"), None);
+        assert_eq!(parse_range_end(""), None);
+    }
+
+    #[test]
+    fn redirect_listener_assembles_segmented_request() {
+        use std::net::TcpStream;
+        // Pick a free port, then hand it to the listener.
+        let probe = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let (slot, stop, handle) = spawn_redirect_listener(port).unwrap();
+
+        // Send the request line split across two writes with a pause between,
+        // exactly the segmentation that broke the old single-read path.
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.write_all(b"GET /callback?code=abc123").unwrap();
+        c.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(40));
+        c.write_all(b"&state=xyz HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        c.flush().unwrap();
+        // Drain the server's response so it doesn't block on write.
+        let mut resp = Vec::new();
+        let _ = c.read_to_end(&mut resp);
+
+        // The captured pair should appear promptly.
+        let mut got = None;
+        for _ in 0..200 {
+            if let Some(pair) = slot.lock().unwrap().take() {
+                got = Some(pair);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Release);
+        let _ = handle.join();
+        assert_eq!(got, Some(("abc123".to_string(), "xyz".to_string())));
     }
 }

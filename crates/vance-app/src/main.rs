@@ -3378,10 +3378,19 @@ fn await_oauth(hub: tauri::State<'_, PublishHandle>) -> Result<bool, String> {
     };
     let (platform, cfg, verifier) = ctx;
     // Poll + exchange with the lock DROPPED.
-    let token = publish::await_and_exchange(&slot, &state, platform, &cfg, &verifier)
-        .map_err(|e| e.to_string())?;
-    hub.lock().finish(token);
-    Ok(true)
+    match publish::await_and_exchange(&slot, &state, platform, &cfg, &verifier) {
+        Ok(token) => {
+            hub.lock().finish(token);
+            Ok(true)
+        }
+        Err(e) => {
+            // On timeout/failure, tear the flow down: stop + join the redirect
+            // listener (freeing the port) and clear `pending` so the next
+            // Connect starts clean instead of hanging on a stale flow.
+            hub.lock().cancel();
+            Err(e.to_string())
+        }
+    }
 }
 
 /// Publish a rendered file to a platform. Reads the token under a brief
