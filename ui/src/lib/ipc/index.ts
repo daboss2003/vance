@@ -448,6 +448,14 @@ export const voiceIsolationAvailable = (): Promise<boolean> =>
 export const isolateVoice = (mediaId: string): Promise<MediaItemInfo> =>
   invoke('isolate_voice', { mediaId });
 
+// ---- GOAT-9: Magic Mask (AI subject isolation) -----------------------------
+
+/** Whether an AI-mask CLI (background remover) is installed. */
+export const magicMaskAvailable = (): Promise<boolean> => invoke('magic_mask_available');
+/** Isolate the subject of a media item; returns the imported matte's info. */
+export const magicMask = (mediaId: string): Promise<MediaItemInfo> =>
+  invoke('magic_mask', { mediaId });
+
 export type SequenceContents = {
   id: string;
   name: string;

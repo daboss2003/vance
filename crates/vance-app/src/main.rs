@@ -15,6 +15,7 @@ mod engine;
 mod peaks;
 mod prefetch;
 mod profiling;
+mod magicmask;
 mod proxy;
 mod separate;
 mod transcribe;
@@ -3189,6 +3190,39 @@ fn voice_isolation_available() -> bool {
     separate::available()
 }
 
+/// Whether an AI-mask CLI (background remover) is installed.
+#[tauri::command]
+fn magic_mask_available() -> bool {
+    magicmask::available()
+}
+
+/// GOAT-9 Magic Mask — isolate the subject of a media item (off-lock) and
+/// import the matted result as new media. Returns the new item's info.
+#[tauri::command]
+fn magic_mask(
+    state: tauri::State<'_, EngineHandle>,
+    media_id: String,
+) -> Result<MediaItemInfo, String> {
+    let uuid: uuid::Uuid = media_id.parse().map_err(|e| format!("bad media id: {e}"))?;
+    let mid = vance_timeline::MediaItemId::from_uuid(uuid);
+    let path = {
+        state
+            .lock()
+            .media_path_for(mid)
+            .ok_or_else(|| "media has no file to mask".to_string())?
+    };
+    let out = magicmask::isolate_subject(&path).map_err(|e| e.to_string())?;
+    // Copy the matted video out of the volatile temp dir into a stable,
+    // app-owned location so the imported media survives save/reopen.
+    let dir = engine::persistent_media_dir().map_err(|e| format!("media dir: {e}"))?;
+    let ext = out.extension().and_then(|e| e.to_str()).unwrap_or("mov");
+    let dest = dir.join(format!("{}-subject.{ext}", uuid::Uuid::new_v4()));
+    std::fs::copy(&out, &dest).map_err(|e| format!("copy matte: {e}"))?;
+    let dest_str = dest.to_string_lossy().into_owned();
+    // Matted output has a video stream → the normal video import path works.
+    state.lock().import_media_file(&dest_str).map_err(|e| e.to_string())
+}
+
 /// Isolate vocals from a media item (off-lock) and import the vocal stem as
 /// a new media item. Returns the new item's info.
 #[tauri::command]
@@ -3367,6 +3401,8 @@ fn main() {
             level_clip,
             voice_isolation_available,
             isolate_voice,
+            magic_mask_available,
+            magic_mask,
             move_clip_to,
             remove_clip,
             add_effect_to_clip,

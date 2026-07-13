@@ -6,7 +6,12 @@
    * reframed video. Uses the ZNCC tracker, so the clip must be open in the
    * viewer (play/scrub it once) before running.
    */
-  import { smartReframe, type TrackSummary } from '$lib/ipc';
+  import {
+    smartReframe,
+    magicMask,
+    magicMaskAvailable,
+    type TrackSummary
+  } from '$lib/ipc';
   import { projectState } from '$lib/project.svelte';
   import { selectionState } from '$lib/selection.svelte';
 
@@ -23,6 +28,32 @@
   let busy = $state(false);
   let error = $state<string | null>(null);
   let status = $state<string | null>(null);
+
+  let maskAvail = $state(false);
+  let maskMediaId = $state('');
+  let mediaChoices = $derived(
+    projectState.media.filter((m) => m.kind === 'video')
+  );
+  $effect(() => {
+    void magicMaskAvailable().then((v) => (maskAvail = v));
+  });
+
+  async function runMask() {
+    if (!maskMediaId) return;
+    busy = true;
+    error = null;
+    status = 'Isolating subject… (this can take a while)';
+    try {
+      const info = await magicMask(maskMediaId);
+      await projectState.refresh();
+      status = `Imported isolated subject: ${info.name}. Key out the background to composite.`;
+    } catch (e) {
+      error = String(e);
+      status = null;
+    } finally {
+      busy = false;
+    }
+  }
 
   /** Resolve the first selected clip to (trackId, clipId, sourceInSeconds). */
   function selectedClip(): { trackId: string; clipId: string; sourceIn: number } | null {
@@ -90,6 +121,23 @@
   </div>
   <button disabled={busy} onclick={run}>Reframe selected clip</button>
   <div class="hint">Tracks the subject (center of the clip) and pans to keep it framed.</div>
+
+  <div class="mask">
+    <div class="head">Magic Mask</div>
+    {#if !maskAvail}
+      <div class="hint">Install to enable: <code>pip install -U backgroundremover</code></div>
+    {/if}
+    <div class="row">
+      <select bind:value={maskMediaId} disabled={busy || !maskAvail}>
+        <option value="">— media —</option>
+        {#each mediaChoices as m (m.id)}
+          <option value={m.id}>{m.name}</option>
+        {/each}
+      </select>
+      <button disabled={busy || !maskAvail || !maskMediaId} onclick={runMask}>Isolate</button>
+    </div>
+    <div class="hint">AI-removes the background; import the matted subject and key it over other tracks.</div>
+  </div>
 </div>
 
 <style>
@@ -119,6 +167,25 @@
   }
   button {
     cursor: pointer;
+  }
+  .mask {
+    border-top: 1px solid var(--border, #2a2a2a);
+    padding-top: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .mask .head {
+    border: none;
+    padding: 0;
+  }
+  .mask select {
+    flex: 1;
+  }
+  code {
+    background: rgba(255, 255, 255, 0.08);
+    padding: 0 3px;
+    border-radius: 2px;
   }
   .hint {
     opacity: 0.5;
