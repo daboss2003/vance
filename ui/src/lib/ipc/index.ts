@@ -749,6 +749,23 @@ export const trackWindow = (
     searchRadius
   });
 
+/** GOAT-9 — smart reframe: track the subject then write a keyframed
+ *  transform keeping it centered for the target aspect. Export at the
+ *  target resolution to get the reframed video. */
+export const smartReframe = (args: {
+  trackId: string;
+  clipId: string;
+  targetW: number;
+  targetH: number;
+  zoom: number;
+  startSourceSeconds: number;
+  nFrames: number;
+  seedCx: number;
+  seedCy: number;
+  patchHalf: number;
+  searchRadius: number;
+}): Promise<TrackSummary> => invoke('smart_reframe', args);
+
 /** Compute the current frame's scope data. Returns `null` when there's
  *  no update (scopes disabled, playing, or no cached frame). */
 export async function computeScopes(

@@ -2591,6 +2591,44 @@ fn track_window(
         .map_err(|e| e.to_string())
 }
 
+/// GOAT-9 — smart reframe: track the subject then write a keyframed
+/// transform that keeps it centered for the target aspect.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn smart_reframe(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    clip_id: String,
+    target_w: u32,
+    target_h: u32,
+    zoom: f32,
+    start_source_seconds: f64,
+    n_frames: u32,
+    seed_cx: f32,
+    seed_cy: f32,
+    patch_half: u32,
+    search_radius: u32,
+) -> Result<TrackSummary, String> {
+    let t = track_id.parse::<uuid::Uuid>().map_err(|e| format!("invalid track id: {e}"))?;
+    let c = clip_id.parse::<uuid::Uuid>().map_err(|e| format!("invalid clip id: {e}"))?;
+    state
+        .lock()
+        .smart_reframe(
+            vance_timeline::TrackId::from_uuid(t),
+            vance_timeline::ClipId::from_uuid(c),
+            target_w,
+            target_h,
+            zoom,
+            start_source_seconds,
+            n_frames,
+            seed_cx,
+            seed_cy,
+            patch_half,
+            search_radius,
+        )
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn set_scopes_enabled(state: tauri::State<'_, EngineHandle>, on: bool) -> Result<(), String> {
     state.lock().set_scopes_enabled(on);
@@ -3405,6 +3443,7 @@ fn main() {
             compute_scopes,
             set_matte_node,
             track_window,
+            smart_reframe,
             apply_grading_command,
             apply_grading_commands,
             grading_command_schema,

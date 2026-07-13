@@ -41,6 +41,7 @@
   import MagneticPanel from '$lib/MagneticPanel.svelte';
   import CaptionsPanel from '$lib/CaptionsPanel.svelte';
   import AiAudioPanel from '$lib/AiAudioPanel.svelte';
+  import ReframePanel from '$lib/ReframePanel.svelte';
   import TransitionInspector from '$lib/TransitionInspector.svelte';
   import ColorWheel from '$lib/color/ColorWheel.svelte';
   import CurveEditor from '$lib/color/CurveEditor.svelte';
@@ -1999,6 +2000,11 @@
         <!-- GOAT-8 — AI audio (dialogue leveling + voice isolation). -->
         <div class="ml-2 w-64 shrink-0 max-h-48 overflow-auto">
           <AiAudioPanel />
+        </div>
+
+        <!-- GOAT-9 — smart reframe (subject-tracking auto-reframe). -->
+        <div class="ml-2 w-60 shrink-0 max-h-48 overflow-auto">
+          <ReframePanel />
         </div>
 
         <span class="text-vance-muted ml-auto">

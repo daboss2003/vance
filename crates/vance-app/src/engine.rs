@@ -426,6 +426,46 @@ fn clip_transform_at(
     }
 }
 
+/// GOAT-9 — smart-reframe transform for one frame. Given the subject at
+/// normalized source UV `subj` and a target aspect (`tgt_w:tgt_h`) plus an
+/// extra `zoom` (≥1), returns the `(translate, scale)` for a "transform"
+/// effect that fills a target-aspect output with a subject-centered,
+/// undistorted window of the source. The renderer maps output UV → source
+/// UV as `source = (out - translate - 0.5)/scale + 0.5`, and its UV is
+/// aspect-agnostic, so the per-axis scale below makes the chosen source
+/// sub-window's pixel aspect equal the (target) output aspect — no stretch
+/// when exported at the target resolution. The subject is clamped so the
+/// window never runs past a source edge (no black bars).
+fn reframe_transform(
+    subj: (f32, f32),
+    src_w: u32,
+    src_h: u32,
+    tgt_w: u32,
+    tgt_h: u32,
+    zoom: f32,
+) -> ([f32; 2], [f32; 2]) {
+    let ar_s = (src_w.max(1) as f32) / (src_h.max(1) as f32);
+    let ar_t = (tgt_w.max(1) as f32) / (tgt_h.max(1) as f32);
+    let (mut sx, mut sy) = if ar_t <= ar_s {
+        // Target narrower than source → full height, zoom X to a slice.
+        (ar_s / ar_t, 1.0)
+    } else {
+        // Target wider → full width, zoom Y.
+        (1.0, ar_t / ar_s)
+    };
+    let z = zoom.max(1.0);
+    sx *= z;
+    sy *= z;
+    // Half-window in source-UV; clamp the subject so the window stays in-frame.
+    let hx = (0.5 / sx).min(0.5);
+    let hy = (0.5 / sy).min(0.5);
+    let cx = subj.0.clamp(hx, 1.0 - hx);
+    let cy = subj.1.clamp(hy, 1.0 - hy);
+    let tx = -sx * (cx - 0.5);
+    let ty = -sy * (cy - 0.5);
+    ([tx, ty], [sx, sy])
+}
+
 /// `[left, right, top, bottom]` crop fractions aggregated from every
 /// enabled "crop" effect on the clip; values stack additively (so two
 /// crop effects can compose). Defaults to all-zero (no crop) when
@@ -4827,6 +4867,155 @@ impl Engine {
             mean_score,
             start_clip_seconds: start_t,
             end_clip_seconds,
+        })
+    }
+
+    /// GOAT-9 — smart reframe: track the subject across `n_frames` from
+    /// `start_source_seconds` (seeded at `seed_cx/seed_cy` in source UV),
+    /// then write a keyframed "transform" effect that keeps the subject
+    /// centered in a `target_w:target_h` output (with extra `zoom`). Export
+    /// at the target resolution to get the reframed video. Reuses the same
+    /// NCC tracker as `track_window`; the decoder must already be open on
+    /// the clip's source. Returns a `TrackSummary`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn smart_reframe(
+        &mut self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+        target_w: u32,
+        target_h: u32,
+        zoom: f32,
+        start_source_seconds: f64,
+        n_frames: u32,
+        seed_cx: f32,
+        seed_cy: f32,
+        patch_half: u32,
+        search_radius: u32,
+    ) -> Result<TrackSummary, EngineError> {
+        const TRACK_FRAMES_MAX: u32 = 240;
+        self.pause_for_edit();
+        let n_frames = n_frames.clamp(2, TRACK_FRAMES_MAX);
+        let patch_half_i = patch_half as i32;
+        let search_radius_i = search_radius as i32;
+
+        let info = self.stream_info.as_ref().ok_or(EngineError::NoFileOpen)?.clone();
+        let (tb_num, tb_den) = info.time_base;
+        let (fr_num, fr_den) = info.frame_rate;
+        if tb_num == 0 || tb_den == 0 || fr_num == 0 || fr_den == 0 {
+            return Err(EngineError::Project("reframe: invalid time_base/frame_rate".into()));
+        }
+        let step_pts = ((fr_den as i128 * tb_den as i128) / (fr_num as i128 * tb_num as i128))
+            .max(1) as i64;
+        let start_pts = (start_source_seconds * tb_den as f64 / tb_num as f64).round() as i64;
+
+        let (source_in_seconds, expected_path) = {
+            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
+            let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+            let seq = project.sequence(seq_id).ok_or(EngineError::SequenceNotFound)?;
+            let clip = seq
+                .tracks
+                .iter()
+                .find_map(|t| t.clips.iter().find(|c| c.id == clip_id))
+                .ok_or(EngineError::Project("reframe: clip not found".into()))?;
+            let media = project.media.get(&clip.media).ok_or(EngineError::MediaNotFound)?;
+            (rt_to_seconds(clip.source_in), media.path.to_string_lossy().into_owned())
+        };
+        match self.current_media_path.as_deref() {
+            Some(p) if p == expected_path => {}
+            _ => {
+                return Err(EngineError::Project(format!(
+                    "reframe: decoder is not open on the clip's source ({expected_path}) — \
+                     open / play this clip first, then re-run reframe"
+                )));
+            }
+        }
+        let pts_to_clip_t =
+            |pts: i64| -> f64 { (pts as f64) * (tb_num as f64) / (tb_den as f64) - source_in_seconds };
+
+        let seed = (seed_cx.clamp(0.0, 1.0), seed_cy.clamp(0.0, 1.0));
+        // Anchor frame → template + source dims.
+        let (template, src_w, src_h) = {
+            let dec = self.decoder.as_mut().ok_or(EngineError::NoFileOpen)?;
+            let frame = dec
+                .decode_at(start_pts)
+                .map_err(|e| EngineError::Project(format!("reframe decode: {e}")))?;
+            let stride = frame.strides[0];
+            let end = (frame.height * stride) as usize;
+            let view = vance_tracker::LumaView {
+                bytes: &frame.bytes[..end],
+                stride,
+                w: frame.width,
+                h: frame.height,
+            };
+            let px = vance_tracker::uv_to_px(seed, frame.width, frame.height);
+            let tpl = vance_tracker::extract_patch(&view, px, patch_half_i)
+                .map_err(|e| EngineError::Project(format!("reframe patch: {e}")))?;
+            (tpl, frame.width, frame.height)
+        };
+        let mut prev_px = vance_tracker::uv_to_px(seed, src_w, src_h);
+
+        // Track the subject → per-frame (clip_t, subject_uv).
+        let mut trail: Vec<(f64, (f32, f32))> = Vec::with_capacity(n_frames as usize);
+        trail.push((pts_to_clip_t(start_pts), seed));
+        let mut sum_score = 1.0f32;
+        let mut scored = 1u32;
+        for i in 1..n_frames {
+            let pts = start_pts + (i as i64) * step_pts;
+            let dec = self.decoder.as_mut().ok_or(EngineError::NoFileOpen)?;
+            let frame = match dec.decode_at(pts) {
+                Ok(f) => f,
+                Err(_) => break, // partial track — commit what we have
+            };
+            let stride = frame.strides[0];
+            let end = (frame.height * stride) as usize;
+            let view = vance_tracker::LumaView {
+                bytes: &frame.bytes[..end],
+                stride,
+                w: frame.width,
+                h: frame.height,
+            };
+            let Ok(r) = vance_tracker::track_ncc(&template, &view, prev_px, search_radius_i, patch_half_i)
+            else {
+                break;
+            };
+            prev_px = r.center_px;
+            sum_score += r.score;
+            scored += 1;
+            trail.push((pts_to_clip_t(pts), vance_tracker::px_to_uv(r.center_px, frame.width, frame.height)));
+        }
+
+        // Build keyframed translate (per frame) + constant scale.
+        let (_, scale) = reframe_transform(seed, src_w, src_h, target_w, target_h, zoom);
+        let mut tx_kfs = Vec::with_capacity(trail.len());
+        let mut ty_kfs = Vec::with_capacity(trail.len());
+        for (t, subj) in &trail {
+            let (tr, _) = reframe_transform(*subj, src_w, src_h, target_w, target_h, zoom);
+            tx_kfs.push(vance_timeline::Keyframe {
+                time_seconds: *t,
+                value: tr[0] as f64,
+                interp: vance_timeline::KeyframeInterp::Linear,
+            });
+            ty_kfs.push(vance_timeline::Keyframe {
+                time_seconds: *t,
+                value: tr[1] as f64,
+                interp: vance_timeline::KeyframeInterp::Linear,
+            });
+        }
+        let mut params: std::collections::BTreeMap<String, EffectValue> = Default::default();
+        params.insert("translate_x".into(), EffectValue::Keyframes { keyframes: tx_kfs });
+        params.insert("translate_y".into(), EffectValue::Keyframes { keyframes: ty_kfs });
+        params.insert("scale_x".into(), EffectValue::Number(scale[0] as f64));
+        params.insert("scale_y".into(), EffectValue::Number(scale[1] as f64));
+        params.insert("rotation".into(), EffectValue::Number(0.0));
+        self.add_effect_to_clip(track_id, clip_id, "transform".into(), params)?;
+
+        let start_t = trail.first().map(|(t, _)| *t).unwrap_or(0.0);
+        let end_t = trail.last().map(|(t, _)| *t).unwrap_or(start_t);
+        Ok(TrackSummary {
+            frames_tracked: trail.len() as u32,
+            mean_score: if scored > 0 { sum_score / scored as f32 } else { 1.0 },
+            start_clip_seconds: start_t,
+            end_clip_seconds: end_t,
         })
     }
 
@@ -9652,6 +9841,32 @@ mod tests {
         a1 = vance_timeline::Track::new(TrackKind::Audio, "A1");
         seq.tracks.push(Arc::new(a1));
         assert!(!build_mixer_snapshot(&seq).solo_anywhere);
+    }
+
+    #[test]
+    fn reframe_transform_centers_subject_and_is_undistorted() {
+        // 16:9 → 9:16, subject at the far right → the window clamps in-frame
+        // and the subject is centered (or as centered as the clamp allows).
+        let (tr, sc) = reframe_transform((0.9, 0.5), 1920, 1080, 1080, 1920, 1.0);
+        // Narrower target → full height (scale_y == 1), horizontal zoom.
+        assert!((sc[1] - 1.0).abs() < 1e-5, "full height, no vertical zoom");
+        let ar_s = 1920.0f32 / 1080.0;
+        let ar_t = 1080.0f32 / 1920.0;
+        assert!((sc[0] - ar_s / ar_t).abs() < 1e-4, "horizontal scale = ar_s/ar_t");
+        // The subject (clamped) maps to output-center: out = scale*(subj-0.5)+0.5+translate.
+        let hx = 0.5 / sc[0];
+        let clamped_cx = 0.9f32.clamp(hx, 1.0 - hx);
+        let out_x = sc[0] * (clamped_cx - 0.5) + 0.5 + tr[0];
+        assert!((out_x - 0.5).abs() < 1e-4, "subject centered horizontally: {out_x}");
+
+        // Centered subject at exactly middle → translate ~0.
+        let (tr2, _) = reframe_transform((0.5, 0.5), 1920, 1080, 1080, 1920, 1.0);
+        assert!(tr2[0].abs() < 1e-5 && tr2[1].abs() < 1e-5);
+
+        // Same aspect + zoom 1 → identity (scale 1, translate 0).
+        let (tr3, sc3) = reframe_transform((0.5, 0.5), 1920, 1080, 1920, 1080, 1.0);
+        assert!((sc3[0] - 1.0).abs() < 1e-5 && (sc3[1] - 1.0).abs() < 1e-5);
+        assert!(tr3[0].abs() < 1e-5 && tr3[1].abs() < 1e-5);
     }
 
     #[test]
