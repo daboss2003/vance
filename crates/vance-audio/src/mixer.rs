@@ -307,6 +307,20 @@ pub enum AudioEffectKind {
         /// Limiter configuration.
         params: LimiterParams,
     },
+    /// GOAT-8 — downward noise gate / expander.
+    NoiseGate {
+        /// Whether this effect contributes to the output.
+        enabled: bool,
+        /// Gate configuration.
+        params: NoiseGateParams,
+    },
+    /// GOAT-8 — mains-hum remover (harmonic notch comb).
+    DeHum {
+        /// Whether this effect contributes to the output.
+        enabled: bool,
+        /// De-hum configuration.
+        params: DeHumParams,
+    },
     /// Phase 7.10 / 7.11 — third-party (or built-in) audio effect
     /// plugin. The fold thread instantiates a real in-process
     /// [`crate::audio_plugin::BlockProcessor`] for this entry (built-in
@@ -356,6 +370,30 @@ pub struct CompressorParams {
 pub struct LimiterParams {
     pub ceiling_db: f32,
     pub release_ms: f32,
+}
+
+/// GOAT-8 — noise gate params (feeds [`crate::dsp::NoiseGate::set`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NoiseGateParams {
+    /// Open threshold in dBFS.
+    pub threshold_db: f32,
+    /// Closed attenuation in dB (e.g. -60 ≈ silence).
+    pub range_db: f32,
+    /// Attack (open) time, ms.
+    pub attack_ms: f32,
+    /// Release (close) time, ms.
+    pub release_ms: f32,
+}
+
+/// GOAT-8 — de-hum params: a notch at `base_hz` plus its harmonics.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DeHumParams {
+    /// Mains fundamental — 50 or 60 Hz.
+    pub base_hz: f32,
+    /// Number of notches (fundamental + harmonics), clamped 1..=10.
+    pub harmonics: u8,
+    /// Notch Q (narrowness); higher = tighter/deeper.
+    pub q: f32,
 }
 
 /// Per-track DSP state — lives on the fold thread, NOT in the snapshot.
@@ -408,6 +446,8 @@ impl TrackDspState {
                 (EffectUnit::Eq6(_), AudioEffectKind::Eq6 { .. }) => false,
                 (EffectUnit::Compressor(_), AudioEffectKind::Compressor { .. }) => false,
                 (EffectUnit::Limiter(_), AudioEffectKind::Limiter { .. }) => false,
+                (EffectUnit::NoiseGate(_), AudioEffectKind::NoiseGate { .. }) => false,
+                (EffectUnit::DeHum(_), AudioEffectKind::DeHum { .. }) => false,
                 // Rebuild a plugin on identity change or (for remote) a
                 // sidecar respawn. A bare enable/disable toggle keeps the
                 // warm instance. Param changes are NOT a rebuild for
@@ -463,6 +503,18 @@ impl TrackDspState {
                 }
                 (EffectUnit::Limiter(lim), AudioEffectKind::Limiter { params, .. }) => {
                     lim.set(params.ceiling_db, params.release_ms, sample_rate);
+                }
+                (EffectUnit::NoiseGate(g), AudioEffectKind::NoiseGate { params, .. }) => {
+                    g.set(
+                        params.threshold_db,
+                        params.range_db,
+                        params.attack_ms,
+                        params.release_ms,
+                        sample_rate,
+                    );
+                }
+                (EffectUnit::DeHum(notches), AudioEffectKind::DeHum { params, .. }) => {
+                    configure_dehum(notches, params, sample_rate);
                 }
                 (EffectUnit::Plugin(slot), AudioEffectKind::Plugin { params, .. }) => {
                     // Remote slots apply a param change live via set_param
@@ -534,6 +586,8 @@ impl TrackDspState {
                 AudioEffectKind::Eq6 { enabled, .. }
                 | AudioEffectKind::Compressor { enabled, .. }
                 | AudioEffectKind::Limiter { enabled, .. }
+                | AudioEffectKind::NoiseGate { enabled, .. }
+                | AudioEffectKind::DeHum { enabled, .. }
                 | AudioEffectKind::Plugin { enabled, .. } => *enabled,
             };
             if !enabled {
@@ -565,6 +619,18 @@ impl TrackDspState {
                     let (nl, nr) = lim.tick_stereo(l, r);
                     l = nl;
                     r = nr;
+                }
+                (EffectUnit::NoiseGate(g), AudioEffectKind::NoiseGate { .. }) => {
+                    let (nl, nr) = g.tick_stereo(l, r);
+                    l = nl;
+                    r = nr;
+                }
+                (EffectUnit::DeHum(notches), AudioEffectKind::DeHum { .. }) => {
+                    for b in notches.iter_mut() {
+                        let (nl, nr) = b.tick_stereo(l, r);
+                        l = nl;
+                        r = nr;
+                    }
                 }
                 (EffectUnit::Plugin(slot), AudioEffectKind::Plugin { .. }) => {
                     match &mut slot.kind {
@@ -718,6 +784,10 @@ enum EffectUnit {
     Eq6(Box<[crate::dsp::Biquad; 6]>),
     Compressor(Box<crate::dsp::Compressor>),
     Limiter(Box<crate::dsp::Limiter>),
+    /// GOAT-8 — noise gate.
+    NoiseGate(Box<crate::dsp::NoiseGate>),
+    /// GOAT-8 — de-hum notch comb (one biquad per harmonic).
+    DeHum(Vec<crate::dsp::Biquad>),
     /// Phase 7.10 / 7.11 — real in-process audio plugin (built-in /
     /// CLAP / LV2), block-processed via
     /// [`crate::audio_plugin::BlockProcessor`].
@@ -820,6 +890,23 @@ impl PluginSlot {
     }
 }
 
+/// GOAT-8 — (re)configure a de-hum notch comb: one notch biquad per
+/// harmonic at `base_hz × k`, dropping any notch at/above Nyquist.
+/// Resizes the vec in place; existing biquads keep their filter state so
+/// a knob drag doesn't click.
+fn configure_dehum(notches: &mut Vec<crate::dsp::Biquad>, p: &DeHumParams, sample_rate: f32) {
+    let n = (p.harmonics.clamp(1, 10)) as usize;
+    let q = p.q.clamp(0.5, 40.0);
+    if notches.len() != n {
+        notches.resize(n, crate::dsp::Biquad::identity());
+    }
+    for (i, b) in notches.iter_mut().enumerate() {
+        let f = p.base_hz * (i as f32 + 1.0);
+        // set() falls back to identity (pass-through) when f >= Nyquist.
+        b.set(crate::dsp::BiquadShape::Notch, sample_rate, f, 0.0, q);
+    }
+}
+
 impl EffectUnit {
     fn new(
         spec: &AudioEffectKind,
@@ -851,6 +938,22 @@ impl EffectUnit {
                 let mut lim = Box::new(crate::dsp::Limiter::new(sample_rate, 3.0));
                 lim.set(params.ceiling_db, params.release_ms, sample_rate);
                 EffectUnit::Limiter(lim)
+            }
+            AudioEffectKind::NoiseGate { params, .. } => {
+                let mut g = Box::new(crate::dsp::NoiseGate::passthrough());
+                g.set(
+                    params.threshold_db,
+                    params.range_db,
+                    params.attack_ms,
+                    params.release_ms,
+                    sample_rate,
+                );
+                EffectUnit::NoiseGate(g)
+            }
+            AudioEffectKind::DeHum { params, .. } => {
+                let mut notches = Vec::new();
+                configure_dehum(&mut notches, params, sample_rate);
+                EffectUnit::DeHum(notches)
             }
             AudioEffectKind::Plugin {
                 format_str,
@@ -3491,6 +3594,58 @@ mod tests {
         // must result in pass-through.
         let (l, _) = state.tick_stereo(&spec, 1.0, 1.0, None);
         assert!((l - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn track_dsp_state_noise_gate_closes_on_quiet() {
+        // GOAT-8: a gate effect on a track closes on a sub-threshold signal.
+        let spec = vec![AudioEffectKind::NoiseGate {
+            enabled: true,
+            params: NoiseGateParams {
+                threshold_db: -20.0,
+                range_db: -80.0,
+                attack_ms: 1.0,
+                release_ms: 5.0,
+            },
+        }];
+        let mut state = TrackDspState::new();
+        state.reconcile_with(&spec, 48_000.0, None);
+        let mut last = 1.0f32;
+        for _ in 0..4096 {
+            let (l, _) = state.tick_stereo(&spec, 0.01, 0.01, None); // -40 dB
+            last = l.abs();
+        }
+        assert!(last < 0.005, "gate closed on quiet input: {last}");
+    }
+
+    #[test]
+    fn track_dsp_state_dehum_attenuates_mains_tone() {
+        // GOAT-8: a 60 Hz de-hum notch comb crushes a 60 Hz tone but passes
+        // a 1 kHz tone.
+        let spec = vec![AudioEffectKind::DeHum {
+            enabled: true,
+            params: DeHumParams {
+                base_hz: 60.0,
+                harmonics: 3,
+                q: 12.0,
+            },
+        }];
+        let sr = 48_000.0;
+        let energy = |freq: f32| -> f32 {
+            let mut state = TrackDspState::new();
+            state.reconcile_with(&spec, sr, None);
+            let mut peak = 0.0f32;
+            for i in 0..9600 {
+                let s = (2.0 * std::f32::consts::PI * freq * i as f32 / sr).sin();
+                let (l, _) = state.tick_stereo(&spec, s, s, None);
+                if i > 4800 {
+                    peak = peak.max(l.abs());
+                }
+            }
+            peak
+        };
+        assert!(energy(60.0) < 0.2, "60Hz hum attenuated");
+        assert!(energy(1000.0) > 0.8, "1kHz passes the de-hum comb");
     }
 
     #[test]

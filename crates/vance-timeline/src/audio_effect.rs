@@ -181,6 +181,51 @@ impl Default for LimiterSpec {
     }
 }
 
+/// GOAT-8 — noise-gate params. See `vance_audio::dsp::NoiseGate`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NoiseGateSpec {
+    /// Open threshold in dBFS (sanitised `[-90, 0]`).
+    pub threshold_db: f32,
+    /// Closed attenuation in dB (sanitised `[-90, 0]`).
+    pub range_db: f32,
+    /// Attack (open) time, ms.
+    pub attack_ms: f32,
+    /// Release (close) time, ms.
+    pub release_ms: f32,
+}
+
+impl Default for NoiseGateSpec {
+    fn default() -> Self {
+        Self {
+            threshold_db: -45.0,
+            range_db: -60.0,
+            attack_ms: 1.0,
+            release_ms: 120.0,
+        }
+    }
+}
+
+/// GOAT-8 — de-hum (mains-hum notch comb) params.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DeHumSpec {
+    /// Mains fundamental, 50 or 60 Hz (sanitised `[40, 120]`).
+    pub base_hz: f32,
+    /// Number of notches (fundamental + harmonics), sanitised `1..=10`.
+    pub harmonics: u8,
+    /// Notch Q (narrowness), sanitised `[0.5, 40]`.
+    pub q: f32,
+}
+
+impl Default for DeHumSpec {
+    fn default() -> Self {
+        Self {
+            base_hz: 60.0,
+            harmonics: 4,
+            q: 12.0,
+        }
+    }
+}
+
 /// Tagged-enum serde so adding a new variant stays backward-compat readable.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
@@ -208,6 +253,22 @@ pub enum AudioEffectSpec {
         enabled: bool,
         /// Limiter configuration.
         spec: LimiterSpec,
+    },
+    /// GOAT-8 — downward noise gate / expander.
+    NoiseGate {
+        /// Whether the effect contributes to the output.
+        #[serde(default = "yes")]
+        enabled: bool,
+        /// Gate configuration.
+        spec: NoiseGateSpec,
+    },
+    /// GOAT-8 — mains-hum remover (harmonic notch comb).
+    DeHum {
+        /// Whether the effect contributes to the output.
+        #[serde(default = "yes")]
+        enabled: bool,
+        /// De-hum configuration.
+        spec: DeHumSpec,
     },
     /// Phase 7.10 / 7.11 — third-party plugin (LV2 / CLAP) loaded by
     /// the sandboxed [`vance-plugin-host`] sidecar. The spec records
@@ -260,6 +321,8 @@ impl AudioEffectSpec {
             AudioEffectSpec::Eq6 { .. } => "EQ",
             AudioEffectSpec::Compressor { .. } => "Comp",
             AudioEffectSpec::Limiter { .. } => "Limit",
+            AudioEffectSpec::NoiseGate { .. } => "Gate",
+            AudioEffectSpec::DeHum { .. } => "DeHum",
             AudioEffectSpec::Plugin { .. } => "Plug",
         }
     }
@@ -270,6 +333,8 @@ impl AudioEffectSpec {
             AudioEffectSpec::Eq6 { enabled, .. }
             | AudioEffectSpec::Compressor { enabled, .. }
             | AudioEffectSpec::Limiter { enabled, .. }
+            | AudioEffectSpec::NoiseGate { enabled, .. }
+            | AudioEffectSpec::DeHum { enabled, .. }
             | AudioEffectSpec::Plugin { enabled, .. } => *enabled,
         }
     }
@@ -281,6 +346,8 @@ impl AudioEffectSpec {
             AudioEffectSpec::Eq6 { enabled, .. }
             | AudioEffectSpec::Compressor { enabled, .. }
             | AudioEffectSpec::Limiter { enabled, .. }
+            | AudioEffectSpec::NoiseGate { enabled, .. }
+            | AudioEffectSpec::DeHum { enabled, .. }
             | AudioEffectSpec::Plugin { enabled, .. } => *enabled = on,
         }
     }
@@ -323,6 +390,22 @@ impl AudioEffectSpec {
             spec: LimiterSpec::default(),
         }
     }
+
+    /// Default for "Add Noise Gate" — dialogue-friendly gate.
+    pub fn default_noise_gate() -> Self {
+        AudioEffectSpec::NoiseGate {
+            enabled: true,
+            spec: NoiseGateSpec::default(),
+        }
+    }
+
+    /// Default for "Add De-Hum" — 60 Hz mains + 3 harmonics.
+    pub fn default_dehum() -> Self {
+        AudioEffectSpec::DeHum {
+            enabled: true,
+            spec: DeHumSpec::default(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -346,6 +429,26 @@ mod tests {
         assert_eq!(AudioEffectSpec::default_eq6().kind_label(), "EQ");
         assert_eq!(AudioEffectSpec::default_compressor().kind_label(), "Comp");
         assert_eq!(AudioEffectSpec::default_limiter().kind_label(), "Limit");
+        assert_eq!(AudioEffectSpec::default_noise_gate().kind_label(), "Gate");
+        assert_eq!(AudioEffectSpec::default_dehum().kind_label(), "DeHum");
+    }
+
+    #[test]
+    fn goat8_effects_round_trip_through_ron() {
+        // GOAT-8: the new gate/de-hum specs must survive the .vance RON path
+        // and toggle without disturbing params.
+        for mut e in [
+            AudioEffectSpec::default_noise_gate(),
+            AudioEffectSpec::default_dehum(),
+        ] {
+            let ron = ron::ser::to_string_pretty(&e, ron::ser::PrettyConfig::default()).unwrap();
+            let back: AudioEffectSpec = ron::from_str(&ron).unwrap();
+            assert_eq!(e, back, "spec survives RON round-trip");
+            let snap = e.clone();
+            e.set_enabled(false);
+            e.set_enabled(true);
+            assert_eq!(e, snap, "toggle preserves params");
+        }
     }
 
     #[test]

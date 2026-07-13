@@ -51,8 +51,8 @@ pub mod track;
 pub mod transition;
 
 pub use audio_effect::{
-    AudioEffectSpec, CompressorSpec, Eq6Spec, EqBandKind, EqBandSpec, LimiterSpec,
-    PluginParamValue, PluginRefSpec,
+    AudioEffectSpec, CompressorSpec, DeHumSpec, Eq6Spec, EqBandKind, EqBandSpec, LimiterSpec,
+    NoiseGateSpec, PluginParamValue, PluginRefSpec,
 };
 pub use clip::Clip;
 pub use edit_log::{apply, EditLog, EditOp, HistoryNodeView};

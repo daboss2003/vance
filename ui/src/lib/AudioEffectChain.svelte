@@ -12,11 +12,15 @@
     defaultCompressor,
     defaultEq6,
     defaultLimiter,
+    defaultNoiseGate,
+    defaultDeHum,
     defaultPlugin,
     listAudioPlugins,
     type AudioEffectSpec,
     type AudioPluginDescriptor,
     type CompressorSpec,
+    type NoiseGateSpec,
+    type DeHumSpec,
     type EqBandSpec,
     type LimiterSpec,
     type PluginParamInfo
@@ -99,6 +103,18 @@
     commit(index, next);
   }
 
+  function updateNoiseGate(index: number, effect: AudioEffectSpec, patch: Partial<NoiseGateSpec>) {
+    if (effect.kind !== 'NoiseGate') return;
+    const next: AudioEffectSpec = { ...effect, spec: { ...effect.spec, ...patch } };
+    commit(index, next);
+  }
+
+  function updateDeHum(index: number, effect: AudioEffectSpec, patch: Partial<DeHumSpec>) {
+    if (effect.kind !== 'DeHum') return;
+    const next: AudioEffectSpec = { ...effect, spec: { ...effect.spec, ...patch } };
+    commit(index, next);
+  }
+
   const eqBandKinds = ['LowShelf', 'Peak', 'HighShelf', 'LowCut', 'HighCut'] as const;
 
   // Phase 7.10 / 7.11 — plugin browser. `null` = not loaded yet;
@@ -151,6 +167,22 @@
         title="Add a look-ahead peak limiter"
       >
         + Limit
+      </button>
+      <button
+        type="button"
+        class="border-vance-border rounded border bg-vance-bg px-1.5 py-0.5 text-[10px] hover:brightness-125"
+        onclick={() => projectState.addAudioEffect(trackId, defaultNoiseGate())}
+        title="Add a noise gate (remove hiss/room between dialogue)"
+      >
+        + Gate
+      </button>
+      <button
+        type="button"
+        class="border-vance-border rounded border bg-vance-bg px-1.5 py-0.5 text-[10px] hover:brightness-125"
+        onclick={() => projectState.addAudioEffect(trackId, defaultDeHum())}
+        title="Add a de-hum (mains 50/60 Hz notch comb)"
+      >
+        + DeHum
       </button>
       <button
         type="button"
@@ -221,7 +253,11 @@
               ? 'Compressor'
               : effect.kind === 'Limiter'
                 ? 'Limiter'
-                : `Plugin · ${effect.descriptor.name}`}
+                : effect.kind === 'NoiseGate'
+                  ? 'Noise Gate'
+                  : effect.kind === 'DeHum'
+                    ? 'De-Hum'
+                    : `Plugin · ${effect.descriptor.name}`}
         </span>
         <button
           type="button"
@@ -456,6 +492,60 @@
                 })}
             />
             <span class="text-vance-muted">ms</span>
+          </label>
+        </div>
+      {:else if effect.kind === 'NoiseGate'}
+        <div class="flex flex-wrap gap-2 text-[10px] font-mono">
+          <label class="flex items-center gap-1">
+            <span class="text-vance-muted">thresh</span>
+            <input type="number" step="1" min="-90" max="0" value={effect.spec.threshold_db}
+              class="border-vance-border w-14 rounded border bg-vance-panel px-1"
+              oninput={(e) => updateNoiseGate(idx, effect, { threshold_db: parseFloat((e.target as HTMLInputElement).value) })} />
+            <span class="text-vance-muted">dB</span>
+          </label>
+          <label class="flex items-center gap-1">
+            <span class="text-vance-muted">range</span>
+            <input type="number" step="1" min="-90" max="0" value={effect.spec.range_db}
+              class="border-vance-border w-14 rounded border bg-vance-panel px-1"
+              oninput={(e) => updateNoiseGate(idx, effect, { range_db: parseFloat((e.target as HTMLInputElement).value) })} />
+            <span class="text-vance-muted">dB</span>
+          </label>
+          <label class="flex items-center gap-1">
+            <span class="text-vance-muted">atk</span>
+            <input type="number" step="0.5" min="0.1" max="500" value={effect.spec.attack_ms}
+              class="border-vance-border w-12 rounded border bg-vance-panel px-1"
+              oninput={(e) => updateNoiseGate(idx, effect, { attack_ms: parseFloat((e.target as HTMLInputElement).value) })} />
+          </label>
+          <label class="flex items-center gap-1">
+            <span class="text-vance-muted">rel</span>
+            <input type="number" step="5" min="1" max="5000" value={effect.spec.release_ms}
+              class="border-vance-border w-14 rounded border bg-vance-panel px-1"
+              oninput={(e) => updateNoiseGate(idx, effect, { release_ms: parseFloat((e.target as HTMLInputElement).value) })} />
+            <span class="text-vance-muted">ms</span>
+          </label>
+        </div>
+      {:else if effect.kind === 'DeHum'}
+        <div class="flex flex-wrap gap-2 text-[10px] font-mono">
+          <label class="flex items-center gap-1">
+            <span class="text-vance-muted">mains</span>
+            <select class="border-vance-border rounded border bg-vance-panel px-1"
+              value={effect.spec.base_hz}
+              onchange={(e) => updateDeHum(idx, effect, { base_hz: parseFloat((e.target as HTMLSelectElement).value) })}>
+              <option value={50}>50 Hz</option>
+              <option value={60}>60 Hz</option>
+            </select>
+          </label>
+          <label class="flex items-center gap-1">
+            <span class="text-vance-muted">harmonics</span>
+            <input type="number" step="1" min="1" max="10" value={effect.spec.harmonics}
+              class="border-vance-border w-12 rounded border bg-vance-panel px-1"
+              oninput={(e) => updateDeHum(idx, effect, { harmonics: parseInt((e.target as HTMLInputElement).value, 10) })} />
+          </label>
+          <label class="flex items-center gap-1">
+            <span class="text-vance-muted">Q</span>
+            <input type="number" step="1" min="0.5" max="40" value={effect.spec.q}
+              class="border-vance-border w-12 rounded border bg-vance-panel px-1"
+              oninput={(e) => updateDeHum(idx, effect, { q: parseFloat((e.target as HTMLInputElement).value) })} />
           </label>
         </div>
       {:else if effect.kind === 'Plugin'}

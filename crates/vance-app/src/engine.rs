@@ -6032,6 +6032,27 @@ impl Engine {
         self.current_sequence_id.map(|id| id.to_string())
     }
 
+    // ---- GOAT-8: dialogue leveling (BS.1770 loudness analysis) ----------------
+
+    /// The media item referenced by a clip on `track_id` (for off-lock
+    /// loudness analysis).
+    pub fn clip_media_id(
+        &self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+    ) -> Option<MediaItemId> {
+        self.current_sequence_ref()
+            .ok()?
+            .tracks
+            .iter()
+            .find(|t| t.id == track_id)?
+            .clips
+            .iter()
+            .find(|c| c.id == clip_id)
+            .map(|c| c.media)
+    }
+
+
     /// The on-disk path of a media item (for transcription). `None` for
     /// synthetic / missing media.
     pub fn media_path_for(&self, media_id: MediaItemId) -> Option<std::path::PathBuf> {
@@ -7038,6 +7059,23 @@ fn translate_audio_effect(
                 release_ms: spec.release_ms.clamp(1.0, 5000.0),
             },
         },
+        Spec::NoiseGate { enabled, spec } => vance_audio::AudioEffectKind::NoiseGate {
+            enabled: *enabled,
+            params: vance_audio::NoiseGateParams {
+                threshold_db: spec.threshold_db.clamp(-90.0, 0.0),
+                range_db: spec.range_db.clamp(-90.0, 0.0),
+                attack_ms: spec.attack_ms.clamp(0.1, 500.0),
+                release_ms: spec.release_ms.clamp(1.0, 5000.0),
+            },
+        },
+        Spec::DeHum { enabled, spec } => vance_audio::AudioEffectKind::DeHum {
+            enabled: *enabled,
+            params: vance_audio::DeHumParams {
+                base_hz: spec.base_hz.clamp(40.0, 120.0),
+                harmonics: spec.harmonics.clamp(1, 10),
+                q: spec.q.clamp(0.5, 40.0),
+            },
+        },
         Spec::Plugin {
             enabled,
             descriptor,
@@ -7458,6 +7496,35 @@ fn op_touches_mixer(op: &EditOp) -> bool {
         EditOp::Compound { .. } => true,
         _ => false,
     }
+}
+
+/// GOAT-8 — measure a media file's integrated loudness (LUFS) by decoding
+/// its full audio through the BS.1770 meter. Slow (decodes the file) — run
+/// OFF the engine lock. Free function so the Tauri layer can call it while
+/// the lock is dropped. `None` on no audio / decoder failure.
+pub(crate) fn measure_loudness(media_path: &std::path::Path) -> Option<f32> {
+    let bin = locate_audio_binary().ok()?;
+    let mut audio = vance_audio::AudioClient::spawn(&bin).ok()?;
+    let info = audio.open(media_path.to_string_lossy().into_owned()).ok()?;
+    if audio.start_stream(0, 8192).is_err() {
+        let _ = audio.shutdown();
+        return None;
+    }
+    let mut meter = vance_audio::loudness::LoudnessMeter::new(info.sample_rate as f32);
+    loop {
+        match audio.next_chunk() {
+            Ok(Some(chunk)) => {
+                for frame in chunk.samples.chunks_exact(2) {
+                    meter.ingest(frame[0], frame[1]);
+                }
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    let _ = audio.stop_stream();
+    let _ = audio.shutdown();
+    let lufs = meter.stats().lufs_i;
+    lufs.is_finite().then_some(lufs)
 }
 
 fn locate_audio_binary() -> Result<PathBuf, EngineError> {

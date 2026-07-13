@@ -16,6 +16,7 @@ mod peaks;
 mod prefetch;
 mod profiling;
 mod proxy;
+mod separate;
 mod transcribe;
 
 use engine::{EngineHandle, MediaItemInfo, ProjectInfo, SequenceContents, SourceState, TrackSummary};
@@ -3090,6 +3091,75 @@ fn transcribe_media(
     Ok(n)
 }
 
+// ---- GOAT-8: dialogue leveling + voice isolation ---------------------------
+
+/// Measure a media item's integrated loudness (LUFS). Decodes off-lock.
+#[tauri::command]
+fn analyze_loudness(
+    state: tauri::State<'_, EngineHandle>,
+    media_id: String,
+) -> Result<Option<f32>, String> {
+    let uuid: uuid::Uuid = media_id.parse().map_err(|e| format!("bad media id: {e}"))?;
+    let mid = vance_timeline::MediaItemId::from_uuid(uuid);
+    let path = { state.lock().media_path_for(mid) };
+    Ok(path.and_then(|p| engine::measure_loudness(&p)))
+}
+
+/// Auto dialogue leveling: measure a clip's loudness off-lock, then set its
+/// gain to land at `target_lufs`. Returns the applied gain in dB.
+#[tauri::command]
+fn level_clip(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    clip_id: String,
+    target_lufs: f32,
+) -> Result<f32, String> {
+    let t = track_id.parse::<uuid::Uuid>().map_err(|e| format!("bad track id: {e}"))?;
+    let c = clip_id.parse::<uuid::Uuid>().map_err(|e| format!("bad clip id: {e}"))?;
+    let tid = vance_timeline::TrackId::from_uuid(t);
+    let cid = vance_timeline::ClipId::from_uuid(c);
+    // Resolve the clip's media path under a brief lock, measure off-lock.
+    let path = {
+        let eng = state.lock();
+        let mid = eng
+            .clip_media_id(tid, cid)
+            .ok_or_else(|| "clip not found".to_string())?;
+        eng.media_path_for(mid)
+            .ok_or_else(|| "clip media has no audio file".to_string())?
+    };
+    let source_lufs =
+        engine::measure_loudness(&path).ok_or_else(|| "could not measure loudness".to_string())?;
+    let gain_db = (target_lufs - source_lufs).clamp(-24.0, 24.0);
+    state.lock().set_clip_gain_db(tid, cid, gain_db).map_err(|e| e.to_string())?;
+    Ok(gain_db)
+}
+
+/// Whether a voice-isolation CLI (Demucs) is installed.
+#[tauri::command]
+fn voice_isolation_available() -> bool {
+    separate::available()
+}
+
+/// Isolate vocals from a media item (off-lock) and import the vocal stem as
+/// a new media item. Returns the new item's info.
+#[tauri::command]
+fn isolate_voice(
+    state: tauri::State<'_, EngineHandle>,
+    media_id: String,
+) -> Result<MediaItemInfo, String> {
+    let uuid: uuid::Uuid = media_id.parse().map_err(|e| format!("bad media id: {e}"))?;
+    let mid = vance_timeline::MediaItemId::from_uuid(uuid);
+    let path = {
+        state
+            .lock()
+            .media_path_for(mid)
+            .ok_or_else(|| "media has no file to isolate".to_string())?
+    };
+    let stems = separate::isolate(&path).map_err(|e| e.to_string())?;
+    let vocals = stems.vocals.to_string_lossy().into_owned();
+    state.lock().import_media_file(&vocals).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn project_info(state: tauri::State<'_, EngineHandle>) -> Option<ProjectInfo> {
     state.lock().project_info()
@@ -3231,6 +3301,10 @@ fn main() {
             export_captions,
             transcription_available,
             transcribe_media,
+            analyze_loudness,
+            level_clip,
+            voice_isolation_available,
+            isolate_voice,
             move_clip_to,
             remove_clip,
             add_effect_to_clip,

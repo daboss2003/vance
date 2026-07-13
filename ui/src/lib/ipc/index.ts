@@ -304,6 +304,8 @@ export type AudioEffectSpec =
   | { kind: 'Eq6'; enabled: boolean; eq: Eq6Spec }
   | { kind: 'Compressor'; enabled: boolean; spec: CompressorSpec }
   | { kind: 'Limiter'; enabled: boolean; spec: LimiterSpec }
+  | { kind: 'NoiseGate'; enabled: boolean; spec: NoiseGateSpec }
+  | { kind: 'DeHum'; enabled: boolean; spec: DeHumSpec }
   | {
       kind: 'Plugin';
       enabled: boolean;
@@ -352,6 +354,19 @@ export type LimiterSpec = {
   release_ms: number;
 };
 
+export type NoiseGateSpec = {
+  threshold_db: number;
+  range_db: number;
+  attack_ms: number;
+  release_ms: number;
+};
+
+export type DeHumSpec = {
+  base_hz: number;
+  harmonics: number;
+  q: number;
+};
+
 /** Phase 7.7 — default specs matching the Rust crate constants. Used
  *  by the "Add EQ / Compressor / Limiter" buttons. */
 export function defaultEq6(): AudioEffectSpec {
@@ -396,6 +411,42 @@ export function defaultLimiter(): AudioEffectSpec {
     }
   };
 }
+
+/** GOAT-8 — default noise gate (dialogue-friendly). */
+export function defaultNoiseGate(): AudioEffectSpec {
+  return {
+    kind: 'NoiseGate',
+    enabled: true,
+    spec: { threshold_db: -45, range_db: -60, attack_ms: 1, release_ms: 120 }
+  };
+}
+
+/** GOAT-8 — default de-hum (60 Hz + harmonics). */
+export function defaultDeHum(): AudioEffectSpec {
+  return {
+    kind: 'DeHum',
+    enabled: true,
+    spec: { base_hz: 60, harmonics: 4, q: 12 }
+  };
+}
+
+// ---- GOAT-8: dialogue leveling + voice isolation ---------------------------
+
+/** Measure a media item's integrated loudness (LUFS), or null. */
+export const analyzeLoudness = (mediaId: string): Promise<number | null> =>
+  invoke('analyze_loudness', { mediaId });
+/** Auto-level a clip to `targetLufs`; returns the applied gain (dB). */
+export const levelClip = (
+  trackId: string,
+  clipId: string,
+  targetLufs: number
+): Promise<number> => invoke('level_clip', { trackId, clipId, targetLufs });
+/** Whether a voice-isolation CLI (Demucs) is installed. */
+export const voiceIsolationAvailable = (): Promise<boolean> =>
+  invoke('voice_isolation_available');
+/** Isolate vocals from a media item; returns the imported stem's info. */
+export const isolateVoice = (mediaId: string): Promise<MediaItemInfo> =>
+  invoke('isolate_voice', { mediaId });
 
 export type SequenceContents = {
   id: string;

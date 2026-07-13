@@ -82,6 +82,10 @@
         return 'Comp';
       case 'Limiter':
         return 'Limit';
+      case 'NoiseGate':
+        return 'Gate';
+      case 'DeHum':
+        return 'DeHum';
       case 'Plugin':
         return e.descriptor.name || 'Plugin';
     }
