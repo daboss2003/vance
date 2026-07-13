@@ -2481,6 +2481,50 @@ impl Engine {
         Ok(info)
     }
 
+    /// GOAT-8 — import an AUDIO-ONLY file (e.g. an isolated voice stem).
+    /// Probes via the audio decoder sidecar (which, unlike the video
+    /// decoder, doesn't require a video stream) and tags `MediaKind::Audio`.
+    pub fn import_audio_file(&mut self, path: &str) -> Result<MediaItemInfo, EngineError> {
+        if self.current_project.is_none() {
+            return Err(EngineError::NoProject);
+        }
+        let bin = locate_audio_binary()?;
+        let mut audio = vance_audio::AudioClient::spawn(&bin)
+            .map_err(|e| EngineError::Project(format!("audio probe spawn: {e}")))?;
+        let info = audio
+            .open(path.to_string())
+            .map_err(|e| EngineError::Project(format!("open audio: {e}")))?;
+        let _ = audio.shutdown();
+        // Duration from the stream's duration_pts × time_base, or a small
+        // fallback so a probe-less stem still lands with a sane length.
+        let (tb_n, tb_d) = info.time_base;
+        let secs = match info.duration_pts {
+            Some(pts) if tb_d != 0 => (pts as f64) * (tb_n as f64) / (tb_d as f64),
+            _ => 1.0,
+        };
+        let duration = seconds_to_rt(secs.max(0.04));
+        let display_name = std::path::Path::new(path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(path)
+            .to_string();
+        let item = MediaItem::new(
+            std::path::PathBuf::from(path),
+            display_name,
+            MediaKind::Audio,
+            duration,
+        );
+        let id = item.id;
+        let out = MediaItemInfo::from(&item);
+        self.current_project
+            .as_mut()
+            .unwrap()
+            .media
+            .insert(id, Arc::new(item));
+        tracing::info!(id = %id, path = %path, "imported audio-only media");
+        Ok(out)
+    }
+
     /// Update `MediaItem.has_audio_track` (Phase 7.2). Called from the
     /// Tauri layer's `import_media_file` wrapper after probing via
     /// `PeaksService::probe_audio`, and from the project-load
@@ -6041,15 +6085,30 @@ impl Engine {
         track_id: TrackId,
         clip_id: vance_timeline::ClipId,
     ) -> Option<MediaItemId> {
-        self.current_sequence_ref()
+        self.clip_media_and_range(track_id, clip_id).map(|(m, _, _)| m)
+    }
+
+    /// GOAT-8 — a clip's media id + its active source range in seconds
+    /// `(media, source_in_sec, duration_sec)`, so leveling measures only
+    /// the clip's used region (not the whole source file).
+    pub fn clip_media_and_range(
+        &self,
+        track_id: TrackId,
+        clip_id: vance_timeline::ClipId,
+    ) -> Option<(MediaItemId, f64, f64)> {
+        let clip = self
+            .current_sequence_ref()
             .ok()?
             .tracks
             .iter()
             .find(|t| t.id == track_id)?
             .clips
             .iter()
-            .find(|c| c.id == clip_id)
-            .map(|c| c.media)
+            .find(|c| c.id == clip_id)?
+            .clone();
+        let start = rt_to_seconds(clip.source_in);
+        let dur = rt_to_seconds(clip.duration());
+        Some((clip.media, start, dur))
     }
 
 
@@ -7498,24 +7557,77 @@ fn op_touches_mixer(op: &EditOp) -> bool {
     }
 }
 
-/// GOAT-8 — measure a media file's integrated loudness (LUFS) by decoding
-/// its full audio through the BS.1770 meter. Slow (decodes the file) — run
-/// OFF the engine lock. Free function so the Tauri layer can call it while
-/// the lock is dropped. `None` on no audio / decoder failure.
+/// GOAT-8 — a STABLE, app-owned directory for Vance-generated media
+/// (isolated stems, renders) that must survive across sessions. Unlike the
+/// OS temp dir (which the reaper wipes and which the isolation runner
+/// clears on each run), files here persist so a project that references
+/// them reopens intact. Created on demand.
+pub(crate) fn persistent_media_dir() -> std::io::Result<PathBuf> {
+    let base = if cfg!(windows) {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join("Library/Application Support"))
+            .unwrap_or_else(std::env::temp_dir)
+    } else {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+            .unwrap_or_else(std::env::temp_dir)
+    };
+    let dir = base.join("Vance").join("media");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// GOAT-8 — measure a media file's whole-file integrated loudness (LUFS).
+/// Convenience wrapper over [`measure_loudness_range`].
 pub(crate) fn measure_loudness(media_path: &std::path::Path) -> Option<f32> {
+    measure_loudness_range(media_path, 0.0, None)
+}
+
+/// GOAT-8 — measure integrated loudness (LUFS) over `[start_sec, start_sec
+/// + dur_sec)` of a media file's audio (or the whole file when `dur_sec`
+/// is `None`) via the BS.1770 meter. Slow (decodes) — run OFF the engine
+/// lock. Measuring only the clip's active source range makes dialogue
+/// leveling correct for trimmed clips.
+pub(crate) fn measure_loudness_range(
+    media_path: &std::path::Path,
+    start_sec: f64,
+    dur_sec: Option<f64>,
+) -> Option<f32> {
     let bin = locate_audio_binary().ok()?;
     let mut audio = vance_audio::AudioClient::spawn(&bin).ok()?;
     let info = audio.open(media_path.to_string_lossy().into_owned()).ok()?;
-    if audio.start_stream(0, 8192).is_err() {
+    // Seek to the clip's in-point (in the stream time base).
+    let (tb_n, tb_d) = info.time_base;
+    let from_pts = if start_sec > 0.0 && tb_n != 0 {
+        (start_sec * tb_d as f64 / tb_n as f64).round() as i64
+    } else {
+        0
+    };
+    if audio.start_stream(from_pts, 8192).is_err() {
         let _ = audio.shutdown();
         return None;
     }
     let mut meter = vance_audio::loudness::LoudnessMeter::new(info.sample_rate as f32);
-    loop {
+    // Stop after the clip's used duration (in frames), so we don't measure
+    // material past the clip's out-point.
+    let max_frames = dur_sec.map(|d| (d.max(0.0) * info.sample_rate as f64).ceil() as u64);
+    let mut frames: u64 = 0;
+    'decode: loop {
         match audio.next_chunk() {
             Ok(Some(chunk)) => {
                 for frame in chunk.samples.chunks_exact(2) {
                     meter.ingest(frame[0], frame[1]);
+                    frames += 1;
+                    if let Some(cap) = max_frames {
+                        if frames >= cap {
+                            break 'decode;
+                        }
+                    }
                 }
             }
             Ok(None) | Err(_) => break,

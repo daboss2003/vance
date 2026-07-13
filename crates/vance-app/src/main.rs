@@ -3118,19 +3118,30 @@ fn level_clip(
     let c = clip_id.parse::<uuid::Uuid>().map_err(|e| format!("bad clip id: {e}"))?;
     let tid = vance_timeline::TrackId::from_uuid(t);
     let cid = vance_timeline::ClipId::from_uuid(c);
-    // Resolve the clip's media path under a brief lock, measure off-lock.
-    let path = {
+    // Resolve the clip's media path + active source range under a brief
+    // lock, measure only that region off-lock (correct for trimmed clips).
+    let (path, start_sec, dur_sec) = {
         let eng = state.lock();
-        let mid = eng
-            .clip_media_id(tid, cid)
+        let (mid, start, dur) = eng
+            .clip_media_and_range(tid, cid)
             .ok_or_else(|| "clip not found".to_string())?;
-        eng.media_path_for(mid)
-            .ok_or_else(|| "clip media has no audio file".to_string())?
+        let path = eng
+            .media_path_for(mid)
+            .ok_or_else(|| "clip media has no audio file".to_string())?;
+        (path, start, dur)
     };
-    let source_lufs =
-        engine::measure_loudness(&path).ok_or_else(|| "could not measure loudness".to_string())?;
+    let source_lufs = engine::measure_loudness_range(&path, start_sec, Some(dur_sec))
+        .ok_or_else(|| "could not measure loudness".to_string())?;
     let gain_db = (target_lufs - source_lufs).clamp(-24.0, 24.0);
-    state.lock().set_clip_gain_db(tid, cid, gain_db).map_err(|e| e.to_string())?;
+    // Re-validate the clip still exists before applying (it may have been
+    // deleted during the off-lock measure).
+    {
+        let mut eng = state.lock();
+        if eng.clip_media_and_range(tid, cid).is_none() {
+            return Err("clip was removed during analysis".into());
+        }
+        eng.set_clip_gain_db(tid, cid, gain_db).map_err(|e| e.to_string())?;
+    }
     Ok(gain_db)
 }
 
@@ -3156,8 +3167,21 @@ fn isolate_voice(
             .ok_or_else(|| "media has no file to isolate".to_string())?
     };
     let stems = separate::isolate(&path).map_err(|e| e.to_string())?;
-    let vocals = stems.vocals.to_string_lossy().into_owned();
-    state.lock().import_media_file(&vocals).map_err(|e| e.to_string())
+    // Copy the stem out of the volatile temp dir (which the next isolate run
+    // wipes and the OS temp reaper clears) into a stable, uuid-named,
+    // app-owned location, so the imported media survives save/reopen.
+    let dir = engine::persistent_media_dir().map_err(|e| format!("media dir: {e}"))?;
+    let ext = stems
+        .vocals
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("wav");
+    let dest = dir.join(format!("{}-vocals.{ext}", uuid::Uuid::new_v4()));
+    std::fs::copy(&stems.vocals, &dest).map_err(|e| format!("copy stem: {e}"))?;
+    let dest_str = dest.to_string_lossy().into_owned();
+    // Audio-only stem → import via the audio-aware path (the video decoder
+    // would reject it with NoVideoStream).
+    state.lock().import_audio_file(&dest_str).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
