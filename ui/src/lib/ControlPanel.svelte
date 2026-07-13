@@ -49,17 +49,23 @@
       .catch(() => {});
   });
 
-  // Poll + dispatch while any surface is live.
+  // Poll + dispatch while any surface is live. A re-entrancy guard skips a
+  // tick if the previous drain+dispatch is still in flight, so a fader
+  // burst can't spawn overlapping runs that apply gain values out of order.
+  let draining = false;
   $effect(() => {
     if (!status.osc_running && !status.midi_running) return;
     const timer = setInterval(async () => {
-      let actions: ControlAction[] = [];
+      if (draining) return;
+      draining = true;
       try {
-        actions = await pollControlActions();
+        const actions = await pollControlActions();
+        for (const a of actions) await dispatch(a);
       } catch {
-        return;
+        // ignore transient poll errors
+      } finally {
+        draining = false;
       }
-      for (const a of actions) await dispatch(a);
     }, 60);
     return () => clearInterval(timer);
   });
