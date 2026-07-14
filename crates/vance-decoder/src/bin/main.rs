@@ -163,6 +163,10 @@ impl State {
         // software decode (the HW/NV12 path can't carry 10-bit correctly).
         let src_pix_fmt: i32 = unsafe { (*stream.parameters().as_ptr()).format };
         let high_bit_source = is_high_bit_source(src_pix_fmt);
+        // HDR transfer hint from the stream's color VUI (for auto-tagging the
+        // clip's input color space on import).
+        let color_trc: i32 = unsafe { (*stream.parameters().as_ptr()).color_trc as i32 };
+        let color_transfer = color_transfer_hint(color_trc);
 
         // Try VideoToolbox before opening the decoder (8-bit only). On
         // success, attach hw_device_ctx so FFmpeg's get_format chooses
@@ -223,6 +227,7 @@ impl State {
             duration_pts: if duration > 0 { Some(duration) } else { None },
             codec_name,
             stream_index: stream_index as u32,
+            color_transfer,
         };
 
         self.open = Some(OpenContext {
@@ -539,6 +544,19 @@ fn map_pixel_format(pf: ffmpeg::format::Pixel) -> Result<PixelFormat, String> {
         // 10-bit 4:2:0 (HEVC Main10 / HDR PQ-HLG) → carried 10-bit.
         P::YUV420P10LE => Ok(PixelFormat::Yuv420P10Le),
         other => Err(format!("{other:?}")),
+    }
+}
+
+/// Map an ffmpeg `AVColorTransferCharacteristic` value to a coarse HDR hint.
+fn color_transfer_hint(trc: i32) -> vance_decoder::protocol::ColorTransferHint {
+    use ffmpeg::sys::AVColorTransferCharacteristic::*;
+    use vance_decoder::protocol::ColorTransferHint as H;
+    if trc == AVCOL_TRC_SMPTE2084 as i32 {
+        H::Pq
+    } else if trc == AVCOL_TRC_ARIB_STD_B67 as i32 {
+        H::Hlg
+    } else {
+        H::Unknown
     }
 }
 

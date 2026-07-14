@@ -2562,6 +2562,18 @@ impl Engine {
         if let Some(fr) = frame_rate {
             item = item.with_frame_rate(fr);
         }
+        // Auto-tag an HDR source's input color space from the stream's
+        // transfer VUI so it grades as HDR without manual setup. SDR / unknown
+        // stays `None` (the engine's Rec.709 default). The user can override.
+        item.input_color_space = match stream.color_transfer {
+            vance_decoder::protocol::ColorTransferHint::Pq => {
+                Some(vance_color::ColorSpace::Rec2020Pq)
+            }
+            vance_decoder::protocol::ColorTransferHint::Hlg => {
+                Some(vance_color::ColorSpace::Rec2020Hlg)
+            }
+            vance_decoder::protocol::ColorTransferHint::Unknown => item.input_color_space,
+        };
         let id = item.id;
         let info = MediaItemInfo::from(&item);
 

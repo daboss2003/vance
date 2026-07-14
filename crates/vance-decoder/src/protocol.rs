@@ -158,6 +158,24 @@ pub struct StreamInfo {
     pub codec_name: String,
     /// 0-based index of this stream within the container.
     pub stream_index: u32,
+    /// Detected HDR transfer from the stream's color VUI, so the engine can
+    /// tag an HDR source's input color space automatically. `#[serde(default)]`
+    /// → `Unknown` for older sidecars.
+    #[serde(default)]
+    pub color_transfer: ColorTransferHint,
+}
+
+/// A coarse transfer-characteristic hint read from the stream's color VUI,
+/// used to auto-tag a clip's input color space on import.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColorTransferHint {
+    /// Not signaled / a standard SDR transfer (Rec.709 / sRGB).
+    #[default]
+    Unknown,
+    /// SMPTE ST 2084 (PQ) — HDR10.
+    Pq,
+    /// ARIB STD-B67 (HLG).
+    Hlg,
 }
 
 /// Pixel formats the decoder emits over the wire.
