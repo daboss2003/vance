@@ -22,6 +22,7 @@
   let startSeconds = $state<number | null>(null);
   let endSeconds = $state<number | null>(null);
   let crf = $state<number | null>(23);
+  let hdr = $state(false);
 
   let rendering = $state(false);
   let lastOutcome = $state<RenderOutcome | null>(null);
@@ -54,7 +55,8 @@
         width,
         height,
         start_seconds: startSeconds,
-        end_seconds: endSeconds
+        end_seconds: endSeconds,
+        hdr
       });
     } catch (e) {
       error = String(e);
@@ -101,6 +103,12 @@
       />
     </label>
   {/if}
+
+  <label class="mb-1 flex items-center gap-1" title="10-bit HEVC Main10, Rec.2020 PQ. Forces software HEVC.">
+    <span class="text-vance-muted w-12">HDR10</span>
+    <input type="checkbox" bind:checked={hdr} />
+    {#if hdr}<span class="text-vance-muted text-[10px]">HEVC Main10 · Rec.2020 PQ</span>{/if}
+  </label>
 
   <div class="mb-1 flex items-center gap-1">
     <span class="text-vance-muted w-12">Size</span>

@@ -1421,6 +1421,8 @@ export type RenderRequest = {
   height?: number | null;
   start_seconds?: number | null;
   end_seconds?: number | null;
+  /** HDR10 export (10-bit HEVC Main10, Rec.2020 PQ). Defaults off. */
+  hdr?: boolean;
 };
 
 /** Phase 8 — UI render outcome. */

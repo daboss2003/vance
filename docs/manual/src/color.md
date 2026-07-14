@@ -25,10 +25,12 @@ Vance understands input color spaces and a working/output space:
 Tag each clip's input color space (camera-dependent) so the pipeline converts
 correctly. LUTs (`.cube`) are parsed once and cached.
 
-> **Note on HDR:** Vance's color science supports Rec.2020 PQ/HLG. Full HDR10
-> mastering (10-bit output with mastering-display metadata) depends on a
-> 10-bit render path and is on the roadmap; today the pipeline is graded and
-> previewed in the working space.
+> **HDR10 export:** Tick **HDR10** in the Export panel to render through a
+> 10-bit pipeline (Rec.2020 primaries, PQ transfer) and write a HEVC Main10
+> file tagged with HDR10 mastering-display + content-light metadata. Preview
+> stays SDR. Note: source frames are 8-bit today, so SDR-range content is
+> correctly PQ-encoded (up to ~100 nits) — true >100-nit highlights await a
+> 10-bit decode path (on the roadmap).
 
 ## Expressions & keyframes
 
