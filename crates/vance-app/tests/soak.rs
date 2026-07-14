@@ -149,6 +149,7 @@ fn soak_cycle_keeps_cache_within_budget() {
                 render_and_replace_track: None,
                 start_seconds: Some(0.0),
                 end_seconds: Some(0.25),
+                hdr: false,
             })
             .expect("render");
         assert!(outcome.video_frames >= 4, "cycle {cycle}: too few frames");

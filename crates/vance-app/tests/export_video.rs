@@ -52,6 +52,7 @@ fn export_frame(engine: &mut Engine, at_seconds: f64) -> Option<(Vec<u8>, f64)> 
             render_and_replace_track: None,
             start_seconds: Some(at_seconds),
             end_seconds: Some(at_seconds + 0.05),
+            hdr: false,
         })
         .ok()?;
     let raw = std::env::temp_dir().join(format!("vance-vexp-{}.rgb", uniq()));

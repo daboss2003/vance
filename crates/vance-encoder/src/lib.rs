@@ -16,6 +16,7 @@ pub mod protocol;
 
 pub use client::{EncoderClient, EncoderClientError};
 pub use protocol::{
-    AudioCodec, AudioConfig, AudioSampleFormat, EncoderError, EncoderPreset, EncoderRequest,
-    EncoderResponse, VideoConfig, VideoPixelFormat, PROTOCOL_VERSION,
+    AudioCodec, AudioConfig, AudioSampleFormat, ColorSignaling, EncoderError, EncoderPreset,
+    EncoderRequest, EncoderResponse, HdrMetadata, MasteringDisplay, VideoConfig, VideoPixelFormat,
+    PROTOCOL_VERSION,
 };

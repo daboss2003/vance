@@ -25,5 +25,7 @@ tracing = { workspace = true }
 fontdue = "0.9"
 
 [dev-dependencies]
-# For the headless golden-frame test we just need the renderer to map
-# its output texture; no extra crate needed.
+# The HDR golden test names the 10-bit target format + builds a Rec.2020-PQ
+# pipeline, so it needs wgpu (the format enum) and vance-color (the pipeline).
+wgpu = "29"
+vance-color = { workspace = true }

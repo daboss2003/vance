@@ -103,6 +103,7 @@ fn render_sequence_with_one_clip_produces_valid_prores() {
             // Half-second slice for fast tests.
             start_seconds: Some(0.0),
             end_seconds: Some(0.5),
+            hdr: false,
         })
         .expect("render_sequence");
 
@@ -204,6 +205,7 @@ fn exit_gate_proxy_multi_clip_prores_export() {
             render_and_replace_track: None,
             start_seconds: Some(0.0),
             end_seconds: Some(1.5),
+            hdr: false,
         })
         .expect("exit-gate render");
 

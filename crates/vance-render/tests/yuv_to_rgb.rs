@@ -129,6 +129,63 @@ fn renders_solid_white_yuv420p() {
     assert!(center_px[0] > 240 && center_px[1] > 240 && center_px[2] > 240);
 }
 
+/// HDR end-to-end (render → PQ → 10-bit readback): white through an
+/// Rgba16Float renderer with a Rec.709 → Rec.2020-PQ pipeline must come back
+/// as the analytic PQ code value of SDR reference white (100 cd/m²).
+#[test]
+fn hdr_white_encodes_to_pq_reference() {
+    use vance_render::{Renderer as R, RendererConfig as Cfg};
+    // White YUV → Rec.709 (1,1,1) → linear 1.0 → Rec.2020 primaries (white
+    // stays white) → * 100/10000 = 0.01 → PQ(0.01) ≈ 0.5081.
+    let frame = solid_yuv420p(64, 64, 235, 128, 128);
+    let mut r = R::new(Cfg {
+        target_format: wgpu::TextureFormat::Rgba16Float,
+        ..Cfg::default()
+    })
+    .expect("hdr renderer");
+    // Rec.709 limited input, Linear Rec.709 working, Rec.2020 PQ output.
+    let params = vance_color::Pipeline {
+        input: vance_color::ColorSpace::Rec709Limited,
+        working: vance_color::ColorSpace::LinearRec709,
+        output: vance_color::ColorSpace::Rec2020Pq,
+    }
+    .to_params()
+    .expect("Rec.2020 PQ output resolves");
+    r.set_pipeline(params);
+    r.upload_frame(&frame).expect("upload");
+    let buf = r.render_to_rgba64_buffer(64, 64).expect("hdr render");
+
+    // Center pixel, R channel as u16 LE (8 bytes/px).
+    let cx = 32u32;
+    let cy = 32u32;
+    let i = ((cy * 64 + cx) * 8) as usize;
+    let r16 = u16::from_le_bytes([buf[i], buf[i + 1]]);
+    let g16 = u16::from_le_bytes([buf[i + 2], buf[i + 3]]);
+    let b16 = u16::from_le_bytes([buf[i + 4], buf[i + 5]]);
+    let a16 = u16::from_le_bytes([buf[i + 6], buf[i + 7]]);
+
+    // PQ(0.01) ≈ 0.5081 → code ≈ 33305. Tolerance covers half-float precision
+    // + YUV/round-trip.
+    let expected = (pq_ref(0.01) * 65535.0).round() as i32;
+    for (ch, v) in [("R", r16), ("G", g16), ("B", b16)] {
+        assert!(
+            (v as i32 - expected).abs() < 500,
+            "{ch} PQ code {v} vs expected ~{expected}"
+        );
+    }
+    assert_eq!(a16, 65535, "opaque alpha");
+    // Sanity: a PQ-coded 100-nit white is a MID code, not near-max (which is
+    // what an SDR white or a mis-tag would produce).
+    assert!(r16 > 25000 && r16 < 42000, "PQ white must be mid-range, got {r16}");
+}
+
+/// Reference SMPTE ST 2084 (PQ) OETF, `E = L/10000` in [0,1].
+fn pq_ref(e: f64) -> f64 {
+    let (m1, m2, c1, c2, c3) = (0.1593017578125, 78.84375, 0.8359375, 18.8515625, 18.6875);
+    let ym1 = e.clamp(0.0, 1.0).powf(m1);
+    ((c1 + c2 * ym1) / (1.0 + c3 * ym1)).powf(m2)
+}
+
 #[test]
 fn renders_solid_black_yuv420p() {
     // Black: Y=16, U=V=128.

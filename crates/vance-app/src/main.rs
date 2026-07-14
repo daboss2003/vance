@@ -1394,6 +1394,9 @@ struct UiRenderRequest {
     start_seconds: Option<f64>,
     #[serde(default)]
     end_seconds: Option<f64>,
+    /// HDR10 export (10-bit HEVC Main10, Rec.2020 PQ). Defaults off.
+    #[serde(default)]
+    hdr: bool,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -1438,6 +1441,7 @@ fn render_sequence(
         render_and_replace_track: None,
         start_seconds: req.start_seconds,
         end_seconds: req.end_seconds,
+        hdr: req.hdr,
     };
     let outcome = state.lock().render_sequence(opts).map_err(|e| e.to_string())?;
     Ok(UiRenderOutcome {

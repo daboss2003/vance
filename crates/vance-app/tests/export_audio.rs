@@ -83,6 +83,7 @@ fn export_and_measure_rms(engine: &mut Engine) -> Option<f64> {
             render_and_replace_track: None,
             start_seconds: Some(0.0),
             end_seconds: Some(1.5),
+            hdr: false,
         })
         .ok()?;
     // Decode the exported audio to raw f32le mono.

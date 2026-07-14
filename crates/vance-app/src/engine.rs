@@ -1291,6 +1291,12 @@ pub struct Engine {
     /// Built lazily on first Fusion render (same rationale as
     /// `mograph_engine`); shared with the playback thread via `Arc`.
     fusion_compositor: std::cell::OnceCell<std::sync::Arc<vance_fusion::Compositor>>,
+
+    /// HDR export — overrides the pipeline OUTPUT color space (normally the
+    /// SDR `Srgb`) for the duration of an HDR render. Set by
+    /// `render_sequence` on the HDR path and cleared when it returns, so
+    /// preview always resolves to SDR. `None` = SDR output (the default).
+    render_output_space_override: Option<vance_color::ColorSpace>,
 }
 
 /// Anchors a stream-time-base playback position back to a sequence
@@ -4408,7 +4414,11 @@ impl Engine {
         let pipeline = vance_color::Pipeline {
             input,
             working: project.working_color_space,
-            output: vance_color::ColorSpace::Srgb,
+            // HDR export overrides this to Rec.2020 PQ; SDR preview/export
+            // use sRGB (the surface store applies the SDR transfer).
+            output: self
+                .render_output_space_override
+                .unwrap_or(vance_color::ColorSpace::Srgb),
         };
         pipeline.to_params()
     }
@@ -8847,6 +8857,11 @@ pub struct RenderOptions {
     pub start_seconds: Option<f64>,
     /// End time in seconds. `None` = sequence end.
     pub end_seconds: Option<f64>,
+    /// HDR10 export. When `true`, render through a 10-bit `Rgba16Float`
+    /// pipeline with Rec.2020-PQ output and encode HEVC Main10 tagged with
+    /// HDR10 mastering metadata. `#[serde]`-less (an engine input struct);
+    /// defaults to `false` (SDR) via the `Default` derive path callers use.
+    pub hdr: bool,
 }
 
 /// Phase 8 — render outcome surfaced to the UI.
@@ -8912,8 +8927,29 @@ impl Engine {
         //    state works (it was built via Renderer::new_with against a
         //    surface but the renderer is surface-agnostic afterwards).
         //    Fall back to a fresh truly-headless Renderer if none exists.
-        let render_state_arc = if let Some(rs) = self.render_state.as_ref() {
-            rs.clone()
+        //
+        // HDR export needs a DEDICATED 10-bit renderer (Rgba16Float target)
+        // with Rec.2020-PQ output, so it can't reuse the SDR preview renderer.
+        // We temporarily swap it into `self.render_state` (so the shared
+        // `apply_clip_render_params` configures it) + set the output-space
+        // override, and restore both when the render returns.
+        let saved_render_state = self.render_state.clone();
+        let (render_state_arc, video_pixel_format, video_bpp) = if opts.hdr {
+            let renderer = Renderer::new(RendererConfig {
+                target_format: wgpu::TextureFormat::Rgba16Float,
+                ..RendererConfig::default()
+            })
+            .map_err(|e| EngineError::Project(format!("hdr renderer: {e}")))?;
+            let arc = Arc::new(Mutex::new(RenderState {
+                renderer,
+                surface_config: None,
+                source_surface_config: None,
+            }));
+            self.render_state = Some(arc.clone());
+            self.render_output_space_override = Some(vance_color::ColorSpace::Rec2020Pq);
+            (arc, vance_encoder::VideoPixelFormat::Rgba64Le, 8usize)
+        } else if let Some(rs) = self.render_state.as_ref() {
+            (rs.clone(), vance_encoder::VideoPixelFormat::Rgba8, 4usize)
         } else {
             let renderer = Renderer::new(RendererConfig::default())
                 .map_err(|e| EngineError::Project(format!("headless renderer: {e}")))?;
@@ -8923,7 +8959,13 @@ impl Engine {
                 source_surface_config: None,
             }));
             self.render_state = Some(arc.clone());
-            arc
+            (arc, vance_encoder::VideoPixelFormat::Rgba8, 4usize)
+        };
+        // HDR10 mastering metadata (Rec.2020 PQ, 1000-nit mastering display).
+        let hdr_meta = if opts.hdr {
+            Some(vance_encoder::HdrMetadata::hdr10(1000.0, 0.0001, 1000, 400))
+        } else {
+            None
         };
 
         // 4. Spawn encoder + open the output. Same path as v1.
@@ -8938,12 +8980,11 @@ impl Engine {
                     height,
                     frame_rate_num,
                     frame_rate_den,
-                    pixel_format: vance_encoder::VideoPixelFormat::Rgba8,
+                    pixel_format: video_pixel_format,
                     preset: opts.preset.clone(),
                     time_base_num: frame_rate_den,
                     time_base_den: frame_rate_num,
-                    // HDR export is wired via the 10-bit path (below); SDR here.
-                    hdr: None,
+                    hdr: hdr_meta,
                 }),
                 Some(vance_encoder::AudioConfig {
                     sample_rate,
@@ -8971,17 +9012,30 @@ impl Engine {
             rs.renderer.set_grades(&[]);
         }
 
-        // 6. Pre-allocate the black-RGBA fallback (used for SceneAt::
-        //    Empty + title clips in v1 + decode errors).
-        let pixel_count = (width as usize) * (height as usize) * 4;
+        // 6. Pre-allocate the black fallback (used for SceneAt::Empty +
+        //    title clips in v1 + decode errors), in the wire format's
+        //    bytes-per-pixel. Opaque black: RGB=0, alpha=max.
+        let pixel_count = (width as usize) * (height as usize) * video_bpp;
         let mut black = vec![0u8; pixel_count];
-        for px in (0..pixel_count).step_by(4) {
-            black[px + 3] = 255;
+        if video_bpp == 8 {
+            // rgba64le: alpha is the last u16 (0xFFFF), little-endian.
+            for px in (0..pixel_count).step_by(8) {
+                black[px + 6] = 0xFF;
+                black[px + 7] = 0xFF;
+            }
+        } else {
+            for px in (0..pixel_count).step_by(4) {
+                black[px + 3] = 255;
+            }
         }
 
         // 7. Frame loop. For each output frame: transition_at / scene_at
-        //    → decode → upload → effects → render_to_rgba_buffer →
-        //    push_video.
+        //    → decode → upload → effects → readback → push_video.
+        //
+        // Wrapped in an IIFE so an HDR export's temporary render-state swap +
+        // output-space override are ALWAYS restored (below), even if the loop
+        // or the encoder finish errors out.
+        let export_result: Result<(u64, u64), EngineError> = (|| -> Result<(u64, u64), EngineError> {
         for f in 0..total_frames {
             let timeline_seconds =
                 start_s + (f as f64) * (frame_rate_den as f64) / (frame_rate_num as f64);
@@ -9085,7 +9139,11 @@ impl Engine {
                             self.apply_clip_render_params(tr.from.clip_id, from_media, from_clip_t);
                             let mut rs = render_state_arc.lock();
                             rs.renderer.set_mix_factor(tr.mix);
-                            rgba = rs.renderer.render_to_rgba_buffer(width, height).ok();
+                            rgba = if opts.hdr {
+                                rs.renderer.render_to_rgba64_buffer(width, height).ok()
+                            } else {
+                                rs.renderer.render_to_rgba_buffer(width, height).ok()
+                            };
                         }
                     }
                     vance_timeline::TransitionKind::Wasm(plugin_id) => {
@@ -9136,10 +9194,15 @@ impl Engine {
                     }
                     self.apply_clip_render_params(clip_id, media_id, entry_clip_t);
                     let mut rs = render_state_arc.lock();
-                    match rs.renderer.render_to_rgba_buffer(width, height) {
+                    let readback = if opts.hdr {
+                        rs.renderer.render_to_rgba64_buffer(width, height)
+                    } else {
+                        rs.renderer.render_to_rgba_buffer(width, height)
+                    };
+                    match readback {
                         Ok(buf) => rgba = Some(buf),
                         Err(e) => {
-                            tracing::warn!(?e, frame = f, "render_to_rgba_buffer failed; black");
+                            tracing::warn!(?e, frame = f, "readback failed; black");
                         }
                     }
                 }
@@ -9147,8 +9210,10 @@ impl Engine {
             let mut push = rgba.unwrap_or_else(|| black.clone());
             // Phase 10.5 — run the clip's WASM plugin effects over the
             // composited RGBA before encoding. No-op when the clip has
-            // no `wasm:` effects.
-            if !clip_effects.is_empty() {
+            // no `wasm:` effects. Skipped on the HDR path: those CPU plugins
+            // operate on 8-bit RGBA and can't interpret the 10-bit rgba64le
+            // buffer (a documented HDR limitation).
+            if !clip_effects.is_empty() && !opts.hdr {
                 let clip_t = active_source_pts_seconds - clip_source_in_seconds;
                 self.apply_wasm_effects(&mut push, width, height, &clip_effects, clip_t);
             }
@@ -9185,6 +9250,18 @@ impl Engine {
             .finish()
             .map_err(|e| EngineError::Project(format!("encoder finish: {e}")))?;
         let _ = client.shutdown();
+        Ok((video_frames, audio_samples))
+        })(); // end IIFE
+
+        // Restore SDR render state after an HDR export (the HDR renderer is a
+        // dedicated Rgba16Float instance; preview needs the original). Always
+        // runs, whether the export succeeded or errored.
+        if opts.hdr {
+            self.render_state = saved_render_state;
+            self.render_output_space_override = None;
+        }
+
+        let (video_frames, audio_samples) = export_result?;
         Ok(RenderOutcome {
             output_path: opts.output_path,
             video_frames,
@@ -9259,6 +9336,7 @@ impl Engine {
             render_and_replace_track: Some(opts.track_id),
             start_seconds: Some(opts.start_seconds),
             end_seconds: Some(opts.end_seconds),
+            hdr: false, // render-and-replace intermediates stay SDR
         })?;
 
         // 2. Re-import the rendered file as a fresh MediaItem so the

@@ -124,6 +124,7 @@ fn render_first_frame_bytes(engine: &mut Engine) -> Option<Vec<u8>> {
             render_and_replace_track: None,
             start_seconds: Some(0.0),
             end_seconds: Some(0.1),
+            hdr: false,
         })
         .ok()?;
     // Extract frame 0 as raw RGB via ffmpeg for a content comparison.
@@ -211,6 +212,7 @@ fn unknown_wasm_plugin_is_skipped_gracefully() {
         render_and_replace_track: None,
         start_seconds: Some(0.0),
         end_seconds: Some(0.1),
+        hdr: false,
     });
     assert!(outcome.is_ok(), "export must survive an unknown plugin ref");
     let _ = std::fs::remove_file(&out);
