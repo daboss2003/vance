@@ -59,6 +59,12 @@ pub struct Sequence {
     /// `#[serde(default)]` so older bundles open with none.
     #[serde(default)]
     pub captions: Vec<vance_captions::Cue>,
+    /// GOAT-gated (collaboration): review comments anchored to timeline
+    /// positions (sorted by position), with author / timestamp / resolve /
+    /// replies. Travel in the project bundle. `#[serde(default)]` so older
+    /// bundles open with none.
+    #[serde(default)]
+    pub review_comments: Vec<crate::review::ReviewComment>,
 }
 
 impl Sequence {
@@ -75,6 +81,7 @@ impl Sequence {
             connections: Vec::new(),
             magnetic: false,
             captions: Vec::new(),
+            review_comments: Vec::new(),
         }
     }
 
@@ -183,6 +190,7 @@ mod tests {
             connections: Vec::new(),
             magnetic: false,
             captions: Vec::new(),
+            review_comments: Vec::new(),
         };
         assert_eq!(seq.duration(), t(7));
         assert_eq!(seq.clip_count(), 2);

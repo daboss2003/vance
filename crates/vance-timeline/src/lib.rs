@@ -40,6 +40,7 @@ pub mod id;
 pub mod bus;
 pub mod connection;
 pub mod marker;
+pub mod review;
 pub mod media;
 pub mod media_query;
 pub mod ops;
@@ -68,6 +69,7 @@ pub use id::{
     BusId, ClipId, EffectId, MarkerId, MediaItemId, ProjectId, SequenceId, TrackId, TransitionId,
 };
 pub use marker::{Marker, MarkerColor, MarkerKind};
+pub use review::{ReviewComment, ReviewReply};
 pub use media::{ContentHash, MediaItem, MediaKind};
 pub use project::{OcioView, Project};
 pub use scene_plan::{scene_at, transition_at, ActiveClip, ActiveTransition, SceneAt};

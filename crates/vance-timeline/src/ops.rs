@@ -92,6 +92,7 @@ fn replace_track(seq: &Sequence, idx: usize, new_track: Track) -> Sequence {
         connections: seq.connections.clone(),
         magnetic: seq.magnetic,
         captions: seq.captions.clone(),
+        review_comments: seq.review_comments.clone(),
     }
 }
 
@@ -180,6 +181,7 @@ pub fn add_track_with_id(
         connections: seq.connections.clone(),
         magnetic: seq.magnetic,
         captions: seq.captions.clone(),
+        review_comments: seq.review_comments.clone(),
     }
 }
 
@@ -199,6 +201,7 @@ pub fn remove_track(seq: &Sequence, track_id: TrackId) -> Result<Sequence> {
         connections: seq.connections.clone(),
         magnetic: seq.magnetic,
         captions: seq.captions.clone(),
+        review_comments: seq.review_comments.clone(),
     })
 }
 
@@ -1555,6 +1558,7 @@ pub fn set_master_gain_db(seq: &Sequence, gain_db: f32) -> Result<Sequence> {
         connections: seq.connections.clone(),
         magnetic: seq.magnetic,
         captions: seq.captions.clone(),
+        review_comments: seq.review_comments.clone(),
     })
 }
 
@@ -1812,6 +1816,7 @@ fn with_buses(seq: &Sequence, buses: Vec<AudioBus>) -> Sequence {
         connections: seq.connections.clone(),
         magnetic: seq.magnetic,
         captions: seq.captions.clone(),
+        review_comments: seq.review_comments.clone(),
     }
 }
 
@@ -2334,6 +2339,59 @@ pub fn magnetic_ripple_insert(seq: &Sequence, track_id: TrackId, clip: Clip) -> 
     let mut out = seq.clone();
     out.tracks = new_tracks;
     insert_clip(&out, track_id, clip)
+}
+
+// ---- GOAT-gated: review comments (collaboration) ----------------------------
+
+use crate::id::CommentId;
+use crate::review::{ReviewComment, ReviewReply};
+
+/// Clone `seq` after mutating its review-comment list via `f`.
+fn with_review_comments(seq: &Sequence, f: impl FnOnce(&mut Vec<ReviewComment>)) -> Sequence {
+    let mut out = seq.clone();
+    f(&mut out.review_comments);
+    out
+}
+
+/// Add a review comment, keeping the list sorted by timeline position.
+pub fn add_review_comment(seq: &Sequence, comment: ReviewComment) -> Sequence {
+    with_review_comments(seq, |cs| {
+        crate::review::insert_sorted(cs, comment);
+    })
+}
+
+/// Remove the comment with `id` (no-op if absent).
+pub fn remove_review_comment(seq: &Sequence, id: CommentId) -> Sequence {
+    with_review_comments(seq, |cs| {
+        cs.retain(|c| c.id != id);
+    })
+}
+
+/// Set a comment's resolved flag.
+pub fn resolve_review_comment(seq: &Sequence, id: CommentId, resolved: bool) -> Sequence {
+    with_review_comments(seq, |cs| {
+        if let Some(c) = cs.iter_mut().find(|c| c.id == id) {
+            c.resolved = resolved;
+        }
+    })
+}
+
+/// Replace a comment's body text.
+pub fn set_review_comment_text(seq: &Sequence, id: CommentId, text: String) -> Sequence {
+    with_review_comments(seq, |cs| {
+        if let Some(c) = cs.iter_mut().find(|c| c.id == id) {
+            c.text = text;
+        }
+    })
+}
+
+/// Append a reply to a comment's thread.
+pub fn reply_review_comment(seq: &Sequence, id: CommentId, reply: ReviewReply) -> Sequence {
+    with_review_comments(seq, |cs| {
+        if let Some(c) = cs.iter_mut().find(|c| c.id == id) {
+            c.replies.push(reply);
+        }
+    })
 }
 
 // ---- GOAT-7: captions / subtitles -------------------------------------------
@@ -2872,6 +2930,7 @@ mod tests {
         connections: seq.connections.clone(),
         magnetic: seq.magnetic,
         captions: seq.captions.clone(),
+        review_comments: seq.review_comments.clone(),
         }
     }
 

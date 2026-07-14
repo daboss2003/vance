@@ -1027,6 +1027,43 @@ export const importCaptions = (path: string): Promise<number> =>
 /** Export captions to .srt (vtt=false) or .vtt (vtt=true). */
 export const exportCaptions = (path: string, vtt: boolean): Promise<void> =>
   invoke('export_captions', { path, vtt });
+
+// ---- GOAT-gated (collaboration): review comments ---------------------
+
+export interface ReviewReply {
+  author: string;
+  text: string;
+  created_unix: number;
+}
+export interface ReviewComment {
+  id: string;
+  timeline_ms: number;
+  author: string;
+  text: string;
+  created_unix: number;
+  resolved: boolean;
+  replies: ReviewReply[];
+}
+
+/** All review comments on the current sequence (sorted by position). */
+export const reviewComments = (): Promise<ReviewComment[]> => invoke('review_comments');
+/** Add a review comment at a timeline position (ms). Returns its id. */
+export const addReviewComment = (
+  timelineMs: number,
+  author: string,
+  text: string
+): Promise<string> => invoke('add_review_comment', { timelineMs, author, text });
+export const removeReviewComment = (commentId: string): Promise<void> =>
+  invoke('remove_review_comment', { commentId });
+export const resolveReviewComment = (commentId: string, resolved: boolean): Promise<void> =>
+  invoke('resolve_review_comment', { commentId, resolved });
+export const setReviewCommentText = (commentId: string, text: string): Promise<void> =>
+  invoke('set_review_comment_text', { commentId, text });
+export const replyReviewComment = (
+  commentId: string,
+  author: string,
+  text: string
+): Promise<void> => invoke('reply_review_comment', { commentId, author, text });
 /** Whether a local Whisper CLI is installed. */
 export const transcriptionAvailable = (): Promise<boolean> =>
   invoke('transcription_available');

@@ -612,6 +612,37 @@ pub enum EditOp {
         /// New cue list (will be sorted).
         cues: Vec<vance_captions::Cue>,
     },
+    /// GOAT-gated (collaboration) — add a review comment.
+    AddReviewComment {
+        /// The comment (placed by timeline position).
+        comment: crate::review::ReviewComment,
+    },
+    /// Remove a review comment.
+    RemoveReviewComment {
+        /// Comment id.
+        comment_id: crate::id::CommentId,
+    },
+    /// Set a review comment's resolved flag.
+    ResolveReviewComment {
+        /// Comment id.
+        comment_id: crate::id::CommentId,
+        /// Resolved state.
+        resolved: bool,
+    },
+    /// Edit a review comment's body text.
+    SetReviewCommentText {
+        /// Comment id.
+        comment_id: crate::id::CommentId,
+        /// New text.
+        text: String,
+    },
+    /// Append a reply to a review comment's thread.
+    ReplyReviewComment {
+        /// Comment id.
+        comment_id: crate::id::CommentId,
+        /// The reply.
+        reply: crate::review::ReviewReply,
+    },
 }
 
 /// Apply a single op to a sequence, returning the new sequence.
@@ -855,6 +886,21 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
         }
         EditOp::ShiftAllCaptions { delta_ms } => Ok(ops::shift_all_captions(seq, *delta_ms)),
         EditOp::SetCaptions { cues } => Ok(ops::set_captions(seq, cues.clone())),
+        EditOp::AddReviewComment { comment } => {
+            Ok(ops::add_review_comment(seq, comment.clone()))
+        }
+        EditOp::RemoveReviewComment { comment_id } => {
+            Ok(ops::remove_review_comment(seq, *comment_id))
+        }
+        EditOp::ResolveReviewComment { comment_id, resolved } => {
+            Ok(ops::resolve_review_comment(seq, *comment_id, *resolved))
+        }
+        EditOp::SetReviewCommentText { comment_id, text } => {
+            Ok(ops::set_review_comment_text(seq, *comment_id, text.clone()))
+        }
+        EditOp::ReplyReviewComment { comment_id, reply } => {
+            Ok(ops::reply_review_comment(seq, *comment_id, reply.clone()))
+        }
     }
 }
 
@@ -1165,6 +1211,11 @@ fn op_label(op: &EditOp) -> String {
         EditOp::MergeCaptionWithNext { .. } => "Merge caption".into(),
         EditOp::ShiftAllCaptions { .. } => "Shift captions".into(),
         EditOp::SetCaptions { .. } => "Import captions".into(),
+        EditOp::AddReviewComment { .. } => "Add review comment".into(),
+        EditOp::RemoveReviewComment { .. } => "Remove review comment".into(),
+        EditOp::ResolveReviewComment { .. } => "Resolve review comment".into(),
+        EditOp::SetReviewCommentText { .. } => "Edit review comment".into(),
+        EditOp::ReplyReviewComment { .. } => "Reply to review comment".into(),
     }
 }
 

@@ -3062,6 +3062,88 @@ fn captions(state: tauri::State<'_, EngineHandle>) -> Vec<vance_captions::Cue> {
     state.lock().captions()
 }
 
+// ---- GOAT-gated (collaboration): review comments ----------------------
+
+fn parse_comment_id(s: &str) -> Result<vance_timeline::id::CommentId, String> {
+    let uuid: uuid::Uuid = s.parse().map_err(|e| format!("bad comment id: {e}"))?;
+    Ok(vance_timeline::id::CommentId::from_uuid(uuid))
+}
+
+/// All review comments on the current sequence (sorted by position).
+#[tauri::command]
+fn review_comments(state: tauri::State<'_, EngineHandle>) -> Vec<vance_timeline::ReviewComment> {
+    state.lock().review_comments()
+}
+
+/// Add a review comment at `timeline_ms`. Returns its id.
+#[tauri::command]
+fn add_review_comment(
+    state: tauri::State<'_, EngineHandle>,
+    timeline_ms: i64,
+    author: String,
+    text: String,
+) -> Result<String, String> {
+    if text.trim().is_empty() {
+        return Err("comment text is empty".into());
+    }
+    state
+        .lock()
+        .add_review_comment(timeline_ms, author, text)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_review_comment(
+    state: tauri::State<'_, EngineHandle>,
+    comment_id: String,
+) -> Result<(), String> {
+    let id = parse_comment_id(&comment_id)?;
+    state.lock().remove_review_comment(id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn resolve_review_comment(
+    state: tauri::State<'_, EngineHandle>,
+    comment_id: String,
+    resolved: bool,
+) -> Result<(), String> {
+    let id = parse_comment_id(&comment_id)?;
+    state
+        .lock()
+        .resolve_review_comment(id, resolved)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_review_comment_text(
+    state: tauri::State<'_, EngineHandle>,
+    comment_id: String,
+    text: String,
+) -> Result<(), String> {
+    let id = parse_comment_id(&comment_id)?;
+    state
+        .lock()
+        .set_review_comment_text(id, text)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn reply_review_comment(
+    state: tauri::State<'_, EngineHandle>,
+    comment_id: String,
+    author: String,
+    text: String,
+) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Err("reply text is empty".into());
+    }
+    let id = parse_comment_id(&comment_id)?;
+    state
+        .lock()
+        .reply_review_comment(id, author, text)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn add_caption(
     state: tauri::State<'_, EngineHandle>,
@@ -3696,6 +3778,12 @@ fn main() {
             captions,
             add_caption,
             remove_caption,
+            review_comments,
+            add_review_comment,
+            remove_review_comment,
+            resolve_review_comment,
+            set_review_comment_text,
+            reply_review_comment,
             set_caption_text,
             set_caption_timing,
             split_caption,

@@ -47,6 +47,7 @@
   import PublishPanel from '$lib/PublishPanel.svelte';
   import FusionPanel from '$lib/FusionPanel.svelte';
   import GeneratePanel from '$lib/GeneratePanel.svelte';
+  import ReviewPanel from '$lib/ReviewPanel.svelte';
   import OnboardingWizard from '$lib/OnboardingWizard.svelte';
   import { getAppSettings } from '$lib/ipc';
 
@@ -2081,6 +2082,11 @@
         <!-- GOAT-gated — generative AI image synthesis. -->
         <div class="ml-2 w-64 shrink-0 max-h-48 overflow-auto">
           <GeneratePanel />
+        </div>
+
+        <!-- GOAT-gated — timeline review comments (collaboration). -->
+        <div class="ml-2 w-64 shrink-0 max-h-48 overflow-auto">
+          <ReviewPanel />
         </div>
 
         <span class="text-vance-muted ml-auto">

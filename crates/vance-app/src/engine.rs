@@ -318,6 +318,15 @@ fn seconds_to_rt(s: f64) -> vance_core::RationalTime {
         .unwrap_or(vance_core::RationalTime::ZERO)
 }
 
+/// Current wall-clock time as Unix seconds (UTC), for review-comment
+/// timestamps. `0` if the clock is before the epoch (never, in practice).
+fn now_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// First video clip in the sequence whose `timeline_in >= after_t`,
 /// across all enabled video tracks. Used by `play_sequence` /
 /// `decode_sequence_at` to do the right thing when the requested
@@ -6439,6 +6448,73 @@ impl Engine {
     /// Remove a caption cue.
     pub fn remove_caption(&mut self, cue_id: vance_captions::CueId) -> Result<(), EngineError> {
         self.apply_edit_op(EditOp::RemoveCaption { cue_id })
+    }
+
+    // ---- GOAT-gated (collaboration): review comments ----------------------
+
+    /// Add a review comment at a timeline position. Returns its id (string).
+    pub fn add_review_comment(
+        &mut self,
+        timeline_ms: i64,
+        author: String,
+        text: String,
+    ) -> Result<String, EngineError> {
+        let comment =
+            vance_timeline::ReviewComment::new(timeline_ms, author, text, now_unix_seconds());
+        let id = comment.id.to_string();
+        self.apply_edit_op(EditOp::AddReviewComment { comment })?;
+        Ok(id)
+    }
+
+    /// Remove a review comment.
+    pub fn remove_review_comment(
+        &mut self,
+        comment_id: vance_timeline::id::CommentId,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::RemoveReviewComment { comment_id })
+    }
+
+    /// Set a review comment's resolved flag.
+    pub fn resolve_review_comment(
+        &mut self,
+        comment_id: vance_timeline::id::CommentId,
+        resolved: bool,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::ResolveReviewComment {
+            comment_id,
+            resolved,
+        })
+    }
+
+    /// Edit a review comment's body text.
+    pub fn set_review_comment_text(
+        &mut self,
+        comment_id: vance_timeline::id::CommentId,
+        text: String,
+    ) -> Result<(), EngineError> {
+        self.apply_edit_op(EditOp::SetReviewCommentText { comment_id, text })
+    }
+
+    /// Append a reply to a review comment's thread.
+    pub fn reply_review_comment(
+        &mut self,
+        comment_id: vance_timeline::id::CommentId,
+        author: String,
+        text: String,
+    ) -> Result<(), EngineError> {
+        let reply = vance_timeline::ReviewReply {
+            author,
+            text,
+            created_unix: now_unix_seconds(),
+        };
+        self.apply_edit_op(EditOp::ReplyReviewComment { comment_id, reply })
+    }
+
+    /// All review comments on the current sequence (sorted by position).
+    pub fn review_comments(&self) -> Vec<vance_timeline::ReviewComment> {
+        self.current_sequence_ref()
+            .map(|s| s.review_comments.clone())
+            .unwrap_or_default()
     }
 
     /// Edit a caption cue's text.
