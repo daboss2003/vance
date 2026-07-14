@@ -1,0 +1,21 @@
+[book]
+title = "Vance User Manual"
+description = "How to install and use Vance, a cross-platform video editor."
+authors = ["The Vance Project"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = ""
+edit-url-template = ""
+smart-punctuation = true
+
+[output.html.search]
+enable = true
+limit-results = 20
+
+[output.html.fold]
+enable = true
+level = 1
