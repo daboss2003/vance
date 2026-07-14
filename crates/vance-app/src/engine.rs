@@ -2616,6 +2616,41 @@ impl Engine {
         Ok(out)
     }
 
+    /// GOAT-gated (generative) — register a generated still PNG as a held
+    /// `Image` media item with a chosen on-timeline duration. The file is
+    /// already at a stable app-owned path (the generator wrote it there), so
+    /// no copy is needed; the decoder reads its true dimensions at play time.
+    pub fn import_generated_image(
+        &mut self,
+        path: &str,
+        duration_seconds: f64,
+    ) -> Result<MediaItemInfo, EngineError> {
+        if self.current_project.is_none() {
+            return Err(EngineError::NoProject);
+        }
+        let duration = seconds_to_rt(duration_seconds.max(0.04));
+        let display_name = std::path::Path::new(path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("generated")
+            .to_string();
+        let item = MediaItem::new(
+            std::path::PathBuf::from(path),
+            display_name,
+            MediaKind::Image,
+            duration,
+        );
+        let id = item.id;
+        let out = MediaItemInfo::from(&item);
+        self.current_project
+            .as_mut()
+            .unwrap()
+            .media
+            .insert(id, Arc::new(item));
+        tracing::info!(id = %id, path = %path, "imported generated image");
+        Ok(out)
+    }
+
     /// Update `MediaItem.has_audio_track` (Phase 7.2). Called from the
     /// Tauri layer's `import_media_file` wrapper after probing via
     /// `PeaksService::probe_audio`, and from the project-load

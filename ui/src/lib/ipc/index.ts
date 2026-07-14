@@ -656,6 +656,33 @@ export const fusionComp = (mediaId: string): Promise<FusionComp | null> =>
 export const setFusionComp = (mediaId: string, comp: FusionComp): Promise<void> =>
   invoke('set_fusion_comp', { mediaId, comp });
 
+// ---- GOAT-gated: generative image synthesis --------------------------
+
+/** Whether an image generator is configured (VANCE_IMAGEGEN_CMD, or `sd` +
+ *  VANCE_SD_MODEL). Drives the panel's enabled state. */
+export const imageGenAvailable = (): Promise<boolean> => invoke('image_gen_available');
+
+/** Generate an image from a prompt via the user's model (off-lock) and
+ *  import it as a held Image media item. Slow (model inference). */
+export const generateImage = (args: {
+  prompt: string;
+  negative?: string | null;
+  width: number;
+  height: number;
+  steps?: number | null;
+  seed?: number | null;
+  durationSeconds?: number | null;
+}): Promise<MediaItemInfo> =>
+  invoke('generate_image', {
+    prompt: args.prompt,
+    negative: args.negative ?? null,
+    width: args.width,
+    height: args.height,
+    steps: args.steps ?? null,
+    seed: args.seed ?? null,
+    durationSeconds: args.durationSeconds ?? null
+  });
+
 /** Override (or clear, by passing `null`) the input color space tag
  *  for a media library item. Phase 6.2. */
 export const setMediaInputColorSpace = (

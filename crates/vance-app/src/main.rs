@@ -13,6 +13,7 @@ mod audio_bounce;
 mod cached_decode;
 mod control;
 mod engine;
+mod generate;
 mod peaks;
 mod prefetch;
 mod profiling;
@@ -3304,6 +3305,53 @@ fn isolate_voice(
     state.lock().import_audio_file(&dest_str).map_err(|e| e.to_string())
 }
 
+/// GOAT-gated (generative) — whether an image generator is configured
+/// (VANCE_IMAGEGEN_CMD, or `sd` + VANCE_SD_MODEL).
+#[tauri::command]
+fn image_gen_available() -> bool {
+    generate::available()
+}
+
+/// GOAT-gated (generative) — synthesize an image from a prompt via the
+/// user's configured model (off-lock), writing it to an app-owned path, and
+/// import it as a held Image media item. Returns the new item's info.
+#[tauri::command]
+fn generate_image(
+    state: tauri::State<'_, EngineHandle>,
+    prompt: String,
+    negative: Option<String>,
+    width: u32,
+    height: u32,
+    steps: Option<u32>,
+    seed: Option<i64>,
+    duration_seconds: Option<f64>,
+) -> Result<MediaItemInfo, String> {
+    if prompt.trim().is_empty() {
+        return Err("enter a prompt".to_string());
+    }
+    // Clamp to even, sane bounds (models want multiples of 8/64; keep it simple).
+    let width = width.clamp(64, 4096) & !1;
+    let height = height.clamp(64, 4096) & !1;
+    let dir = engine::persistent_media_dir().map_err(|e| format!("media dir: {e}"))?;
+    let out_path = dir.join(format!("{}-gen.png", uuid::Uuid::new_v4()));
+    let req = generate::GenRequest {
+        prompt,
+        negative: negative.filter(|s| !s.is_empty()),
+        width,
+        height,
+        steps,
+        seed,
+        out_path,
+    };
+    // Model inference is slow — run it entirely off the engine lock.
+    let produced = generate::generate(&req).map_err(|e| e.to_string())?;
+    let path_str = produced.to_string_lossy().into_owned();
+    state
+        .lock()
+        .import_generated_image(&path_str, duration_seconds.unwrap_or(5.0))
+        .map_err(|e| e.to_string())
+}
+
 // ---- GOAT-10: control surfaces (OSC / MIDI) --------------------------------
 
 /// `(osc_running, osc_port, midi_running, midi_name)`.
@@ -3622,6 +3670,8 @@ fn main() {
             isolate_voice,
             magic_mask_available,
             magic_mask,
+            image_gen_available,
+            generate_image,
             control_status,
             start_osc_control,
             stop_osc_control,
