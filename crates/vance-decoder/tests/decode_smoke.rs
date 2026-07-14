@@ -75,7 +75,7 @@ fn handshake_open_decode_close() {
     );
     // YUV420P → 3 planes (Y/U/V); NV12 → 2 planes (Y + interleaved UV).
     let expected_planes = match frame0.pixel_format {
-        PixelFormat::Yuv420P => 3,
+        PixelFormat::Yuv420P | PixelFormat::Yuv420P10Le => 3,
         PixelFormat::Nv12 => 2,
     };
     assert_eq!(
