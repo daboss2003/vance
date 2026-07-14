@@ -49,9 +49,12 @@ struct Params {
     brightness: f32,
     contrast: f32,
     crop_lrtb: vec4<f32>,
-    mix_factor: f32,
-    // (`_pad0` lives implicitly here — WGSL aligns the next vec4 to
-    // offset 64, matching the 12 bytes Rust spells out explicitly.)
+    // (mix_factor, sample_scale_a, sample_scale_b, _pad) — the transition
+    // blend factor plus the per-side YUV sample scale (1.0 for 8-bit,
+    // 65535/1023 for 10-bit R16Unorm sources). A 16-byte-aligned vec4 at
+    // offset 48, matching Rust's `mix_factor + sample_scale + sample_scale_b
+    // + _pad0`.
+    mix_misc: vec4<f32>,
     // (r, g, b, enable) — chroma key color + on/off.
     chroma_key: vec4<f32>,
     // (tolerance, softness, _, _) — match radius + falloff width.
@@ -424,6 +427,15 @@ fn linearize(rgb: vec3<f32>, id: u32) -> vec3<f32> {
         let toe = rgb / vec3<f32>(4.5);
         let lift = pow(max(rgb + vec3<f32>(0.099), vec3<f32>(0.0)) / vec3<f32>(1.099), vec3<f32>(1.0 / 0.45));
         return select(toe, lift, rgb > vec3<f32>(0.081));
+    } else if (id == 4u) {
+        // PQ (ST 2084) EOTF → normalized L/10000, scaled ×100 so working 1.0
+        // = 100 cd/m² (reference white). This is the exact inverse of the
+        // output encode (pq_oetf(lin*100/10000)), so HDR round-trips; HDR
+        // highlights land above 1.0 (up to 100.0 = 10000 nits).
+        return pq_eotf(rgb) * 100.0;
+    } else if (id == 5u) {
+        // HLG EOTF → scene-linear [0,1] (relative; working 1.0 = peak white).
+        return hlg_eotf(rgb);
     }
     return rgb;
 }
@@ -455,6 +467,34 @@ fn hlg_oetf(e: vec3<f32>) -> vec3<f32> {
     let lo = sqrt(3.0 * en);
     let hi = a * log(12.0 * en - b) + vec3<f32>(c);
     return select(lo, hi, en > vec3<f32>(1.0 / 12.0));
+}
+
+// SMPTE ST 2084 (PQ) inverse EOTF. Input is the PQ code value in [0,1];
+// output is display luminance normalized to 10000 cd/m² (E = L/10000).
+fn pq_eotf(code: vec3<f32>) -> vec3<f32> {
+    let m1 = 0.1593017578125;
+    let m2 = 78.84375;
+    let c1 = 0.8359375;
+    let c2 = 18.8515625;
+    let c3 = 18.6875;
+    let cn = clamp(code, vec3<f32>(0.0), vec3<f32>(1.0));
+    let v = pow(cn, vec3<f32>(1.0 / m2));
+    let num = max(v - vec3<f32>(c1), vec3<f32>(0.0));
+    // den = c2 - c3·v ∈ [0.16, 18.85] for v∈[0,1] — always positive.
+    let den = vec3<f32>(c2) - c3 * v;
+    return pow(num / den, vec3<f32>(1.0 / m1));
+}
+
+// ARIB STD-B67 (HLG) inverse OETF. Input is the HLG signal in [0,1]; output
+// is scene-linear in [0,1].
+fn hlg_eotf(sig: vec3<f32>) -> vec3<f32> {
+    let a = 0.17883277;
+    let b = 0.28466892;
+    let c = 0.55991073;
+    let sn = clamp(sig, vec3<f32>(0.0), vec3<f32>(1.0));
+    let lo = sn * sn / vec3<f32>(3.0);
+    let hi = (exp((sn - vec3<f32>(c)) / vec3<f32>(a)) + vec3<f32>(b)) / vec3<f32>(12.0);
+    return select(lo, hi, sn > vec3<f32>(0.5));
 }
 
 fn apply_mat3(rgb: vec3<f32>, m: array<vec4<f32>, 3>) -> vec3<f32> {
@@ -504,10 +544,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     let input_range = params.pipeline_flags.z;
+    // Per-side sample scale: 1.0 for 8-bit (R8Unorm, code/255) or 65535/1023
+    // for 10-bit (R16Unorm, code/65535 → code/1023) so the normalized value
+    // feeds the same limited-range expansion regardless of source bit depth.
+    let sc_a = params.mix_misc.y;
     let rgb_a_enc = yuv_to_rgb(
-        textureSample(tex_y_a, samp, source_uv).r,
-        textureSample(tex_u_a, samp, source_uv).r,
-        textureSample(tex_v_a, samp, source_uv).r,
+        textureSample(tex_y_a, samp, source_uv).r * sc_a,
+        textureSample(tex_u_a, samp, source_uv).r * sc_a,
+        textureSample(tex_v_a, samp, source_uv).r * sc_a,
         input_range,
     );
 
@@ -518,10 +562,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // frame UV — the transform/crop apply uniformly to the blended
     // image. (If we ever want per-side transforms, that's a future
     // refactor.)
+    let sc_b = params.mix_misc.z;
     let rgb_b_enc = yuv_to_rgb(
-        textureSample(tex_y_b, samp, source_uv).r,
-        textureSample(tex_u_b, samp, source_uv).r,
-        textureSample(tex_v_b, samp, source_uv).r,
+        textureSample(tex_y_b, samp, source_uv).r * sc_b,
+        textureSample(tex_u_b, samp, source_uv).r * sc_b,
+        textureSample(tex_v_b, samp, source_uv).r * sc_b,
         input_range,
     );
 
@@ -529,7 +574,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     //    behaves the same way the renderer did pre-6.3. We could
     //    blend in linear, but for SDR sources the perceptual change
     //    is minor and the gamma-space mix is what colorists expect.
-    var rgb_enc = mix(rgb_a_enc, rgb_b_enc, params.mix_factor);
+    var rgb_enc = mix(rgb_a_enc, rgb_b_enc, params.mix_misc.x);
     // 1b. Apply the loaded 3D LUT, if enabled. LUTs are sampled in
     //     source-space gamma RGB — matches the convention colorists
     //     use when authoring Rec.709 / sRGB film-emulation LUTs.
@@ -570,7 +615,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     //    6.3's commit; matches how Resolve operates in ACEScct/cg.
     var rgb = (rgb_lin_working - vec3<f32>(0.5)) * params.contrast
         + vec3<f32>(0.5) + vec3<f32>(params.brightness);
-    rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    // Clamp to [0,1] for SDR. For a PQ HDR source, working linear carries
+    // highlights above reference white (>1.0), so keep only the 0 floor —
+    // otherwise the [0,1] clamp would crush every highlight to white here.
+    if (input_transfer == 4u) {
+        rgb = max(rgb, vec3<f32>(0.0));
+    } else {
+        rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
 
     // Chroma + luma keys produce a per-pixel "keep" factor in [0,1].
     // Without a multi-track composite path in v1 we just multiply
@@ -612,9 +664,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     //      space is already the output primaries (Rec.2020) from step 4.
     let out_transfer = params.pipeline_flags.y;
     if (out_transfer == 4u) {
-        // PQ: map SDR-range working linear (1.0 = 100 cd/m² reference white)
-        // to the 10000-nit-normalized PQ input, then encode.
-        let lin = clamp(rgb_out, vec3<f32>(0.0), vec3<f32>(1.0));
+        // PQ: working linear where 1.0 = 100 cd/m² reference white; allow
+        // highlights up to 100.0 (= 10000 nits) so an HDR source's highlights
+        // survive to the PQ encode instead of clipping at reference white.
+        let lin = clamp(rgb_out, vec3<f32>(0.0), vec3<f32>(100.0));
         rgb_out = pq_oetf(lin * (100.0 / 10000.0));
     } else if (out_transfer == 5u) {
         let lin = clamp(rgb_out, vec3<f32>(0.0), vec3<f32>(1.0));

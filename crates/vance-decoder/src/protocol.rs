@@ -172,14 +172,30 @@ pub enum PixelFormat {
     Yuv420P,
     /// NV12: Y plane, then interleaved UV plane at half resolution.
     Nv12,
+    /// I420 with 10-bit samples stored as little-endian `u16` (2 bytes/
+    /// sample, 10 valid low bits) — the wire format for a 10-bit source
+    /// (HEVC Main10 / `yuv420p10le`, incl. HDR PQ/HLG). Same plane layout as
+    /// `Yuv420P`, twice the bytes. Carried 10-bit end to end so HDR
+    /// highlights survive to the render pipeline.
+    Yuv420P10Le,
 }
 
 impl PixelFormat {
     /// Number of bytes for a frame of this format at `width` × `height`.
-    /// All Phase 1 formats are 12 bits per pixel (4:2:0).
     pub fn frame_size(self, width: u32, height: u32) -> usize {
         match self {
+            // 12 bpp, 1 byte/sample.
             PixelFormat::Yuv420P | PixelFormat::Nv12 => width as usize * height as usize * 3 / 2,
+            // 4:2:0 with 2 bytes/sample → 24 bpp.
+            PixelFormat::Yuv420P10Le => width as usize * height as usize * 3,
+        }
+    }
+
+    /// Bytes per sample on the wire (1 for 8-bit, 2 for 10/16-bit).
+    pub fn bytes_per_sample(self) -> usize {
+        match self {
+            PixelFormat::Yuv420P | PixelFormat::Nv12 => 1,
+            PixelFormat::Yuv420P10Le => 2,
         }
     }
 }
@@ -236,6 +252,16 @@ mod tests {
         // 3840x2160 @ 4:2:0 = 12_441_600 bytes ~ 11.9 MiB.
         // Inline-payload-OK for now (vance-ipc cap is 16 MiB) but tight.
         assert_eq!(PixelFormat::Yuv420P.frame_size(3840, 2160), 12_441_600);
+    }
+
+    #[test]
+    fn pixel_format_size_10bit() {
+        // 10-bit is 2 bytes/sample → double the 8-bit size.
+        assert_eq!(PixelFormat::Yuv420P10Le.frame_size(1920, 1080), 6_220_800);
+        assert_eq!(PixelFormat::Yuv420P10Le.bytes_per_sample(), 2);
+        assert_eq!(PixelFormat::Yuv420P.bytes_per_sample(), 1);
+        // 4K 10-bit ≈ 23.7 MiB — exceeds the old 16 MiB IPC cap (raised).
+        assert_eq!(PixelFormat::Yuv420P10Le.frame_size(3840, 2160), 24_883_200);
     }
 
     #[test]

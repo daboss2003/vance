@@ -40,6 +40,7 @@ pub fn pack_frame(frame: &FrameData) -> Vec<u8> {
     out.push(match frame.pixel_format {
         PixelFormat::Yuv420P => 0,
         PixelFormat::Nv12 => 1,
+        PixelFormat::Yuv420P10Le => 2,
     });
     out.extend_from_slice(&frame.width.to_le_bytes());
     out.extend_from_slice(&frame.height.to_le_bytes());
@@ -64,6 +65,7 @@ pub fn unpack_frame(buf: &[u8]) -> Option<FrameData> {
     let pixel_format = match buf[1] {
         0 => PixelFormat::Yuv420P,
         1 => PixelFormat::Nv12,
+        2 => PixelFormat::Yuv420P10Le,
         _ => return None,
     };
     let width = u32::from_le_bytes(buf[2..6].try_into().ok()?);

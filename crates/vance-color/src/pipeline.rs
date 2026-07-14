@@ -69,10 +69,10 @@ impl Pipeline {
     /// ACEScct) and the `ocio` feature is off — the engine then
     /// falls back to OCIO or surfaces a clear error.
     pub fn to_params(&self) -> Option<PipelineParams> {
-        // Input + working must be built-in DECODE-able (no PQ/HLG decode in
-        // the shader); the output may additionally be Rec.2020 PQ/HLG since
-        // the shader now has forward PQ/HLG OETFs (HDR export).
-        if !self.input.is_builtin_supported()
+        // Input may be Rec.2020 PQ/HLG (the shader decodes them, 10-bit HDR
+        // source); working must be a plain linearizable primaries space; the
+        // output may be Rec.2020 PQ/HLG (forward OETFs, HDR export).
+        if !self.input.is_builtin_input_supported()
             || !self.working.is_builtin_supported()
             || !self.output.is_builtin_output_supported()
         {
@@ -145,14 +145,25 @@ mod tests {
     }
 
     #[test]
-    fn pq_input_falls_back_through_ocio() {
+    fn pq_input_resolves_with_pq_transfer() {
+        // A PQ INPUT now resolves on the built-in path (the shader decodes PQ
+        // for 10-bit HDR sources): output transfer id 4 on the input side.
         let p = Pipeline {
             input: ColorSpace::Rec2020Pq,
+            working: ColorSpace::LinearRec709,
+            output: ColorSpace::Srgb,
+        };
+        let params = p.to_params().expect("PQ input is now built-in-decodable");
+        assert_eq!(params.input_transfer, transfer_id(TransferFunction::Pq));
+    }
+
+    #[test]
+    fn acescct_input_still_falls_back_through_ocio() {
+        // ACEScct (log) has no built-in decode → still None (OCIO route).
+        let p = Pipeline {
+            input: ColorSpace::Acescct,
             ..Pipeline::default()
         };
-        // Built-in path can't handle PQ, so params come back None.
-        // The engine layer will then route to OCIO (6.1b) or surface
-        // ColorError::UnsupportedSpace.
         assert!(p.to_params().is_none());
     }
 

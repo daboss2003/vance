@@ -158,11 +158,21 @@ impl State {
         let mut codec_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
             .map_err(|e| OpenError::FfmpegError(e.to_string()))?;
 
-        // Try VideoToolbox before opening the decoder. On success, attach
-        // hw_device_ctx so FFmpeg's get_format chooses AV_PIX_FMT_VIDEOTOOLBOX
-        // and decoded frames come back as opaque GPU surfaces (which we
-        // then transfer to NV12 system memory).
-        let hw_device = HwDeviceCtx::try_videotoolbox();
+        // Detect the source bit depth from the stream's declared pixel
+        // format BEFORE choosing a decode path. A >8-bit source forces
+        // software decode (the HW/NV12 path can't carry 10-bit correctly).
+        let src_pix_fmt: i32 = unsafe { (*stream.parameters().as_ptr()).format };
+        let high_bit_source = is_high_bit_source(src_pix_fmt);
+
+        // Try VideoToolbox before opening the decoder (8-bit only). On
+        // success, attach hw_device_ctx so FFmpeg's get_format chooses
+        // AV_PIX_FMT_VIDEOTOOLBOX and decoded frames come back as opaque GPU
+        // surfaces (which we then transfer to NV12 system memory).
+        let hw_device = if high_bit_source {
+            None
+        } else {
+            HwDeviceCtx::try_videotoolbox()
+        };
         let using_hw = if let Some(ref hw) = hw_device {
             unsafe {
                 hw.attach_to(codec_ctx.as_mut_ptr() as *mut std::ffi::c_void);
@@ -526,8 +536,22 @@ fn map_pixel_format(pf: ffmpeg::format::Pixel) -> Result<PixelFormat, String> {
     match pf {
         P::YUV420P | P::YUVJ420P => Ok(PixelFormat::Yuv420P),
         P::NV12 => Ok(PixelFormat::Nv12),
+        // 10-bit 4:2:0 (HEVC Main10 / HDR PQ-HLG) → carried 10-bit.
+        P::YUV420P10LE => Ok(PixelFormat::Yuv420P10Le),
         other => Err(format!("{other:?}")),
     }
+}
+
+/// Whether a source pixel format is >8-bit. We force SOFTWARE decode for
+/// these: VideoToolbox returns a P010 surface for a Main10 source but the HW
+/// path unconditionally reports/handles NV12, which would corrupt the frame.
+/// Software decode yields planar `yuv420p10le` we carry losslessly.
+fn is_high_bit_source(src_pix_fmt: i32) -> bool {
+    use ffmpeg::sys::AVPixelFormat::*;
+    src_pix_fmt == AV_PIX_FMT_YUV420P10LE as i32
+        || src_pix_fmt == AV_PIX_FMT_YUV420P10BE as i32
+        || src_pix_fmt == AV_PIX_FMT_P010LE as i32
+        || src_pix_fmt == AV_PIX_FMT_YUV420P12LE as i32
 }
 
 fn frame_to_payload(
@@ -546,9 +570,12 @@ fn frame_to_payload(
     }
 
     let plane_count = match expected_pf {
-        PixelFormat::Yuv420P => 3,
+        PixelFormat::Yuv420P | PixelFormat::Yuv420P10Le => 3,
         PixelFormat::Nv12 => 2,
     };
+    // 1 for 8-bit, 2 for 10-bit (samples are little-endian u16 on both the
+    // ffmpeg plane and our wire — copied through verbatim).
+    let bytes_per_sample = expected_pf.bytes_per_sample();
 
     let mut strides = Vec::with_capacity(plane_count);
     let mut bytes = Vec::new();
@@ -560,17 +587,21 @@ fn frame_to_payload(
         } else {
             height.div_ceil(2)
         };
+        // Width in SAMPLES for this plane.
         let plane_width = if plane == 0 || expected_pf == PixelFormat::Nv12 && plane == 1 {
             width
         } else {
             width.div_ceil(2)
         };
+        // Row length in BYTES (samples × bytes-per-sample).
+        let row_bytes = plane_width as usize * bytes_per_sample;
         let data = frame.data(plane);
         for row in 0..plane_height {
             let start = (row as usize) * (stride as usize);
-            let end = start + plane_width as usize;
+            let end = start + row_bytes;
             bytes.extend_from_slice(&data[start..end]);
         }
+        // Emitted stride is the tight per-row SAMPLE count (padding stripped).
         strides[plane] = plane_width;
     }
 

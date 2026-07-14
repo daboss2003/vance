@@ -374,6 +374,35 @@ fn yuv_or_nv12_to_rgba(frame: &vance_decoder::protocol::FrameData, pixel_count_r
                 }
             }
         }
+        PixelFormat::Yuv420P10Le => {
+            // 10-bit planar: samples are little-endian u16; strides are in
+            // samples. Downshift 10→8 bit for the (8-bit, scrub-only) proxy.
+            let sy = frame.strides[0] as usize;
+            let su = frame.strides[1] as usize;
+            let sv = frame.strides[2] as usize;
+            let y_bytes = sy * 2 * h;
+            let u_bytes = su * 2 * (h / 2);
+            let y_plane = &frame.bytes[..y_bytes];
+            let u_plane = &frame.bytes[y_bytes..y_bytes + u_bytes];
+            let v_plane = &frame.bytes[y_bytes + u_bytes..y_bytes + u_bytes + sv * 2 * (h / 2)];
+            let s16 = |plane: &[u8], idx: usize| -> f32 {
+                let b = idx * 2;
+                (u16::from_le_bytes([plane[b], plane[b + 1]]) >> 2) as f32
+            };
+            for y in 0..h {
+                for x in 0..w {
+                    let y_b = s16(y_plane, y * sy + x);
+                    let u_b = s16(u_plane, (y / 2) * su + (x / 2));
+                    let v_b = s16(v_plane, (y / 2) * sv + (x / 2));
+                    let (r, g, b) = bt709_full_range(y_b, u_b, v_b);
+                    let i = (y * w + x) * 4;
+                    out[i] = r;
+                    out[i + 1] = g;
+                    out[i + 2] = b;
+                    out[i + 3] = 255;
+                }
+            }
+        }
         PixelFormat::Nv12 => {
             let stride_y = frame.strides[0] as usize;
             let stride_uv = frame.strides[1] as usize;

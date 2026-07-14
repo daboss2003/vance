@@ -97,11 +97,15 @@ pub struct Renderer {
     /// (width, height) of the currently-allocated A-side Y texture;
     /// `None` if no frame has been uploaded yet.
     plane_dims_a: Option<(u32, u32)>,
+    /// Whether the A-side plane textures are `R16Unorm` (10-bit source) vs
+    /// `R8Unorm` (8-bit). Drives re-allocation when the bit depth changes.
+    plane_hi_a: bool,
     tex_y_a: Option<wgpu::Texture>,
     tex_u_a: Option<wgpu::Texture>,
     tex_v_a: Option<wgpu::Texture>,
     /// Same, for the B side (transition target).
     plane_dims_b: Option<(u32, u32)>,
+    plane_hi_b: bool,
     tex_y_b: Option<wgpu::Texture>,
     tex_u_b: Option<wgpu::Texture>,
     tex_v_b: Option<wgpu::Texture>,
@@ -186,7 +190,15 @@ struct RenderParams {
     /// All other per-clip effects (opacity / transform / crop /
     /// color) apply *after* the mix.
     mix_factor: f32,
-    _pad0: [f32; 3],
+    /// Per-sample scale applied to the raw A-side YUV texture samples before
+    /// the limited-range expansion. 1.0 for 8-bit (R8Unorm, sample=code/255);
+    /// `65535/1023` for 10-bit (R16Unorm, sample=code/65535 → code/1023, the
+    /// 8-bit-equivalent normalized value). Shares the `mix_factor` vec4.
+    sample_scale: f32,
+    /// Same, for the B-side (transition) samples — separate so an 8-bit↔
+    /// 10-bit cross-dissolve scales each side correctly.
+    sample_scale_b: f32,
+    _pad0: f32,
     /// Chroma key: `(r, g, b, enable)`. When `enable > 0.5`, pixels
     /// within `chroma_params.x` of the key color fade toward black
     /// (no alpha out yet — `vance-render` doesn't blend tracks in v1).
@@ -601,7 +613,9 @@ impl Default for RenderParams {
             contrast: 1.0,
             crop_lrtb: [0.0; 4],
             mix_factor: 0.0,
-            _pad0: [0.0; 3],
+            sample_scale: 1.0,
+            sample_scale_b: 1.0,
+            _pad0: 0.0,
             chroma_key: [0.0; 4],
             chroma_params: [0.1, 0.05, 0.0, 0.0],
             luma_key: [0.5, 1.0, 0.05, 0.0],
@@ -949,6 +963,8 @@ impl Renderer {
             bind_group_layout,
             sampler,
             plane_dims_a: None,
+            plane_hi_a: false,
+            plane_hi_b: false,
             tex_y_a: None,
             tex_u_a: None,
             tex_v_a: None,
@@ -1765,6 +1781,31 @@ impl Renderer {
         );
     }
 
+    /// Set the YUV sample scale for the A or B side (`1.0` for 8-bit inputs,
+    /// `65535/1023` for 10-bit R16Unorm inputs). Called from `upload_frame`
+    /// per the frame's bit depth so the shader's limited-range expansion sees
+    /// a normalized `[0,1]` value regardless of source bit depth.
+    fn set_sample_scale(&mut self, value: f32, b_side: bool) {
+        let cur = if b_side {
+            self.current_params.sample_scale_b
+        } else {
+            self.current_params.sample_scale
+        };
+        if (cur - value).abs() < 1e-6 {
+            return;
+        }
+        if b_side {
+            self.current_params.sample_scale_b = value;
+        } else {
+            self.current_params.sample_scale = value;
+        }
+        self.queue.write_buffer(
+            &self.params_buffer,
+            0,
+            bytemuck::cast_slice(&[self.current_params]),
+        );
+    }
+
     fn upload_frame_inner(
         &mut self,
         frame: &FrameData,
@@ -1779,19 +1820,27 @@ impl Renderer {
             });
         }
 
+        let is_10bit = frame.pixel_format == PixelFormat::Yuv420P10Le;
         let needs_alloc = if b_side {
-            self.plane_dims_b != Some((w, h))
+            self.plane_dims_b != Some((w, h)) || self.plane_hi_b != is_10bit
         } else {
-            self.plane_dims_a != Some((w, h))
+            self.plane_dims_a != Some((w, h)) || self.plane_hi_a != is_10bit
         };
         if needs_alloc {
-            self.allocate_plane_textures(w, h, b_side);
+            self.allocate_plane_textures(w, h, b_side, is_10bit);
             if b_side {
                 self.plane_dims_b = Some((w, h));
+                self.plane_hi_b = is_10bit;
             } else {
                 self.plane_dims_a = Some((w, h));
+                self.plane_hi_a = is_10bit;
             }
         }
+        // Tell the shader how to normalize this side's samples: a 10-bit
+        // R16Unorm sample is code/65535, so ×65535/1023 recovers code/1023
+        // (the 8-bit-equivalent normalized value the expansion expects).
+        let scale = if is_10bit { 65535.0 / 1023.0 } else { 1.0 };
+        self.set_sample_scale(scale, b_side);
 
         let chroma_w = w.div_ceil(2);
         let chroma_h = h.div_ceil(2);
@@ -1816,9 +1865,21 @@ impl Renderer {
                 let chroma_size = (chroma_w * chroma_h) as usize;
                 let (y_bytes, rest) = frame.bytes.split_at(y_size);
                 let (u_bytes, v_bytes) = rest.split_at(chroma_size);
-                self.write_plane(tex_y, w, h, y_bytes);
-                self.write_plane(tex_u, chroma_w, chroma_h, u_bytes);
-                self.write_plane(tex_v, chroma_w, chroma_h, v_bytes);
+                self.write_plane(tex_y, w, h, y_bytes, 1);
+                self.write_plane(tex_u, chroma_w, chroma_h, u_bytes, 1);
+                self.write_plane(tex_v, chroma_w, chroma_h, v_bytes, 1);
+            }
+            PixelFormat::Yuv420P10Le => {
+                // 2 bytes/sample; planes are R16Unorm. Bytes are native
+                // little-endian u16 (matches R16Unorm's expected layout),
+                // copied straight through.
+                let y_size = (w * h) as usize * 2;
+                let chroma_size = (chroma_w * chroma_h) as usize * 2;
+                let (y_bytes, rest) = frame.bytes.split_at(y_size);
+                let (u_bytes, v_bytes) = rest.split_at(chroma_size);
+                self.write_plane(tex_y, w, h, y_bytes, 2);
+                self.write_plane(tex_u, chroma_w, chroma_h, u_bytes, 2);
+                self.write_plane(tex_v, chroma_w, chroma_h, v_bytes, 2);
             }
             PixelFormat::Nv12 => {
                 let y_size = (w * h) as usize;
@@ -1831,9 +1892,9 @@ impl Renderer {
                     u_buf.push(chunk[0]);
                     v_buf.push(chunk[1]);
                 }
-                self.write_plane(tex_y, w, h, y_bytes);
-                self.write_plane(tex_u, chroma_w, chroma_h, &u_buf);
-                self.write_plane(tex_v, chroma_w, chroma_h, &v_buf);
+                self.write_plane(tex_y, w, h, y_bytes, 1);
+                self.write_plane(tex_u, chroma_w, chroma_h, &u_buf, 1);
+                self.write_plane(tex_v, chroma_w, chroma_h, &v_buf, 1);
             }
         }
         Ok(())
@@ -2238,17 +2299,27 @@ impl Renderer {
         result
     }
 
-    fn allocate_plane_textures(&mut self, width: u32, height: u32, b_side: bool) {
+    fn allocate_plane_textures(&mut self, width: u32, height: u32, b_side: bool, is_10bit: bool) {
         let chroma_w = width.div_ceil(2);
         let chroma_h = height.div_ceil(2);
+        // 10-bit sources use R16Unorm single-channel plane textures; 8-bit use
+        // R8Unorm. Both sample as filterable f32 (`texture_2d<f32>`), so the
+        // bind-group layout is unchanged.
+        let plane = |dev: &wgpu::Device, w: u32, h: u32, label: &str| -> wgpu::Texture {
+            if is_10bit {
+                create_r16_texture(dev, w, h, label)
+            } else {
+                create_r8_texture(dev, w, h, label)
+            }
+        };
         if b_side {
-            self.tex_y_b = Some(create_r8_texture(&self.device, width, height, "tex_y_b"));
-            self.tex_u_b = Some(create_r8_texture(&self.device, chroma_w, chroma_h, "tex_u_b"));
-            self.tex_v_b = Some(create_r8_texture(&self.device, chroma_w, chroma_h, "tex_v_b"));
+            self.tex_y_b = Some(plane(&self.device, width, height, "tex_y_b"));
+            self.tex_u_b = Some(plane(&self.device, chroma_w, chroma_h, "tex_u_b"));
+            self.tex_v_b = Some(plane(&self.device, chroma_w, chroma_h, "tex_v_b"));
         } else {
-            self.tex_y_a = Some(create_r8_texture(&self.device, width, height, "tex_y_a"));
-            self.tex_u_a = Some(create_r8_texture(&self.device, chroma_w, chroma_h, "tex_u_a"));
-            self.tex_v_a = Some(create_r8_texture(&self.device, chroma_w, chroma_h, "tex_v_a"));
+            self.tex_y_a = Some(plane(&self.device, width, height, "tex_y_a"));
+            self.tex_u_a = Some(plane(&self.device, chroma_w, chroma_h, "tex_u_a"));
+            self.tex_v_a = Some(plane(&self.device, chroma_w, chroma_h, "tex_v_a"));
         }
 
         // First A-side allocation also primes a 1×1 B-side dummy so
@@ -2387,7 +2458,7 @@ impl Renderer {
         }));
     }
 
-    fn write_plane(&self, tex: &wgpu::Texture, w: u32, h: u32, bytes: &[u8]) {
+    fn write_plane(&self, tex: &wgpu::Texture, w: u32, h: u32, bytes: &[u8], bytes_per_sample: u32) {
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: tex,
@@ -2398,7 +2469,7 @@ impl Renderer {
             bytes,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(w),
+                bytes_per_row: Some(w * bytes_per_sample),
                 rows_per_image: Some(h),
             },
             wgpu::Extent3d {
@@ -2427,10 +2498,15 @@ async fn create_device(
     // allocate Y/U/V planes at any reasonable resolution. We still keep
     // the rest of the request defensive (no special features).
     let limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
+    // R16Unorm plane textures (10-bit YUV sources) need TEXTURE_FORMAT_16BIT_
+    // NORM, which is a native (non-baseline) feature. Request it only when
+    // the adapter offers it (universal on desktop Metal/Vulkan/D3D12); 8-bit
+    // decode + everything else works without it.
+    let features = wgpu::Features::TEXTURE_FORMAT_16BIT_NORM & adapter.features();
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("vance-render.device"),
-            required_features: wgpu::Features::empty(),
+            required_features: features,
             required_limits: limits,
             experimental_features: wgpu::ExperimentalFeatures::default(),
             memory_hints: wgpu::MemoryHints::Performance,
@@ -2466,6 +2542,27 @@ fn create_r8_texture(device: &wgpu::Device, w: u32, h: u32, label: &str) -> wgpu
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+/// A single-channel 16-bit-unorm plane texture (for 10-bit YUV sources).
+/// R16Unorm is a filterable-float format in the WebGPU baseline, so it binds
+/// through the same `texture_2d<f32>` layout as R8Unorm and needs no device
+/// feature.
+fn create_r16_texture(device: &wgpu::Device, w: u32, h: u32, label: &str) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R16Unorm,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     })

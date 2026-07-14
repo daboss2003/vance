@@ -18,10 +18,11 @@ use std::io::{Read, Write};
 /// Hard cap on a single frame's payload size. Protects against corrupt
 /// length headers driving multi-GB allocations.
 ///
-/// Decoded video frames do **not** flow through this channel — they go via
-/// shared memory. Anything we send here is a small command, response, or
-/// status. 16 MiB is generous for that.
-pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
+/// Decoded video frames are inlined through this channel today (shared
+/// memory is a later milestone), so the cap must cover the largest frame we
+/// emit: 4K 10-bit 4:2:0 is 3840·2160·3 ≈ 23.7 MiB. 48 MiB leaves headroom
+/// for DCI-4K 10-bit while still bounding a corrupt-header allocation.
+pub const MAX_FRAME_BYTES: u32 = 48 * 1024 * 1024;
 
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 

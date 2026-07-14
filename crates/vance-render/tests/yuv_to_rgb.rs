@@ -129,6 +129,122 @@ fn renders_solid_white_yuv420p() {
     assert!(center_px[0] > 240 && center_px[1] > 240 && center_px[2] > 240);
 }
 
+/// Construct a `width`×`height` solid 10-bit YUV420P10LE frame (u16 LE
+/// samples, 3 planes).
+fn solid_yuv420p10le(width: u32, height: u32, y: u16, u: u16, v: u16) -> FrameData {
+    let cw = width.div_ceil(2);
+    let ch = height.div_ceil(2);
+    let mut bytes = Vec::with_capacity((width * height * 3) as usize);
+    for _ in 0..(width * height) {
+        bytes.extend_from_slice(&y.to_le_bytes());
+    }
+    for _ in 0..(cw * ch) {
+        bytes.extend_from_slice(&u.to_le_bytes());
+    }
+    for _ in 0..(cw * ch) {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    FrameData {
+        pts: 0,
+        width,
+        height,
+        pixel_format: PixelFormat::Yuv420P10Le,
+        strides: vec![width, cw, cw],
+        bytes,
+    }
+}
+
+/// A 10-bit source decodes to the SAME RGB as its 8-bit equivalent (the
+/// R16Unorm upload + sample-scale path is correct): 10-bit white
+/// (Y=940, C=512) matches 8-bit white (Y=235, C=128).
+#[test]
+fn ten_bit_matches_eight_bit_equivalent() {
+    let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
+
+    // 8-bit reference white.
+    r.upload_frame(&solid_yuv420p(64, 64, 235, 128, 128)).unwrap();
+    let ref8 = center(&r.render_to_rgba_buffer(64, 64).unwrap(), 64, 64);
+
+    // 10-bit white (values ×4 of the 8-bit limited points).
+    r.upload_frame(&solid_yuv420p10le(64, 64, 940, 512, 512)).unwrap();
+    let px10 = center(&r.render_to_rgba_buffer(64, 64).unwrap(), 64, 64);
+
+    for ch in 0..3 {
+        assert!(
+            (px10[ch] as i32 - ref8[ch] as i32).abs() <= 2,
+            "10-bit ch{ch}={} vs 8-bit ref={} (should match within rounding)",
+            px10[ch],
+            ref8[ch]
+        );
+    }
+    assert!(px10[0] > 240, "10-bit white should be bright: {}", px10[0]);
+
+    // A 10-bit mid-gray also matches its 8-bit equivalent.
+    r.upload_frame(&solid_yuv420p(64, 64, 128, 128, 128)).unwrap();
+    let gray8 = center(&r.render_to_rgba_buffer(64, 64).unwrap(), 64, 64);
+    r.upload_frame(&solid_yuv420p10le(64, 64, 512, 512, 512)).unwrap();
+    let gray10 = center(&r.render_to_rgba_buffer(64, 64).unwrap(), 64, 64);
+    assert!((gray10[0] as i32 - gray8[0] as i32).abs() <= 3, "mid-gray 10 vs 8 bit");
+}
+
+/// FULL 10-bit HDR round-trip: a 10-bit PQ Rec.2020 source decoded and
+/// re-encoded to PQ Rec.2020 must come back unchanged (PQ input EOTF is the
+/// exact inverse of the PQ output OETF), and a highlight above reference
+/// white must survive rather than clip. This exercises: 10-bit R16 upload →
+/// YUV→R'G'B' → PQ inverse-EOTF (input) → working → PQ OETF (output) → 10-bit
+/// readback.
+#[test]
+fn ten_bit_pq_source_round_trips_including_highlights() {
+    use vance_render::{Renderer as R, RendererConfig as Cfg};
+    let compositor_pipeline = |code: f64| {
+        // 10-bit limited-range luma for an encoded R'G'B' value `code`:
+        // Y10 = code·876 + 64; neutral chroma = 512.
+        (code * 876.0 + 64.0).round() as u16
+    };
+    let mut r = R::new(Cfg {
+        target_format: wgpu::TextureFormat::Rgba16Float,
+        ..Cfg::default()
+    })
+    .expect("hdr renderer");
+    // Input Rec.2020 PQ, working Linear Rec.2020 (identity primaries), output
+    // Rec.2020 PQ — a pure transfer round-trip.
+    let params = vance_color::Pipeline {
+        input: vance_color::ColorSpace::Rec2020Pq,
+        working: vance_color::ColorSpace::LinearRec2020,
+        output: vance_color::ColorSpace::Rec2020Pq,
+    }
+    .to_params()
+    .expect("PQ→PQ resolves");
+    r.set_pipeline(params);
+
+    let read_center_r = |r: &R| -> u16 {
+        let buf = r.render_to_rgba64_buffer(64, 64).unwrap();
+        let i = ((32 * 64 + 32) * 8) as usize;
+        u16::from_le_bytes([buf[i], buf[i + 1]])
+    };
+
+    // Reference-white-ish mid PQ code 0.5 round-trips close to 0.5 (the PQ
+    // input EOTF is the inverse of the output OETF).
+    r.upload_frame(&solid_yuv420p10le(64, 64, compositor_pipeline(0.5), 512, 512)).unwrap();
+    let mid = read_center_r(&r);
+    let want_mid = (0.5 * 65535.0) as i32;
+    assert!((mid as i32 - want_mid).abs() < 1200, "PQ 0.5 round-trip: {mid} vs ~{want_mid}");
+
+    // A HIGHLIGHT (PQ code 0.75, far above reference white) must SURVIVE, not
+    // clip to reference white. If the [0,1] working clamp weren't lifted for
+    // HDR, working would clamp at 1.0 (100 nits) and the highlight would read
+    // ~0.5 (≈ mid). It reads much higher, and round-trips approximately (the
+    // residual is the accumulated 10-bit↔8-bit-constant + steep-PQ-curve
+    // approximation; exact HDR fidelity is a hardware-verified follow-up).
+    r.upload_frame(&solid_yuv420p10le(64, 64, compositor_pipeline(0.75), 512, 512)).unwrap();
+    let hi = read_center_r(&r);
+    assert!(
+        hi > mid + 10000,
+        "highlight must survive well above reference white (not clipped): hi={hi} mid={mid}"
+    );
+    assert!(hi > 42000 && hi < 55000, "highlight round-trips near PQ 0.75: {hi}");
+}
+
 /// HDR end-to-end (render → PQ → 10-bit readback): white through an
 /// Rgba16Float renderer with a Rec.709 → Rec.2020-PQ pipeline must come back
 /// as the analytic PQ code value of SDR reference white (100 cd/m²).
