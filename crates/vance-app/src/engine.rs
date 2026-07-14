@@ -8942,6 +8942,8 @@ impl Engine {
                     preset: opts.preset.clone(),
                     time_base_num: frame_rate_den,
                     time_base_den: frame_rate_num,
+                    // HDR export is wired via the 10-bit path (below); SDR here.
+                    hdr: None,
                 }),
                 Some(vance_encoder::AudioConfig {
                     sample_rate,

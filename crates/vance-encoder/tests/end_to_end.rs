@@ -166,6 +166,7 @@ fn every_codec_preset_produces_an_output_file() {
             preset: preset.clone(),
             time_base_num: 1,
             time_base_den: 24,
+            hdr: None,
         };
         if client.open(out.to_string_lossy().to_string(), Some(cfg), None).is_err() {
             // ffmpeg refused (codec missing). Skip — not a sidecar bug.
@@ -253,6 +254,7 @@ fn prores_422_hq_is_deterministic_across_runs() {
                     preset: EncoderPreset::ProRes422HQ,
                     time_base_num: 1,
                     time_base_den: 24,
+                    hdr: None,
                 }),
                 None, // video-only — audio adds a mux step that's
                       // itself deterministic, but isolating video makes
@@ -335,6 +337,7 @@ fn prores_422_hq_one_second_round_trip() {
                 preset: EncoderPreset::ProRes422HQ,
                 time_base_num: frame_rate_den,
                 time_base_den: frame_rate_num,
+                hdr: None,
             }),
             Some(AudioConfig {
                 sample_rate,

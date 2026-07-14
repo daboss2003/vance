@@ -247,6 +247,7 @@ fn run_one(
                 preset,
                 time_base_num: stream.frame_rate.1 as u32,
                 time_base_den: stream.frame_rate.0 as u32,
+                hdr: None, // proxies are SDR
             }),
             // Audio-side stub: silent track at 48 kHz stereo. ProRes
             // muxers expect at least one audio stream for the typical

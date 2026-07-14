@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use vance_encoder::protocol::{
     AudioCodec, AudioConfig, EncoderError, EncoderPreset, EncoderRequest, EncoderResponse,
-    VideoConfig, VideoPixelFormat, PROTOCOL_VERSION,
+    HdrMetadata, VideoConfig, PROTOCOL_VERSION,
 };
 
 fn main() -> vance_ipc::Result<()> {
@@ -42,6 +42,9 @@ struct VideoPipe {
     stdin: ChildStdin,
     width: u32,
     height: u32,
+    /// Bytes per pixel of the raw frames the parent pushes (4 for 8-bit
+    /// RGBA/BGRA, 8 for the 10-bit `rgba64le` HDR wire format).
+    bytes_per_pixel: usize,
     out_path: PathBuf,
     frames: u64,
 }
@@ -138,7 +141,7 @@ impl State {
     fn push_video(&mut self, pixels: &[u8]) -> Result<(), String> {
         let s = self.open.as_mut().ok_or("encoder not open")?;
         let v = s.video.as_mut().ok_or("no video stream configured")?;
-        let expected = (v.width * v.height * 4) as usize;
+        let expected = (v.width as usize) * (v.height as usize) * v.bytes_per_pixel;
         if pixels.len() != expected {
             return Err(format!(
                 "video frame size mismatch: got {} bytes, expected {}",
@@ -216,11 +219,14 @@ impl State {
 }
 
 fn spawn_video_ffmpeg(cfg: &VideoConfig, out_path: &PathBuf) -> Result<VideoPipe, String> {
-    let pix_fmt = match cfg.pixel_format {
-        VideoPixelFormat::Rgba8 => "rgba",
-        VideoPixelFormat::Bgra8 => "bgra",
+    let pix_fmt = cfg.pixel_format.ffmpeg_rawvideo();
+    // HDR10 export overrides the preset with a software HEVC Main10 path so
+    // the mastering metadata + PQ signaling are emitted reliably (hardware
+    // encoders don't accept x265-params); otherwise use the chosen preset.
+    let video_codec_args = match &cfg.hdr {
+        Some(hdr) => hdr_encode_args(hdr, &cfg.preset),
+        None => preset_to_ffmpeg_args(&cfg.preset),
     };
-    let video_codec_args = preset_to_ffmpeg_args(&cfg.preset);
 
     let frame_rate = format!("{}/{}", cfg.frame_rate_num, cfg.frame_rate_den);
     let size = format!("{}x{}", cfg.width, cfg.height);
@@ -258,9 +264,42 @@ fn spawn_video_ffmpeg(cfg: &VideoConfig, out_path: &PathBuf) -> Result<VideoPipe
         stdin,
         width: cfg.width,
         height: cfg.height,
+        bytes_per_pixel: cfg.pixel_format.bytes_per_pixel(),
         out_path: out_path.clone(),
         frames: 0,
     })
+}
+
+/// FFmpeg args for an HDR10 encode: software HEVC Main10 (`libx265` +
+/// `yuv420p10le`) with the full HDR10 x265 params (color signaling +
+/// mastering display + content light + `hdr10=1`) and the stream-level color
+/// signaling flags. Replaces the preset entirely so no incompatible option
+/// (e.g. a ProRes profile) leaks in.
+fn hdr_encode_args(hdr: &HdrMetadata, preset: &EncoderPreset) -> Vec<String> {
+    let v = |s: &str| s.to_string();
+    let crf = preset_crf(preset).unwrap_or(18);
+    let mut args = vec![
+        v("-c:v"),
+        v("libx265"),
+        v("-pix_fmt"),
+        v("yuv420p10le"),
+        v("-profile:v"),
+        v("main10"),
+        v("-x265-params"),
+        hdr.x265_params(crf),
+    ];
+    args.extend(hdr.signaling.ffmpeg_args());
+    args
+}
+
+/// Extract a CRF from a quality-based preset (H.264 / HEVC / AV1), else None.
+fn preset_crf(preset: &EncoderPreset) -> Option<u8> {
+    match preset {
+        EncoderPreset::H264 { crf }
+        | EncoderPreset::Hevc { crf }
+        | EncoderPreset::Av1 { crf } => Some(*crf),
+        _ => None,
+    }
 }
 
 fn preset_to_ffmpeg_args(preset: &EncoderPreset) -> Vec<String> {

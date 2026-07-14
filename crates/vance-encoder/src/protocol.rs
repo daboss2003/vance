@@ -23,6 +23,29 @@ pub enum VideoPixelFormat {
     /// Packed BGRA, 8 bits per channel. Same shape as Rgba8 with
     /// channel swap — matches macOS view-output convention.
     Bgra8,
+    /// Packed RGBA, 16 bits per channel, little-endian (`rgba64le`) — 8
+    /// bytes/pixel. The wire format for a 10-bit HDR readback (10-bit render
+    /// data lives in the high bits). Sidecar converts to `yuv420p10le`.
+    Rgba64Le,
+}
+
+impl VideoPixelFormat {
+    /// Bytes per pixel on the IPC boundary.
+    pub fn bytes_per_pixel(self) -> usize {
+        match self {
+            VideoPixelFormat::Rgba8 | VideoPixelFormat::Bgra8 => 4,
+            VideoPixelFormat::Rgba64Le => 8,
+        }
+    }
+
+    /// The FFmpeg rawvideo `-pix_fmt` name for this input format.
+    pub fn ffmpeg_rawvideo(self) -> &'static str {
+        match self {
+            VideoPixelFormat::Rgba8 => "rgba",
+            VideoPixelFormat::Bgra8 => "bgra",
+            VideoPixelFormat::Rgba64Le => "rgba64le",
+        }
+    }
 }
 
 /// Audio sample format on the IPC boundary. Sidecar converts to the
@@ -157,6 +180,277 @@ pub struct VideoConfig {
     pub time_base_num: u32,
     /// Time-base denominator.
     pub time_base_den: u32,
+    /// HDR10 signaling + mastering metadata. When `Some`, the sidecar encodes
+    /// a 10-bit HDR10 stream (libx265 Main10) tagged with these values.
+    /// `#[serde(default)]` so existing SDR configs deserialize as `None`.
+    #[serde(default)]
+    pub hdr: Option<HdrMetadata>,
+}
+
+// ---------------------------------------------------------------------
+// HDR10 signaling + mastering metadata
+// ---------------------------------------------------------------------
+
+/// Color primaries (container/stream signaling). Maps to FFmpeg + x265 names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColorPrimaries {
+    /// Rec.709 / sRGB gamut.
+    Bt709,
+    /// Rec.2020 (wide gamut, HDR).
+    Bt2020,
+    /// Display P3 (D65).
+    DisplayP3,
+}
+
+impl ColorPrimaries {
+    /// FFmpeg `-color_primaries` value.
+    pub fn ffmpeg(self) -> &'static str {
+        match self {
+            ColorPrimaries::Bt709 => "bt709",
+            ColorPrimaries::Bt2020 => "bt2020",
+            ColorPrimaries::DisplayP3 => "smpte432",
+        }
+    }
+}
+
+/// Transfer characteristics (the EOTF/OETF the samples are encoded with).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransferCharacteristics {
+    /// Rec.709.
+    Bt709,
+    /// SMPTE ST 2084 (PQ) — HDR10.
+    Pq,
+    /// Hybrid Log-Gamma (ARIB STD-B67).
+    Hlg,
+}
+
+impl TransferCharacteristics {
+    /// FFmpeg `-color_trc` value.
+    pub fn ffmpeg(self) -> &'static str {
+        match self {
+            TransferCharacteristics::Bt709 => "bt709",
+            TransferCharacteristics::Pq => "smpte2084",
+            TransferCharacteristics::Hlg => "arib-std-b67",
+        }
+    }
+}
+
+/// Matrix coefficients (RGB↔YCbCr).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MatrixCoefficients {
+    /// Rec.709.
+    Bt709,
+    /// Rec.2020 non-constant luminance.
+    Bt2020Ncl,
+}
+
+impl MatrixCoefficients {
+    /// FFmpeg `-colorspace` value.
+    pub fn ffmpeg(self) -> &'static str {
+        match self {
+            MatrixCoefficients::Bt709 => "bt709",
+            MatrixCoefficients::Bt2020Ncl => "bt2020nc",
+        }
+    }
+}
+
+/// Signal quantization range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SignalRange {
+    /// Limited / "TV" (16–235 at 8-bit).
+    Limited,
+    /// Full / "PC".
+    Full,
+}
+
+impl SignalRange {
+    /// FFmpeg `-color_range` value.
+    pub fn ffmpeg(self) -> &'static str {
+        match self {
+            SignalRange::Limited => "tv",
+            SignalRange::Full => "pc",
+        }
+    }
+}
+
+/// The four color-signaling codes written into the stream + container.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColorSignaling {
+    /// Color primaries.
+    pub primaries: ColorPrimaries,
+    /// Transfer characteristics.
+    pub transfer: TransferCharacteristics,
+    /// Matrix coefficients.
+    pub matrix: MatrixCoefficients,
+    /// Signal range.
+    pub range: SignalRange,
+}
+
+impl ColorSignaling {
+    /// The standard HDR10 signaling: Rec.2020 primaries, PQ transfer,
+    /// Rec.2020 non-constant-luminance matrix, limited range.
+    pub fn hdr10() -> Self {
+        ColorSignaling {
+            primaries: ColorPrimaries::Bt2020,
+            transfer: TransferCharacteristics::Pq,
+            matrix: MatrixCoefficients::Bt2020Ncl,
+            range: SignalRange::Limited,
+        }
+    }
+
+    /// FFmpeg color-signaling flags (`-color_primaries … -color_trc … …`).
+    pub fn ffmpeg_args(&self) -> Vec<String> {
+        vec![
+            "-color_primaries".into(),
+            self.primaries.ffmpeg().into(),
+            "-color_trc".into(),
+            self.transfer.ffmpeg().into(),
+            "-colorspace".into(),
+            self.matrix.ffmpeg().into(),
+            "-color_range".into(),
+            self.range.ffmpeg().into(),
+        ]
+    }
+}
+
+/// SMPTE ST 2086 mastering-display color volume. Chromaticities are CIE xy
+/// in `[0,1]`; luminance is cd/m² (nits).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MasteringDisplay {
+    /// Red primary `[x, y]`.
+    pub red: [f64; 2],
+    /// Green primary `[x, y]`.
+    pub green: [f64; 2],
+    /// Blue primary `[x, y]`.
+    pub blue: [f64; 2],
+    /// White point `[x, y]`.
+    pub white: [f64; 2],
+    /// Peak luminance in nits.
+    pub max_luminance: f64,
+    /// Minimum luminance in nits.
+    pub min_luminance: f64,
+}
+
+impl MasteringDisplay {
+    /// A Rec.2020-primaries, D65 mastering display at the given peak/black.
+    pub fn rec2020(max_nits: f64, min_nits: f64) -> Self {
+        MasteringDisplay {
+            red: [0.708, 0.292],
+            green: [0.170, 0.797],
+            blue: [0.131, 0.046],
+            white: [0.3127, 0.3290],
+            max_luminance: max_nits,
+            min_luminance: min_nits,
+        }
+    }
+
+    /// A P3-D65-primaries mastering display (a common grading monitor volume).
+    pub fn p3_d65(max_nits: f64, min_nits: f64) -> Self {
+        MasteringDisplay {
+            red: [0.680, 0.320],
+            green: [0.265, 0.690],
+            blue: [0.150, 0.060],
+            white: [0.3127, 0.3290],
+            max_luminance: max_nits,
+            min_luminance: min_nits,
+        }
+    }
+
+    /// The x265 `master-display=G(...)B(...)R(...)WP(...)L(max,min)` string.
+    /// Chromaticities are in units of `0.00002` (×50000); luminance in units
+    /// of `0.0001` cd/m² (×10000) — the ST 2086 / x265 fixed-point form.
+    pub fn x265_master_display(&self) -> String {
+        let c = |v: f64| (v * 50000.0).round() as i64;
+        let l = |v: f64| (v * 10000.0).round() as i64;
+        format!(
+            "G({},{})B({},{})R({},{})WP({},{})L({},{})",
+            c(self.green[0]),
+            c(self.green[1]),
+            c(self.blue[0]),
+            c(self.blue[1]),
+            c(self.red[0]),
+            c(self.red[1]),
+            c(self.white[0]),
+            c(self.white[1]),
+            l(self.max_luminance),
+            l(self.min_luminance),
+        )
+    }
+}
+
+/// HDR10 metadata: color signaling + mastering-display volume + content
+/// light levels (MaxCLL / MaxFALL, in nits).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HdrMetadata {
+    /// Stream/container color signaling.
+    pub signaling: ColorSignaling,
+    /// Mastering display (ST 2086).
+    pub mastering: MasteringDisplay,
+    /// Maximum content light level (nits).
+    pub max_cll: u16,
+    /// Maximum frame-average light level (nits).
+    pub max_fall: u16,
+}
+
+impl HdrMetadata {
+    /// Standard HDR10: Rec.2020/PQ signaling, a Rec.2020 mastering display at
+    /// `max_nits`/`min_nits`, and the given content light levels.
+    pub fn hdr10(max_nits: f64, min_nits: f64, max_cll: u16, max_fall: u16) -> Self {
+        HdrMetadata {
+            signaling: ColorSignaling::hdr10(),
+            mastering: MasteringDisplay::rec2020(max_nits, min_nits),
+            max_cll,
+            max_fall,
+        }
+    }
+
+    /// The full x265 `-x265-params` value for HDR10 at the given CRF: color
+    /// signaling + mastering display + content light levels + `hdr10=1`.
+    pub fn x265_params(&self, crf: u8) -> String {
+        format!(
+            "crf={crf}:colorprim={}:transfer={}:colormatrix={}:master-display={}:max-cll={},{}:hdr10=1:repeat-headers=1:range={}",
+            self.signaling.primaries.x265(),
+            self.signaling.transfer.x265(),
+            self.signaling.matrix.x265(),
+            self.mastering.x265_master_display(),
+            self.max_cll,
+            self.max_fall,
+            match self.signaling.range {
+                SignalRange::Limited => "limited",
+                SignalRange::Full => "full",
+            },
+        )
+    }
+}
+
+impl ColorPrimaries {
+    /// x265 `colorprim` value.
+    pub fn x265(self) -> &'static str {
+        match self {
+            ColorPrimaries::Bt709 => "bt709",
+            ColorPrimaries::Bt2020 => "bt2020",
+            ColorPrimaries::DisplayP3 => "smpte432",
+        }
+    }
+}
+impl TransferCharacteristics {
+    /// x265 `transfer` value.
+    pub fn x265(self) -> &'static str {
+        match self {
+            TransferCharacteristics::Bt709 => "bt709",
+            TransferCharacteristics::Pq => "smpte2084",
+            TransferCharacteristics::Hlg => "arib-std-b67",
+        }
+    }
+}
+impl MatrixCoefficients {
+    /// x265 `colormatrix` value.
+    pub fn x265(self) -> &'static str {
+        match self {
+            MatrixCoefficients::Bt709 => "bt709",
+            MatrixCoefficients::Bt2020Ncl => "bt2020nc",
+        }
+    }
 }
 
 /// Configuration for one audio output stream.
@@ -241,6 +535,64 @@ mod tests {
     }
 
     #[test]
+    fn hdr10_signaling_ffmpeg_args() {
+        let sig = ColorSignaling::hdr10();
+        assert_eq!(
+            sig.ffmpeg_args(),
+            vec![
+                "-color_primaries", "bt2020",
+                "-color_trc", "smpte2084",
+                "-colorspace", "bt2020nc",
+                "-color_range", "tv",
+            ]
+        );
+    }
+
+    #[test]
+    fn mastering_display_st2086_units() {
+        // Rec.2020 red (0.708, 0.292) → ×50000 = (35400, 14600); max 1000 nits
+        // → ×10000 = 10_000_000; min 0.0001 → 1.
+        let md = MasteringDisplay::rec2020(1000.0, 0.0001);
+        let s = md.x265_master_display();
+        assert!(s.contains("R(35400,14600)"), "red primary units: {s}");
+        assert!(s.contains("G(8500,39850)"), "green primary units: {s}");
+        assert!(s.contains("B(6550,2300)"), "blue primary units: {s}");
+        assert!(s.contains("WP(15635,16450)"), "D65 white point units: {s}");
+        assert!(s.ends_with("L(10000000,1)"), "luminance units: {s}");
+    }
+
+    #[test]
+    fn hdr10_x265_params_are_complete() {
+        let hdr = HdrMetadata::hdr10(1000.0, 0.0001, 1000, 400);
+        let p = hdr.x265_params(20);
+        assert!(p.contains("crf=20"));
+        assert!(p.contains("colorprim=bt2020"));
+        assert!(p.contains("transfer=smpte2084"));
+        assert!(p.contains("colormatrix=bt2020nc"));
+        assert!(p.contains("master-display=G("));
+        assert!(p.contains("max-cll=1000,400"));
+        assert!(p.contains("hdr10=1"));
+        assert!(p.contains("range=limited"));
+    }
+
+    #[test]
+    fn pixel_format_bytes_and_rawvideo() {
+        assert_eq!(VideoPixelFormat::Rgba8.bytes_per_pixel(), 4);
+        assert_eq!(VideoPixelFormat::Bgra8.bytes_per_pixel(), 4);
+        assert_eq!(VideoPixelFormat::Rgba64Le.bytes_per_pixel(), 8);
+        assert_eq!(VideoPixelFormat::Rgba8.ffmpeg_rawvideo(), "rgba");
+        assert_eq!(VideoPixelFormat::Rgba64Le.ffmpeg_rawvideo(), "rgba64le");
+    }
+
+    #[test]
+    fn hdr_metadata_round_trips() {
+        let hdr = HdrMetadata::hdr10(4000.0, 0.005, 4000, 1000);
+        let s = serde_json::to_string(&hdr).unwrap();
+        let back: HdrMetadata = serde_json::from_str(&s).unwrap();
+        assert_eq!(hdr, back);
+    }
+
+    #[test]
     fn open_request_serde_round_trip() {
         let req = EncoderRequest::Open {
             path: "/tmp/out.mov".into(),
@@ -253,6 +605,7 @@ mod tests {
                 preset: EncoderPreset::ProRes422HQ,
                 time_base_num: 1001,
                 time_base_den: 30_000,
+                hdr: None,
             }),
             audio: Some(AudioConfig {
                 sample_rate: 48_000,
