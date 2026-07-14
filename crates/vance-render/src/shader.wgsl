@@ -497,6 +497,21 @@ fn hlg_eotf(sig: vec3<f32>) -> vec3<f32> {
     return select(lo, hi, sn > vec3<f32>(0.5));
 }
 
+// Narkowicz ACES-filmic tone map. Compresses HDR working linear (where 1.0 =
+// 100 cd/m² reference white and highlights run up to 100.0 = 10000 nits) into
+// SDR [0,1] with a filmic highlight roll-off, so an HDR source shown on an
+// SDR display preserves highlight DETAIL instead of clipping to flat white.
+fn aces_tonemap(x: vec3<f32>) -> vec3<f32> {
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    let xn = max(x, vec3<f32>(0.0));
+    let mapped = (xn * (a * xn + vec3<f32>(b))) / (xn * (c * xn + vec3<f32>(d)) + vec3<f32>(e));
+    return clamp(mapped, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 fn apply_mat3(rgb: vec3<f32>, m: array<vec4<f32>, 3>) -> vec3<f32> {
     let m0 = m[0].xyz;
     let m1 = m[1].xyz;
@@ -672,6 +687,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     } else if (out_transfer == 5u) {
         let lin = clamp(rgb_out, vec3<f32>(0.0), vec3<f32>(1.0));
         rgb_out = hlg_oetf(lin);
+    } else if (input_transfer == 4u) {
+        // HDR (PQ) source → SDR output (preview / SDR export): tone-map the
+        // HDR working range into [0,1] so highlights roll off instead of
+        // clipping. The SDR texture store then applies the SDR transfer.
+        // (SDR sources keep the plain clamp below — bit-identical.)
+        rgb_out = aces_tonemap(rgb_out);
     } else {
         rgb_out = clamp(rgb_out, vec3<f32>(0.0), vec3<f32>(1.0));
     }

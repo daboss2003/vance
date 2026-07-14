@@ -25,12 +25,14 @@ Vance understands input color spaces and a working/output space:
 Tag each clip's input color space (camera-dependent) so the pipeline converts
 correctly. LUTs (`.cube`) are parsed once and cached.
 
-> **HDR10 export:** Tick **HDR10** in the Export panel to render through a
-> 10-bit pipeline (Rec.2020 primaries, PQ transfer) and write a HEVC Main10
-> file tagged with HDR10 mastering-display + content-light metadata. Preview
-> stays SDR. Note: source frames are 8-bit today, so SDR-range content is
-> correctly PQ-encoded (up to ~100 nits) — true >100-nit highlights await a
-> 10-bit decode path (on the roadmap).
+> **HDR:** Vance decodes 10-bit HDR sources (HEVC Main10, PQ/HLG) and
+> auto-tags their input color space, so HDR footage grades with its highlights
+> intact. On an SDR display the viewport tone-maps HDR to SDR (filmic
+> highlight roll-off) so it looks right; tick **HDR10** in the Export panel to
+> render a 10-bit HEVC Main10 file tagged with HDR10 mastering-display +
+> content-light metadata instead. For the widest HDR grade, set the project
+> working space to a Rec.2020 variant. (Final HDR display fidelity should be
+> checked on an HDR monitor.)
 
 ## Expressions & keyframes
 

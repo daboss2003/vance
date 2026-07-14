@@ -245,6 +245,40 @@ fn ten_bit_pq_source_round_trips_including_highlights() {
     assert!(hi > 42000 && hi < 55000, "highlight round-trips near PQ 0.75: {hi}");
 }
 
+/// HDR → SDR preview tone map: an HDR (PQ) source shown on an SDR output
+/// must preserve highlight DETAIL — three increasingly bright HDR inputs
+/// produce three strictly-increasing SDR values. The old behavior (clamp to
+/// [0,1]) would flatten every above-white highlight to the same 255.
+#[test]
+fn hdr_source_to_sdr_tonemaps_highlights() {
+    let y_for = |code: f64| (code * 876.0 + 64.0).round() as u16;
+    // SDR (Rgba8) output, HDR (PQ) input → the tone-map path.
+    let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
+    let params = vance_color::Pipeline {
+        input: vance_color::ColorSpace::Rec2020Pq,
+        working: vance_color::ColorSpace::LinearRec2020,
+        output: vance_color::ColorSpace::Srgb,
+    }
+    .to_params()
+    .expect("PQ input → SDR output resolves");
+    r.set_pipeline(params);
+
+    let render_pq = |r: &mut Renderer, code: f64| -> u8 {
+        r.upload_frame(&solid_yuv420p10le(64, 64, y_for(code), 512, 512)).unwrap();
+        center(&r.render_to_rgba_buffer(64, 64).unwrap(), 64, 64)[0]
+    };
+    // PQ 0.4 (~50 nits), 0.6 (~180 nits), 0.85 (bright) — all above SDR
+    // reference-white in working space.
+    let a = render_pq(&mut r, 0.4);
+    let b = render_pq(&mut r, 0.6);
+    let c = render_pq(&mut r, 0.85);
+    assert!(a < b && b < c, "tone map must keep highlight ordering: {a} < {b} < {c}");
+    assert!(c > 240, "the brightest highlight should be near SDR white: {c}");
+    // Detail is preserved: the mid-highlight is clearly below white (a hard
+    // clamp would have pinned it to 255 along with the brighter ones).
+    assert!(b < 250, "mid-highlight must not be fully clipped: {b}");
+}
+
 /// HDR end-to-end (render → PQ → 10-bit readback): white through an
 /// Rgba16Float renderer with a Rec.709 → Rec.2020-PQ pipeline must come back
 /// as the analytic PQ code value of SDR reference white (100 cd/m²).
