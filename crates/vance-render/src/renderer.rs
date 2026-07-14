@@ -88,6 +88,10 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
+    /// The color-target format `pipeline` was built for. A render-pass
+    /// attachment must match it, so the readback targets use this format.
+    /// An HDR export renderer is built with `Rgba16Float` here.
+    target_format: wgpu::TextureFormat,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     /// (width, height) of the currently-allocated A-side Y texture;
@@ -660,6 +664,39 @@ fn f32_to_f16_bits(v: f32) -> u16 {
     (sign << 15) | ((new_exp as u16) << 10) | ((mant >> 13) as u16)
 }
 
+/// Decode an IEEE 754 binary16 (half) bit pattern to `f32`. Inverse of
+/// [`f32_to_f16_bits`], used to read back the HDR `Rgba16Float` target.
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = ((h >> 15) & 0x1) as u32;
+    let exp = ((h >> 10) & 0x1f) as u32;
+    let mant = (h & 0x3ff) as u32;
+    let bits = if exp == 0 {
+        if mant == 0 {
+            sign << 31 // ±0
+        } else {
+            // Subnormal → normalize into an f32 normal.
+            let mut e = -1i32;
+            let mut m = mant;
+            loop {
+                e += 1;
+                m <<= 1;
+                if m & 0x400 != 0 {
+                    break;
+                }
+            }
+            let f32_exp = (127 - 15 - e) as u32;
+            (sign << 31) | (f32_exp << 23) | ((m & 0x3ff) << 13)
+        }
+    } else if exp == 0x1f {
+        // Inf / NaN.
+        (sign << 31) | 0x7f80_0000 | (mant << 13)
+    } else {
+        let f32_exp = (exp as i32 - 15 + 127) as u32;
+        (sign << 31) | (f32_exp << 23) | (mant << 13)
+    };
+    f32::from_bits(bits)
+}
+
 /// Evaluate a curve's control points at input `x`, returning the
 /// IDENTITY (`y = x`) when the curve is empty — `eval_curve` returns
 /// 0.0 for an empty list (the keyframe convention), which would crush
@@ -908,6 +945,7 @@ impl Renderer {
             device,
             queue,
             pipeline,
+            target_format: cfg.target_format,
             bind_group_layout,
             sampler,
             plane_dims_a: None,
@@ -1974,6 +2012,119 @@ impl Renderer {
         Ok(out)
     }
 
+    /// HDR export readback: render to an internal `Rgba16Float` target, then
+    /// map and return packed **`rgba64le`** bytes (16-bit unsigned per
+    /// channel, little-endian, 8 bytes/pixel) — the encoder's HDR wire
+    /// format. The renderer MUST have been built with
+    /// `RendererConfig.target_format = Rgba16Float` so `self.pipeline`
+    /// matches the float attachment (asserted). The shader emits final PQ/HLG
+    /// code values into the float target, which are converted to 16-bit here.
+    pub fn render_to_rgba64_buffer(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, RenderError> {
+        if self.target_format != wgpu::TextureFormat::Rgba16Float {
+            return Err(RenderError::DeviceRequest(
+                "render_to_rgba64_buffer requires a renderer built with Rgba16Float target".into(),
+            ));
+        }
+        let target = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("vance-render.hdr-target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        self.render_to(&view)?;
+
+        // Rgba16Float is 8 bytes/pixel (4 half-floats). Row alignment to 256.
+        let src_bpp = 8u32;
+        let unpadded_row = width * src_bpp;
+        let row_align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_row = unpadded_row.div_ceil(row_align) * row_align;
+        let buffer_size = (padded_row as u64) * (height as u64);
+
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("vance-render.hdr-staging"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("vance-render.hdr-copy"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = sender.send(r);
+        });
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .ok();
+        receiver
+            .recv()
+            .map_err(|e| RenderError::DeviceRequest(format!("hdr staging map recv: {e}")))?
+            .map_err(|e| RenderError::DeviceRequest(format!("hdr staging map: {e}")))?;
+        let mapped = slice.get_mapped_range();
+
+        // Convert each half-float channel → 16-bit unorm (rgba64le). Strip the
+        // row padding while we're at it.
+        let mut out = Vec::with_capacity((width as usize) * (height as usize) * 8);
+        for row in 0..height {
+            let row_start = (row * padded_row) as usize;
+            for px in 0..width as usize {
+                let base = row_start + px * 8;
+                for ch in 0..4 {
+                    let h = u16::from_le_bytes([mapped[base + ch * 2], mapped[base + ch * 2 + 1]]);
+                    let v = f16_to_f32(h).clamp(0.0, 1.0);
+                    let u = (v * 65535.0).round() as u16;
+                    out.extend_from_slice(&u.to_le_bytes());
+                }
+            }
+        }
+        drop(mapped);
+        staging.unmap();
+        Ok(out)
+    }
+
     /// Phase 10 — headless convenience: blit `rgba` via
     /// [`Self::present_rgba`] to an internal Rgba8UnormSrgb target and
     /// read it back. Used to test the preview blit path; production
@@ -2318,6 +2469,51 @@ fn create_r8_texture(device: &wgpu::Device, w: u32, h: u32, label: &str) -> wgpu
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     })
+}
+
+#[cfg(test)]
+mod hdr_tests {
+    use super::*;
+
+    /// Reference PQ (SMPTE ST 2084) OETF mirroring the WGSL `pq_oetf`, used
+    /// to lock the constants.
+    fn pq_oetf_ref(e: f64) -> f64 {
+        let m1 = 0.1593017578125;
+        let m2 = 78.84375;
+        let c1 = 0.8359375;
+        let c2 = 18.8515625;
+        let c3 = 18.6875;
+        let en = e.clamp(0.0, 1.0);
+        let ym1 = en.powf(m1);
+        ((c1 + c2 * ym1) / (1.0 + c3 * ym1)).powf(m2)
+    }
+
+    #[test]
+    fn pq_constants_match_reference() {
+        // Known ST 2084 anchors: E=0 → a tiny floor (~7e-7, rounds to code 0
+        // at 16-bit); E=1 (10000 nits) → 1.
+        assert!(pq_oetf_ref(0.0) < 1e-5, "PQ(0) floor: {}", pq_oetf_ref(0.0));
+        assert!((pq_oetf_ref(0.0) * 65535.0).round() as u32 == 0, "PQ(0) rounds to code 0");
+        assert!((pq_oetf_ref(1.0) - 1.0).abs() < 1e-6);
+        // 100 nits (E=0.01, SDR reference white) → ≈0.5081 code value.
+        assert!((pq_oetf_ref(0.01) - 0.5081).abs() < 2e-3, "PQ(100 nits) = {}", pq_oetf_ref(0.01));
+        // Monotonic increasing.
+        assert!(pq_oetf_ref(0.001) < pq_oetf_ref(0.01));
+        assert!(pq_oetf_ref(0.01) < pq_oetf_ref(0.1));
+    }
+
+    #[test]
+    fn f16_round_trips_through_readback_conversion() {
+        // f16_to_f32 (HDR readback) must invert f32_to_f16_bits within
+        // half-float precision across [0,1] (the PQ output range).
+        for &v in &[0.0f32, 0.001, 0.01, 0.1, 0.25, 0.5, 0.5081, 0.75, 0.999, 1.0] {
+            let back = f16_to_f32(f32_to_f16_bits(v));
+            assert!((back - v).abs() <= 1e-3, "f16 round-trip {v} -> {back}");
+        }
+        // Exact endpoints.
+        assert_eq!(f16_to_f32(f32_to_f16_bits(0.0)), 0.0);
+        assert!((f16_to_f32(f32_to_f16_bits(1.0)) - 1.0).abs() < 1e-4);
+    }
 }
 
 #[cfg(test)]

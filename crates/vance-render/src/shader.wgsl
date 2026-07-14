@@ -428,6 +428,35 @@ fn linearize(rgb: vec3<f32>, id: u32) -> vec3<f32> {
     return rgb;
 }
 
+// SMPTE ST 2084 (PQ) forward OETF. Input is display luminance NORMALIZED to
+// the 10000 cd/m² peak (E = L/10000, in [0,1]); output is the PQ code value
+// in [0,1]. Used only on the HDR (Rgba16Float) export target, where the
+// store applies no implicit transfer.
+fn pq_oetf(e: vec3<f32>) -> vec3<f32> {
+    let m1 = 0.1593017578125;
+    let m2 = 78.84375;
+    let c1 = 0.8359375;
+    let c2 = 18.8515625;
+    let c3 = 18.6875;
+    let en = clamp(e, vec3<f32>(0.0), vec3<f32>(1.0));
+    let ym1 = pow(en, vec3<f32>(m1));
+    let num = vec3<f32>(c1) + c2 * ym1;
+    let den = vec3<f32>(1.0) + c3 * ym1;
+    return pow(num / den, vec3<f32>(m2));
+}
+
+// ARIB STD-B67 (HLG) forward OETF. Input is scene linear in [0,1]; output is
+// the HLG signal in [0,1].
+fn hlg_oetf(e: vec3<f32>) -> vec3<f32> {
+    let a = 0.17883277;
+    let b = 0.28466892;
+    let c = 0.55991073;
+    let en = clamp(e, vec3<f32>(0.0), vec3<f32>(1.0));
+    let lo = sqrt(3.0 * en);
+    let hi = a * log(12.0 * en - b) + vec3<f32>(c);
+    return select(lo, hi, en > vec3<f32>(1.0 / 12.0));
+}
+
 fn apply_mat3(rgb: vec3<f32>, m: array<vec4<f32>, 3>) -> vec3<f32> {
     let m0 = m[0].xyz;
     let m1 = m[1].xyz;
@@ -573,11 +602,26 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     //    no-op in the common case but lights up automatically when
     //    the user picks a different working space (e.g., ACEScg).
     var rgb_out = apply_mat3(rgb, params.pipeline_working_to_out);
-    // 5. The surface format (Rgba8UnormSrgb) handles the linear →
-    //    sRGB encoding on write, so we leave the output linear here.
-    //    `pipeline_flags.y` (output_transfer) is recorded for
-    //    future use when we land non-sRGB surface targets (HDR).
-    rgb_out = clamp(rgb_out, vec3<f32>(0.0), vec3<f32>(1.0));
+    // 5. Output transfer. `pipeline_flags.y` is the output-transfer id
+    //    (0 Linear, 1 sRGB, 2 Rec709, 3 Rec2020, 4 PQ, 5 HLG).
+    //    - SDR targets (Rgba8UnormSrgb): the texture store applies the
+    //      implicit linear → sRGB encode, so we leave the output linear
+    //      (clamped to [0,1]) — bit-identical to prior behavior.
+    //    - HDR targets (Rgba16Float, no implicit transfer): we apply the
+    //      PQ / HLG OETF here so the stored code values are final. Working
+    //      space is already the output primaries (Rec.2020) from step 4.
+    let out_transfer = params.pipeline_flags.y;
+    if (out_transfer == 4u) {
+        // PQ: map SDR-range working linear (1.0 = 100 cd/m² reference white)
+        // to the 10000-nit-normalized PQ input, then encode.
+        let lin = clamp(rgb_out, vec3<f32>(0.0), vec3<f32>(1.0));
+        rgb_out = pq_oetf(lin * (100.0 / 10000.0));
+    } else if (out_transfer == 5u) {
+        let lin = clamp(rgb_out, vec3<f32>(0.0), vec3<f32>(1.0));
+        rgb_out = hlg_oetf(lin);
+    } else {
+        rgb_out = clamp(rgb_out, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
     // 6. Optional view LUT — a monitoring transform applied *after*
     //    the project's color pipeline. Export bypasses this slot
     //    so the on-disk render isn't tinted by the display look.
