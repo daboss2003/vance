@@ -683,6 +683,38 @@ export const generateImage = (args: {
     durationSeconds: args.durationSeconds ?? null
   });
 
+// ---- Phase 11: capabilities, settings, onboarding --------------------
+
+/** A detected tool/capability (FFmpeg, sidecars, optional AI runners). */
+export interface Capability {
+  id: string;
+  name: string;
+  present: boolean;
+  required: boolean;
+  hint: string;
+}
+
+/** Detect available tools for onboarding + diagnostics. */
+export const detectCapabilities = (): Promise<Capability[]> => invoke('detect_capabilities');
+
+/** Persisted app settings (first-run flag + privacy opt-ins). */
+export interface AppSettings {
+  first_run_complete: boolean;
+  crash_reports_opt_in: boolean;
+  telemetry_opt_in: boolean;
+  ai_provider: string | null;
+}
+
+/** Load app settings. */
+export const getAppSettings = (): Promise<AppSettings> => invoke('get_app_settings');
+
+/** Persist app settings; resolves to the stored value. */
+export const setAppSettings = (next: AppSettings): Promise<AppSettings> =>
+  invoke('set_app_settings', { new: next });
+
+/** Path to the local crash-log directory. */
+export const crashLogDir = (): Promise<string> => invoke('crash_log_dir');
+
 /** Override (or clear, by passing `null`) the input color space tag
  *  for a media library item. Phase 6.2. */
 export const setMediaInputColorSpace = (

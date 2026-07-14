@@ -9977,6 +9977,17 @@ fn locate_decoder_binary() -> Result<PathBuf, EngineError> {
     Err(EngineError::DecoderBinaryMissing(tried))
 }
 
+/// Phase 11 — presence of the bundled media sidecars, for the capability
+/// report: `(decoder, encoder, audio)`. Each is located the same way the
+/// engine locates it at runtime, so a positive here means it will spawn.
+pub(crate) fn sidecar_presence() -> (bool, bool, bool) {
+    (
+        locate_decoder_binary().is_ok(),
+        locate_encoder_binary().is_ok(),
+        locate_audio_binary().is_ok(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

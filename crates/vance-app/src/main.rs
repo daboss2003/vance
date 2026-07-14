@@ -11,7 +11,9 @@
 
 mod audio_bounce;
 mod cached_decode;
+mod capabilities;
 mod control;
+mod crash;
 mod engine;
 mod generate;
 mod peaks;
@@ -21,6 +23,7 @@ mod magicmask;
 mod proxy;
 mod publish;
 mod separate;
+mod settings;
 mod transcribe;
 
 use engine::{EngineHandle, MediaItemInfo, ProjectInfo, SequenceContents, SourceState, TrackSummary};
@@ -3352,6 +3355,36 @@ fn generate_image(
         .map_err(|e| e.to_string())
 }
 
+// ---- Phase 11: capabilities, settings, onboarding -------------------
+
+/// Detect available tools (FFmpeg, bundled sidecars, optional AI runners) for
+/// the onboarding wizard + diagnostics.
+#[tauri::command]
+fn detect_capabilities() -> Vec<capabilities::Capability> {
+    capabilities::detect()
+}
+
+/// The persisted app settings (first-run flag + privacy opt-ins).
+#[tauri::command]
+fn get_app_settings() -> settings::AppSettings {
+    settings::load()
+}
+
+/// Persist app settings. Returns the stored value.
+#[tauri::command]
+fn set_app_settings(new: settings::AppSettings) -> Result<settings::AppSettings, String> {
+    settings::save(&new).map_err(|e| format!("save settings: {e}"))?;
+    Ok(new)
+}
+
+/// Path to the local crash-log directory (for the Help ▸ Diagnostics link).
+#[tauri::command]
+fn crash_log_dir() -> Result<String, String> {
+    crash::crash_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .map_err(|e| format!("crash dir: {e}"))
+}
+
 // ---- GOAT-10: control surfaces (OSC / MIDI) --------------------------------
 
 /// `(osc_running, osc_port, midi_running, midi_name)`.
@@ -3539,6 +3572,10 @@ fn set_current_sequence(
 }
 
 fn main() {
+    // Phase 11 — capture panics to a local crash log before anything else,
+    // so even a startup panic leaves a report the user can find.
+    crash::install_panic_hook();
+
     // Phase 9.7 — when VANCE_TRACE_PATH is set we emit chrome trace
     // JSON to that path on top of the stderr fmt subscriber. Without
     // the env var, only the stderr subscriber runs (same as before).
@@ -3672,6 +3709,10 @@ fn main() {
             magic_mask,
             image_gen_available,
             generate_image,
+            detect_capabilities,
+            get_app_settings,
+            set_app_settings,
+            crash_log_dir,
             control_status,
             start_osc_control,
             stop_osc_control,

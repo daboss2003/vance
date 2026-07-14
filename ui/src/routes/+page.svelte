@@ -47,6 +47,16 @@
   import PublishPanel from '$lib/PublishPanel.svelte';
   import FusionPanel from '$lib/FusionPanel.svelte';
   import GeneratePanel from '$lib/GeneratePanel.svelte';
+  import OnboardingWizard from '$lib/OnboardingWizard.svelte';
+  import { getAppSettings } from '$lib/ipc';
+
+  // Phase 11 — show the first-run wizard until the user finishes/skips it.
+  let showOnboarding = $state(false);
+  $effect(() => {
+    void getAppSettings()
+      .then((s) => (showOnboarding = !s.first_run_complete))
+      .catch(() => {});
+  });
   import TransitionInspector from '$lib/TransitionInspector.svelte';
   import ColorWheel from '$lib/color/ColorWheel.svelte';
   import CurveEditor from '$lib/color/CurveEditor.svelte';
@@ -1311,6 +1321,10 @@
     }
   }
 </script>
+
+{#if showOnboarding}
+  <OnboardingWizard onDone={() => (showOnboarding = false)} />
+{/if}
 
 <div class="flex h-screen flex-col">
   <!-- Header -->
