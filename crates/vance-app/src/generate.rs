@@ -163,22 +163,63 @@ fn default_sd_args(model: &Path, req: &GenRequest) -> Vec<String> {
 /// Substitute placeholders in one template token. Returns `None` to DROP the
 /// token when it reduces to an empty string (e.g. a lone `{negative}` with no
 /// negative prompt), so an optional argument disappears cleanly.
+///
+/// SINGLE-PASS over the ORIGINAL token: a substituted value is written to the
+/// output and never re-scanned, so a `{seed}`/`{out}` that happens to appear
+/// literally inside the user's prompt text is NOT re-expanded (that would
+/// mangle the prompt or leak the internal output path into it). Unknown
+/// `{...}` names are left verbatim.
 fn substitute(token: &str, req: &GenRequest) -> Option<String> {
     let neg = req.negative.clone().unwrap_or_default();
     let seed = req.seed.map(|s| s.to_string()).unwrap_or_else(|| "-1".to_string());
     let steps = req.steps.unwrap_or(20).to_string();
-    let out = token
-        .replace("{prompt}", &req.prompt)
-        .replace("{negative}", &neg)
-        .replace("{width}", &req.width.to_string())
-        .replace("{height}", &req.height.to_string())
-        .replace("{steps}", &steps)
-        .replace("{seed}", &seed)
-        .replace("{out}", &req.out_path.to_string_lossy());
-    if out.is_empty() {
+    let width = req.width.to_string();
+    let height = req.height.to_string();
+    let out = req.out_path.to_string_lossy();
+
+    let mut result = String::with_capacity(token.len());
+    let mut rest = token;
+    while let Some(open) = rest.find('{') {
+        result.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        match after.find('}') {
+            Some(close) => {
+                let name = &after[..close];
+                let value: Option<&str> = match name {
+                    "prompt" => Some(&req.prompt),
+                    "negative" => Some(&neg),
+                    "width" => Some(&width),
+                    "height" => Some(&height),
+                    "steps" => Some(&steps),
+                    "seed" => Some(&seed),
+                    "out" => Some(&out),
+                    _ => None,
+                };
+                match value {
+                    Some(v) => {
+                        result.push_str(v);
+                        rest = &after[close + 1..];
+                    }
+                    None => {
+                        // Unknown placeholder — keep the literal `{` and rescan
+                        // from just after it.
+                        result.push('{');
+                        rest = after;
+                    }
+                }
+            }
+            None => {
+                // No closing brace — keep `{` literally and stop scanning.
+                result.push('{');
+                rest = after;
+            }
+        }
+    }
+    result.push_str(rest);
+    if result.is_empty() {
         None
     } else {
-        Some(out)
+        Some(result)
     }
 }
 
@@ -282,6 +323,23 @@ mod tests {
         assert_eq!(substitute("{seed}", &r).as_deref(), Some("42"));
         // Absent negative → the token drops entirely.
         assert_eq!(substitute("{negative}", &r), None);
+    }
+
+    #[test]
+    fn prompt_placeholders_are_not_re_expanded() {
+        // Review fix: a {seed}/{out} literally inside the prompt must survive
+        // verbatim — substitution is single-pass over the original token.
+        let mut r = req();
+        r.prompt = "a photo at {seed} dpi near {out}".into();
+        assert_eq!(
+            substitute("{prompt}", &r).as_deref(),
+            Some("a photo at {seed} dpi near {out}"),
+            "user prompt content must not be re-scanned for placeholders"
+        );
+        // Unknown placeholders are left verbatim.
+        assert_eq!(substitute("{init}", &r).as_deref(), Some("{init}"));
+        // Unterminated brace is kept literally.
+        assert_eq!(substitute("{prompt", &r).as_deref(), Some("{prompt"));
     }
 
     #[test]
