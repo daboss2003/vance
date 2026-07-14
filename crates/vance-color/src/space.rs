@@ -124,6 +124,16 @@ impl ColorSpace {
         // simple matrix-and-power; the OCIO path (6.1b) handles them.
         !matches!(self, Rec2020Pq | Rec2020Hlg | Acescct)
     }
+
+    /// Built-in support for this space as an ENCODE (output) target. The
+    /// shader gained forward PQ/HLG OETFs (HDR export), so Rec.2020 PQ/HLG
+    /// are valid OUTPUTs even though they remain unsupported as INPUTs
+    /// (there's no built-in PQ/HLG *decode* in `linearize`). ACEScct (a log
+    /// grading space) is still OCIO-only.
+    pub fn is_builtin_output_supported(self) -> bool {
+        use ColorSpace::*;
+        !matches!(self, Acescct)
+    }
 }
 
 #[cfg(test)]

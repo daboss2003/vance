@@ -69,9 +69,12 @@ impl Pipeline {
     /// ACEScct) and the `ocio` feature is off — the engine then
     /// falls back to OCIO or surfaces a clear error.
     pub fn to_params(&self) -> Option<PipelineParams> {
+        // Input + working must be built-in DECODE-able (no PQ/HLG decode in
+        // the shader); the output may additionally be Rec.2020 PQ/HLG since
+        // the shader now has forward PQ/HLG OETFs (HDR export).
         if !self.input.is_builtin_supported()
             || !self.working.is_builtin_supported()
-            || !self.output.is_builtin_supported()
+            || !self.output.is_builtin_output_supported()
         {
             return None;
         }
@@ -123,6 +126,22 @@ mod tests {
         assert_eq!(params.output_transfer, transfer_id(TransferFunction::Srgb));
         assert_eq!(params.input_to_working, Transform::IDENTITY);
         assert_eq!(params.working_to_output, Transform::IDENTITY);
+    }
+
+    #[test]
+    fn rec2020_pq_output_resolves_with_pq_transfer() {
+        // HDR export: Rec.709 input, Linear Rec.709 working, Rec.2020 PQ
+        // output now produces params (the shader encodes PQ), with a
+        // 709→2020 primaries matrix and output transfer id 4 (PQ).
+        let p = Pipeline {
+            input: ColorSpace::Rec709Limited,
+            working: ColorSpace::LinearRec709,
+            output: ColorSpace::Rec2020Pq,
+        };
+        let params = p.to_params().expect("Rec.2020 PQ output is now built-in-encodable");
+        assert_eq!(params.output_transfer, transfer_id(TransferFunction::Pq));
+        // 709 → 2020 primaries is NOT identity.
+        assert_ne!(params.working_to_output, Transform::IDENTITY);
     }
 
     #[test]
