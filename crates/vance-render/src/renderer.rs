@@ -97,8 +97,13 @@ pub struct Renderer {
     /// (width, height) of the currently-allocated A-side Y texture;
     /// `None` if no frame has been uploaded yet.
     plane_dims_a: Option<(u32, u32)>,
-    /// Whether the A-side plane textures are `R16Unorm` (10-bit source) vs
-    /// `R8Unorm` (8-bit). Drives re-allocation when the bit depth changes.
+    /// Whether the device enabled `TEXTURE_FORMAT_16BIT_NORM` (needed for
+    /// R16Unorm 10-bit plane textures). When false, a 10-bit source falls
+    /// back to 8-bit R8 planes (down-shifted) instead of crashing — the
+    /// feature is native-only and absent on some Vulkan/GL adapters.
+    supports_r16: bool,
+    /// Whether the A-side plane textures are `R16Unorm` (10-bit source, and
+    /// the GPU supports it) vs `R8Unorm`. Drives re-allocation on change.
     plane_hi_a: bool,
     tex_y_a: Option<wgpu::Texture>,
     tex_u_a: Option<wgpu::Texture>,
@@ -954,6 +959,11 @@ impl Renderer {
         });
         queue.write_buffer(&params_buffer, 0, bytemuck::cast_slice(&[initial_params]));
 
+        // Capture before `device` moves into the struct below.
+        let supports_r16 = device
+            .features()
+            .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
+
         Ok(Self {
             adapter,
             device,
@@ -962,6 +972,7 @@ impl Renderer {
             target_format: cfg.target_format,
             bind_group_layout,
             sampler,
+            supports_r16,
             plane_dims_a: None,
             plane_hi_a: false,
             plane_hi_b: false,
@@ -1821,25 +1832,30 @@ impl Renderer {
         }
 
         let is_10bit = frame.pixel_format == PixelFormat::Yuv420P10Le;
+        // Use R16Unorm planes only when the source is 10-bit AND the GPU
+        // supports 16-bit-norm textures; otherwise a 10-bit source is
+        // down-shifted into 8-bit R8 planes below (graceful, 8-bit precision).
+        let use_r16 = is_10bit && self.supports_r16;
         let needs_alloc = if b_side {
-            self.plane_dims_b != Some((w, h)) || self.plane_hi_b != is_10bit
+            self.plane_dims_b != Some((w, h)) || self.plane_hi_b != use_r16
         } else {
-            self.plane_dims_a != Some((w, h)) || self.plane_hi_a != is_10bit
+            self.plane_dims_a != Some((w, h)) || self.plane_hi_a != use_r16
         };
         if needs_alloc {
-            self.allocate_plane_textures(w, h, b_side, is_10bit);
+            self.allocate_plane_textures(w, h, b_side, use_r16);
             if b_side {
                 self.plane_dims_b = Some((w, h));
-                self.plane_hi_b = is_10bit;
+                self.plane_hi_b = use_r16;
             } else {
                 self.plane_dims_a = Some((w, h));
-                self.plane_hi_a = is_10bit;
+                self.plane_hi_a = use_r16;
             }
         }
-        // Tell the shader how to normalize this side's samples: a 10-bit
-        // R16Unorm sample is code/65535, so ×65535/1023 recovers code/1023
-        // (the 8-bit-equivalent normalized value the expansion expects).
-        let scale = if is_10bit { 65535.0 / 1023.0 } else { 1.0 };
+        // Tell the shader how to normalize this side's samples: an R16Unorm
+        // 10-bit sample is code/65535, so ×65535/1023 recovers code/1023 (the
+        // 8-bit-equivalent value). The 8-bit path (native or downshifted) is
+        // already code/255, so scale 1.0.
+        let scale = if use_r16 { 65535.0 / 1023.0 } else { 1.0 };
         self.set_sample_scale(scale, b_side);
 
         let chroma_w = w.div_ceil(2);
@@ -1870,16 +1886,29 @@ impl Renderer {
                 self.write_plane(tex_v, chroma_w, chroma_h, v_bytes, 1);
             }
             PixelFormat::Yuv420P10Le => {
-                // 2 bytes/sample; planes are R16Unorm. Bytes are native
-                // little-endian u16 (matches R16Unorm's expected layout),
-                // copied straight through.
                 let y_size = (w * h) as usize * 2;
                 let chroma_size = (chroma_w * chroma_h) as usize * 2;
                 let (y_bytes, rest) = frame.bytes.split_at(y_size);
                 let (u_bytes, v_bytes) = rest.split_at(chroma_size);
-                self.write_plane(tex_y, w, h, y_bytes, 2);
-                self.write_plane(tex_u, chroma_w, chroma_h, u_bytes, 2);
-                self.write_plane(tex_v, chroma_w, chroma_h, v_bytes, 2);
+                if use_r16 {
+                    // 2 bytes/sample → R16Unorm planes. The little-endian u16
+                    // bytes match R16Unorm's layout, copied straight through.
+                    self.write_plane(tex_y, w, h, y_bytes, 2);
+                    self.write_plane(tex_u, chroma_w, chroma_h, u_bytes, 2);
+                    self.write_plane(tex_v, chroma_w, chroma_h, v_bytes, 2);
+                } else {
+                    // Fallback (GPU lacks 16-bit-norm): down-shift 10→8 bit
+                    // into R8 planes. 8-bit precision, but the clip plays
+                    // instead of crashing. sample_scale is 1.0 here.
+                    let down = |src: &[u8]| -> Vec<u8> {
+                        src.chunks_exact(2)
+                            .map(|c| (u16::from_le_bytes([c[0], c[1]]) >> 2) as u8)
+                            .collect()
+                    };
+                    self.write_plane(tex_y, w, h, &down(y_bytes), 1);
+                    self.write_plane(tex_u, chroma_w, chroma_h, &down(u_bytes), 1);
+                    self.write_plane(tex_v, chroma_w, chroma_h, &down(v_bytes), 1);
+                }
             }
             PixelFormat::Nv12 => {
                 let y_size = (w * h) as usize;
@@ -2548,9 +2577,11 @@ fn create_r8_texture(device: &wgpu::Device, w: u32, h: u32, label: &str) -> wgpu
 }
 
 /// A single-channel 16-bit-unorm plane texture (for 10-bit YUV sources).
-/// R16Unorm is a filterable-float format in the WebGPU baseline, so it binds
-/// through the same `texture_2d<f32>` layout as R8Unorm and needs no device
-/// feature.
+/// R16Unorm samples as filterable f32, so it binds through the same
+/// `texture_2d<f32>` layout as R8Unorm — but it is a NATIVE-only format
+/// gated by `Features::TEXTURE_FORMAT_16BIT_NORM` (NOT in the WebGPU
+/// baseline). Callers must only reach this when `Renderer::supports_r16` is
+/// true; the 8-bit fallback in `upload_frame` handles adapters without it.
 fn create_r16_texture(device: &wgpu::Device, w: u32, h: u32, label: &str) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
