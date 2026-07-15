@@ -16,6 +16,10 @@ fn hdr_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../vance-decoder/tests/fixtures/hdr10_320x240_2s.mp4")
 }
+fn hlg_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../vance-decoder/tests/fixtures/hlg_320x240_2s.mp4")
+}
 
 fn tool(n: &str) -> bool {
     Command::new(n).arg("-version").output().is_ok()
@@ -119,4 +123,31 @@ fn hdr10_source_decodes_autotags_and_exports_hdr10() {
     assert_eq!(probe(&out, "color_transfer"), "smpte2084", "output must be PQ-tagged");
     assert_eq!(probe(&out, "color_primaries"), "bt2020", "output must be Rec.2020-tagged");
     let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn hlg_source_decodes_and_autotags() {
+    if !tool("ffmpeg") || !tool("ffprobe") || !sidecars_present() {
+        eprintln!("ffmpeg/ffprobe/sidecars absent — skipping HLG e2e");
+        return;
+    }
+    let fixture = hlg_fixture();
+    if !fixture.exists() {
+        eprintln!("HLG fixture missing — skipping");
+        return;
+    }
+    assert_eq!(probe(&fixture, "color_transfer"), "arib-std-b67", "fixture must be HLG");
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    std::env::set_current_dir(&workspace_root).expect("chdir");
+    let mut engine = Engine::default();
+    engine.new_project("hlg".into()).unwrap();
+    // A 10-bit HLG source imports and auto-tags Rec.2020 HLG.
+    let media = engine
+        .import_media_file(&fixture.canonicalize().unwrap().to_string_lossy())
+        .expect("HLG source must import");
+    assert_eq!(
+        media.input_color_space.as_deref(),
+        Some("rec2020-hlg"),
+        "HLG source must auto-tag Rec.2020 HLG"
+    );
 }
