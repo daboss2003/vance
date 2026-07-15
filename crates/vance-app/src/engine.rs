@@ -8998,8 +8998,12 @@ impl Engine {
             let frame_rate_den = fr_r.denom() as u32;
             (frame_rate_num, frame_rate_den, seq_duration)
         };
-        let width = opts.width.unwrap_or(1920);
-        let height = opts.height.unwrap_or(1080);
+        // Round output dimensions DOWN to even: 4:2:0 codecs (H.264 / HEVC /
+        // AV1) require even width AND height for their subsampled chroma
+        // planes, and even the synthetic YUV path crops to even. Clamp to a
+        // minimum of 2 so a tiny/odd request still yields a valid frame.
+        let width = (opts.width.unwrap_or(1920) & !1).max(2);
+        let height = (opts.height.unwrap_or(1080) & !1).max(2);
         let start_s = opts.start_seconds.unwrap_or(0.0).max(0.0);
         let end_s = opts.end_seconds.unwrap_or(seq_duration).min(seq_duration);
         if end_s <= start_s {
