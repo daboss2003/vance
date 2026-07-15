@@ -79,6 +79,39 @@ fn odd_dimensions_export_crops_to_even() {
 }
 
 #[test]
+fn audio_only_file_imports_via_audio_decoder() {
+    if !tool("ffmpeg") || !sidecars_present() {
+        eprintln!("ffmpeg/sidecars absent — skipping audio import");
+        return;
+    }
+    chdir_root();
+    // Generate a real stereo tone at runtime (no committed asset).
+    let wav = std::env::temp_dir().join(format!("vance-tone-{}.wav", std::process::id()));
+    let _ = std::fs::remove_file(&wav);
+    let made = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+               "sine=frequency=440:duration=1", "-ac", "2", "-ar", "48000"])
+        .arg(&wav)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !made {
+        eprintln!("ffmpeg could not make the tone — skipping");
+        return;
+    }
+    let mut e = Engine::default();
+    e.new_project("a".into()).unwrap();
+    // The audio-only import path uses the AUDIO decoder sidecar (the video
+    // decoder would reject a stream with no video).
+    let info = e
+        .import_audio_file(&wav.canonicalize().unwrap().to_string_lossy())
+        .expect("audio-only file must import via the audio decoder");
+    assert_eq!(info.kind, "audio", "must register as audio-kind media");
+    assert!(info.duration_seconds > 0.5, "duration probed: {}", info.duration_seconds);
+    let _ = std::fs::remove_file(&wav);
+}
+
+#[test]
 fn captions_srt_and_vtt_round_trip_tricky_text() {
     let mut e = Engine::default();
     e.new_project("x".into()).unwrap();
