@@ -12,27 +12,46 @@ bundler** (`tauri build`) per platform, orchestrated in CI, with
 [`cargo-dist`](https://opensource.axo.dev/cargo-dist/) driving the release
 workflow and the auto-updater artifacts.
 
+Wrap the bundler with **`cargo xtask bundle`** — it stages the out-of-process
+sidecars (`externalBin`) and applies the release bundle overlay before calling
+`tauri build`. A raw `tauri build` alone would emit a sidecar-less app. The
+bundling architecture (base vs. overlay config, sidecar staging, and the
+optional AI-tools install flow) is documented in [INSTALLER.md](INSTALLER.md).
+
 | Platform | Installer | Produced by |
 | --- | --- | --- |
-| macOS | `.dmg` (universal: `x86_64` + `aarch64`) | `tauri build --target universal-apple-darwin` |
-| Windows | `.msi` + updater | `tauri build` (WiX) |
-| Linux | `.AppImage` (primary), `.deb`, `.rpm` | `tauri build` |
+| macOS | `.dmg` (universal: `x86_64` + `aarch64`) | `cargo xtask bundle --target universal-apple-darwin` |
+| Windows | `.exe` (NSIS) + updater | `cargo xtask bundle` |
+| Linux | `.AppImage` (primary), `.deb`, `.rpm` | `cargo xtask bundle` |
 
 ## Buildable now (no external accounts)
 
 1. **Bump the version** in `[workspace.package] version` and the Tauri
    `tauri.conf.json` `version`.
-2. **Build the UI**: `cd ui && npm ci && npm run build`.
-3. **Build installers** per platform on that platform's runner:
-   - macOS: `cargo tauri build --target universal-apple-darwin`
-   - Windows: `cargo tauri build`
-   - Linux: `cargo tauri build`
+2. **Icons** (once / when branding changes): generate the icon set from a
+   1024×1024 master — `cargo tauri icon path/to/master.png` — replacing the
+   placeholder `crates/vance-app/icons/`.
+3. **Build installers** per platform on that platform's runner (needs the Tauri
+   CLI: `cargo install tauri-cli --version '^2'`). `cargo xtask bundle` builds
+   the UI, stages the sidecars, and runs `tauri build` with the overlay:
+   - macOS: `cargo xtask bundle --target universal-apple-darwin`
+   - Windows: `cargo xtask bundle`
+   - Linux: `cargo xtask bundle`
 4. **Codec pack**: build `vance-plugin-host` / GPL-encoder artifacts as a
    separate, independently-versioned bundle so it can update on its own.
 5. **User manual**: `mdbook build docs/manual` → static site to publish.
 
 Unsigned installers work locally and for testing. The steps above require no
-secrets.
+secrets. Verified: `cargo xtask bundle --bundles app` produces a working
+`Vance.app` with all four sidecars embedded.
+
+### Optional AI tools
+
+The installers wire an "add the optional AI tools?" prompt to the same
+`vance-app --install-ai-tools` primitive the in-app panel uses (Windows via the
+NSIS hook; macOS/Linux via first-run onboarding). Nothing needs hosting except
+the `sd` model download — see [INSTALLER.md](INSTALLER.md) and
+[tools-manifest.example.json](tools-manifest.example.json).
 
 ## Gated — requires your accounts / certificates / hosting
 
@@ -57,6 +76,10 @@ These cannot be done from the source tree alone. Provide them as CI secrets.
   env var; the local reporter already captures the panic.
 - **Telemetry endpoint** (optional) — opt-in, aggregate, no PII. Needs an
   ingestion endpoint you host; the opt-in flag already exists in settings.
+- **AI-tools `sd` download** (optional) — a `VANCE_TOOLS_MANIFEST_URL` serving
+  the manifest, plus a chosen stable-diffusion model whose license permits the
+  use. URLs may point upstream (GitHub/Hugging Face); the pip-based tools
+  (whisper/demucs/backgroundremover) need nothing hosted. See INSTALLER.md.
 
 ## cargo-dist
 

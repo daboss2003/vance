@@ -6,8 +6,23 @@ your OS and run it.
 | Platform | Installer | Notes |
 | --- | --- | --- |
 | macOS | `.dmg` (universal: Intel + Apple Silicon) | Drag Vance to Applications. |
-| Windows | `.msi` | Includes the auto-updater. |
+| Windows | `.exe` (NSIS) | Per-user install; includes the auto-updater. |
 | Linux | `.AppImage` (primary), plus `.deb` / `.rpm` / Flatpak | Mark the AppImage executable and run it. |
+
+## Optional AI tools
+
+Captions (speech-to-text), voice isolation, subject masking, and generative
+images are **optional** add-ons. Vance installs and manages them for you into
+its own per-user folder — nothing else on your system changes.
+
+- The Windows installer **asks** whether to add them during setup.
+- On macOS/Linux, the **first-run wizard** asks.
+- Either way you can skip it and add or remove them **any time** from the
+  **AI tools** panel inside the editor.
+
+Three of the four install via `pip` (they need Python 3 on your system);
+generative images additionally downloads a model. The editor works fully
+without any of them.
 
 ## FFmpeg
 

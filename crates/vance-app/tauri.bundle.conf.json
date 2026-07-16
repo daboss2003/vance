@@ -1,0 +1,47 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeBuildCommand": ""
+  },
+  "bundle": {
+    "active": true,
+    "category": "Video",
+    "publisher": "Vance",
+    "copyright": "Copyright © 2026 the Vance authors",
+    "shortDescription": "Fast, cross-platform video editor",
+    "longDescription": "Vance is a fast, cross-platform non-linear video editor: edit, grade, mix, caption, composite (Fusion node graph), and export to ProRes/DNxHR/H.264/HEVC/AV1 — with optional, on-demand AI helpers for captions, voice isolation, subject masking, and generative images.",
+    "licenseFile": "../../LICENSE-APACHE",
+    "externalBin": [
+      "binaries/vance-decoder",
+      "binaries/vance-encoder",
+      "binaries/vance-audio-decoder",
+      "binaries/vance-plugin-host"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "10.15",
+      "hardenedRuntime": true,
+      "entitlements": "macos/entitlements.plist",
+      "signingIdentity": null,
+      "dmg": {
+        "windowSize": { "width": 660, "height": 400 },
+        "appPosition": { "x": 180, "y": 170 },
+        "applicationFolderPosition": { "x": 480, "y": 170 }
+      }
+    },
+    "windows": {
+      "webviewInstallMode": { "type": "downloadBootstrapper" },
+      "nsis": {
+        "installerHooks": "windows/installer.nsh",
+        "installMode": "currentUser"
+      }
+    },
+    "linux": {
+      "deb": {
+        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0"]
+      },
+      "appimage": {
+        "bundleMediaFramework": true
+      }
+    }
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "sd": {
+    "macos-aarch64": [
+      {
+        "url": "https://example.com/vance/sd/macos-aarch64/sd",
+        "sha256": "FILL_ME_IN_sha256_of_the_sd_binary",
+        "dest": "bin/sd"
+      },
+      {
+        "url": "https://example.com/vance/sd/models/sd-model.gguf",
+        "sha256": "FILL_ME_IN_sha256_of_the_model_weights",
+        "dest": "models/sd-model.gguf"
+      }
+    ],
+    "macos-x86_64": [
+      {
+        "url": "https://example.com/vance/sd/macos-x86_64/sd",
+        "sha256": "FILL_ME_IN",
+        "dest": "bin/sd"
+      },
+      {
+        "url": "https://example.com/vance/sd/models/sd-model.gguf",
+        "sha256": "FILL_ME_IN",
+        "dest": "models/sd-model.gguf"
+      }
+    ],
+    "linux-x86_64": [
+      {
+        "url": "https://example.com/vance/sd/linux-x86_64/sd",
+        "sha256": "FILL_ME_IN",
+        "dest": "bin/sd"
+      },
+      {
+        "url": "https://example.com/vance/sd/models/sd-model.gguf",
+        "sha256": "FILL_ME_IN",
+        "dest": "models/sd-model.gguf"
+      }
+    ],
+    "windows-x86_64": [
+      {
+        "url": "https://example.com/vance/sd/windows-x86_64/sd.exe",
+        "sha256": "FILL_ME_IN",
+        "dest": "bin/sd.exe"
+      },
+      {
+        "url": "https://example.com/vance/sd/models/sd-model.gguf",
+        "sha256": "FILL_ME_IN",
+        "dest": "models/sd-model.gguf"
+      }
+    ]
+  }
+}

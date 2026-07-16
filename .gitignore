@@ -32,5 +32,9 @@ Thumbs.db
 src-tauri/target/
 src-tauri/gen/
 
+# Phase 11 staged sidecars for `externalBin` bundling (built by
+# `cargo xtask stage-sidecars`; regenerated per target, never committed).
+crates/vance-app/binaries/
+
 # Phase 10 sample plugin build artifacts
 plugins/*/target/

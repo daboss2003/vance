@@ -50,7 +50,11 @@ pub fn venv_bin_dir() -> std::io::Result<PathBuf> {
 }
 /// The venv's own Python interpreter, if the venv has been created.
 fn venv_python() -> Option<PathBuf> {
-    let name = if cfg!(windows) { "python.exe" } else { "python" };
+    let name = if cfg!(windows) {
+        "python.exe"
+    } else {
+        "python"
+    };
     let p = venv_bin_dir().ok()?.join(name);
     p.is_file().then_some(p)
 }
@@ -297,10 +301,13 @@ pub struct Artifact {
     pub dest: String,
 }
 
-/// The manifest: `{ "<tool_id>": { "<platform>": Artifact, ... }, ... }`.
+/// The manifest: `{ "<tool_id>": { "<platform>": [Artifact, ...], ... }, ... }`.
 /// Platform keys are `os-arch`, e.g. `macos-aarch64`, `linux-x86_64`,
-/// `windows-x86_64`.
-pub type Manifest = std::collections::BTreeMap<String, std::collections::BTreeMap<String, Artifact>>;
+/// `windows-x86_64`. Each (tool, platform) maps to a LIST of artifacts so a
+/// tool that needs several files installs atomically — e.g. `sd` ships both its
+/// `bin/sd` executable and its `models/sd-model.gguf` weights.
+pub type Manifest =
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<Artifact>>>;
 
 /// The current platform key used to select a manifest artifact.
 pub fn platform_key() -> String {
@@ -323,11 +330,15 @@ pub fn platform_key() -> String {
 pub fn fetch_manifest() -> Result<Manifest, InstallError> {
     let url = std::env::var("VANCE_TOOLS_MANIFEST_URL").map_err(|_| InstallError::NoSource)?;
     let client = http_client()?;
-    let resp = client.get(&url).send().map_err(|e| InstallError::Http(e.to_string()))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .map_err(|e| InstallError::Http(e.to_string()))?;
     if !resp.status().is_success() {
         return Err(InstallError::Http(format!("manifest {}", resp.status())));
     }
-    resp.json::<Manifest>().map_err(|e| InstallError::Http(e.to_string()))
+    resp.json::<Manifest>()
+        .map_err(|e| InstallError::Http(e.to_string()))
 }
 
 /// Install `tool` into Vance's managed tools dir, picking the right method:
@@ -382,9 +393,15 @@ fn install_via_pip(tool: Tool, package: &str) -> Result<PathBuf, InstallError> {
 
 /// Build a `Pip` error from a failed process, prefixing the phase.
 fn pip_err(phase: &str, out: &std::process::Output) -> InstallError {
-    let mut stderr: String = String::from_utf8_lossy(&out.stderr).chars().take(2000).collect();
+    let mut stderr: String = String::from_utf8_lossy(&out.stderr)
+        .chars()
+        .take(2000)
+        .collect();
     if stderr.trim().is_empty() {
-        stderr = String::from_utf8_lossy(&out.stdout).chars().take(2000).collect();
+        stderr = String::from_utf8_lossy(&out.stdout)
+            .chars()
+            .take(2000)
+            .collect();
     }
     InstallError::Pip {
         code: out.status.code(),
@@ -392,35 +409,58 @@ fn pip_err(phase: &str, out: &std::process::Output) -> InstallError {
     }
 }
 
-/// Download + verify + place the native-binary/model artifact for `tool` on
-/// this platform into the managed tools dir. Returns the installed path.
+/// Download + verify + place every native-binary/model artifact for `tool` on
+/// this platform into the managed tools dir. Returns the installed executable
+/// path (a tool with only model artifacts resolves via its bin still).
 fn install_via_manifest(tool: Tool) -> Result<PathBuf, InstallError> {
     let manifest = fetch_manifest()?;
-    let entry = manifest
+    let artifacts = manifest
         .get(tool.id())
         .and_then(|p| p.get(&platform_key()))
+        .filter(|a| !a.is_empty())
         .ok_or_else(|| InstallError::NotInManifest(tool.id().into()))?;
     let client = http_client()?;
+    let mut last_bin: Option<PathBuf> = None;
+    for art in artifacts {
+        let dest = place_artifact(&client, art)?;
+        if art.dest.starts_with("bin/") {
+            last_bin = Some(dest);
+        }
+    }
+    // Prefer the tool's resolvable executable; fall back to a placed bin/ dest.
+    resolve(tool.bin_name())
+        .or(last_bin)
+        .ok_or_else(|| InstallError::MissingAfterInstall(tool.id().into()))
+}
+
+/// Download one artifact, verify its sha256, and atomically place it under the
+/// (sandboxed) managed tools dir. Returns the final path.
+fn place_artifact(
+    client: &reqwest::blocking::Client,
+    art: &Artifact,
+) -> Result<PathBuf, InstallError> {
     let resp = client
-        .get(&entry.url)
+        .get(&art.url)
         .send()
         .map_err(|e| InstallError::Http(e.to_string()))?;
     if !resp.status().is_success() {
-        return Err(InstallError::Http(format!("{} {}", entry.url, resp.status())));
+        return Err(InstallError::Http(format!("{} {}", art.url, resp.status())));
     }
-    let bytes = resp.bytes().map_err(|e| InstallError::Http(e.to_string()))?;
-    verify_sha256(&bytes, &entry.sha256)?;
+    let bytes = resp
+        .bytes()
+        .map_err(|e| InstallError::Http(e.to_string()))?;
+    verify_sha256(&bytes, &art.sha256)?;
 
-    // Place under the managed tools dir; only `bin/` and `models/` are allowed
-    // dests (guards against a manifest writing outside the sandbox).
-    let dest = safe_dest(&entry.dest)?;
+    // Only `bin/` and `models/` are allowed dests (guards against a manifest
+    // writing outside the sandbox).
+    let dest = safe_dest(&art.dest)?;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = dest.with_extension("part");
     std::fs::write(&tmp, &bytes)?;
     #[cfg(unix)]
-    if entry.dest.starts_with("bin/") {
+    if art.dest.starts_with("bin/") {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
     }
@@ -458,6 +498,139 @@ fn http_client() -> Result<reqwest::blocking::Client, InstallError> {
         .timeout(std::time::Duration::from_secs(1800)) // large model downloads
         .build()
         .map_err(|e| InstallError::Http(e.to_string()))
+}
+
+// ---------------------------------------------------------------------
+// Headless CLI (installer postinstall hooks + power users)
+// ---------------------------------------------------------------------
+
+/// Handle the headless AI-tool subcommands. This is the single primitive every
+/// OS installer's postinstall step drives (`vance-app --install-ai-tools all`),
+/// so a native yes/no prompt in the installer maps to the exact same
+/// `tools::install` path the in-app "AI tools" panel uses.
+///
+/// Returns `Some(exit_code)` when it recognized and handled a subcommand — the
+/// caller MUST then exit without starting the GUI — or `None` to fall through
+/// to the normal window launch (so a plain double-click / OS-passed args still
+/// open the editor).
+///
+/// Recognized flags (scanned anywhere in argv):
+/// * `--list-ai-tools`       — print the catalog + install method, exit 0.
+/// * `--ai-tools-status`     — print status as JSON, exit 0.
+/// * `--install-ai-tools [all|id,id,…]` — install the given tools (default
+///   `all`); exit 0 only if every requested tool ends up ready.
+pub fn handle_cli(args: &[String]) -> Option<i32> {
+    let rest = args.get(1..).unwrap_or(&[]);
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--list-ai-tools" => {
+                print_catalog();
+                return Some(0);
+            }
+            "--ai-tools-status" => {
+                match serde_json::to_string_pretty(&status()) {
+                    Ok(j) => println!("{j}"),
+                    Err(e) => {
+                        eprintln!("vance: serializing status: {e}");
+                        return Some(1);
+                    }
+                }
+                return Some(0);
+            }
+            "--install-ai-tools" => {
+                // The optional value is the next arg unless it's another flag.
+                let spec = rest
+                    .get(i + 1)
+                    .map(|s| s.as_str())
+                    .filter(|s| !s.starts_with('-'))
+                    .unwrap_or("all");
+                return Some(install_cli(spec));
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Parse an `--install-ai-tools` selector into the concrete tool list.
+/// `all` → every catalog tool; otherwise a comma/space separated list of ids.
+fn parse_selector(spec: &str) -> Result<Vec<Tool>, String> {
+    let spec = spec.trim();
+    if spec.is_empty() || spec.eq_ignore_ascii_case("all") {
+        return Ok(Tool::all().to_vec());
+    }
+    let mut out = Vec::new();
+    for id in spec.split([',', ' ']).filter(|s| !s.is_empty()) {
+        match Tool::from_id(id) {
+            Some(t) if !out.contains(&t) => out.push(t),
+            Some(_) => {}
+            None => {
+                return Err(format!(
+                    "unknown AI tool '{id}' (known: whisper, demucs, backgroundremover, sd)"
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn print_catalog() {
+    println!("Optional AI tools:");
+    for t in Tool::all() {
+        println!("  {:<18} {:<8} {}", t.id(), t.install_method(), t.label());
+    }
+    println!(
+        "\nInstall:  vance-app --install-ai-tools all\n\
+         Or a subset:  vance-app --install-ai-tools whisper,demucs\n\
+         Status (JSON):  vance-app --ai-tools-status"
+    );
+}
+
+/// Run the headless install for a selector, printing progress. Returns a
+/// process exit code (0 = every requested tool ready, 1 = a failure).
+fn install_cli(spec: &str) -> i32 {
+    let tools = match parse_selector(spec) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("vance: {e}");
+            return 2;
+        }
+    };
+    // Fail fast with an actionable message if a pip tool is requested but no
+    // system Python exists to bootstrap the managed venv.
+    let needs_python = tools.iter().any(|t| t.pip_package().is_some());
+    if needs_python && !python_available() {
+        eprintln!(
+            "vance: Python 3 is required to install the pip-based tools \
+             (whisper / demucs / backgroundremover) but was not found on PATH. \
+             Install Python 3, then rerun."
+        );
+        // Don't hard-abort: a caller asking for `all` may still get `sd`.
+    }
+    let mut failures = 0;
+    for t in &tools {
+        println!(
+            "vance: installing {} ({}, via {})…",
+            t.id(),
+            t.label(),
+            t.install_method()
+        );
+        match install(*t) {
+            Ok(path) => println!("vance:   ✓ {} → {}", t.id(), path.display()),
+            Err(e) => {
+                eprintln!("vance:   ✗ {} failed: {e}", t.id());
+                failures += 1;
+            }
+        }
+    }
+    if failures == 0 {
+        println!("vance: done — {} tool(s) ready.", tools.len());
+        0
+    } else {
+        eprintln!("vance: {failures} tool(s) failed to install.");
+        1
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -560,5 +733,43 @@ mod tests {
         if let (Ok(root), Ok(vbin)) = (tools_dir(), venv_bin_dir()) {
             assert!(vbin.starts_with(&root));
         }
+    }
+
+    #[test]
+    fn selector_parsing() {
+        assert_eq!(parse_selector("all").unwrap().len(), 4);
+        assert_eq!(parse_selector("").unwrap().len(), 4);
+        assert_eq!(parse_selector("ALL").unwrap().len(), 4);
+        assert_eq!(parse_selector("whisper").unwrap(), vec![Tool::Whisper]);
+        assert_eq!(
+            parse_selector("whisper,sd").unwrap(),
+            vec![Tool::Whisper, Tool::StableDiffusion]
+        );
+        // De-dupes and accepts space separators.
+        assert_eq!(parse_selector("demucs demucs").unwrap(), vec![Tool::Demucs]);
+        assert!(parse_selector("nope").is_err());
+    }
+
+    #[test]
+    fn handle_cli_only_intercepts_known_flags() {
+        // A bare launch (no flags) or an OS-passed file path falls through.
+        assert_eq!(handle_cli(&["vance-app".into()]), None);
+        assert_eq!(
+            handle_cli(&["vance-app".into(), "/some/project.vance".into()]),
+            None
+        );
+        assert_eq!(
+            handle_cli(&["vance-app".into(), "-psn_0_12345".into()]),
+            None
+        );
+        // A recognized, read-only flag is handled (exit 0) without a GUI.
+        assert_eq!(
+            handle_cli(&["vance-app".into(), "--list-ai-tools".into()]),
+            Some(0)
+        );
+        assert_eq!(
+            handle_cli(&["vance-app".into(), "--ai-tools-status".into()]),
+            Some(0)
+        );
     }
 }

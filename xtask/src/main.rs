@@ -20,6 +20,15 @@ SUBCOMMANDS:
     clippy      Lint all Rust code (warnings = errors).
     bench       Run benchmarks (criterion).
     dist        Build distribution artifacts (Phase 11).
+    stage-sidecars
+                Build the release sidecar binaries and copy them, named with
+                the target triple, into crates/vance-app/binaries/ so Tauri's
+                `externalBin` can bundle them. Pass `--target <triple>` to
+                cross-compile; defaults to the host triple.
+    bundle      Stage sidecars, then run `cargo tauri build` with the release
+                bundle overlay (tauri.bundle.conf.json) to produce installers.
+                Extra args (e.g. `--target <triple>`, `--bundles dmg`) pass
+                through. Requires the Tauri CLI (`cargo install tauri-cli`).
     ui-dev      Run the Tauri dev shell with hot reload.
     ui-build    Production build of the frontend.
     ui-fmt      Format frontend code (prettier).
@@ -72,9 +81,7 @@ fn main() {
         "ui-fmt" => pnpm(&["fmt"], &rest),
         "ui-lint" => pnpm(&["lint"], &rest),
         "app-build" => app_build(),
-        "app-run" => app_build().and_then(|_| {
-            cargo(&["run", "--package", "vance-app"], &rest)
-        }),
+        "app-run" => app_build().and_then(|_| cargo(&["run", "--package", "vance-app"], &rest)),
         "check-deps" => check_deps(),
         "verify-grading-schema" => cargo(
             &[
@@ -90,6 +97,8 @@ fn main() {
             &rest,
         ),
         "build-plugins" => build_plugins(),
+        "stage-sidecars" => stage_sidecars(&rest),
+        "bundle" => bundle(&rest),
         "help" | "--help" | "-h" => {
             print!("{HELP}");
             return;
@@ -159,6 +168,131 @@ fn build_plugins() -> Result<(), String> {
         dirs.len()
     );
     Ok(())
+}
+
+/// The out-of-process sidecars bundled next to `vance-app`: (cargo package,
+/// binary name). The audio crate's package name differs from its binary.
+const SIDECARS: &[(&str, &str)] = &[
+    ("vance-decoder", "vance-decoder"),
+    ("vance-encoder", "vance-encoder"),
+    ("vance-audio", "vance-audio-decoder"),
+    ("vance-plugin-host", "vance-plugin-host"),
+];
+
+/// The host target triple, parsed from `rustc -vV`.
+fn host_triple() -> Result<String, String> {
+    let out = Command::new("rustc")
+        .arg("-vV")
+        .output()
+        .map_err(|e| format!("running rustc -vV: {e}"))?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("host: "))
+        .map(|s| s.trim().to_string())
+        .ok_or_else(|| "could not parse host triple from `rustc -vV`".to_string())
+}
+
+/// Pull an optional `--target <triple>` out of the passthrough args.
+fn explicit_target(rest: &[String]) -> Option<String> {
+    rest.iter()
+        .position(|a| a == "--target")
+        .and_then(|i| rest.get(i + 1).cloned())
+}
+
+/// Build the release sidecars and stage them, target-triple-suffixed, under
+/// `crates/vance-app/binaries/` so Tauri's `externalBin` can bundle them.
+fn stage_sidecars(rest: &[String]) -> Result<(), String> {
+    let root = workspace_root();
+    let target = explicit_target(rest);
+    let triple = match &target {
+        Some(t) => t.clone(),
+        None => host_triple()?,
+    };
+    let windows = triple.contains("windows");
+    let ext = if windows { ".exe" } else { "" };
+
+    // Build every sidecar in one release invocation (add --target only when the
+    // caller asked to cross-compile, so a host build stays in target/release).
+    let mut args: Vec<String> = vec!["build".into(), "--release".into()];
+    for (pkg, _) in SIDECARS {
+        args.push("-p".into());
+        args.push((*pkg).into());
+    }
+    if let Some(t) = &target {
+        args.push("--target".into());
+        args.push(t.clone());
+    }
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    cargo(&arg_refs, &[])?;
+
+    // Locate the built binaries and copy them with the triple suffix.
+    let profile_dir = match &target {
+        Some(t) => root.join("target").join(t).join("release"),
+        None => root.join("target").join("release"),
+    };
+    let dest_dir = root.join("crates/vance-app/binaries");
+    std::fs::create_dir_all(&dest_dir)
+        .map_err(|e| format!("creating {}: {e}", dest_dir.display()))?;
+
+    for (_, bin) in SIDECARS {
+        let src = profile_dir.join(format!("{bin}{ext}"));
+        if !src.exists() {
+            return Err(format!(
+                "sidecar not found after build: {} (did the build succeed for this target?)",
+                src.display()
+            ));
+        }
+        let dst = dest_dir.join(format!("{bin}-{triple}{ext}"));
+        std::fs::copy(&src, &dst)
+            .map_err(|e| format!("copying {} -> {}: {e}", src.display(), dst.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("chmod {}: {e}", dst.display()))?;
+        }
+        eprintln!("xtask: staged {}", dst.display());
+    }
+    eprintln!(
+        "xtask: staged {} sidecar(s) for {triple} → {}",
+        SIDECARS.len(),
+        dest_dir.display()
+    );
+    Ok(())
+}
+
+/// Stage sidecars, then run `cargo tauri build` with the release bundle overlay
+/// to produce platform installers. Extra args pass through to `tauri build`.
+fn bundle(rest: &[String]) -> Result<(), String> {
+    // Fail early with an actionable message if the Tauri CLI isn't installed.
+    let has_cli = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .args(["tauri", "--version"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !has_cli {
+        return Err(
+            "the Tauri CLI is required for `bundle`. Install it with \
+             `cargo install tauri-cli --version '^2'` (or `npm i -g @tauri-apps/cli`), then retry."
+                .to_string(),
+        );
+    }
+
+    stage_sidecars(rest)?;
+
+    // Build the frontend deterministically here (the overlay disables Tauri's
+    // beforeBuildCommand, whose relative path is CWD-sensitive). `frontendDist`
+    // in the base config points at ui/build, which this produces.
+    pnpm(&["build"], &[])?;
+
+    // Run from the app crate dir so `tauri build` finds tauri.conf.json and the
+    // overlay's relative paths (binaries/, macos/, windows/) resolve.
+    let app_dir = workspace_root().join("crates/vance-app");
+    let mut c = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    c.current_dir(&app_dir)
+        .args(["tauri", "build", "--config", "tauri.bundle.conf.json"])
+        .args(rest);
+    run(c)
 }
 
 fn pnpm(args: &[&str], extra: &[String]) -> Result<(), String> {
