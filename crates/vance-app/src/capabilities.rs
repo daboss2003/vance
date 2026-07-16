@@ -74,28 +74,32 @@ pub fn detect() -> Vec<Capability> {
             "Speech-to-text (captions)",
             crate::transcribe::available(),
             false,
-            "Optional. Install `whisper` (or whisper.cpp `main`) on PATH to auto-generate captions.",
+            "Optional. Add it from the AI tools panel — Vance installs it for you \
+             (or install `whisper` on PATH yourself).",
         ),
         Capability::new(
             "demucs",
             "Voice isolation (AI audio)",
             crate::separate::available(),
             false,
-            "Optional. `pip install demucs` to isolate vocals / de-mix stems.",
+            "Optional. Add it from the AI tools panel — Vance installs it for you \
+             (or `pip install demucs` yourself).",
         ),
         Capability::new(
             "matte",
             "Subject mask (Magic Mask)",
             crate::magicmask::available(),
             false,
-            "Optional. `pip install -U backgroundremover` for AI subject isolation.",
+            "Optional. Add it from the AI tools panel — Vance installs it for you \
+             (or `pip install -U backgroundremover` yourself).",
         ),
         Capability::new(
             "imagegen",
             "Generative images",
             crate::generate::available(),
             false,
-            "Optional. Set VANCE_IMAGEGEN_CMD, or install `sd` (stable-diffusion.cpp) + set VANCE_SD_MODEL.",
+            "Optional. Add it from the AI tools panel (downloads the `sd` runner + \
+             model), or set VANCE_IMAGEGEN_CMD / VANCE_SD_MODEL yourself.",
         ),
     ]
 }
