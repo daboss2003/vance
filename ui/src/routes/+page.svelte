@@ -407,10 +407,27 @@
   }
 
   function reportBounds() {
+    // The Source/Record viewports are NATIVE GPU child windows that float
+    // ABOVE the webview, so any full-screen webview overlay (the first-run
+    // wizard) would be occluded by them and its buttons unreachable. While a
+    // blocking overlay is up, collapse the native windows to 0×0 (invisible)
+    // so the overlay is fully visible + clickable; restore real bounds after.
+    if (showOnboarding) {
+      setViewportBounds(0, 0, 0, 0).catch(() => {});
+      setSourceViewportBounds(0, 0, 0, 0).catch(() => {});
+      return;
+    }
     if (viewportEl) reportBoundsFor(viewportEl, setViewportBounds, 'set_viewport_bounds');
     if (sourceViewportEl)
       reportBoundsFor(sourceViewportEl, setSourceViewportBounds, 'set_source_viewport_bounds');
   }
+
+  // Re-sync the native viewports whenever the onboarding overlay opens/closes
+  // (hide while it's up, restore its real position when dismissed).
+  $effect(() => {
+    void showOnboarding;
+    requestAnimationFrame(reportBounds);
+  });
 
   // Re-broadcast bounds whenever the chrome around the viewport changes
   // shape (project loaded/cleared, sequence selection, save path appears).
