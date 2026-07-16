@@ -202,26 +202,9 @@ fn read_first_srt(dir: &Path) -> Result<String, TranscribeError> {
 }
 
 /// Find an executable on PATH (cross-platform, honouring PATHEXT on Windows).
+/// Find an executable: Vance's managed tools dir first, then `PATH`.
 fn which(bin: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    let exts: Vec<String> = if cfg!(windows) {
-        std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".EXE;.CMD;.BAT".into())
-            .split(';')
-            .map(|s| s.to_string())
-            .collect()
-    } else {
-        vec![String::new()]
-    };
-    for dir in std::env::split_paths(&path) {
-        for ext in &exts {
-            let candidate = dir.join(format!("{bin}{ext}"));
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+    crate::tools::resolve(bin)
 }
 
 #[cfg(test)]

@@ -24,6 +24,7 @@ mod proxy;
 mod publish;
 mod separate;
 mod settings;
+mod tools;
 mod transcribe;
 
 use engine::{EngineHandle, MediaItemInfo, ProjectInfo, SequenceContents, SourceState, TrackSummary};
@@ -3471,6 +3472,33 @@ fn crash_log_dir() -> Result<String, String> {
         .map_err(|e| format!("crash dir: {e}"))
 }
 
+// ---- Optional AI tools: status + on-demand install ------------------------
+
+/// Status of every optional AI helper (captions / voice isolation / subject
+/// mask / generative images): installed? managed by Vance? model ready?
+#[tauri::command]
+fn ai_tool_status() -> Vec<tools::ToolStatus> {
+    tools::status()
+}
+
+/// Whether a system Python 3 is present to install the pip-based AI tools.
+/// Drives the Settings/onboarding UI (offer pip install vs. "install Python").
+#[tauri::command]
+fn ai_python_available() -> bool {
+    tools::python_available()
+}
+
+/// Install an optional AI tool by id (`whisper` / `demucs` /
+/// `backgroundremover` / `sd`) into Vance's managed tools dir — pip into the
+/// managed venv for the Python tools, or a manifest download for native ones.
+/// Blocking + slow (venv build, large downloads); returns the installed path.
+#[tauri::command]
+fn install_ai_tool(id: String) -> Result<String, String> {
+    let tool = tools::Tool::from_id(&id).ok_or_else(|| format!("unknown AI tool: {id}"))?;
+    let path = tools::install(tool).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 // ---- GOAT-10: control surfaces (OSC / MIDI) --------------------------------
 
 /// `(osc_running, osc_port, midi_running, midi_name)`.
@@ -3805,6 +3833,9 @@ fn main() {
             get_app_settings,
             set_app_settings,
             crash_log_dir,
+            ai_tool_status,
+            ai_python_available,
+            install_ai_tool,
             control_status,
             start_osc_control,
             stop_osc_control,

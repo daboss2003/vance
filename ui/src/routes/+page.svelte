@@ -48,6 +48,7 @@
   import FusionPanel from '$lib/FusionPanel.svelte';
   import GeneratePanel from '$lib/GeneratePanel.svelte';
   import ReviewPanel from '$lib/ReviewPanel.svelte';
+  import AiToolsPanel from '$lib/AiToolsPanel.svelte';
   import OnboardingWizard from '$lib/OnboardingWizard.svelte';
   import { getAppSettings } from '$lib/ipc';
 
@@ -2104,6 +2105,12 @@
         <!-- GOAT-gated — timeline review comments (collaboration). -->
         <div class="ml-2 w-64 shrink-0 max-h-48 overflow-auto">
           <ReviewPanel />
+        </div>
+
+        <!-- Optional AI tools — install/manage captions, voice isolation,
+             subject mask, and generative-image helpers. -->
+        <div class="ml-2 w-72 shrink-0 max-h-48 overflow-auto">
+          <AiToolsPanel />
         </div>
 
         <span class="text-vance-muted ml-auto">

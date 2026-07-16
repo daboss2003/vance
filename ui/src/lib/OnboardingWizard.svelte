@@ -12,11 +12,12 @@
     type Capability,
     type AppSettings
   } from '$lib/ipc';
+  import AiToolsPanel from '$lib/AiToolsPanel.svelte';
 
   let { onDone }: { onDone: () => void } = $props();
 
   let step = $state(0);
-  const steps = ['Welcome', 'What Vance found', 'Privacy', 'You’re set'];
+  const steps = ['Welcome', 'What Vance found', 'AI tools', 'Privacy', 'You’re set'];
 
   let caps = $state<Capability[]>([]);
   let settings = $state<AppSettings>({
@@ -103,6 +104,14 @@
         {/each}
       </div>
     {:else if step === 2}
+      <h1>Optional AI tools</h1>
+      <p class="lead">
+        Add the AI helpers you want — captions, voice isolation, subject mask, and
+        generative images. It’s entirely optional and you can skip this; add or remove
+        them any time from the <strong>AI tools</strong> panel in the editor.
+      </p>
+      <AiToolsPanel embedded />
+    {:else if step === 3}
       <h1>Privacy</h1>
       <p class="lead">Both are off by default and you can change them any time. Vance never collects personal data.</p>
       <label class="opt">

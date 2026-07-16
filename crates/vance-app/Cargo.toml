@@ -71,8 +71,11 @@ vance-publish = { workspace = true }
 vance-viewport = { workspace = true }
 # GOAT-10 — MIDI control-surface input (CoreMIDI / ALSA / WinMM).
 midir = "0.10"
-# GOAT-11 — HTTPS for OAuth token exchange + platform uploads.
+# GOAT-11 — HTTPS for OAuth token exchange + platform uploads. Also used by
+# the managed AI-tool downloader (tools.rs).
 reqwest = { version = "0.13", features = ["blocking", "json"] }
+# Checksum verification for downloaded AI-tool artifacts (tools.rs).
+sha2 = "0.10"
 vance-audio = { workspace = true }
 vance-audio-plugins = { workspace = true }
 # Linked only so the app's `clap`/`lv2` features can forward to the

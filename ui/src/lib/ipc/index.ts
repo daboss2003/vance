@@ -715,6 +715,40 @@ export const setAppSettings = (next: AppSettings): Promise<AppSettings> =>
 /** Path to the local crash-log directory. */
 export const crashLogDir = (): Promise<string> => invoke('crash_log_dir');
 
+// ---- Optional AI tools: status + on-demand install -------------------
+
+/** Install/availability state of one optional AI helper. */
+export interface AiToolStatus {
+  /** Stable id: `whisper` | `demucs` | `backgroundremover` | `sd`. */
+  id: string;
+  /** Human label for the UI. */
+  label: string;
+  /** How Vance installs it: `"pip"` (managed venv) or `"download"`. */
+  method: string;
+  /** Vance can find the executable (managed dir or PATH). */
+  installed: boolean;
+  /** It lives in Vance's managed dir/venv (vs. the system PATH). */
+  managed: boolean;
+  /** A required model is present (only meaningful for `sd`). */
+  model_ready: boolean;
+  /** Vance can install it right now (pip needs Python; download needs a URL). */
+  installable: boolean;
+  /** Resolved executable path, when found. */
+  path: string | null;
+}
+
+/** Status of every optional AI helper (captions / voice isolation / subject
+ *  mask / generative images). */
+export const aiToolStatus = (): Promise<AiToolStatus[]> => invoke('ai_tool_status');
+
+/** Whether a system Python 3 is present to install the pip-based AI tools. */
+export const aiPythonAvailable = (): Promise<boolean> => invoke('ai_python_available');
+
+/** Install an optional AI tool by id into Vance's managed tools dir. Slow
+ *  (venv build / large downloads); resolves to the installed executable path. */
+export const installAiTool = (id: string): Promise<string> =>
+  invoke('install_ai_tool', { id });
+
 /** Override (or clear, by passing `null`) the input color space tag
  *  for a media library item. Phase 6.2. */
 export const setMediaInputColorSpace = (
