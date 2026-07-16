@@ -29,6 +29,15 @@ use tracing_subscriber::util::SubscriberInitExt;
 pub fn init() -> bool {
     let chrome_path = std::env::var("VANCE_TRACE_PATH").ok();
     let fmt_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+    // Default to `info` for our own crates and quiet the very chatty
+    // windowing / GPU dependencies, so a user running from a terminal sees
+    // real messages (and panics) instead of a flood of `tao`/`wgpu` TRACE.
+    // `RUST_LOG` overrides this entirely when set.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(
+            "info,tao=warn,wry=warn,wgpu=warn,wgpu_core=warn,wgpu_hal=warn,naga=warn",
+        )
+    });
     if let Some(path) = chrome_path {
         let (chrome_layer, guard) = ChromeLayerBuilder::new()
             .file(path)
@@ -36,12 +45,16 @@ pub fn init() -> bool {
             .build();
         Box::leak(Box::new(guard));
         let _ = tracing_subscriber::registry()
+            .with(filter)
             .with(fmt_layer)
             .with(chrome_layer)
             .try_init();
         true
     } else {
-        let _ = tracing_subscriber::registry().with(fmt_layer).try_init();
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .try_init();
         false
     }
 }
