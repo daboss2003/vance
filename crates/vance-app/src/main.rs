@@ -3828,7 +3828,11 @@ fn main() {
     // power users): `--install-ai-tools [all|ids]`, `--list-ai-tools`,
     // `--ai-tools-status`. Handled BEFORE any window/engine is built, so it
     // runs and exits without opening the GUI. A plain launch falls through.
-    let argv: Vec<String> = std::env::args().collect();
+    // `args_os` + lossy so a non-UTF-8 argv element (e.g. an Open-With path with
+    // odd bytes) can't panic startup; handle_cli only matches ASCII flags.
+    let argv: Vec<String> = std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     if let Some(code) = tools::handle_cli(&argv) {
         std::process::exit(code);
     }

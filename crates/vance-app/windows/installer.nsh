@@ -14,29 +14,36 @@
 ; first-run onboarding step) let them add the tools at any time.
 
 !macro NSIS_HOOK_POSTINSTALL
+  ; Save $0 (we clobber it below) so we don't disturb the caller's registers.
+  Push $0
+
   ; The pip-based tools need a system Python 3. Detect it so we only offer the
   ; heavy install when it can actually succeed; otherwise point at Settings.
-  nsExec::ExecToStack 'cmd /c where python || where python3'
+  ; nsExec::Exec pushes only the return code (unlike ExecToStack).
+  nsExec::Exec 'cmd /c where python || where python3'
   Pop $0 ; return code (0 = found)
 
   ${If} $0 == 0
+    ; `/SD IDNO`: an unattended (`/S`) install skips the several-hundred-MB
+    ; download rather than blocking on the dialog; add later from the panel.
     MessageBox MB_YESNO|MB_ICONQUESTION \
       "Add Vance's optional AI tools now?$\r$\n$\r$\n\
        Speech-to-text captions, voice isolation, subject masking, and \
        generative images. This downloads several hundred MB and can take a few \
        minutes.$\r$\n$\r$\n\
        You can skip this and add them any time from the AI tools panel." \
-      IDNO vance_skip_ai
+      /SD IDNO IDNO vance_skip_ai
     ; Fire-and-forget: launch the install so the installer can finish. Progress
     ; is visible later in the app's AI tools panel; exit code isn't awaited.
     Exec '"$INSTDIR\vance-app.exe" --install-ai-tools all'
     Goto vance_skip_ai
   ${Else}
-    MessageBox MB_OK|MB_ICONINFORMATION \
+    MessageBox MB_OK|MB_ICONINFORMATION /SD IDOK \
       "Vance installed.$\r$\n$\r$\n\
        The optional AI tools need Python 3 (not detected). Install Python 3, \
        then add them from the AI tools panel inside Vance."
   ${EndIf}
 
   vance_skip_ai:
+  Pop $0 ; restore the caller's $0 on every path
 !macroend

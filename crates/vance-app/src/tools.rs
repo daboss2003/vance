@@ -420,17 +420,13 @@ fn install_via_manifest(tool: Tool) -> Result<PathBuf, InstallError> {
         .filter(|a| !a.is_empty())
         .ok_or_else(|| InstallError::NotInManifest(tool.id().into()))?;
     let client = http_client()?;
-    let mut last_bin: Option<PathBuf> = None;
     for art in artifacts {
-        let dest = place_artifact(&client, art)?;
-        if art.dest.starts_with("bin/") {
-            last_bin = Some(dest);
-        }
+        place_artifact(&client, art)?;
     }
-    // Prefer the tool's resolvable executable; fall back to a placed bin/ dest.
-    resolve(tool.bin_name())
-        .or(last_bin)
-        .ok_or_else(|| InstallError::MissingAfterInstall(tool.id().into()))
+    // Validate via the SAME resolve() the rest of the app uses, so a manifest
+    // whose bin dest doesn't match bin_name() fails loudly rather than reporting
+    // a false success the app then can't act on.
+    resolve(tool.bin_name()).ok_or_else(|| InstallError::MissingAfterInstall(tool.id().into()))
 }
 
 /// Download one artifact, verify its sha256, and atomically place it under the
@@ -571,6 +567,11 @@ fn parse_selector(spec: &str) -> Result<Vec<Tool>, String> {
                 ))
             }
         }
+    }
+    // A non-empty, non-"all" spec that resolves to nothing (e.g. "," or ", ,")
+    // is a mistake — don't silently report success installing zero tools.
+    if out.is_empty() {
+        return Err(format!("no AI tools in selector '{spec}'"));
     }
     Ok(out)
 }
@@ -748,6 +749,9 @@ mod tests {
         // De-dupes and accepts space separators.
         assert_eq!(parse_selector("demucs demucs").unwrap(), vec![Tool::Demucs]);
         assert!(parse_selector("nope").is_err());
+        // A separators-only spec resolves to nothing → error, not silent 0-tool success.
+        assert!(parse_selector(",").is_err());
+        assert!(parse_selector(", ,").is_err());
     }
 
     #[test]

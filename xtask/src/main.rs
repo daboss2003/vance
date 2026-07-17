@@ -192,11 +192,21 @@ fn host_triple() -> Result<String, String> {
         .ok_or_else(|| "could not parse host triple from `rustc -vV`".to_string())
 }
 
-/// Pull an optional `--target <triple>` out of the passthrough args.
+/// Pull an optional target out of the passthrough args, accepting every
+/// spelling `cargo`/`tauri` do: `--target <t>`, `--target=<t>`, `-t <t>`,
+/// `-t=<t>`. Returning the wrong answer here silently desyncs the staged
+/// suffix from the one Tauri later resolves, so match them all.
 fn explicit_target(rest: &[String]) -> Option<String> {
-    rest.iter()
-        .position(|a| a == "--target")
-        .and_then(|i| rest.get(i + 1).cloned())
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        if let Some(t) = a.strip_prefix("--target=").or_else(|| a.strip_prefix("-t=")) {
+            return Some(t.to_string());
+        }
+        if a == "--target" || a == "-t" {
+            return it.next().cloned();
+        }
+    }
+    None
 }
 
 /// Build the release sidecars and stage them, target-triple-suffixed, under
@@ -208,9 +218,18 @@ fn stage_sidecars(rest: &[String]) -> Result<(), String> {
         Some(t) => t.clone(),
         None => host_triple()?,
     };
-    let windows = triple.contains("windows");
-    let ext = if windows { ".exe" } else { "" };
+    let dest_dir = root.join("crates/vance-app/binaries");
+    std::fs::create_dir_all(&dest_dir)
+        .map_err(|e| format!("creating {}: {e}", dest_dir.display()))?;
 
+    // `universal-apple-darwin` is a Tauri pseudo-target: cargo can't build it
+    // directly, so build both arches and `lipo`-fold each sidecar into a fat
+    // binary under the universal suffix Tauri's externalBin expects.
+    if triple == "universal-apple-darwin" {
+        return stage_universal(&root, &dest_dir);
+    }
+
+    let ext = if triple.contains("windows") { ".exe" } else { "" };
     // Build every sidecar in one release invocation (add --target only when the
     // caller asked to cross-compile, so a host build stays in target/release).
     let mut args: Vec<String> = vec!["build".into(), "--release".into()];
@@ -230,10 +249,6 @@ fn stage_sidecars(rest: &[String]) -> Result<(), String> {
         Some(t) => root.join("target").join(t).join("release"),
         None => root.join("target").join("release"),
     };
-    let dest_dir = root.join("crates/vance-app/binaries");
-    std::fs::create_dir_all(&dest_dir)
-        .map_err(|e| format!("creating {}: {e}", dest_dir.display()))?;
-
     for (_, bin) in SIDECARS {
         let src = profile_dir.join(format!("{bin}{ext}"));
         if !src.exists() {
@@ -243,14 +258,7 @@ fn stage_sidecars(rest: &[String]) -> Result<(), String> {
             ));
         }
         let dst = dest_dir.join(format!("{bin}-{triple}{ext}"));
-        std::fs::copy(&src, &dst)
-            .map_err(|e| format!("copying {} -> {}: {e}", src.display(), dst.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))
-                .map_err(|e| format!("chmod {}: {e}", dst.display()))?;
-        }
+        copy_executable(&src, &dst)?;
         eprintln!("xtask: staged {}", dst.display());
     }
     eprintln!(
@@ -258,6 +266,64 @@ fn stage_sidecars(rest: &[String]) -> Result<(), String> {
         SIDECARS.len(),
         dest_dir.display()
     );
+    Ok(())
+}
+
+/// Build both macOS arches and `lipo`-fold each sidecar into a universal binary
+/// staged under the `-universal-apple-darwin` suffix.
+fn stage_universal(root: &std::path::Path, dest_dir: &std::path::Path) -> Result<(), String> {
+    const ARCHES: [&str; 2] = ["x86_64-apple-darwin", "aarch64-apple-darwin"];
+    for arch in ARCHES {
+        let mut args: Vec<String> = vec!["build".into(), "--release".into()];
+        for (pkg, _) in SIDECARS {
+            args.push("-p".into());
+            args.push((*pkg).into());
+        }
+        args.push("--target".into());
+        args.push(arch.into());
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        cargo(&arg_refs, &[])?;
+    }
+    for (_, bin) in SIDECARS {
+        let inputs: Vec<PathBuf> = ARCHES
+            .iter()
+            .map(|a| root.join("target").join(a).join("release").join(bin))
+            .collect();
+        for src in &inputs {
+            if !src.exists() {
+                return Err(format!("sidecar not found after build: {}", src.display()));
+            }
+        }
+        let dst = dest_dir.join(format!("{bin}-universal-apple-darwin"));
+        let mut lipo = Command::new("lipo");
+        lipo.arg("-create").arg("-output").arg(&dst).args(&inputs);
+        run(lipo)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("chmod {}: {e}", dst.display()))?;
+        }
+        eprintln!("xtask: staged {} (universal)", dst.display());
+    }
+    eprintln!(
+        "xtask: staged {} universal sidecar(s) → {}",
+        SIDECARS.len(),
+        dest_dir.display()
+    );
+    Ok(())
+}
+
+/// Copy a built binary to `dst` and mark it executable (unix).
+fn copy_executable(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    std::fs::copy(src, dst)
+        .map_err(|e| format!("copying {} -> {}: {e}", src.display(), dst.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod {}: {e}", dst.display()))?;
+    }
     Ok(())
 }
 
@@ -300,7 +366,11 @@ fn pnpm(args: &[&str], extra: &[String]) -> Result<(), String> {
     if !ui_dir.exists() {
         return Err(format!("ui/ does not exist at {}", ui_dir.display()));
     }
-    let mut c = Command::new("pnpm");
+    // On Windows pnpm is a corepack/npm `.cmd` shim; std's Command doesn't apply
+    // PATHEXT search, so name the shim explicitly. (Rust ≥1.77 auto-escapes args
+    // for `.cmd`/`.bat`, so this is safe.)
+    let prog = if cfg!(windows) { "pnpm.cmd" } else { "pnpm" };
+    let mut c = Command::new(prog);
     c.current_dir(&ui_dir).args(args).args(extra);
     run(c)
 }

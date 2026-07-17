@@ -16,11 +16,19 @@ set -euo pipefail
 APP="/Applications/Vance.app/Contents/MacOS/vance-app"
 [ -x "$APP" ] || exit 0   # nothing to do if the app isn't where we expect
 
-# The user who initiated the install (set by Installer.app for postinstall).
-target_user="${USER:-}"
-[ -n "$target_user" ] || exit 0
+# A .pkg postinstall runs as root under installd, where $USER is unreliable
+# (root or unset). The canonical way to find the logged-in GUI user is the
+# owner of /dev/console. Reject the no-real-user sentinels (headless / MDM /
+# setup assistant) so we never install into root's home.
+target_user="$(stat -f%Su /dev/console 2>/dev/null || true)"
+case "$target_user" in
+  ""|root|loginwindow|_mbsetupuser|_windowserver)
+    exit 0   # no real console user — defer to the app's first-run onboarding
+    ;;
+esac
 uid="$(id -u "$target_user" 2>/dev/null || true)"
-[ -n "$uid" ] || exit 0
+# Belt-and-suspenders: never run the per-user install as uid 0.
+[ "${uid:-0}" -gt 0 ] 2>/dev/null || exit 0
 
 # Only the pip tools need Python; if it's absent, skip silently — the user can
 # add tools later from the in-app AI tools panel.
