@@ -3,7 +3,8 @@
 Status: **design spec** (nothing here is built yet). This is the plan for turning
 today's "drag-in / import a `.wasm` effect" into a full marketplace where people
 **browse, buy, sell, and create** add-on effects, with accounts, devices,
-payouts, and protection for paid effects.
+activation codes, and protection for paid effects — where **Vance only ever
+receives money and never pays anyone out** (§8).
 
 It is deliberately honest about what is and isn't achievable — especially around
 DRM and offline revocation — because building on wrong assumptions there is
@@ -16,12 +17,16 @@ flagged as **[gated]**.
 
 **Goals**
 - **Browse & install** effects in-app from a hosted catalog (free and paid).
-- **Buy once, use on any of your machines** — install on a new machine, or have
-  it auto-install in the background (a per-device setting).
-- **Sell** effects: creators get a **wallet** of earnings and can **withdraw**.
+- **Free effects: use on unlimited machines. Paid effects: up to 2 machines** at a
+  time — install on a new machine, or have it auto-install in the background (a
+  per-device setting).
+- **Sell** effects **without Vance touching the buyer's money**: the buyer pays
+  the seller directly; Vance issues an **activation code** for the buyer's account
+  once the seller has remitted Vance's commission. **Vance only ever receives
+  money, never sends it** (no payouts, no wallet-to-bank withdrawals). (§8)
 - **Accounts** via OAuth (Google / Apple / GitHub / Meta) **plus a password**
-  (required to authorize a purchase and to remove the account/effects from a
-  machine).
+  (required to redeem/authorize a paid activation and to remove the
+  account/effects from a machine).
 - **Manage your devices** — see where you're signed in, sign a machine out
   remotely; removing a machine **uninstalls its paid effects**.
 - **Protect paid effects** so they can't just be copied and used for free, and
@@ -75,14 +80,16 @@ Desktop app (Tauri/Rust + Svelte)
 Backend services (vance cloud)  [new]
   ├─ accounts.vance   — OAuth client for all 4 providers, password, sessions, devices
   ├─ store.vance      — catalog: effects, versions, categories, reviews, prices
-  ├─ entitle.vance    — orders → entitlements → signed entitlement tokens + license leases
-  ├─ build.vance      — hosted build/sign service for the creator tiers (later phase)
-  └─ payouts          — Stripe Connect (seller wallets + withdrawals)
+  ├─ activate.vance   — activation codes → entitlements → signed entitlement tokens + license leases
+  ├─ commission.vance — charges the SELLER the platform % (Vance-as-merchant); gates code issuance
+  └─ build.vance      — hosted build/sign service for the creator tiers (later phase)
 
 Third parties  [gated]
-  ├─ Merchant-of-Record (Paddle or Lemon Squeezy) — buyer checkout + global tax
-  ├─ Stripe Connect (Express) — seller KYC + payouts
+  ├─ Processor for SELLER commission only (Stripe/Paddle) — Vance charges sellers; no payouts
   └─ (optional) Keygen — licensing/activation/leases/revocation, self-hostable
+
+  (No merchant-of-record and no Stripe Connect payouts: the buyer pays the seller
+   directly, off-platform. Vance never holds buyer funds and never pays anyone out.)
 ```
 
 Backend is the **source of truth**. The client only ever holds short-lived,
@@ -164,11 +171,13 @@ that the sensitive endpoint requires in an `X-Step-Up` header. Optional short
 - **Manage Devices** screen: `GET /v1/devices` → list `{name, platform,
   app_version, last_seen, this_device}`; per-row **Sign out** → `POST
   /v1/devices/{id}/revoke` (step-up required).
-- **Buy-once vs device caps** — an explicit policy call. Recommended: **no hard
-  cap** (a cap contradicts "use on any machine" and creates "remove one to add
-  one" friction), but track devices, show the Manage-Devices screen, and use
-  server-side abuse signals (many new devices/hr, impossible-travel logins)
-  rather than blocking installs. This is the JetBrains/Adobe posture.
+- **Device caps (chosen):** **free effects = unlimited** machines; **paid effects
+  = a hard cap of 2 active machines** per account. Adding a 3rd machine requires
+  deactivating one (self-service in Manage-Devices, or auto-oldest-out — a policy
+  choice). Enforced server-side at activation/heartbeat: the 2 active
+  `device_installs` for a paid sku are the only ones whose lease renews. Still
+  track all devices + show Manage-Devices; layer abuse signals (many new
+  devices/hr, impossible-travel) on top.
 
 ### How a removed device learns and self-uninstalls (3 tiers)
 1. **Push (SSE):** the app holds `GET /v1/events` (auth via Authorization
@@ -197,26 +206,35 @@ untouched.
 
 ---
 
-## 6. Entitlements — "buy once, use on any machine"
+## 6. Entitlements — activation codes, "up to 2 machines"
 
-- Entitlements are **user-scoped** (named-user model): any device with a live
-  session may install an owned effect. That *is* "buy once."
+- Entitlements are **user-scoped**: an owned effect may run on the account's
+  active devices — **unlimited for free effects, up to 2 for paid** (§5).
+- **Activation code = the entitlement trigger.** A paid entitlement is created
+  when an activation code is **redeemed** by (or issued to) the buyer's account.
+  A code is a single-use, server-generated token bound to `{sku, issued_to_user
+  or open, state}`. Vance mints it only after the seller's commission settles
+  (§8). Redeeming it inserts the `entitlement` row.
 - Server issues a **signed entitlement token** (Ed25519 JWT: `{sub, did,
   skus:[…], iat, exp=iat+14d, ent_ver}`) on login / heartbeat /
   `entitlement.changed`; cached in the keychain. `exp` is the **offline grace
   window** (buyer works ~14 days with no internet; while online it silently
   renews).
 - **Enforce at load:** before instantiating a paid effect, `host.rs` checks a
-  currently-valid entitlement token lists that sku. Free effects skip the check.
+  currently-valid entitlement token lists that sku **and** this device is one of
+  the ≤2 active for it. Free effects skip both checks.
 - **Install / auto-install:** reconcile = "for each active entitlement not on
-  this device, install it." Manual (click Install) or **Auto** (Settings toggle
-  `autoInstallPurchases`, per device) → a background task installs newly-entitled
-  skus silently. Install reuses the manifest pipeline: `GET
-  /v1/artifacts/{sku}?platform=…` returns `{url, sha256, dest}` where `url` is a
-  **short-lived signed URL** minted only after the server re-checks entitlement;
-  client verifies the sha256 pin (unchanged) and places the file.
-- **Refunds/chargebacks** flow through the **same** `entitlement.changed` path →
-  `state=refunded` → uninstall, or paid effects leak after refunds.
+  this device (and within the 2-device cap), install it." Manual (click Install)
+  or **Auto** (Settings toggle `autoInstallPurchases`, per device) → a background
+  task installs newly-entitled skus silently. Install reuses the manifest
+  pipeline: `GET /v1/artifacts/{sku}?platform=…` returns `{url, sha256, dest}`
+  where `url` is a **short-lived signed URL** minted only after the server
+  re-checks entitlement + device slot; client verifies the sha256 pin (unchanged)
+  and places the file.
+- **Revocation / seller-initiated refund** flow through the **same**
+  `entitlement.changed` path → `state=revoked` → uninstall. (There's no Vance
+  refund to process — Vance never charged the buyer — but a seller can ask Vance
+  to revoke a specific activation, e.g. after refunding the buyer themselves.)
 
 ---
 
@@ -288,51 +306,80 @@ Most people pay for convenience and fair pricing when DRM is invisible.
 
 ---
 
-## 8. Payments & payouts  [gated — vendor + legal]
+## 8. Monetization — activation codes, seller-remits-commission (no payouts)  [chosen model]
 
-**Recommended "hybrid": Merchant-of-Record for money-in, Stripe Connect for
-money-out.**
+> This replaces the earlier Merchant-of-Record + Stripe-Connect payout design.
+> The earlier approach is preserved in git history if we ever want built-in
+> checkout later.
 
-- **Buy side (money-in):** front the buyer with a **MoR** (Paddle or Lemon
-  Squeezy). The MoR is the reseller and handles **all global VAT/GST/US sales tax
-  + chargebacks**; Vance is its single "seller." Effective cost ~7–8%. **Open the
-  MoR hosted checkout in the SYSTEM BROWSER** (Tauri opener), **not** the embedded
-  webview — this gives card + **Apple Pay + Google Pay** + Link/PayPal
-  automatically and avoids the whole class of "Apple Pay won't render in WKWebView"
-  bugs. On success, the MoR webhook → `entitle.vance` issues the signed
-  entitlement/lease → client installs via the manifest pipeline.
-- **Sell side (wallet + withdraw):** **Stripe Connect (Express)**. Each seller
-  onboards an Express account; **Stripe hosts KYC/identity/bank/tax-forms** and
-  pays out to banks in 100+ countries. The "wallet balance" = an **accrued-royalty
-  ledger we keep** (buyer paid MoR → we compute seller share = price − platform
-  cut − processing reserve) → pay out via Connect transfers (on-demand withdrawal
-  or scheduled with a minimum threshold).
-- **Platform split:** take **20–30%**; sellers get ~70% (matches app-store
-  expectations plugin sellers already accept; JetBrains ≤25% is a good benchmark).
+**Core principle: Vance only ever RECEIVES money — it never holds buyer funds and
+never pays anyone out.** This is a deliberate trade: buyer-side
+convenience/protection for *radically* simpler operations (no merchant-of-record
+for consumer sales, no Stripe Connect, no seller wallet/withdrawals, no
+marketplace-facilitator VAT/sales-tax across 100+ jurisdictions).
 
-> **Apple Pay ≠ IAP.** Apple Pay for digital goods on desktop *web* is allowed
-> (just processor fees). The 15–30% cut only appears if you route through
-> Apple/Google **IAP inside a store-distributed build**.
+- **Free effects:** unlimited machines, install exactly like today. No money, no
+  codes, no cap.
+- **Paid effects:** capped at **2 active machines** per account (deactivate one
+  to add another).
 
-> **[traps]**
-> - **MoRs can't do marketplace payouts** — they pay one account (you). You still
->   need Stripe Connect/PayPal/Wise for sellers. (No MoR does multi-party payout.)
-> - **Pure Stripe Connect = you own the tax** (deemed marketplace facilitator;
->   register + file VAT/sales tax everywhere; Stripe Tax only *calculates*). Prefer
->   the MoR front early; switch to pure Connect only once volume funds a tax
->   function.
-> - **Mac App Store trap:** selling effects in-app there forces StoreKit IAP at
->   30% (15% small-biz), incompatible with a seller wallet. **Don't ship the
->   marketplace in a MAS build** (or US-only link-out). **Microsoft Store is fine**
->   (0% on non-gaming own-commerce). Keep the marketplace in the self-distributed
->   installer.
-> - **"Wallet" is a regulated word** — keep it a simple accrued-royalty ledger that
->   pays out via Stripe; never let buyers preload/store balances (money-transmitter
->   licensing risk). Money flows buyer → MoR → us → seller payout, never pooled.
-> - **Onboarding is slow** (MoR approval, Stripe Connect KYC) — bake in weeks of
->   lead time; don't gate GA on it.
-> - **EU DSA "trader verification"** applies even to free-with-donation sellers —
->   budget KYC + a public seller-identity surface from day one.
+### The flow
+1. The marketplace lists the effect with its **price** and the **seller's own
+   payment method/contact**. Vance *connects* buyer and seller; it does not
+   process the sale.
+2. **Buyer pays the seller directly** (the seller's own PayPal/bank/Stripe/etc.,
+   outside Vance). The seller keeps 100% of the buyer payment.
+3. To make the effect usable, the seller **approves the sale to the buyer's
+   account** and **pays Vance's commission (the listed %) into Vance's wallet**.
+   Here Vance is a normal merchant charging the seller a per-sale activation fee.
+4. Once the commission settles, Vance issues an **activation code** bound to the
+   buyer's account → the account gets the entitlement (2-machine cap; the paid
+   `.wasm` decrypts + runs via the §7 gate).
+5. **Withholding is the whole lever:** no commission → no activation code → the
+   encrypted effect stays inert. A seller can't complete a Vance-marketplace sale
+   without paying the commission, because the effect is encrypted and only Vance
+   can unlock it.
+
+### Collecting the commission (seller → Vance)
+- **Per-sale charge** — seller pays the commission at approval time. Simplest, but
+  a small charge every sale and the buyer waits for the seller to act.
+- **Prepaid commission balance (recommended)** — seller tops up once; each
+  approval auto-deducts the commission and issues the code **instantly**. Removes
+  buyer wait + per-sale friction. It's the seller pre-paying for a service (not
+  stored customer value), so it stays clear of money-transmitter concerns —
+  unused-balance refunds just need a simple policy.
+
+### What Vance needs (far lighter than MoR/Connect)
+- A way to **charge sellers** the commission — a plain processor (Stripe/Paddle)
+  with **Vance as the merchant** selling "activation" to sellers. Vance owes tax
+  only on **its own commission revenue**, not sales tax on buyer↔seller deals.
+- **Activation-code issuance + redemption** on top of the entitlement/DRM
+  machinery from §6–§7 (unchanged — the code just replaces the purchase webhook as
+  the entitlement trigger).
+
+> **[honest trade-offs — the buyer bears the risk; treat mitigations as required]**
+> - **No buyer protection / escrow.** The buyer pays the seller directly with
+>   nothing held in the middle. If the seller never approves + pays commission, or
+>   is fraudulent, the buyer is out of pocket with **no working effect** and will
+>   blame Vance even though Vance never touched the money. This is the biggest
+>   downside of "only receive." Mitigate with: **verified sellers**, owner-gated
+>   **reviews/ratings**, visible "activations issued" counts, a **report/dispute**
+>   flow, and delisting bad actors. Vance cannot refund a buyer it never charged.
+> - **Sellers run their own payment collection + their own buyer-side taxes.** A
+>   higher bar than a built-in checkout — some creators love keeping ~100% and
+>   controlling payment; casual ones may not bother. An *optional* built-in
+>   checkout could come later, but it reintroduces payouts, so keep it opt-in.
+> - **Approval latency** with per-sale commission — the prepaid-balance option
+>   removes it.
+> - **Leverage only exists on ENCRYPTED (paid) effects.** Free effects have no
+>   lever, which is fine. A seller can always self-distribute their own effect
+>   outside Vance entirely; Vance's value is reach + activation + the marketplace,
+>   not exclusivity.
+
+**Net:** this cuts the payment/payout/tax surface enormously at the cost of buyer
+protection and some seller friction — a reasonable v1 given the "only receive
+money" priority, provided the buyer-risk mitigations above are built in, not
+deferred.
 
 ---
 
@@ -363,18 +410,23 @@ metadata + `versions[]` + screenshots + rating + price + capabilities; `GET
 /effects/{id}/reviews`.
 
 **Publisher verification (two tiers):** email-verified free authors; **DNS-TXT
-domain-verified** brands get a badge; paid sellers also complete MoR KYC / EU DSA
-trader verification.
+domain-verified** brands get a badge; **paid sellers must be verified** (identity
++ their own payout/contact details shown to buyers) — this is the main buyer-trust
+safeguard, since buyers pay sellers directly (§8).
 
 **Reviews:** 1–5 stars + text, **gated to users who installed/purchased** (kills
 most spam), aggregate on the card, velocity limits + moderation queue.
 
-**In-app flow:** Browse → item page (screenshots, reviews, price, requested
-capabilities) → Buy (MoR in system browser) → Install (download, verify sha256 +
-Ed25519 against the pinned manifest, **diff requested capabilities vs sandbox
-policy and prompt for any elevated capability**) → run sandboxed. Updates = version
-bump + re-verify; **flag ownership transfers before auto-updating** (supply-chain
-guard).
+**In-app flow (paid):** Browse → item page (screenshots, reviews, price, seller +
+their payment method, requested capabilities) → **"Get" shows the seller's price +
+how to pay them** → buyer pays the seller directly → seller approves + remits
+commission (§8) → Vance issues the **activation code** to the buyer's account →
+**Redeem** (auto if issued straight to the account, else paste the code) →
+entitlement created → Install (download, verify sha256 + Ed25519 against the pinned
+manifest, **diff requested capabilities vs sandbox policy and prompt for any
+elevated capability**) → run sandboxed. Free effects skip straight from Browse to
+Install. Updates = version bump + re-verify; **flag ownership transfers before
+auto-updating** (supply-chain guard).
 
 **Review pipeline:** automated gate on every publish (wasm validates + within
 size budget + no disallowed host imports + capabilities match declaration +
@@ -424,10 +476,13 @@ inside onboarding):
   Create/Change password, sign out.
 - **Devices** — list (name, platform, app version, last-seen, "this device"),
   Sign out per device (step-up), rename this device.
-- **Purchases / My Effects** — owned effects, per-device Install/Uninstall state,
-  `autoInstallPurchases` toggle.
-- **Wallet** (sellers) — balance ledger, Stripe Connect onboarding status,
-  Withdraw.
+- **My Effects** — owned effects (free + activated paid), per-device
+  Install/Uninstall state, **redeem an activation code**, `autoInstallPurchases`
+  toggle. Paid effects show their 2 device slots.
+- **Selling** (sellers) — list/manage effects + prices + your payment details
+  shown to buyers, **pending sales to approve**, commission owed / prepaid
+  commission balance + top-up, issued activation codes. (No withdraw screen —
+  buyers pay you directly.)
 - Existing **privacy** opt-ins move here too.
 
 ---
@@ -438,10 +493,12 @@ inside onboarding):
 users(id, email citext unique, email_verified, password_hash null, password_set_at, created_at, updated_at)
 oauth_identities(id, user_id, provider{google,apple,github,meta}, provider_subject, email_at_provider, linked_at, UNIQUE(provider, provider_subject))
 sessions(id=session_id, user_id, device_id, device_name, platform, app_version, refresh_token_hash, refresh_generation, created_at, last_seen_at, ip_last, revoked_at null, revoked_reason null, UNIQUE(user_id, device_id))
-entitlements(id, user_id, sku, source{purchase,bundle,subscription,grant}, state{active,refunded,expired,revoked}, granted_at, expires_at null, order_id, UNIQUE(user_id, sku))
-orders(id, user_id, sku, amount, currency, processor, processor_ref, status, step_up_id, created_at)
+entitlements(id, user_id, sku, source{activation_code,grant,free}, state{active,expired,revoked}, granted_at, expires_at null, activation_code_id null, UNIQUE(user_id, sku))
+activation_codes(id, code_hash, sku, seller_id, issued_to_user null, state{pending,issued,redeemed,void}, commission_payment_id, created_at, redeemed_at null, redeemed_by_user null)
+commission_payments(id, seller_id, sku, buyer_ref null, amount, currency, processor, processor_ref, status{paid,failed,refunded}, created_at)   -- SELLER pays Vance; gates code issuance
+seller_balances(seller_id, currency, prepaid_balance, updated_at)   -- optional prepaid-commission model
 plugin_artifacts(sku, version, platform, object_key, sha256, dest)   -- entitlement-gated serve
-device_installs(session_id, sku, installed_version, installed_at, uninstalled_at null)
+device_installs(session_id, sku, installed_version, installed_at, uninstalled_at null)   -- ≤2 active rows per paid sku per user
 step_up_challenges(id, user_id, session_id, action{purchase,remove_device,change_password}, target_ref, created_at, expires_at, consumed_at null)
 -- store side:
 publishers(id, user_id, display_name, verified_domain null, kyc_status)
@@ -463,34 +520,48 @@ reviews(id, sku, user_id, stars, body, created_at, UNIQUE(sku, user_id))   -- ga
    auto install, reconcile-on-login, uninstall-on-revoke.
 3. **M3 — Catalog browse (free effects).** `store.vance`, signed catalog manifest,
    in-app Browse tab in the existing modal, capability-prompt on install, reviews.
-4. **M4 — Payments (buy paid effects).** MoR checkout in system browser →
-   webhook → entitlement; paid-effect **encryption + decrypt-on-load shim** (or
-   adopt Keygen); refund→revoke wiring.
-5. **M5 — Seller wallet + payouts.** Stripe Connect Express onboarding, royalty
-   ledger, Withdraw UI; EU DSA trader verification.
+4. **M4 — Paid effects via activation codes.** Seller-price + payment-details on
+   the listing, **seller approves a sale + remits commission** (Vance-as-merchant
+   charge, or prepaid-balance deduct), **activation-code issuance + redemption**,
+   paid-effect **encryption + decrypt-on-load shim** (or adopt Keygen), 2-device
+   cap enforcement, seller-initiated revoke wiring.
+5. **M5 — Seller trust + tooling.** Verified-seller onboarding, "Selling" panel
+   (pending sales, commission owed / prepaid top-up, issued codes), owner-gated
+   reviews/ratings, report/dispute + delist flow. *(This is what protects buyers,
+   so it's not optional.)*
 6. **M6 — Creator tooling.** Phase 0 starter template → Phase 1 Effect Studio
    (ISF shaders) → Phase 2 node graph → Phase 3 hosted build.
 
 M1–M2 are **client + backend fundamentals** and unblock everything. M3 delivers
-visible value (browse/install free) without payments. Paid (M4+) is where the
-[gated] vendor/legal work lands.
+visible value (browse/install free) without any money. Paid (M4+) needs only a
+**seller-commission processor** — no MoR, no payouts, no facilitator tax.
 
 ---
 
 ## 14. Decisions needed from you  [gated / product]
 
-- **Merchant-of-Record:** Paddle vs Lemon Squeezy (both handle global tax +
-  wallets like Apple/Google Pay via system-browser checkout).
-- **Payout rail:** Stripe Connect Express (recommended) vs PayPal/Wise.
-- **Platform cut:** 20% / 25% / 30%.
-- **Buy licensing:** adopt **Keygen** (self-hostable, does activation/leases/
-  revocation) vs build the license server ourselves.
-- **Device policy:** no hard cap (recommended) vs a cap (e.g. 3 machines).
+- **Commission collection:** **per-sale charge** vs **prepaid seller balance**
+  (recommended — makes buyer activation instant). Affects UX + a little regulatory
+  nuance on holding prepaid balances.
+- **Activation-code delivery:** **direct-grant** (seller enters the buyer's Vance
+  account → code auto-lands on that account) vs **hand-off code** (Vance gives the
+  seller a code to pass to the buyer, who pastes it). Direct-grant is smoother;
+  hand-off lets the buyer stay anonymous to the seller until redemption.
+- **Who initiates:** buyer requests activation in-app (seller approves) vs seller
+  initiates after being paid. (Recommend buyer-initiated request + seller approve.)
+- **Platform commission:** what % the seller remits (e.g. 15% / 20% / 30%).
+- **3rd-machine policy:** block until the user frees a slot vs auto-deactivate the
+  oldest device.
+- **Commission processor:** Stripe vs Paddle to charge sellers (Vance-as-merchant).
+- **Buy licensing:** adopt **Keygen** (self-hostable activation/leases/revocation)
+  vs build the license server ourselves.
 - **Offline grace window:** 7 vs 14 days (revocation speed ⇄ offline tolerance).
 - **Distribution:** self-installer + Microsoft Store carry the marketplace; **Mac
   App Store build ships without in-app buying** — confirm.
-- **Legal:** seller ToS granting Vance resale rights (needed for the MoR-reseller
-  model), buyer EULA, EU DSA seller-identity surface.
+- **Legal:** seller ToS (they sell directly to buyers; Vance provides activation +
+  takes a commission; sellers own buyer support/refunds/their own taxes), buyer
+  EULA, verified-seller identity surface, and a clear **buyer-beware notice** that
+  Vance doesn't process or guarantee the buyer↔seller payment.
 
 ---
 
@@ -507,5 +578,13 @@ visible value (browse/install free) without payments. Paid (M4+) is where the
    same milestone.
 5. **No-code ≠ every effect** — parameter/graph tiers cover most visual effects;
    procedural/temporal/ML effects need the code/hosted-build tier.
-6. **Tax/compliance is real** — solved by the MoR front, not by us registering in
-   100+ jurisdictions.
+6. **No buyer protection on paid effects** — buyers pay sellers directly with no
+   escrow, so a bad/absent seller can leave a buyer out of pocket, and Vance can't
+   refund money it never held. This is the deliberate cost of "Vance only receives
+   money." Mitigated (not eliminated) by verified sellers, owner-gated reviews,
+   visible activation counts, and a report/delist flow — these are **required**,
+   not nice-to-haves.
+7. **Vance still owes tax on its own commission income** — far simpler than
+   marketplace-facilitator sales tax, but not zero: the seller-commission charges
+   are Vance's business revenue. Sellers are responsible for their own buyer-side
+   taxes.
