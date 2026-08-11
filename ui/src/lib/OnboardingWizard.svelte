@@ -17,7 +17,7 @@
 
   let { onDone }: { onDone: () => void } = $props();
 
-  const steps = ['Welcome', 'What Vance found', 'AI tools', 'Privacy', 'You’re set'];
+  const steps = ['Welcome', 'What Vance found', 'Privacy', 'You’re set'];
   const CAPS_STEP = 1;
   let step = $state(0);
   let loaded = $state(false);
@@ -49,7 +49,8 @@
       .catch(() => {});
   });
 
-  let requiredMissing = $derived(caps.filter((c) => c.required && !c.present));
+  let requiredCaps = $derived(caps.filter((c) => c.required));
+  let requiredMissing = $derived(requiredCaps.filter((c) => !c.present));
   let coreReady = $derived(caps.length > 0 && requiredMissing.length === 0);
 
   /** Remember the current step so a hard quit still resumes here next launch. */
@@ -142,19 +143,19 @@
       <h1>What Vance found</h1>
       <p class="lead">
         {#if coreReady}
-          Core editing and export are ready. Optional AI tools light up when their helpers are installed.
+          Core editing and export are ready. Add any optional AI tools below — Vance installs them for you, right here.
         {:else}
           A required component is missing — install it (see the hint below), then press <strong>Re-check</strong>. Setup can’t finish until it’s present.
         {/if}
       </p>
       <div class="caps">
-        {#each caps as c (c.id)}
+        {#each requiredCaps as c (c.id)}
           <div class="cap" class:missing={!c.present}>
-            <span class="mark">{c.present ? '✓' : c.required ? '✕' : '○'}</span>
+            <span class="mark">{c.present ? '✓' : '✕'}</span>
             <div class="cbody">
               <div class="cname">
                 {c.name}
-                <span class="tag">{c.required ? 'required' : 'optional'}</span>
+                <span class="tag">required</span>
               </div>
               {#if !c.present}<div class="chint">{c.hint}</div>{/if}
             </div>
@@ -162,15 +163,11 @@
         {/each}
       </div>
       <button class="ghost recheck" onclick={recheck} disabled={busy}>↻ Re-check</button>
-    {:else if step === 2}
-      <h1>Optional AI tools</h1>
-      <p class="lead">
-        Add the AI helpers you want — captions, voice isolation, subject mask, and
-        generative images. It’s entirely optional and you can skip this; add or remove
-        them any time from the <strong>AI tools</strong> panel in the editor.
-      </p>
+
+      <h2 class="aihdr">Optional AI tools</h2>
+      <p class="lead sub">Captions, voice isolation, subject mask, and generative images. Click <strong>Install</strong> on the ones you want — they download in the background while you keep setting up. All optional; add or remove them any time later.</p>
       <AiToolsPanel embedded />
-    {:else if step === 3}
+    {:else if step === 2}
       <h1>Privacy</h1>
       <p class="lead">Both are off by default and you can change them any time. Vance never collects personal data.</p>
       <label class="opt">
@@ -271,6 +268,17 @@
   }
   .recheck {
     margin-top: 10px;
+  }
+  .aihdr {
+    font-size: 15px;
+    font-weight: 700;
+    margin: 18px 0 6px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border, #2c2d33);
+  }
+  .lead.sub {
+    font-size: 12px;
+    opacity: 0.72;
   }
   .cap {
     display: flex;

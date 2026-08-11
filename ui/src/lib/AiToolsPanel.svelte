@@ -30,6 +30,7 @@
   let tools = $state<AiToolStatus[]>([]);
   let pythonOk = $state(true);
   let installing = $state<string | null>(null);
+  let queue = $state<string[]>([]);
   let errors = $state<Record<string, string>>({});
   let loaded = $state(false);
 
@@ -65,16 +66,28 @@
       : 'Needs a download source (set VANCE_TOOLS_MANIFEST_URL).';
   }
 
-  async function install(t: AiToolStatus) {
-    installing = t.id;
-    errors = { ...errors, [t.id]: '' };
-    try {
-      await installAiTool(t.id);
-      await refresh();
-      onChange();
-    } catch (e) {
-      errors = { ...errors, [t.id]: String(e) };
-    } finally {
+  /** Queue a tool for install. Multiple can be queued and install one at a
+   *  time — the pip tools share one managed venv, so serial is the safe order. */
+  function enqueue(t: AiToolStatus) {
+    if (installing === t.id || queue.includes(t.id)) return;
+    queue = [...queue, t.id];
+    void processQueue();
+  }
+
+  async function processQueue() {
+    if (installing) return; // a run is already draining the queue
+    while (queue.length) {
+      const id = queue[0];
+      installing = id;
+      errors = { ...errors, [id]: '' };
+      try {
+        await installAiTool(id);
+        await refresh();
+        onChange();
+      } catch (e) {
+        errors = { ...errors, [id]: String(e) };
+      }
+      queue = queue.slice(1);
       installing = null;
     }
   }
@@ -118,8 +131,10 @@
             <span class="done">Ready</span>
           {:else if installing === t.id}
             <button disabled>Installing…</button>
+          {:else if queue.includes(t.id)}
+            <button disabled>Queued…</button>
           {:else}
-            <button onclick={() => install(t)} disabled={!t.installable || installing !== null}>
+            <button onclick={() => enqueue(t)} disabled={!t.installable}>
               {t.installed && t.id === 'sd' ? 'Get model' : 'Install'}
             </button>
           {/if}
@@ -129,8 +144,9 @@
   </div>
 
   <div class="hint foot">
-    Installs run in the background and can take several minutes (models are large).
-    You can keep editing while they download.
+    Click Install on as many as you want — they queue and install one at a time in
+    the background (several minutes each; models are large). You can keep going
+    meanwhile, and installs continue even after you close setup.
   </div>
 </div>
 
