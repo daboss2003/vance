@@ -50,7 +50,8 @@
   import ReviewPanel from '$lib/ReviewPanel.svelte';
   import AiToolsPanel from '$lib/AiToolsPanel.svelte';
   import OnboardingWizard from '$lib/OnboardingWizard.svelte';
-  import { getAppSettings } from '$lib/ipc';
+  import { getAppSettings, crashLogDir } from '$lib/ipc';
+  import { listen } from '@tauri-apps/api/event';
 
   // Phase 11 — show the first-run wizard until the user finishes/skips it.
   let showOnboarding = $state(false);
@@ -79,6 +80,55 @@
     { id: 'aitools', label: 'AI Tools' }
   ];
   let activeDock = $state('export');
+
+  // Native menu bar → app actions. The Rust menu emits `menu://action` with an
+  // item id; map each to the same handler as the matching toolbar button.
+  $effect(() => {
+    let un: (() => void) | null = null;
+    void listen<string>('menu://action', (e) => {
+      switch (e.payload) {
+        case 'new':
+          handleNewProject();
+          break;
+        case 'open_project':
+          handleOpenProject();
+          break;
+        case 'open_file':
+          handleOpen();
+          break;
+        case 'save':
+          handleSaveProject();
+          break;
+        case 'export':
+          activeDock = 'export';
+          break;
+        case 'undo':
+          void projectState.undo();
+          break;
+        case 'redo':
+          void projectState.redo();
+          break;
+        case 'page_edit':
+          activePage = 'edit';
+          break;
+        case 'page_color':
+          activePage = 'color';
+          break;
+        case 'dock_ai_tools':
+          activeDock = 'aitools';
+          break;
+        case 'settings':
+          showOnboarding = true;
+          break;
+        case 'diagnostics':
+          void crashLogDir()
+            .then((p) => alert(`Crash logs are saved in:\n${p}`))
+            .catch((err) => alert(`Couldn't locate crash logs: ${err}`));
+          break;
+      }
+    }).then((u) => (un = u));
+    return () => un?.();
+  });
   import TransitionInspector from '$lib/TransitionInspector.svelte';
   import ColorWheel from '$lib/color/ColorWheel.svelte';
   import CurveEditor from '$lib/color/CurveEditor.svelte';

@@ -3522,11 +3522,32 @@ fn image_gen_available() -> bool {
     generate::available()
 }
 
+/// A live image-generation progress event on `gen://progress`.
+#[derive(Clone, serde::Serialize)]
+struct GenProgressEvent {
+    /// Current diffusion step (0 for non-step status lines).
+    step: u32,
+    /// Total steps (0 when unknown, e.g. while loading the model).
+    total: u32,
+    /// 0..100 when steps are known.
+    pct: Option<f32>,
+    /// Latest status line from the runner.
+    detail: String,
+    /// True on the terminal event.
+    done: bool,
+    /// True only on a successful terminal event.
+    ok: bool,
+    /// Error text on a failed terminal event.
+    error: Option<String>,
+}
+
 /// GOAT-gated (generative) — synthesize an image from a prompt via the
 /// user's configured model (off-lock), writing it to an app-owned path, and
-/// import it as a held Image media item. Returns the new item's info.
+/// import it as a held Image media item. Streams per-step progress on
+/// `gen://progress`. Returns the new item's info.
 #[tauri::command]
-fn generate_image(
+async fn generate_image(
+    app: tauri::AppHandle,
     state: tauri::State<'_, EngineHandle>,
     prompt: String,
     negative: Option<String>,
@@ -3553,8 +3574,50 @@ fn generate_image(
         seed,
         out_path,
     };
-    // Model inference is slow — run it entirely off the engine lock.
-    let produced = generate::generate(&req).map_err(|e| e.to_string())?;
+
+    // Model inference is slow — run it on a blocking task and stream progress.
+    let emit_app = app.clone();
+    let produced = tauri::async_runtime::spawn_blocking(move || {
+        let mut on = |step: u32, total: u32, detail: &str| {
+            let pct = (total > 0).then(|| (step as f32 / total as f32 * 100.0).min(100.0));
+            let _ = emit_app.emit(
+                "gen://progress",
+                GenProgressEvent {
+                    step,
+                    total,
+                    pct,
+                    detail: detail.into(),
+                    done: false,
+                    ok: false,
+                    error: None,
+                },
+            );
+        };
+        generate::generate_with_progress(&req, &mut on)
+    })
+    .await
+    .map_err(|e| format!("generate task failed: {e}"))?;
+
+    // Terminal event so the panel can close its progress UI either way.
+    let terminal = |ok: bool, error: Option<String>| GenProgressEvent {
+        step: 0,
+        total: 0,
+        pct: ok.then_some(100.0),
+        detail: if ok { "Done".into() } else { "Failed".into() },
+        done: true,
+        ok,
+        error,
+    };
+    match &produced {
+        Ok(_) => {
+            let _ = app.emit("gen://progress", terminal(true, None));
+        }
+        Err(e) => {
+            let _ = app.emit("gen://progress", terminal(false, Some(e.to_string())));
+        }
+    }
+
+    let produced = produced.map_err(|e| e.to_string())?;
     let path_str = produced.to_string_lossy().into_owned();
     state
         .lock()
@@ -3883,6 +3946,91 @@ fn set_current_sequence(
         .map_err(|e| e.to_string())
 }
 
+/// The application menu bar (macOS: the system menu bar; Windows/Linux: a window
+/// menu). Custom items emit `menu://action` with their id; the frontend maps
+/// each id to the same handler as the matching toolbar button. Predefined items
+/// (undo-native/cut/copy/paste/quit/…) act natively.
+fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
+
+    let item = |id: &str, label: &str, accel: Option<&str>| {
+        let mut b = MenuItemBuilder::with_id(id, label);
+        if let Some(a) = accel {
+            b = b.accelerator(a);
+        }
+        b.build(app)
+    };
+
+    // App menu (shows as "Vance" on macOS).
+    let app_menu = SubmenuBuilder::new(app, "Vance")
+        .about(Some(tauri::menu::AboutMetadata {
+            name: Some("Vance".into()),
+            comments: Some("A fast, cross-platform video editor.".into()),
+            ..Default::default()
+        }))
+        .separator()
+        .item(&item("settings", "Settings…", Some("CmdOrCtrl+,"))?)
+        .separator()
+        .services()
+        .separator()
+        .hide()
+        .hide_others()
+        .show_all()
+        .separator()
+        .quit()
+        .build()?;
+
+    let file = SubmenuBuilder::new(app, "File")
+        .item(&item("new", "New Project", Some("CmdOrCtrl+N"))?)
+        .item(&item("open_project", "Open Project…", Some("CmdOrCtrl+Shift+O"))?)
+        .item(&item("open_file", "Open File…", Some("CmdOrCtrl+O"))?)
+        .separator()
+        .item(&item("save", "Save", Some("CmdOrCtrl+S"))?)
+        .item(&item("export", "Export…", Some("CmdOrCtrl+E"))?)
+        .separator()
+        .close_window()
+        .build()?;
+
+    // App-level Undo/Redo (the edit history) plus the native clipboard items
+    // that operate on the focused text field.
+    let edit = SubmenuBuilder::new(app, "Edit")
+        .item(&item("undo", "Undo", Some("CmdOrCtrl+Z"))?)
+        .item(&item("redo", "Redo", Some("CmdOrCtrl+Shift+Z"))?)
+        .separator()
+        .cut()
+        .copy()
+        .paste()
+        .select_all()
+        .build()?;
+
+    let view = SubmenuBuilder::new(app, "View")
+        .item(&item("page_edit", "Edit Page", Some("CmdOrCtrl+1"))?)
+        .item(&item("page_color", "Color Page", Some("CmdOrCtrl+2"))?)
+        .separator()
+        .item(&item("dock_ai_tools", "AI Tools Panel", None)?)
+        .build()?;
+
+    let window = SubmenuBuilder::new(app, "Window")
+        .minimize()
+        .maximize()
+        .separator()
+        .close_window()
+        .build()?;
+
+    let help = SubmenuBuilder::new(app, "Help")
+        .item(&item("diagnostics", "Show Crash Logs", None)?)
+        .build()?;
+
+    MenuBuilder::new(app)
+        .item(&app_menu)
+        .item(&file)
+        .item(&edit)
+        .item(&view)
+        .item(&window)
+        .item(&help)
+        .build()
+}
+
 fn main() {
     // Phase 11 — capture panics to a local crash log before anything else,
     // so even a startup panic leaves a report the user can find.
@@ -3919,6 +4067,13 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .menu(|handle| build_app_menu(handle))
+        .on_menu_event(|app, event| {
+            // Custom items carry a known id; forward it to the frontend, which
+            // maps it to the same action as the corresponding toolbar button.
+            // Predefined items (copy/paste/quit/…) act natively and are ignored.
+            let _ = app.emit("menu://action", event.id().0.as_str());
+        })
         .manage(engine.clone())
         .manage(peaks_handle.clone())
         .manage(control_hub.clone())
