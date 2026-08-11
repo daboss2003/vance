@@ -99,6 +99,7 @@ mod tests {
     fn round_trips_through_json() {
         let s = AppSettings {
             first_run_complete: true,
+            onboarding_step: 3,
             crash_reports_opt_in: true,
             telemetry_opt_in: false,
             ai_provider: Some("ollama".into()),

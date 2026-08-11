@@ -3608,15 +3608,90 @@ fn ai_python_available() -> bool {
     tools::python_available()
 }
 
+/// A live install-progress event, emitted on `ai-tool://progress` while an
+/// install runs so the UI can show it instead of appearing frozen.
+#[derive(Clone, serde::Serialize)]
+struct AiToolProgress {
+    /// Tool id this event is about.
+    id: String,
+    /// Coarse phase: `setup` | `pip` | `download` | `done` | `error`.
+    phase: String,
+    /// Human-readable line (latest subprocess output / status).
+    detail: String,
+    /// 0..100 when known (downloads); `null` for indeterminate steps.
+    pct: Option<f32>,
+    /// True on the terminal event.
+    done: bool,
+    /// True only on a successful terminal event.
+    ok: bool,
+    /// Error text on a failed terminal event.
+    error: Option<String>,
+}
+
 /// Install an optional AI tool by id (`whisper` / `demucs` /
 /// `backgroundremover` / `sd`) into Vance's managed tools dir — pip into the
 /// managed venv for the Python tools, or a manifest download for native ones.
-/// Blocking + slow (venv build, large downloads); returns the installed path.
+/// Runs on a blocking task and streams progress on `ai-tool://progress`;
+/// resolves to the installed path.
 #[tauri::command]
-fn install_ai_tool(id: String) -> Result<String, String> {
+async fn install_ai_tool(app: tauri::AppHandle, id: String) -> Result<String, String> {
     let tool = tools::Tool::from_id(&id).ok_or_else(|| format!("unknown AI tool: {id}"))?;
-    let path = tools::install(tool).map_err(|e| e.to_string())?;
-    Ok(path.to_string_lossy().into_owned())
+    let emit_id = id.clone();
+    let emit_app = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let mut on = |phase: &str, detail: &str, pct: Option<f32>| {
+            let _ = emit_app.emit(
+                "ai-tool://progress",
+                AiToolProgress {
+                    id: emit_id.clone(),
+                    phase: phase.into(),
+                    detail: detail.into(),
+                    pct,
+                    done: false,
+                    ok: false,
+                    error: None,
+                },
+            );
+        };
+        tools::install_with_progress(tool, &mut on)
+    })
+    .await
+    .map_err(|e| format!("install task failed: {e}"))?;
+
+    // Terminal event so the UI can close its progress dialog either way.
+    match &result {
+        Ok(path) => {
+            let _ = app.emit(
+                "ai-tool://progress",
+                AiToolProgress {
+                    id: id.clone(),
+                    phase: "done".into(),
+                    detail: "Installed".into(),
+                    pct: Some(100.0),
+                    done: true,
+                    ok: true,
+                    error: None,
+                },
+            );
+            Ok(path.to_string_lossy().into_owned())
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let _ = app.emit(
+                "ai-tool://progress",
+                AiToolProgress {
+                    id: id.clone(),
+                    phase: "error".into(),
+                    detail: "Install failed".into(),
+                    pct: None,
+                    done: true,
+                    ok: false,
+                    error: Some(msg.clone()),
+                },
+            );
+            Err(msg)
+        }
+    }
 }
 
 // ---- GOAT-10: control surfaces (OSC / MIDI) --------------------------------

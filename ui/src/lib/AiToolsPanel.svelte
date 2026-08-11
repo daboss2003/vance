@@ -19,6 +19,7 @@
     installAiTool,
     type AiToolStatus
   } from '$lib/ipc';
+  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
   let {
     /** Tighter chrome when embedded in the onboarding card. */
@@ -33,6 +34,61 @@
   let queue = $state<string[]>([]);
   let errors = $state<Record<string, string>>({});
   let loaded = $state(false);
+
+  // ---- live install progress (streamed from the backend) ----
+  interface Progress {
+    id: string;
+    phase: string;
+    detail: string;
+    pct: number | null;
+  }
+  let progress = $state<Progress | null>(null);
+  let elapsed = $state(0);
+
+  // Listen for progress events; only reflect the tool THIS panel is installing
+  // (events are global, but only the initiating panel shows the dialog).
+  $effect(() => {
+    let unlisten: UnlistenFn | null = null;
+    let alive = true;
+    void listen('ai-tool://progress', (e) => {
+      const p = e.payload as Progress & { done?: boolean };
+      if (!p || p.done) return;
+      if (installing && p.id === installing) {
+        progress = { id: p.id, phase: p.phase, detail: p.detail, pct: p.pct ?? null };
+      }
+    }).then((u) => {
+      if (alive) unlisten = u;
+      else u();
+    });
+    return () => {
+      alive = false;
+      if (unlisten) unlisten();
+    };
+  });
+
+  // Elapsed timer + reset, driven by which tool is installing.
+  $effect(() => {
+    if (!installing) return;
+    const started = Date.now();
+    elapsed = 0;
+    progress = null;
+    const t = setInterval(() => (elapsed = Math.floor((Date.now() - started) / 1000)), 1000);
+    return () => clearInterval(t);
+  });
+
+  const PHASE_LABEL: Record<string, string> = {
+    setup: 'Setting up',
+    pip: 'Installing packages',
+    download: 'Downloading',
+    done: 'Finishing'
+  };
+  function currentLabel(): string {
+    return tools.find((t) => t.id === installing)?.label ?? 'AI tool';
+  }
+  function fmtElapsed(s: number): string {
+    const m = Math.floor(s / 60);
+    return `${m}:${String(s % 60).padStart(2, '0')}`;
+  }
 
   async function refresh() {
     try {
@@ -150,6 +206,29 @@
   </div>
 </div>
 
+{#if installing}
+  <div class="prog-scrim" role="dialog" aria-modal="true" aria-label="Installing AI tool">
+    <div class="prog-card">
+      <div class="prog-title">Installing {currentLabel()}…</div>
+      <div class="prog-phase">
+        {progress ? (PHASE_LABEL[progress.phase] ?? progress.phase) : 'Starting…'}
+      </div>
+      <div class="prog-bar" class:indet={!progress || progress.pct == null}>
+        <i style={progress && progress.pct != null ? `width:${progress.pct}%` : ''}></i>
+      </div>
+      <div class="prog-detail">{progress?.detail ?? 'Preparing…'}</div>
+      <div class="prog-foot">
+        <span class="prog-elapsed">{fmtElapsed(elapsed)} elapsed</span>
+        {#if queue.length > 0}<span> · {queue.length} more queued</span>{/if}
+      </div>
+      <div class="prog-note">
+        Large downloads — this can take several minutes. You can leave this open, or
+        close setup and it keeps going in the background.
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style>
   .panel {
     display: flex;
@@ -256,5 +335,103 @@
   .err.small {
     font-size: 10px;
     margin-top: 2px;
+  }
+
+  /* ---- live install progress dialog (sits above the onboarding modal) ---- */
+  .prog-scrim {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.66);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 2500;
+  }
+  .prog-card {
+    width: 460px;
+    max-width: 92vw;
+    background: var(--panel-bg, #1c1d21);
+    color: var(--fg, #e6e6e6);
+    border: 1px solid var(--border, #33343a);
+    border-radius: 12px;
+    padding: 20px 22px;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
+  }
+  .prog-title {
+    font-size: 15px;
+    font-weight: 700;
+    margin-bottom: 3px;
+  }
+  .prog-phase {
+    font-size: 12px;
+    opacity: 0.7;
+    margin-bottom: 12px;
+  }
+  .prog-bar {
+    height: 8px;
+    border-radius: 999px;
+    background: #2a2b31;
+    overflow: hidden;
+    position: relative;
+  }
+  .prog-bar > i {
+    display: block;
+    height: 100%;
+    background: #6ea8fe;
+    border-radius: 999px;
+    transition: width 0.3s ease;
+  }
+  .prog-bar.indet > i {
+    width: 34%;
+    position: absolute;
+    left: 0;
+    animation: prog-slide 1.25s ease-in-out infinite;
+  }
+  @keyframes prog-slide {
+    0% {
+      left: -34%;
+    }
+    100% {
+      left: 100%;
+    }
+  }
+  .prog-detail {
+    margin-top: 11px;
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+    font-size: 11px;
+    line-height: 1.4;
+    color: #c7ccd6;
+    background: #15161a;
+    border: 1px solid var(--border, #2c2d33);
+    border-radius: 7px;
+    padding: 8px 10px;
+    max-height: 44px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .prog-foot {
+    display: flex;
+    gap: 4px;
+    margin-top: 10px;
+    font-size: 12px;
+    opacity: 0.8;
+  }
+  .prog-elapsed {
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+  }
+  .prog-note {
+    margin-top: 8px;
+    font-size: 10.5px;
+    opacity: 0.55;
+    line-height: 1.4;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .prog-bar.indet > i {
+      animation: none;
+      width: 100%;
+      position: static;
+    }
   }
 </style>

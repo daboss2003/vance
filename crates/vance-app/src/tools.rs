@@ -341,14 +341,24 @@ pub fn fetch_manifest() -> Result<Manifest, InstallError> {
         .map_err(|e| InstallError::Http(e.to_string()))
 }
 
-/// Install `tool` into Vance's managed tools dir, picking the right method:
-/// pip-into-managed-venv for the Python tools (no hosting needed), or a
-/// manifest download for native-binary tools. Blocking + slow (venv build,
+/// A live progress reporter: `(phase, human-readable detail, optional 0..100 %)`.
+/// Phases: `"setup"` (venv build), `"pip"` (package install), `"download"`
+/// (native binary / model), `"done"`.
+pub type Progress<'a> = dyn FnMut(&str, &str, Option<f32>) + 'a;
+
+/// Install `tool` into Vance's managed tools dir. Blocking + slow (venv build,
 /// large downloads) — run OFF the engine lock. Returns the installed path.
 pub fn install(tool: Tool) -> Result<PathBuf, InstallError> {
+    install_with_progress(tool, &mut |_, _, _| {})
+}
+
+/// Like [`install`], but streams live progress (venv build, each pip output
+/// line, download bytes) through `on` so the UI can show it instead of
+/// appearing frozen for minutes.
+pub fn install_with_progress(tool: Tool, on: &mut Progress) -> Result<PathBuf, InstallError> {
     match tool.pip_package() {
-        Some(package) => install_via_pip(tool, package),
-        None => install_via_manifest(tool),
+        Some(package) => install_via_pip(tool, package, on),
+        None => install_via_manifest(tool, on),
     }
 }
 
@@ -356,11 +366,12 @@ pub fn install(tool: Tool) -> Result<PathBuf, InstallError> {
 /// use. Uses a system Python 3 only to bootstrap the venv; the tool itself
 /// then lives entirely under `…/Vance/tools/venv` and resolves with no PATH
 /// setup.
-fn install_via_pip(tool: Tool, package: &str) -> Result<PathBuf, InstallError> {
+fn install_via_pip(tool: Tool, package: &str, on: &mut Progress) -> Result<PathBuf, InstallError> {
     // Bootstrap the managed venv if it doesn't exist yet.
     let vpython = match venv_python() {
         Some(p) => p,
         None => {
+            on("setup", "Creating a private Python environment…", None);
             let sys = system_python().ok_or(InstallError::NoPython)?;
             let venv = venv_dir()?;
             let out = Command::new(&sys)
@@ -376,19 +387,74 @@ fn install_via_pip(tool: Tool, package: &str) -> Result<PathBuf, InstallError> {
     };
     // Keep pip itself current, then install the package. `--upgrade` makes a
     // re-install idempotent (and pulls a newer tool if one shipped).
-    let up = Command::new(&vpython)
-        .args(["-m", "pip", "install", "--upgrade", "pip"])
-        .output()?;
-    if !up.status.success() {
-        return Err(pip_err("upgrading pip", &up));
-    }
-    let out = Command::new(&vpython)
-        .args(["-m", "pip", "install", "--upgrade", package])
-        .output()?;
-    if !out.status.success() {
-        return Err(pip_err(&format!("installing {package}"), &out));
-    }
+    on("pip", "Updating the package installer (pip)…", None);
+    let mut up = Command::new(&vpython);
+    up.args(["-m", "pip", "install", "--upgrade", "pip"]);
+    run_streaming(up, "pip", "upgrading pip", on)?;
+
+    on("pip", &format!("Installing {package} and its dependencies…"), None);
+    let mut inst = Command::new(&vpython);
+    inst.args(["-m", "pip", "install", "--upgrade", package]);
+    run_streaming(inst, "pip", &format!("installing {package}"), on)?;
+
     resolve(tool.bin_name()).ok_or_else(|| InstallError::MissingAfterInstall(tool.id().into()))
+}
+
+/// Spawn a child, stream its stdout+stderr line-by-line to `on`, and turn a
+/// non-zero exit into a `Pip` error carrying the tail of its output.
+fn run_streaming(
+    mut cmd: Command,
+    phase: &str,
+    what: &str,
+    on: &mut Progress,
+) -> Result<(), InstallError> {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut readers = Vec::new();
+    if let Some(out) = child.stdout.take() {
+        let tx = tx.clone();
+        readers.push(std::thread::spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        }));
+    }
+    if let Some(err) = child.stderr.take() {
+        let tx = tx.clone();
+        readers.push(std::thread::spawn(move || {
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        }));
+    }
+    drop(tx); // rx closes once both reader threads finish
+    let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    for line in rx {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        on(phase, t, None);
+        tail.push_back(t.to_string());
+        if tail.len() > 40 {
+            tail.pop_front();
+        }
+    }
+    for h in readers {
+        let _ = h.join();
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        let joined: Vec<String> = tail.into_iter().collect();
+        return Err(InstallError::Pip {
+            code: status.code(),
+            stderr: format!("{what}: {}", joined.join("\n")),
+        });
+    }
+    Ok(())
 }
 
 /// Build a `Pip` error from a failed process, prefixing the phase.
@@ -412,7 +478,7 @@ fn pip_err(phase: &str, out: &std::process::Output) -> InstallError {
 /// Download + verify + place every native-binary/model artifact for `tool` on
 /// this platform into the managed tools dir. Returns the installed executable
 /// path (a tool with only model artifacts resolves via its bin still).
-fn install_via_manifest(tool: Tool) -> Result<PathBuf, InstallError> {
+fn install_via_manifest(tool: Tool, on: &mut Progress) -> Result<PathBuf, InstallError> {
     let manifest = fetch_manifest()?;
     let artifacts = manifest
         .get(tool.id())
@@ -420,8 +486,11 @@ fn install_via_manifest(tool: Tool) -> Result<PathBuf, InstallError> {
         .filter(|a| !a.is_empty())
         .ok_or_else(|| InstallError::NotInManifest(tool.id().into()))?;
     let client = http_client()?;
-    for art in artifacts {
-        place_artifact(&client, art)?;
+    let n = artifacts.len();
+    for (i, art) in artifacts.iter().enumerate() {
+        let name = art.dest.rsplit('/').next().unwrap_or(&art.dest).to_string();
+        on("download", &format!("Downloading {name} ({}/{n})…", i + 1), Some(0.0));
+        place_artifact(&client, art, &name, on)?;
     }
     // Validate via the SAME resolve() the rest of the app uses, so a manifest
     // whose bin dest doesn't match bin_name() fails loudly rather than reporting
@@ -429,23 +498,24 @@ fn install_via_manifest(tool: Tool) -> Result<PathBuf, InstallError> {
     resolve(tool.bin_name()).ok_or_else(|| InstallError::MissingAfterInstall(tool.id().into()))
 }
 
-/// Download one artifact, verify its sha256, and atomically place it under the
-/// (sandboxed) managed tools dir. Returns the final path.
+/// Stream-download one artifact (hashing as it goes so a multi-GB file never
+/// buffers in memory), verify its sha256, and atomically place it under the
+/// (sandboxed) managed tools dir. Emits byte progress through `on`.
 fn place_artifact(
     client: &reqwest::blocking::Client,
     art: &Artifact,
+    name: &str,
+    on: &mut Progress,
 ) -> Result<PathBuf, InstallError> {
-    let resp = client
+    use std::io::{Read, Write};
+    let mut resp = client
         .get(&art.url)
         .send()
         .map_err(|e| InstallError::Http(e.to_string()))?;
     if !resp.status().is_success() {
         return Err(InstallError::Http(format!("{} {}", art.url, resp.status())));
     }
-    let bytes = resp
-        .bytes()
-        .map_err(|e| InstallError::Http(e.to_string()))?;
-    verify_sha256(&bytes, &art.sha256)?;
+    let total = resp.content_length();
 
     // Only `bin/` and `models/` are allowed dests (guards against a manifest
     // writing outside the sandbox).
@@ -454,7 +524,41 @@ fn place_artifact(
         std::fs::create_dir_all(parent)?;
     }
     let tmp = dest.with_extension("part");
-    std::fs::write(&tmp, &bytes)?;
+    let mut file = std::fs::File::create(&tmp)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 65536];
+    let mut done: u64 = 0;
+    let mut last_emit: u64 = 0;
+    loop {
+        let read = resp.read(&mut buf).map_err(|e| InstallError::Http(e.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+        file.write_all(&buf[..read])?;
+        done += read as u64;
+        if done - last_emit >= 1_048_576 {
+            last_emit = done;
+            let pct = total
+                .map(|t| if t > 0 { (done as f32 / t as f32 * 100.0).min(100.0) } else { 0.0 });
+            let detail = match total {
+                Some(t) => format!("Downloading {name} — {} / {}", human_bytes(done), human_bytes(t)),
+                None => format!("Downloading {name} — {}", human_bytes(done)),
+            };
+            on("download", &detail, pct);
+        }
+    }
+    file.flush()?;
+    drop(file);
+
+    let got_hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    if !got_hex.eq_ignore_ascii_case(&art.sha256) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(InstallError::Checksum {
+            got: got_hex,
+            want: art.sha256.clone(),
+        });
+    }
     #[cfg(unix)]
     if art.dest.starts_with("bin/") {
         use std::os::unix::fs::PermissionsExt;
@@ -462,6 +566,22 @@ fn place_artifact(
     }
     std::fs::rename(&tmp, &dest)?;
     Ok(dest)
+}
+
+/// Human-readable byte count for progress (e.g. `842.0 MB`).
+fn human_bytes(n: u64) -> String {
+    const U: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", U[i])
+    }
 }
 
 /// Resolve a manifest `dest` under the managed tools dir, rejecting anything
@@ -472,21 +592,6 @@ fn safe_dest(dest: &str) -> Result<PathBuf, InstallError> {
         return Err(InstallError::Http(format!("unsafe manifest dest: {dest}")));
     }
     Ok(tools_dir()?.join(rel))
-}
-
-fn verify_sha256(bytes: &[u8], want: &str) -> Result<(), InstallError> {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    let got = h.finalize();
-    let got_hex: String = got.iter().map(|b| format!("{b:02x}")).collect();
-    if got_hex.eq_ignore_ascii_case(want) {
-        Ok(())
-    } else {
-        Err(InstallError::Checksum {
-            got: got_hex,
-            want: want.to_string(),
-        })
-    }
 }
 
 fn http_client() -> Result<reqwest::blocking::Client, InstallError> {
@@ -694,10 +799,15 @@ mod tests {
 
     #[test]
     fn checksum_verify() {
-        // sha256("") = e3b0c442...
+        // sha256("") = e3b0c442… — mirrors the hex compare in place_artifact.
         let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        assert!(verify_sha256(b"", empty).is_ok());
-        assert!(verify_sha256(b"x", empty).is_err());
+        let hex = |b: &[u8]| {
+            let mut h = Sha256::new();
+            h.update(b);
+            h.finalize().iter().map(|x| format!("{x:02x}")).collect::<String>()
+        };
+        assert!(hex(b"").eq_ignore_ascii_case(empty));
+        assert!(!hex(b"x").eq_ignore_ascii_case(empty));
     }
 
     #[test]
@@ -726,6 +836,44 @@ mod tests {
         assert_eq!(Tool::StableDiffusion.install_method(), "download");
         assert_eq!(Tool::StableDiffusion.pip_package(), None);
         assert!(Tool::Whisper.pip_package().is_some());
+    }
+
+    #[test]
+    fn run_streaming_captures_stdout_and_stderr() {
+        if !cfg!(unix) {
+            return;
+        }
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("echo out-line; echo err-line 1>&2; exit 0");
+        let mut lines: Vec<String> = Vec::new();
+        let mut on = |_p: &str, detail: &str, _pct: Option<f32>| lines.push(detail.to_string());
+        assert!(run_streaming(cmd, "pip", "test", &mut on).is_ok());
+        assert!(lines.iter().any(|l| l == "out-line"), "missing stdout: {lines:?}");
+        assert!(lines.iter().any(|l| l == "err-line"), "missing stderr: {lines:?}");
+    }
+
+    #[test]
+    fn run_streaming_maps_nonzero_exit_to_error() {
+        if !cfg!(unix) {
+            return;
+        }
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("echo boom 1>&2; exit 3");
+        let mut on = |_: &str, _: &str, _: Option<f32>| {};
+        match run_streaming(cmd, "pip", "installing x", &mut on) {
+            Err(InstallError::Pip { code, stderr }) => {
+                assert_eq!(code, Some(3));
+                assert!(stderr.contains("boom"), "tail lost: {stderr}");
+            }
+            other => panic!("expected Pip error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn human_bytes_reads_naturally() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1536), "1.5 KB");
+        assert_eq!(human_bytes(5 * 1024 * 1024), "5.0 MB");
     }
 
     #[test]
