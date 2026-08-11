@@ -1544,17 +1544,16 @@
     {/if}
 
     {#if projectState.info}
-      <span class="ml-3 text-xs text-vance-muted flex items-center gap-1">
-        Project: <span class="text-vance-fg font-medium">{projectState.info.name}</span>
-        {#if projectState.path}
-          <span class="text-vance-muted">·</span>
-          <span class="text-vance-muted">{projectState.path}</span>
-        {:else}
-          <span class="text-vance-muted">·</span>
-          <span class="text-yellow-400">unsaved</span>
+      <span
+        class="ml-3 text-xs text-vance-muted flex min-w-0 items-center gap-1"
+        title={projectState.path ?? 'Unsaved project'}
+      >
+        <span class="text-vance-fg font-medium truncate max-w-[12rem]">{projectState.info.name}</span>
+        {#if !projectState.path}
+          <span class="text-yellow-400">· unsaved</span>
         {/if}
-        <span class="text-vance-muted ml-2">·</span>
-        <span class="text-vance-muted">Working space:</span>
+        <span class="text-vance-muted ml-2 shrink-0">·</span>
+        <span class="text-vance-muted shrink-0">Color space:</span>
         <select
           class="bg-vance-bg border-vance-border rounded border px-1 py-0.5 text-[10px]"
           value={projectState.info.working_color_space}
@@ -1562,14 +1561,14 @@
             const v = (ev.currentTarget as HTMLSelectElement).value as ColorSpaceLabel;
             projectState.setWorkingColorSpace(v);
           }}
-          title="Project working color space (Phase 6.2)"
+          title="Project working color space"
         >
           {#each COLOR_SPACE_OPTIONS as opt (opt.value)}
             <option value={opt.value}>{opt.label}</option>
           {/each}
         </select>
-        <span class="text-vance-muted ml-2">·</span>
-        <span class="text-vance-muted">View LUT:</span>
+        <span class="text-vance-muted ml-2 shrink-0">·</span>
+        <span class="text-vance-muted shrink-0">Preview look:</span>
         {#if projectState.info.view_lut_path}
           <button
             class="bg-vance-bg border-vance-border rounded border px-1 py-0.5 text-[10px] truncate max-w-[12rem]"
@@ -1595,9 +1594,9 @@
           </button>
         {/if}
 
-        <!-- OCIO display transform (Phase 6.1b) -->
-        <span class="text-vance-muted ml-2">·</span>
-        <span class="text-vance-muted">OCIO:</span>
+        <!-- OCIO display transform (advanced color management) -->
+        <span class="text-vance-muted ml-2 shrink-0">·</span>
+        <span class="text-vance-muted shrink-0">Advanced:</span>
         <div class="relative inline-block">
           <button
             class="bg-vance-bg border-vance-border rounded border px-1 py-0.5 text-[10px] disabled:opacity-40 max-w-[12rem] truncate"
@@ -1605,7 +1604,7 @@
             disabled={!projectState.info.ocio_available}
             title={projectState.info.ocio_available
               ? 'Configure an OpenColorIO display transform'
-              : 'OCIO not enabled in this build (rebuild with --features ocio)'}
+              : 'Advanced color management (OpenColorIO) is not available in this version.'}
           >
             {#if projectState.info.ocio_view}
               {projectState.info.ocio_view.src} → {projectState.info.ocio_view.dst}
@@ -1718,7 +1717,7 @@
       </span>
     {/if}
 
-    <div class="ml-auto flex items-center gap-2">
+    <div class="ml-auto flex shrink-0 items-center gap-2">
       <button
         class="rounded bg-vance-bg border-vance-border border px-2 py-1 text-xs hover:brightness-110"
         onclick={handleNewProject}

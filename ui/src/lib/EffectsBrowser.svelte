@@ -83,15 +83,15 @@
 
 <div class="border-vance-border rounded border bg-vance-bg p-2 text-[11px]">
   <div class="mb-1 flex items-center justify-between">
-    <span class="text-vance-muted uppercase tracking-wider">Plugins</span>
+    <span class="text-vance-muted uppercase tracking-wider">Add-on effects</span>
     <button
       type="button"
       class="border-vance-border rounded border bg-vance-panel px-1.5 py-0.5 text-[10px] hover:brightness-125"
       onclick={refresh}
       disabled={loading}
-      title="Rescan ~/.vance/plugins and the project plugins folder"
+      title="Check for installed add-on effects (advanced: .wasm plugins in ~/.vance/plugins/)"
     >
-      {loading ? '…' : 'Rescan'}
+      {loading ? '…' : 'Refresh'}
     </button>
   </div>
 
@@ -100,16 +100,13 @@
   {/if}
 
   {#if !canApply}
-    <div class="text-vance-muted mb-1 text-[10px] italic">Select a clip to apply a plugin.</div>
+    <div class="text-vance-muted mb-1 text-[10px] italic">Select a clip to apply an effect.</div>
   {/if}
 
   {#if plugins === null}
     <div class="text-vance-muted text-[10px] italic">Loading…</div>
   {:else if plugins.length === 0}
-    <div class="text-vance-muted text-[10px] italic">
-      No plugins found. Drop a <span class="font-mono">.wasm</span> into
-      <span class="font-mono">~/.vance/plugins/</span>.
-    </div>
+    <div class="text-vance-muted text-[10px] italic">None installed.</div>
   {:else}
     <ul class="flex flex-col gap-1">
       {#each plugins as p (p.id)}
