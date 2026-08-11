@@ -59,6 +59,26 @@
       .then((s) => (showOnboarding = !s.first_run_complete))
       .catch(() => {});
   });
+
+  // Feature-panel dock — tabbed so each panel gets full space instead of
+  // overflowing the transport bar. One panel is shown at a time.
+  const DOCK_PANELS = [
+    { id: 'export', label: 'Export' },
+    { id: 'history', label: 'History' },
+    { id: 'mixer', label: 'Mixer' },
+    { id: 'mograph', label: 'Titles' },
+    { id: 'magnetic', label: 'Magnetic' },
+    { id: 'captions', label: 'Captions' },
+    { id: 'aiaudio', label: 'AI Audio' },
+    { id: 'reframe', label: 'Reframe' },
+    { id: 'control', label: 'Control' },
+    { id: 'publish', label: 'Publish' },
+    { id: 'fusion', label: 'Fusion' },
+    { id: 'generate', label: 'Generate' },
+    { id: 'review', label: 'Review' },
+    { id: 'aitools', label: 'AI Tools' }
+  ];
+  let activeDock = $state('export');
   import TransitionInspector from '$lib/TransitionInspector.svelte';
   import ColorWheel from '$lib/color/ColorWheel.svelte';
   import CurveEditor from '$lib/color/CurveEditor.svelte';
@@ -2040,85 +2060,61 @@
              tuning. -->
         <MasterMeter />
 
-        <!-- Phase 8 — sequence export panel. Calls render_sequence
-             via Tauri; v1 emits a frame-index test pattern, real
-             renderer-to-encoder integration lands in 8.5. -->
-        <div class="ml-2 w-56 shrink-0">
-          <ExportPanel />
-        </div>
-
-        <!-- GOAT-1 — edit history + branching ("Git for edits"). -->
-        <div class="ml-2 w-56 shrink-0 max-h-48 overflow-auto">
-          <HistoryPanel />
-        </div>
-
-        <!-- GOAT-4 — Fairlight-class mixer console (bus channel strips). -->
-        <div class="ml-2 w-72 shrink-0 max-h-48 overflow-auto">
-          <MixerConsole />
-        </div>
-
-        <!-- GOAT-5 — Motion Graphics Templates (titles + graphics). -->
-        <div class="ml-2 w-72 shrink-0 max-h-48 overflow-auto">
-          <MographPanel />
-        </div>
-
-        <!-- GOAT-6 — magnetic timeline + clip connections. -->
-        <div class="ml-2 w-56 shrink-0 max-h-48 overflow-auto">
-          <MagneticPanel />
-        </div>
-
-        <!-- GOAT-7 — captions / subtitles + transcription. -->
-        <div class="ml-2 w-72 shrink-0 max-h-48 overflow-auto">
-          <CaptionsPanel />
-        </div>
-
-        <!-- GOAT-8 — AI audio (dialogue leveling + voice isolation). -->
-        <div class="ml-2 w-64 shrink-0 max-h-48 overflow-auto">
-          <AiAudioPanel />
-        </div>
-
-        <!-- GOAT-9 — smart reframe (subject-tracking auto-reframe). -->
-        <div class="ml-2 w-60 shrink-0 max-h-48 overflow-auto">
-          <ReframePanel />
-        </div>
-
-        <!-- GOAT-10 — control surfaces (OSC / MIDI). -->
-        <div class="ml-2 w-60 shrink-0 max-h-48 overflow-auto">
-          <ControlPanel />
-        </div>
-
-        <!-- GOAT-11 — direct publish (YouTube / Vimeo / TikTok). -->
-        <div class="ml-2 w-64 shrink-0 max-h-48 overflow-auto">
-          <PublishPanel />
-        </div>
-
-        <!-- GOAT-12 — Fusion node-graph compositor. -->
-        <div class="ml-2 w-72 shrink-0 max-h-48 overflow-auto">
-          <FusionPanel />
-        </div>
-
-        <!-- GOAT-gated — generative AI image synthesis. -->
-        <div class="ml-2 w-64 shrink-0 max-h-48 overflow-auto">
-          <GeneratePanel />
-        </div>
-
-        <!-- GOAT-gated — timeline review comments (collaboration). -->
-        <div class="ml-2 w-64 shrink-0 max-h-48 overflow-auto">
-          <ReviewPanel />
-        </div>
-
-        <!-- Optional AI tools — install/manage captions, voice isolation,
-             subject mask, and generative-image helpers. -->
-        <div class="ml-2 w-72 shrink-0 max-h-48 overflow-auto">
-          <AiToolsPanel />
-        </div>
-
         <span class="text-vance-muted ml-auto">
           last PTS: <span class="text-vance-fg font-mono">{lastPts ?? '—'}</span>
           {#if playError}
             <span class="ml-3 text-red-400">{playError}</span>
           {/if}
         </span>
+      </div>
+
+      <!-- Feature-panel dock. Previously these 14 panels were crammed into the
+           transport bar and overflowed off-screen; now they're a tabbed dock so
+           each gets full width. One panel shows at a time. -->
+      <div class="border-vance-border bg-vance-panel flex min-h-0 flex-shrink-0 flex-col border-t">
+        <div class="flex gap-1 overflow-x-auto px-2 py-1 text-xs">
+          {#each DOCK_PANELS as p (p.id)}
+            <button
+              class="shrink-0 rounded px-2.5 py-1 whitespace-nowrap {activeDock === p.id
+                ? 'bg-[var(--color-vance-accent)] font-semibold text-[#003040]'
+                : 'text-vance-muted hover:text-vance-fg hover:bg-vance-bg'}"
+              onclick={() => (activeDock = p.id)}
+            >
+              {p.label}
+            </button>
+          {/each}
+        </div>
+        <div class="h-56 overflow-auto border-t border-vance-border px-2 py-2">
+          {#if activeDock === 'export'}
+            <ExportPanel />
+          {:else if activeDock === 'history'}
+            <HistoryPanel />
+          {:else if activeDock === 'mixer'}
+            <MixerConsole />
+          {:else if activeDock === 'mograph'}
+            <MographPanel />
+          {:else if activeDock === 'magnetic'}
+            <MagneticPanel />
+          {:else if activeDock === 'captions'}
+            <CaptionsPanel />
+          {:else if activeDock === 'aiaudio'}
+            <AiAudioPanel />
+          {:else if activeDock === 'reframe'}
+            <ReframePanel />
+          {:else if activeDock === 'control'}
+            <ControlPanel />
+          {:else if activeDock === 'publish'}
+            <PublishPanel />
+          {:else if activeDock === 'fusion'}
+            <FusionPanel />
+          {:else if activeDock === 'generate'}
+            <GeneratePanel />
+          {:else if activeDock === 'review'}
+            <ReviewPanel />
+          {:else if activeDock === 'aitools'}
+            <AiToolsPanel />
+          {/if}
+        </div>
       </div>
     </main>
 
