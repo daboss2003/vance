@@ -58,6 +58,8 @@
   import { openDialog } from '$lib/dialog.svelte';
   import { addWasmPlugin } from '$lib/ipc';
   import { getCurrentWebview } from '@tauri-apps/api/webview';
+  import EffectsMarketplace from '$lib/EffectsMarketplace.svelte';
+  import { market, importEffectPaths } from '$lib/effectsMarket.svelte';
 
   // Phase 11 — show the first-run wizard until the user finishes/skips it.
   let showOnboarding = $state(false);
@@ -307,11 +309,18 @@
     void getCurrentWebview()
       .onDragDropEvent((event) => {
         const p = event.payload;
-        if (p.type === 'over' || p.type === 'enter') dropActive = true;
-        else if (p.type === 'leave') dropActive = false;
-        else if (p.type === 'drop') {
+        // While the effects marketplace is open, drops go straight to it.
+        if (p.type === 'over' || p.type === 'enter') {
+          if (market.open) market.dragOver = true;
+          else dropActive = true;
+        } else if (p.type === 'leave') {
           dropActive = false;
-          void handleFileDrop(p.paths);
+          market.dragOver = false;
+        } else if (p.type === 'drop') {
+          dropActive = false;
+          market.dragOver = false;
+          if (market.open) void importEffectPaths(p.paths);
+          else void handleFileDrop(p.paths);
         }
       })
       .then((u) => (un = u));
@@ -1602,8 +1611,9 @@
 
 <Toasts />
 <Dialogs />
+<EffectsMarketplace />
 
-{#if dropActive}
+{#if dropActive && !market.open}
   <div
     class="pointer-events-none fixed inset-3 z-[2800] flex items-center justify-center rounded-2xl border-2 border-dashed border-[var(--color-vance-accent)] bg-[color-mix(in_srgb,var(--color-vance-accent)_10%,transparent)]"
   >

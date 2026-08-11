@@ -1677,6 +1677,30 @@ fn list_wasm_plugins(state: tauri::State<'_, EngineHandle>) -> Vec<UiWasmPlugin>
     eng.discovered_plugins().iter().map(ui_wasm_plugin).collect()
 }
 
+/// Uninstall an add-on effect by id: delete its `.wasm` from the managed
+/// add-ons folder and rescan. Refuses to touch project-bundled effects.
+#[tauri::command]
+fn remove_wasm_plugin(state: tauri::State<'_, EngineHandle>, id: String) -> Result<(), String> {
+    let mut eng = state.lock();
+    eng.rescan_plugins();
+    let path = eng
+        .discovered_plugins()
+        .into_iter()
+        .find(|d| d.manifest.id == id)
+        .map(|d| d.path);
+    let path = path.ok_or_else(|| "that effect isn't installed".to_string())?;
+    // Only allow removing effects the user added (the managed folder), never a
+    // project-bundled one.
+    let user_dir = vance_plugin_sdk::discovery::user_plugins_dir();
+    match &user_dir {
+        Some(ud) if path.starts_with(ud) => {}
+        _ => return Err("This effect is part of the project, not your add-ons.".into()),
+    }
+    std::fs::remove_file(&path).map_err(|e| format!("removing the effect: {e}"))?;
+    eng.rescan_plugins();
+    Ok(())
+}
+
 /// The managed add-on-effects folder (`…/.vance/plugins`), created if missing.
 #[tauri::command]
 fn plugins_folder() -> Result<String, String> {
@@ -4355,6 +4379,7 @@ fn main() {
             rescan_plugins,
             list_wasm_plugins,
             add_wasm_plugin,
+            remove_wasm_plugin,
             plugins_folder,
             list_ofx_plugins,
             set_track_gain_keyframes,

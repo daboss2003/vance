@@ -1442,6 +1442,10 @@ export const listWasmPlugins = (): Promise<WasmPlugin[]> => invoke('list_wasm_pl
 export const addWasmPlugin = (source: string): Promise<WasmPlugin> =>
   invoke('add_wasm_plugin', { source });
 
+/** Uninstall an add-on effect by id (deletes it from the managed folder). */
+export const removeWasmPlugin = (id: string): Promise<void> =>
+  invoke('remove_wasm_plugin', { id });
+
 /** Path to Vance's managed add-ons folder (for a "show folder" affordance). */
 export const pluginsFolder = (): Promise<string> => invoke('plugins_folder');
 
