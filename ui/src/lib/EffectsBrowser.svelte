@@ -14,10 +14,15 @@
     listWasmPlugins,
     applyWasmPlugin,
     listOfxPlugins,
+    addWasmPlugin,
+    pluginsFolder,
     type WasmPlugin,
     type OfxPlugin
   } from '$lib/ipc';
   import { projectState } from '$lib/project.svelte';
+  import { openDialog } from '$lib/dialog.svelte';
+  import { toast } from '$lib/toast.svelte';
+  import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 
   let {
     trackId,
@@ -55,6 +60,50 @@
     }
   }
 
+  /** Install an add-on effect from a chosen .wasm file, then refresh the list. */
+  async function importEffectFile() {
+    const picked = await openFileDialog({
+      multiple: false,
+      filters: [{ name: 'Vance add-on effect', extensions: ['wasm'] }]
+    });
+    if (typeof picked !== 'string') return;
+    try {
+      const p = await addWasmPlugin(picked);
+      await refresh();
+      toast.success(`Added the “${p.name}” effect.`);
+    } catch (e) {
+      toast.error("That file couldn't be added as an effect.\n" + String(e));
+    }
+  }
+
+  /** Explainer dialog: what add-on effects are, how to get/create one, + import. */
+  async function showEffectsHelp() {
+    let folder = '~/.vance/plugins';
+    try {
+      folder = await pluginsFolder();
+    } catch {
+      /* keep the default hint */
+    }
+    const choice = await openDialog({
+      title: 'Add-on effects',
+      body:
+        'Add-on effects are extra video effects you can install into Vance. ' +
+        'The easiest way to add one: just drag an effect file (.wasm) anywhere ' +
+        'onto Vance — it’s installed automatically and shows up here when a clip ' +
+        'is selected. You can also import one below.',
+      bullets: [
+        'Get one — download a Vance effect (.wasm) shared by a creator, then drag it in.',
+        'Create one — build a small effect with the Vance plugin SDK and export a .wasm to share.',
+        'Installed effects live in: ' + folder
+      ],
+      actions: [
+        { label: 'Import a file…', value: 'import', kind: 'primary' },
+        { label: 'Close', value: 'close' }
+      ]
+    });
+    if (choice === 'import') await importEffectFile();
+  }
+
   async function apply(plugin: WasmPlugin) {
     if (!trackId || !clipId) return;
     error = null;
@@ -84,15 +133,25 @@
 <div class="border-vance-border rounded border bg-vance-bg p-2 text-[11px]">
   <div class="mb-1 flex items-center justify-between">
     <span class="text-vance-muted uppercase tracking-wider">Add-on effects</span>
-    <button
-      type="button"
-      class="border-vance-border rounded border bg-vance-panel px-1.5 py-0.5 text-[10px] hover:brightness-125"
-      onclick={refresh}
-      disabled={loading}
-      title="Check for installed add-on effects (advanced: .wasm plugins in ~/.vance/plugins/)"
-    >
-      {loading ? '…' : 'Refresh'}
-    </button>
+    <div class="flex items-center gap-1">
+      <button
+        type="button"
+        class="border-vance-border rounded border bg-vance-panel px-1.5 py-0.5 text-[10px] hover:brightness-125"
+        onclick={showEffectsHelp}
+        title="What are add-on effects? Get or import one"
+      >
+        + Get / Import
+      </button>
+      <button
+        type="button"
+        class="border-vance-border rounded border bg-vance-panel px-1.5 py-0.5 text-[10px] hover:brightness-125"
+        onclick={refresh}
+        disabled={loading}
+        title="Check for installed add-on effects"
+      >
+        {loading ? '…' : 'Refresh'}
+      </button>
+    </div>
   </div>
 
   {#if error}
@@ -106,7 +165,13 @@
   {#if plugins === null}
     <div class="text-vance-muted text-[10px] italic">Loading…</div>
   {:else if plugins.length === 0}
-    <div class="text-vance-muted text-[10px] italic">None installed.</div>
+    <button
+      type="button"
+      class="text-vance-muted hover:text-vance-fg text-left text-[10px] italic"
+      onclick={showEffectsHelp}
+    >
+      None installed — drag an effect file in, or click to get one.
+    </button>
   {:else}
     <ul class="flex flex-col gap-1">
       {#each plugins as p (p.id)}

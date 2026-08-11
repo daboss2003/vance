@@ -54,6 +54,10 @@
   import { listen } from '@tauri-apps/api/event';
   import Toasts from '$lib/Toasts.svelte';
   import { toast, pushToast } from '$lib/toast.svelte';
+  import Dialogs from '$lib/Dialogs.svelte';
+  import { openDialog } from '$lib/dialog.svelte';
+  import { addWasmPlugin } from '$lib/ipc';
+  import { getCurrentWebview } from '@tauri-apps/api/webview';
 
   // Phase 11 — show the first-run wizard until the user finishes/skips it.
   let showOnboarding = $state(false);
@@ -230,6 +234,82 @@
     }).then((u) => (un = u));
     return () => un?.();
   });
+
+  // ---- External file drop (from Finder): plugins, media, LUTs ----
+  let dropActive = $state(false);
+  const MEDIA_EXT = new Set([
+    'mp4', 'mov', 'mkv', 'webm', 'avi', 'm4v', 'mp3', 'wav', 'aac', 'flac', 'm4a', 'ogg',
+    'png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'tiff', 'tif'
+  ]);
+
+  async function addEffectFromFile(path: string, name: string) {
+    try {
+      const p = await addWasmPlugin(path);
+      toast.success(
+        `Added the “${p.name}” effect. Select a clip and find it under Add-on effects.`
+      );
+    } catch (e) {
+      toast.error(`“${name}” couldn’t be added as an effect.\n${String(e)}`);
+    }
+  }
+
+  async function importMediaPath(path: string, name: string) {
+    if (!projectState.info) {
+      toast.error('Create or open a project first, then add media.');
+      return;
+    }
+    try {
+      await projectState.importMedia(path);
+      toast.success(`Added “${name}” to the media pool.`);
+    } catch (e) {
+      toast.error(`Couldn’t import “${name}”.\n${String(e)}`);
+    }
+  }
+
+  async function handleFileDrop(paths: string[]) {
+    for (const path of paths) {
+      const name = path.split('/').pop() ?? path;
+      const ext = (name.split('.').pop() ?? '').toLowerCase();
+      if (ext === 'wasm') {
+        await addEffectFromFile(path, name);
+      } else if (MEDIA_EXT.has(ext)) {
+        await importMediaPath(path, name);
+      } else if (ext === 'cube' || ext === '3dl') {
+        await projectState.setViewLut(path);
+        toast.success(`Preview look set from “${name}”.`);
+      } else {
+        // Ambiguous / unknown — ask instead of guessing.
+        const choice = await openDialog({
+          title: 'Add this file',
+          body: `Vance isn’t sure what “${name}” is. How would you like to add it?`,
+          actions: [
+            { label: 'Import as media', value: 'media', kind: 'primary' },
+            { label: 'Add as add-on effect', value: 'effect' },
+            { label: 'Cancel', value: 'cancel' }
+          ]
+        });
+        if (choice === 'media') await importMediaPath(path, name);
+        else if (choice === 'effect') await addEffectFromFile(path, name);
+      }
+    }
+  }
+
+  $effect(() => {
+    let un: (() => void) | null = null;
+    void getCurrentWebview()
+      .onDragDropEvent((event) => {
+        const p = event.payload;
+        if (p.type === 'over' || p.type === 'enter') dropActive = true;
+        else if (p.type === 'leave') dropActive = false;
+        else if (p.type === 'drop') {
+          dropActive = false;
+          void handleFileDrop(p.paths);
+        }
+      })
+      .then((u) => (un = u));
+    return () => un?.();
+  });
+
   import TransitionInspector from '$lib/TransitionInspector.svelte';
   import ColorWheel from '$lib/color/ColorWheel.svelte';
   import CurveEditor from '$lib/color/CurveEditor.svelte';
@@ -1513,6 +1593,17 @@
 {/if}
 
 <Toasts />
+<Dialogs />
+
+{#if dropActive}
+  <div
+    class="pointer-events-none fixed inset-3 z-[2800] flex items-center justify-center rounded-2xl border-2 border-dashed border-[var(--color-vance-accent)] bg-[color-mix(in_srgb,var(--color-vance-accent)_10%,transparent)]"
+  >
+    <div class="bg-vance-panel border-vance-border rounded-lg border px-5 py-3 text-sm font-medium shadow-xl">
+      Drop to add — media, an add-on effect (.wasm), or a color look
+    </div>
+  </div>
+{/if}
 
 <div class="flex h-screen flex-col">
   <!-- Header -->

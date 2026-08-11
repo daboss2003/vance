@@ -1641,6 +1641,32 @@ fn rescan_plugins(state: tauri::State<'_, EngineHandle>) -> usize {
     state.lock().rescan_plugins()
 }
 
+/// Map a discovered plugin to its UI descriptor.
+fn ui_wasm_plugin(d: &vance_plugin_sdk::discovery::DiscoveredPlugin) -> UiWasmPlugin {
+    UiWasmPlugin {
+        id: d.manifest.id.clone(),
+        name: d.manifest.name.clone(),
+        version: d.manifest.version.clone(),
+        author: d.manifest.author.clone(),
+        kind: match d.manifest.kind {
+            vance_plugin_sdk::manifest::PluginKind::Effect => "effect",
+            vance_plugin_sdk::manifest::PluginKind::Transition => "transition",
+        },
+        params: d
+            .manifest
+            .params
+            .iter()
+            .map(|p| UiWasmPluginParam {
+                key: p.key.clone(),
+                label: p.label.clone(),
+                min: p.min,
+                max: p.max,
+                default: p.default,
+            })
+            .collect(),
+    }
+}
+
 /// Phase 10.5 — list discovered WASM plugins for the effects browser.
 /// Triggers a rescan first so freshly-dropped plugins appear without
 /// a restart.
@@ -1648,31 +1674,55 @@ fn rescan_plugins(state: tauri::State<'_, EngineHandle>) -> usize {
 fn list_wasm_plugins(state: tauri::State<'_, EngineHandle>) -> Vec<UiWasmPlugin> {
     let mut eng = state.lock();
     eng.rescan_plugins();
-    eng.discovered_plugins()
+    eng.discovered_plugins().iter().map(ui_wasm_plugin).collect()
+}
+
+/// The managed add-on-effects folder (`…/.vance/plugins`), created if missing.
+#[tauri::command]
+fn plugins_folder() -> Result<String, String> {
+    let dir = vance_plugin_sdk::discovery::user_plugins_dir()
+        .ok_or_else(|| "couldn't locate the add-ons folder".to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("creating add-ons folder: {e}"))?;
+    Ok(dir.to_string_lossy().into_owned())
+}
+
+/// Install a dropped/imported `.wasm` add-on effect: copy it into the managed
+/// add-ons folder, rescan, and return the newly-usable effect — or an error if
+/// the file isn't a valid Vance effect. So the user never touches a folder.
+#[tauri::command]
+fn add_wasm_plugin(
+    state: tauri::State<'_, EngineHandle>,
+    source: String,
+) -> Result<UiWasmPlugin, String> {
+    let src = std::path::PathBuf::from(&source);
+    if src.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()) != Some("wasm".into())
+    {
+        return Err("That file isn't an add-on effect (.wasm).".into());
+    }
+    let dir = vance_plugin_sdk::discovery::user_plugins_dir()
+        .ok_or_else(|| "couldn't locate the add-ons folder".to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("creating add-ons folder: {e}"))?;
+    let file_name = src
+        .file_name()
+        .ok_or_else(|| "that file has no name".to_string())?;
+    let dest = dir.join(file_name);
+
+    std::fs::copy(&src, &dest).map_err(|e| format!("saving the effect: {e}"))?;
+
+    let mut eng = state.lock();
+    eng.rescan_plugins();
+    let found = eng
+        .discovered_plugins()
         .into_iter()
-        .map(|d| UiWasmPlugin {
-            id: d.manifest.id.clone(),
-            name: d.manifest.name.clone(),
-            version: d.manifest.version.clone(),
-            author: d.manifest.author.clone(),
-            kind: match d.manifest.kind {
-                vance_plugin_sdk::manifest::PluginKind::Effect => "effect",
-                vance_plugin_sdk::manifest::PluginKind::Transition => "transition",
-            },
-            params: d
-                .manifest
-                .params
-                .iter()
-                .map(|p| UiWasmPluginParam {
-                    key: p.key.clone(),
-                    label: p.label.clone(),
-                    min: p.min,
-                    max: p.max,
-                    default: p.default,
-                })
-                .collect(),
-        })
-        .collect()
+        .find(|d| d.path == dest);
+    match found {
+        Some(d) => Ok(ui_wasm_plugin(&d)),
+        None => {
+            // Not a valid Vance effect — don't leave a dud in the folder.
+            let _ = std::fs::remove_file(&dest);
+            Err("This file isn't a Vance add-on effect, or it couldn't be loaded.".into())
+        }
+    }
 }
 
 /// Phase 10.7 — read-only OFX plugin catalog entry for the UI.
@@ -4304,6 +4354,8 @@ fn main() {
             set_media_proxy_path,
             rescan_plugins,
             list_wasm_plugins,
+            add_wasm_plugin,
+            plugins_folder,
             list_ofx_plugins,
             set_track_gain_keyframes,
             set_clip_gain_keyframes,

@@ -1436,6 +1436,15 @@ export const rescanPlugins = (): Promise<number> => invoke('rescan_plugins');
  *  freshly-dropped .wasm appears without a restart). */
 export const listWasmPlugins = (): Promise<WasmPlugin[]> => invoke('list_wasm_plugins');
 
+/** Install an add-on effect from a `.wasm` file: Vance copies it into its
+ *  managed add-ons folder and returns the usable effect (or rejects if the
+ *  file isn't a valid Vance effect). */
+export const addWasmPlugin = (source: string): Promise<WasmPlugin> =>
+  invoke('add_wasm_plugin', { source });
+
+/** Path to Vance's managed add-ons folder (for a "show folder" affordance). */
+export const pluginsFolder = (): Promise<string> => invoke('plugins_folder');
+
 /** Apply a discovered WASM plugin to a clip as a `wasm:<id>` effect,
  *  seeding params with the plugin's declared defaults. */
 export const applyWasmPlugin = (
