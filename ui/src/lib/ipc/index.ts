@@ -700,6 +700,8 @@ export const detectCapabilities = (): Promise<Capability[]> => invoke('detect_ca
 /** Persisted app settings (first-run flag + privacy opt-ins). */
 export interface AppSettings {
   first_run_complete: boolean;
+  /** Furthest wizard step reached, so unfinished setup resumes where it left off. */
+  onboarding_step: number;
   crash_reports_opt_in: boolean;
   telemetry_opt_in: boolean;
   ai_provider: string | null;

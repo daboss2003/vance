@@ -1,9 +1,10 @@
 <script lang="ts">
   /**
-   * Phase 11 — first-run onboarding. Shown once (until `first_run_complete`),
-   * as a dismissible modal overlay. Welcomes the user, shows what's detected
-   * vs. what to install, offers privacy opt-ins (default OFF), and gets out
-   * of the way. The editor is fully usable whether or not this is completed.
+   * Phase 11 — first-run onboarding, as a RESUMABLE setup flow. Instead of
+   * showing once, it reappears on every launch until the user actually
+   * finishes it with all required components present, resuming at the step
+   * they left off (`onboarding_step`). "Finish later" closes it for the
+   * session but it returns next launch. The editor is fully usable throughout.
    */
   import {
     detectCapabilities,
@@ -16,12 +17,15 @@
 
   let { onDone }: { onDone: () => void } = $props();
 
-  let step = $state(0);
   const steps = ['Welcome', 'What Vance found', 'AI tools', 'Privacy', 'You’re set'];
+  const CAPS_STEP = 1;
+  let step = $state(0);
+  let loaded = $state(false);
 
   let caps = $state<Capability[]>([]);
   let settings = $state<AppSettings>({
     first_run_complete: false,
+    onboarding_step: 0,
     crash_reports_opt_in: false,
     telemetry_opt_in: false,
     ai_provider: null
@@ -34,25 +38,79 @@
       .then((c) => (caps = c))
       .catch((e) => (error = String(e)));
     void getAppSettings()
-      .then((s) => (settings = s))
+      .then((s) => {
+        settings = s;
+        // Resume where setup was left off (once, on load; clamped to range).
+        if (!loaded) {
+          step = Math.min(Math.max(s.onboarding_step ?? 0, 0), steps.length - 1);
+          loaded = true;
+        }
+      })
       .catch(() => {});
   });
 
   let requiredMissing = $derived(caps.filter((c) => c.required && !c.present));
   let coreReady = $derived(caps.length > 0 && requiredMissing.length === 0);
 
-  function next() {
-    if (step < steps.length - 1) step += 1;
-  }
-  function back() {
-    if (step > 0) step -= 1;
+  /** Remember the current step so a hard quit still resumes here next launch. */
+  async function persistStep(s: number) {
+    settings = { ...settings, onboarding_step: s };
+    try {
+      await setAppSettings(settings);
+    } catch {
+      /* non-fatal: resume just won't advance */
+    }
   }
 
+  function next() {
+    if (step < steps.length - 1) {
+      step += 1;
+      void persistStep(step);
+    }
+  }
+  function back() {
+    if (step > 0) {
+      step -= 1;
+      void persistStep(step);
+    }
+  }
+
+  /** Re-run capability detection (after the user installs a missing component). */
+  function recheck() {
+    error = null;
+    void detectCapabilities()
+      .then((c) => (caps = c))
+      .catch((e) => (error = String(e)));
+  }
+
+  /** Finish for good — only allowed once required components are present, so an
+   *  incomplete setup keeps bringing the wizard back at the components step. */
   async function finish() {
+    if (!coreReady) {
+      error = 'A required component is still missing. Install it and press “Re-check”, then finish.';
+      step = CAPS_STEP;
+      await persistStep(step);
+      return;
+    }
     busy = true;
     error = null;
     try {
-      await setAppSettings({ ...settings, first_run_complete: true });
+      await setAppSettings({ ...settings, first_run_complete: true, onboarding_step: steps.length - 1 });
+      onDone();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  /** Close for this session WITHOUT completing — it returns next launch,
+   *  resuming at the step we're on now. */
+  async function finishLater() {
+    busy = true;
+    error = null;
+    try {
+      await persistStep(step);
       onDone();
     } catch (e) {
       error = String(e);
@@ -86,7 +144,7 @@
         {#if coreReady}
           Core editing and export are ready. Optional AI tools light up when their helpers are installed.
         {:else}
-          A required component is missing — install it below, then reopen Vance.
+          A required component is missing — install it (see the hint below), then press <strong>Re-check</strong>. Setup can’t finish until it’s present.
         {/if}
       </p>
       <div class="caps">
@@ -103,6 +161,7 @@
           </div>
         {/each}
       </div>
+      <button class="ghost recheck" onclick={recheck} disabled={busy}>↻ Re-check</button>
     {:else if step === 2}
       <h1>Optional AI tools</h1>
       <p class="lead">
@@ -138,13 +197,13 @@
     {/if}
 
     <div class="actions">
-      <button class="ghost" onclick={finish} disabled={busy}>Skip setup</button>
+      <button class="ghost" onclick={finishLater} disabled={busy} title="Closes setup for now; it returns next launch where you left off">Finish later</button>
       <span class="spacer"></span>
       {#if step > 0}<button class="ghost" onclick={back} disabled={busy}>Back</button>{/if}
       {#if step < steps.length - 1}
         <button onclick={next} disabled={busy}>Next</button>
       {:else}
-        <button onclick={finish} disabled={busy}>Get started</button>
+        <button onclick={finish} disabled={busy}>{coreReady ? 'Get started' : 'Finish setup'}</button>
       {/if}
     </div>
   </div>
@@ -209,6 +268,9 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
+  }
+  .recheck {
+    margin-top: 10px;
   }
   .cap {
     display: flex;

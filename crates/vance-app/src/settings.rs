@@ -12,9 +12,15 @@ use serde::{Deserialize, Serialize};
 /// App-wide settings, independent of any project.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
-    /// Set once the user has finished (or skipped) the first-run wizard.
+    /// Set once the user has FINISHED the first-run wizard with all required
+    /// components present. While false, the wizard reappears on every launch,
+    /// resuming at `onboarding_step`.
     #[serde(default)]
     pub first_run_complete: bool,
+    /// The furthest wizard step the user has reached, so an unfinished setup
+    /// resumes where they left off instead of restarting. 0-based.
+    #[serde(default)]
+    pub onboarding_step: u32,
     /// Opt-in to sending crash reports (local crash logs are always written;
     /// this gates any future upload). Defaults OFF.
     #[serde(default)]
