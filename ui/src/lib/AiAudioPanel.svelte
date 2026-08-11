@@ -6,11 +6,10 @@
   import { levelClip, voiceIsolationAvailable, isolateVoice } from '$lib/ipc';
   import { projectState } from '$lib/project.svelte';
   import { selectionState } from '$lib/selection.svelte';
+  import { toast } from '$lib/toast.svelte';
 
   let targetLufs = $state(-16);
   let busy = $state(false);
-  let status = $state<string | null>(null);
-  let error = $state<string | null>(null);
 
   let isolateAvail = $state(false);
   let isolateMediaId = $state('');
@@ -35,12 +34,10 @@
   async function levelSelected() {
     const ids = selectionState.ids;
     if (ids.length === 0) {
-      error = 'Select one or more clips on the timeline first.';
+      toast.error('Select one or more clips on the timeline first.');
       return;
     }
     busy = true;
-    error = null;
-    status = `Analyzing loudness of ${ids.length} clip(s)…`;
     let done = 0;
     try {
       for (const clipId of ids) {
@@ -54,10 +51,9 @@
         }
       }
       await projectState.refresh();
-      status = `Leveled ${done} clip(s) to ${targetLufs} LUFS.`;
+      toast.success(`Balanced the loudness of ${done} clip(s).`);
     } catch (e) {
-      error = String(e);
-      status = null;
+      toast.error('Loudness balancing failed.\n' + String(e));
     } finally {
       busy = false;
     }
@@ -66,15 +62,13 @@
   async function runIsolate() {
     if (!isolateMediaId) return;
     busy = true;
-    error = null;
-    status = 'Isolating vocals… (this can take a while)';
+    toast.info('Isolating the voice… this can take a while.');
     try {
       const info = await isolateVoice(isolateMediaId);
       await projectState.refresh();
-      status = `Imported isolated stem: ${info.name}`;
+      toast.success(`Added the isolated vocal track: ${info.name}`);
     } catch (e) {
-      error = String(e);
-      status = null;
+      toast.error('Voice isolation failed.\n' + String(e));
     } finally {
       busy = false;
     }
@@ -82,36 +76,34 @@
 </script>
 
 <div class="panel">
-  <div class="head">AI Audio</div>
-  {#if error}<div class="err">{error}</div>{/if}
-  {#if status}<div class="status">{status}</div>{/if}
+  <div class="head">Voice & Levels</div>
 
   <div class="section">
-    <div class="lbl">Dialogue leveling</div>
+    <div class="lbl">Balance loudness</div>
     <div class="row">
       <span>Target</span>
       <input type="number" step="1" min="-40" max="0" bind:value={targetLufs} disabled={busy} />
-      <span>LUFS</span>
-      <button disabled={busy} onclick={levelSelected}>Level selected</button>
+      <span title="Loudness units. −16 is a good target for YouTube.">LUFS</span>
+      <button disabled={busy} onclick={levelSelected}>Balance selected</button>
     </div>
-    <div class="hint">Normalizes each selected clip's perceived loudness to the target.</div>
+    <div class="hint">Evens out the loudness of the selected clips. −16 LUFS suits YouTube.</div>
   </div>
 
   <div class="section">
-    <div class="lbl">Voice isolation</div>
+    <div class="lbl">Isolate voice</div>
     {#if !isolateAvail}
-      <div class="hint">Install Demucs to enable: <code>pip install -U demucs</code></div>
+      <div class="hint">Needs the voice-isolation add-on. Set it up in Settings → AI add-ons.</div>
     {/if}
     <div class="row">
       <select bind:value={isolateMediaId} disabled={busy || !isolateAvail}>
-        <option value="">— media —</option>
+        <option value="">Choose a clip…</option>
         {#each mediaChoices as m (m.id)}
           <option value={m.id}>{m.name}</option>
         {/each}
       </select>
       <button disabled={busy || !isolateAvail || !isolateMediaId} onclick={runIsolate}>Isolate</button>
     </div>
-    <div class="hint">Separates vocals from background; imports the vocal stem.</div>
+    <div class="hint">Separates the voice from background audio and adds it as a new track.</div>
   </div>
 </div>
 

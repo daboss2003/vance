@@ -19,11 +19,10 @@
     type Cue
   } from '$lib/ipc';
   import { projectState } from '$lib/project.svelte';
+  import { toast } from '$lib/toast.svelte';
 
   let cues = $state<Cue[]>([]);
   let busy = $state(false);
-  let error = $state<string | null>(null);
-  let status = $state<string | null>(null);
 
   let filePath = $state('captions.srt');
   let whisperOk = $state(false);
@@ -47,21 +46,19 @@
     try {
       cues = await ipcCaptions();
     } catch (e) {
-      error = String(e);
+      toast.error(String(e));
     }
   }
 
   async function act(fn: () => Promise<unknown>, ok?: string) {
     busy = true;
-    error = null;
-    status = null;
     try {
       await fn();
       await projectState.refresh();
       await refresh();
-      if (ok) status = ok;
+      if (ok) toast.success(ok);
     } catch (e) {
-      error = String(e);
+      toast.error(String(e));
     } finally {
       busy = false;
     }
@@ -83,16 +80,14 @@
   async function runTranscribe() {
     if (!transcribeMediaId) return;
     busy = true;
-    error = null;
-    status = 'Transcribing… (this can take a while)';
+    toast.info('Transcribing… this can take a while.');
     try {
       const n = await transcribeMedia(transcribeMediaId, model, language || null);
       await projectState.refresh();
       await refresh();
-      status = `Transcribed ${n} cues.`;
+      toast.success(`Added ${n} captions.`);
     } catch (e) {
-      error = String(e);
-      status = null;
+      toast.error('Transcription failed.\n' + String(e));
     } finally {
       busy = false;
     }
@@ -102,14 +97,12 @@
 <div class="panel">
   <div class="head">
     <span>Captions</span>
-    <button onclick={addAtEnd} disabled={busy}>＋ Cue</button>
+    <button onclick={addAtEnd} disabled={busy}>＋ Caption</button>
   </div>
-  {#if error}<div class="err">{error}</div>{/if}
-  {#if status}<div class="status">{status}</div>{/if}
 
   <div class="cues">
     {#if cues.length === 0}
-      <div class="hint">No captions. Add a cue, import a file, or transcribe below.</div>
+      <div class="hint">No captions yet. Add one, import a file, or auto-transcribe below.</div>
     {:else}
       {#each cues as c (c.id)}
         <div class="cue">
@@ -151,29 +144,29 @@
   </div>
 
   <div class="transcribe">
-    <div class="t-head">Auto-transcribe (Whisper)</div>
+    <div class="t-head">Auto-transcribe (speech to text)</div>
     {#if !whisperOk}
       <div class="hint">
-        Install a Whisper CLI to enable: <code>pip install -U openai-whisper</code> (or whisper.cpp).
+        Needs the speech-to-text add-on. Set it up in Settings → AI add-ons.
       </div>
     {/if}
     <div class="t-row">
       <select bind:value={transcribeMediaId} disabled={busy || !whisperOk}>
-        <option value="">— media —</option>
+        <option value="">Choose a clip…</option>
         {#each mediaChoices as m (m.id)}
           <option value={m.id}>{m.name}</option>
         {/each}
       </select>
-      <select bind:value={model} disabled={busy || !whisperOk} title="Whisper model">
-        <option value="tiny">tiny</option>
-        <option value="base">base</option>
-        <option value="small">small</option>
-        <option value="medium">medium</option>
-        <option value="large-v3">large-v3</option>
+      <select bind:value={model} disabled={busy || !whisperOk} title="Transcription quality">
+        <option value="tiny">Fastest</option>
+        <option value="base">Fast</option>
+        <option value="small">Balanced</option>
+        <option value="medium">Better</option>
+        <option value="large-v3">Best (slowest)</option>
       </select>
     </div>
     <div class="t-row">
-      <input type="text" bind:value={language} placeholder="lang (auto)" disabled={busy || !whisperOk} />
+      <input type="text" bind:value={language} placeholder="Language (auto-detect)" disabled={busy || !whisperOk} />
       <button disabled={busy || !whisperOk || !transcribeMediaId} onclick={runTranscribe}>Transcribe</button>
     </div>
   </div>

@@ -74,6 +74,14 @@
   let currentPage = $state<'edit' | 'compositor' | 'color' | 'audio' | 'deliver'>('edit');
   let activePage = $derived<'edit' | 'color'>(currentPage === 'color' ? 'color' : 'edit');
 
+  // Inspector tabs (DaVinci-style): "Adjust" leads with the controls; "Details"
+  // holds the technical clip metadata, out of the way.
+  const INSPECTOR_TABS = [
+    { id: 'adjust', label: 'Adjust' },
+    { id: 'details', label: 'Details' }
+  ] as const;
+  let inspectorTab = $state<'adjust' | 'details'>('adjust');
+
   // DaVinci-style pages: the tool panels are grouped by post-production stage
   // rather than shown as one flat strip. Each page's dock shows only its tools.
   const PAGES = [
@@ -2812,28 +2820,44 @@
         {#if selectedClipDetails}
           {@const c = selectedClipDetails.clip}
           {@const t = selectedClipDetails.track}
-          <div class="mb-3">
+          <div class="mb-2">
             <div class="text-xs uppercase tracking-wider text-vance-muted">Clip</div>
             <div class="mt-1 break-all text-sm font-medium">{c.name}</div>
           </div>
-          <dl class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 font-mono text-xs">
-            <dt class="text-vance-muted">track</dt>
-            <dd>{t.name} ({t.kind})</dd>
-            <dt class="text-vance-muted">tl in</dt>
-            <dd>{formatPrecise(c.timeline_in_seconds)}</dd>
-            <dt class="text-vance-muted">tl out</dt>
-            <dd>{formatPrecise(c.timeline_in_seconds + c.duration_seconds)}</dd>
-            <dt class="text-vance-muted">duration</dt>
-            <dd>{formatPrecise(c.duration_seconds)}</dd>
-            <dt class="text-vance-muted">src in</dt>
-            <dd>{formatPrecise(c.source_in_seconds)}</dd>
-            <dt class="text-vance-muted">src out</dt>
-            <dd>{formatPrecise(c.source_in_seconds + c.duration_seconds)}</dd>
-            <dt class="text-vance-muted">enabled</dt>
-            <dd>{c.enabled ? 'yes' : 'muted'}</dd>
-          </dl>
 
-          <!-- Phase 10.6 — WASM effect plugins browser. Applies a
+          <!-- Inspector tabs -->
+          <div class="mb-3 flex gap-1 text-[11px]">
+            {#each INSPECTOR_TABS as tab (tab.id)}
+              <button
+                class="rounded px-2 py-0.5 {inspectorTab === tab.id
+                  ? 'bg-[var(--color-vance-accent)] font-semibold text-[#003040]'
+                  : 'text-vance-muted hover:text-vance-fg'}"
+                onclick={() => (inspectorTab = tab.id)}
+              >
+                {tab.label}
+              </button>
+            {/each}
+          </div>
+
+          {#if inspectorTab === 'details'}
+            <dl class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
+              <dt class="text-vance-muted">Track</dt>
+              <dd>{t.name} ({t.kind})</dd>
+              <dt class="text-vance-muted">Start</dt>
+              <dd>{formatPrecise(c.timeline_in_seconds)}</dd>
+              <dt class="text-vance-muted">End</dt>
+              <dd>{formatPrecise(c.timeline_in_seconds + c.duration_seconds)}</dd>
+              <dt class="text-vance-muted">Duration</dt>
+              <dd>{formatPrecise(c.duration_seconds)}</dd>
+              <dt class="text-vance-muted">Trim start</dt>
+              <dd>{formatPrecise(c.source_in_seconds)}</dd>
+              <dt class="text-vance-muted">Trim end</dt>
+              <dd>{formatPrecise(c.source_in_seconds + c.duration_seconds)}</dd>
+              <dt class="text-vance-muted">Status</dt>
+              <dd>{c.enabled ? 'enabled' : 'muted'}</dd>
+            </dl>
+          {:else}
+            <!-- Phase 10.6 — WASM effect plugins browser. Applies a
                discovered plugin to this clip as a `wasm:<id>` effect. -->
           <div class="mt-3">
             <EffectsBrowser trackId={t.id} clipId={c.id} />
@@ -3248,27 +3272,20 @@
               </ul>
             {/if}
           </div>
+          {/if}
         {:else if selectionState.count > 1}
           <p class="text-vance-muted text-xs">
             {selectionState.count} clips selected. Single-selection details show here.
           </p>
         {:else if info}
-          <div class="mb-2 text-xs uppercase tracking-wider text-vance-muted">File</div>
-          <dl class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 font-mono text-xs">
-            <dt class="text-vance-muted">codec</dt>
-            <dd>{info.codec_name}</dd>
-            <dt class="text-vance-muted">size</dt>
+          <div class="mb-2 text-xs uppercase tracking-wider text-vance-muted">Source clip</div>
+          <dl class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
+            <dt class="text-vance-muted">Format</dt>
+            <dd>{info.codec_name.toUpperCase()}</dd>
+            <dt class="text-vance-muted">Resolution</dt>
             <dd>{info.width} × {info.height}</dd>
-            <dt class="text-vance-muted">format</dt>
-            <dd>{info.pixel_format}</dd>
-            <dt class="text-vance-muted">rate</dt>
-            <dd>{info.frame_rate_num}/{info.frame_rate_den}</dd>
-            <dt class="text-vance-muted">tb</dt>
-            <dd>{info.time_base_num}/{info.time_base_den}</dd>
-            {#if info.duration_pts}
-              <dt class="text-vance-muted">dur (pts)</dt>
-              <dd>{info.duration_pts}</dd>
-            {/if}
+            <dt class="text-vance-muted">Frame rate</dt>
+            <dd>{(info.frame_rate_num / info.frame_rate_den).toFixed(2)} fps</dd>
           </dl>
         {:else}
           <p class="text-vance-muted text-xs">
