@@ -10,6 +10,7 @@
   import { imageGenAvailable, generateImage } from '$lib/ipc';
   import { projectState } from '$lib/project.svelte';
   import { listen } from '@tauri-apps/api/event';
+  import { toast } from '$lib/toast.svelte';
 
   let available = $state(false);
   let prompt = $state('');
@@ -64,12 +65,12 @@
 
   async function generate() {
     if (!prompt.trim()) {
-      error = 'Enter a prompt.';
+      toast.error('Type a description of the image you want first.');
       return;
     }
     busy = true;
     error = null;
-    phase = 'Loading model…';
+    phase = 'Getting ready…';
     pct = null;
     status = null;
     try {
@@ -83,9 +84,10 @@
         seed: Number.isFinite(seedNum as number) ? seedNum : null
       });
       await projectState.refresh();
-      status = `Generated “${info.name}”. It’s in the Browser — drag it onto the timeline.`;
+      toast.success(`Created “${info.name}”. It’s in the Browser — drag it onto the timeline.`);
+      status = null;
     } catch (e) {
-      error = String(e);
+      toast.error("Couldn't create the image.\n" + String(e));
       status = null;
     } finally {
       busy = false;
@@ -95,8 +97,6 @@
 
 <div class="panel">
   <div class="head">Generate Image</div>
-  {#if error}<div class="err">{error}</div>{/if}
-  {#if status}<div class="status">{status}</div>{/if}
 
   {#if !available}
     <div class="hint">

@@ -3983,7 +3983,9 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tau
     let file = SubmenuBuilder::new(app, "File")
         .item(&item("new", "New Project", Some("CmdOrCtrl+N"))?)
         .item(&item("open_project", "Open Project…", Some("CmdOrCtrl+Shift+O"))?)
-        .item(&item("open_file", "Open File…", Some("CmdOrCtrl+O"))?)
+        .separator()
+        .item(&item("open_file", "Import Media…", Some("CmdOrCtrl+I"))?)
+        .item(&item("new_title", "New Title…", Some("CmdOrCtrl+T"))?)
         .separator()
         .item(&item("save", "Save", Some("CmdOrCtrl+S"))?)
         .item(&item("export", "Export…", Some("CmdOrCtrl+E"))?)
@@ -3991,8 +3993,10 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tau
         .close_window()
         .build()?;
 
-    // App-level Undo/Redo (the edit history) plus the native clipboard items
-    // that operate on the focused text field.
+    // App-level Undo/Redo (the edit history) + native clipboard items, plus the
+    // common timeline edits. The plain-key shortcuts (Delete, T) are handled in
+    // the frontend; they're shown in the labels but NOT registered as menu
+    // accelerators so they don't hijack the keys while typing in a field.
     let edit = SubmenuBuilder::new(app, "Edit")
         .item(&item("undo", "Undo", Some("CmdOrCtrl+Z"))?)
         .item(&item("redo", "Redo", Some("CmdOrCtrl+Shift+Z"))?)
@@ -4001,11 +4005,40 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tau
         .copy()
         .paste()
         .select_all()
+        .separator()
+        .item(&item("delete_clip", "Delete Selected  (Delete)", None)?)
+        .item(&item("add_transition", "Add Cross-Dissolve  (T)", None)?)
+        .build()?;
+
+    // Three-point editing (Source → Timeline). Shortcuts I/O/X/,/. live in the
+    // frontend; shown in labels, not registered here.
+    let clip = SubmenuBuilder::new(app, "Clip")
+        .item(&item("mark_in", "Mark In  (I)", None)?)
+        .item(&item("mark_out", "Mark Out  (O)", None)?)
+        .item(&item("clear_marks", "Clear In/Out  (X)", None)?)
+        .separator()
+        .item(&item("insert", "Insert to Timeline  (,)", None)?)
+        .item(&item("overwrite", "Overwrite to Timeline  (.)", None)?)
+        .build()?;
+
+    // Space / arrows are handled by the frontend and MUST NOT be menu
+    // accelerators (they'd hijack typing/navigation), so these are click-only.
+    let playback = SubmenuBuilder::new(app, "Playback")
+        .item(&item("play_pause", "Play / Pause  (Space)", None)?)
+        .separator()
+        .item(&item("prev_frame", "Previous Frame  (←)", None)?)
+        .item(&item("next_frame", "Next Frame  (→)", None)?)
+        .separator()
+        .item(&item("back_1s", "Back 1 Second  (J)", None)?)
+        .item(&item("forward_1s", "Forward 1 Second  (L)", None)?)
         .build()?;
 
     let view = SubmenuBuilder::new(app, "View")
-        .item(&item("page_edit", "Edit Page", Some("CmdOrCtrl+1"))?)
-        .item(&item("page_color", "Color Page", Some("CmdOrCtrl+2"))?)
+        .item(&item("page_edit", "Edit", Some("CmdOrCtrl+1"))?)
+        .item(&item("page_compositor", "Compositor", Some("CmdOrCtrl+2"))?)
+        .item(&item("page_color", "Color", Some("CmdOrCtrl+3"))?)
+        .item(&item("page_audio", "Audio", Some("CmdOrCtrl+4"))?)
+        .item(&item("page_deliver", "Deliver", Some("CmdOrCtrl+5"))?)
         .separator()
         .item(&item("dock_ai_tools", "AI Add-ons…", None)?)
         .build()?;
@@ -4018,6 +4051,8 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tau
         .build()?;
 
     let help = SubmenuBuilder::new(app, "Help")
+        .item(&item("shortcuts", "Keyboard Shortcuts", None)?)
+        .separator()
         .item(&item("diagnostics", "Show Crash Logs", None)?)
         .build()?;
 
@@ -4025,6 +4060,8 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tau
         .item(&app_menu)
         .item(&file)
         .item(&edit)
+        .item(&clip)
+        .item(&playback)
         .item(&view)
         .item(&window)
         .item(&help)

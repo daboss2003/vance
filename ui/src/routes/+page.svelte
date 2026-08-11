@@ -52,6 +52,8 @@
   import OnboardingWizard from '$lib/OnboardingWizard.svelte';
   import { getAppSettings, crashLogDir } from '$lib/ipc';
   import { listen } from '@tauri-apps/api/event';
+  import Toasts from '$lib/Toasts.svelte';
+  import { toast, pushToast } from '$lib/toast.svelte';
 
   // Phase 11 — show the first-run wizard until the user finishes/skips it.
   let showOnboarding = $state(false);
@@ -131,7 +133,11 @@
           handleSaveProject();
           break;
         case 'export':
+          currentPage = 'deliver';
           activeDock = 'export';
+          break;
+        case 'new_title':
+          titleModalOpen = true;
           break;
         case 'undo':
           void projectState.undo();
@@ -139,23 +145,86 @@
         case 'redo':
           void projectState.redo();
           break;
+        // ---- Edit / clip actions (mirror the keyboard shortcuts) ----
+        case 'delete_clip':
+          deleteSelectedClips();
+          break;
+        case 'add_transition':
+          if (selectionState.count === 1 && projectState.sequence) addDissolveForSelection();
+          break;
+        case 'mark_in':
+          if (projectState.source) projectState.setSourceMarkIn();
+          break;
+        case 'mark_out':
+          if (projectState.source) projectState.setSourceMarkOut();
+          break;
+        case 'clear_marks':
+          projectState.clearSourceMarks();
+          break;
+        case 'insert':
+        case 'overwrite': {
+          const tid = firstVideoTrackId();
+          if (tid && projectState.source && projectState.sequence)
+            projectState.insertFromSource(tid, e.payload === 'overwrite');
+          break;
+        }
+        // ---- Playback ----
+        case 'play_pause':
+          void togglePlayback();
+          break;
+        case 'prev_frame':
+          void stepFrame(-1);
+          break;
+        case 'next_frame':
+          void stepFrame(1);
+          break;
+        case 'back_1s':
+          void jumpSeconds(-1);
+          break;
+        case 'forward_1s':
+          void jumpSeconds(1);
+          break;
+        // ---- Pages ----
         case 'page_edit':
           currentPage = 'edit';
+          break;
+        case 'page_compositor':
+          currentPage = 'compositor';
           break;
         case 'page_color':
           currentPage = 'color';
           break;
+        case 'page_audio':
+          currentPage = 'audio';
+          break;
+        case 'page_deliver':
+          currentPage = 'deliver';
+          break;
         case 'dock_ai_tools':
-          // AI add-ons install lives in Settings now, not the editing dock.
+        case 'settings':
+          // AI add-ons + settings live in the setup panel, not the editing dock.
           showOnboarding = true;
           break;
-        case 'settings':
-          showOnboarding = true;
+        case 'shortcuts':
+          pushToast(
+            'Keyboard shortcuts\n' +
+              'Space — Play / Pause\n' +
+              'J / K / L — Back 1s / Pause / Play\n' +
+              '← / → — Previous / Next frame\n' +
+              'I / O — Mark In / Out (Source)\n' +
+              ', / . — Insert / Overwrite to timeline\n' +
+              'X — Clear In/Out    T — Cross-dissolve\n' +
+              'Delete — Delete clip\n' +
+              '⌘Z / ⌘⇧Z — Undo / Redo\n' +
+              '⌘1…5 — Edit / Compositor / Color / Audio / Deliver',
+            'info',
+            0
+          );
           break;
         case 'diagnostics':
           void crashLogDir()
-            .then((p) => alert(`Crash logs are saved in:\n${p}`))
-            .catch((err) => alert(`Couldn't locate crash logs: ${err}`));
+            .then((p) => toast.info(`Crash logs are saved in:\n${p}`))
+            .catch((err) => toast.error(`Couldn't locate crash logs: ${err}`));
           break;
       }
     }).then((u) => (un = u));
@@ -1443,14 +1512,33 @@
   <OnboardingWizard onDone={() => (showOnboarding = false)} />
 {/if}
 
+<Toasts />
+
 <div class="flex h-screen flex-col">
   <!-- Header -->
   <header
     class="border-vance-border bg-vance-panel flex h-11 flex-shrink-0 items-center gap-3 border-b px-4"
   >
-    <h1 class="text-sm font-semibold tracking-tight">
-      Vance<span class="text-[var(--color-vance-accent)]">.</span>
-    </h1>
+    <div class="flex items-center gap-2 select-none">
+      <svg viewBox="0 0 32 32" width="22" height="22" class="shrink-0" aria-label="Vance">
+        <defs>
+          <linearGradient id="vanceMark" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#63a9ff" />
+            <stop offset="1" stop-color="#3d7fd6" />
+          </linearGradient>
+        </defs>
+        <rect x="1" y="1" width="30" height="30" rx="7.5" fill="#22262d" stroke="#333a44" stroke-width="1" />
+        <path
+          d="M8.5 9 L16 22.5 L23.5 9"
+          fill="none"
+          stroke="url(#vanceMark)"
+          stroke-width="3.6"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
+      </svg>
+      <h1 class="text-sm font-semibold tracking-tight">Vance</h1>
+    </div>
     {#if projectState.sequence}
       <span class="text-vance-muted text-xs truncate max-w-[16rem]">{projectState.sequence.name}</span>
     {/if}
@@ -3139,20 +3227,6 @@
       </button>
     {/each}
   </nav>
-
-  <!-- Footer / status bar -->
-  <footer
-    class="border-vance-border bg-vance-panel text-vance-muted flex h-7 flex-shrink-0 items-center gap-4 border-t px-4 text-[11px]"
-  >
-    {#if projectState.sequence}
-      <span class="font-mono">
-        {(
-          projectState.sequence.frame_rate_num / projectState.sequence.frame_rate_den
-        ).toFixed(2)} fps · {projectState.sequence.duration_seconds.toFixed(1)}s
-      </span>
-    {/if}
-    <span class="ml-auto opacity-70">{backend}</span>
-  </footer>
 </div>
 
 {#if dragState.mediaId}

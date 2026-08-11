@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#242832"/>
+      <stop offset="1" stop-color="#14161b"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="0.15" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#6fb0ff"/>
+      <stop offset="1" stop-color="#3877cf"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.14"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- app-icon tile -->
+  <rect x="64" y="64" width="896" height="896" rx="208" fill="url(#bg)"/>
+  <rect x="64" y="64" width="896" height="896" rx="208" fill="url(#sheen)"/>
+  <rect x="65.5" y="65.5" width="893" height="893" rx="206.5" fill="none" stroke="#3a4150" stroke-width="3"/>
+
+  <!-- V mark: a bold chevron that reads as both the letter V and a play/scrub cue -->
+  <path d="M300 336 L512 700 L724 336"
+        fill="none" stroke="url(#mark)" stroke-width="104"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- subtle highlight on the left arm -->
+  <path d="M300 336 L512 700"
+        fill="none" stroke="#ffffff" stroke-opacity="0.18" stroke-width="104"
+        stroke-linecap="round" stroke-linejoin="round"
+        stroke-dasharray="0 470 60" />
+</svg>

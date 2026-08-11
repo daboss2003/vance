@@ -14,6 +14,7 @@
    */
 
   import { renderSequence, type EncoderPresetKey, type RenderOutcome } from '$lib/ipc';
+  import { toast } from '$lib/toast.svelte';
 
   let outputPath = $state('vance-export.mp4');
   let preset = $state<EncoderPresetKey>('H264');
@@ -58,8 +59,9 @@
         end_seconds: endSeconds,
         hdr
       });
+      toast.success('Export finished — saved to ' + lastOutcome.output_path);
     } catch (e) {
-      error = String(e);
+      toast.error("Export failed.\n" + String(e));
     } finally {
       rendering = false;
     }
@@ -158,10 +160,6 @@
   >
     {rendering ? 'Rendering…' : 'Render'}
   </button>
-
-  {#if error}
-    <div class="mt-1 text-[10px] text-red-400">{error}</div>
-  {/if}
 
   {#if lastOutcome}
     <div class="text-vance-muted mt-1 font-mono text-[10px]">
