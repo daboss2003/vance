@@ -52,12 +52,19 @@ is exactly where the runtime locators look.
 
 ## The optional AI tools
 
-Three of the four install via **pip into Vance's managed venv** — no hosting
-needed, PyPI serves them; only a system Python 3 is required. `sd`
-(stable-diffusion) is a native binary + model **download**. Everything lands in
-the per-user managed tools dir (`…/Vance/tools/{bin,venv,models}`), resolved
-before `PATH`, so tools "just work" with zero setup. See
-[adr/0003-ai-architecture.md](adr/0003-ai-architecture.md).
+All four install via **pip into Vance's managed venv** — no hosting needed,
+PyPI serves them; only a system Python 3 is required. The three CLI tools
+(whisper / demucs / backgroundremover) are single packages; **Generative images**
+installs the Hugging Face `diffusers` stack (`torch` + `diffusers` + …) plus a
+bundled wrapper script, and its model is pulled from Hugging Face on install
+(default `stabilityai/stable-diffusion-2-1-base`, overridable via
+`VANCE_SD_MODEL`). Everything lands in the per-user managed tools dir
+(`…/Vance/tools/{bin,venv,imagegen,models}`), resolved before `PATH`, so tools
+"just work" with zero setup. See [adr/0003-ai-architecture.md](adr/0003-ai-architecture.md).
+
+The manifest-download path ([tools-manifest.example.json](tools-manifest.example.json))
+remains available for a native-binary tool (e.g. the legacy `sd`
+stable-diffusion.cpp runner), but no catalog tool uses it by default anymore.
 
 ### One primitive, every entry point
 

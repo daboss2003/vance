@@ -98,8 +98,8 @@ pub fn detect() -> Vec<Capability> {
             "Generative images",
             crate::generate::available(),
             false,
-            "Optional. Add it from the AI tools panel (downloads the `sd` runner + \
-             model), or set VANCE_IMAGEGEN_CMD / VANCE_SD_MODEL yourself.",
+            "Optional. Add it from the AI tools panel — Vance installs diffusers + \
+             a model for you (or set VANCE_IMAGEGEN_CMD / VANCE_SD_MODEL yourself).",
         ),
     ]
 }

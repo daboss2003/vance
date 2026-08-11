@@ -91,14 +91,51 @@ pub fn python_available() -> bool {
     system_python().is_some()
 }
 
-/// The stable-diffusion model path: `VANCE_SD_MODEL` if set, else a managed
-/// default (`…/tools/models/sd-model.gguf`) if it exists.
+/// The stable-diffusion model path for the LEGACY `sd` (stable-diffusion.cpp)
+/// runner: `VANCE_SD_MODEL` if set, else a managed default if it exists. The
+/// default install now uses `diffusers` instead (see [`diffusers_runner`]).
 pub fn sd_model() -> Option<PathBuf> {
     if let Some(m) = std::env::var_os("VANCE_SD_MODEL") {
         return Some(PathBuf::from(m));
     }
     let managed = models_dir().ok()?.join("sd-model.gguf");
     managed.is_file().then_some(managed)
+}
+
+/// The bundled `diffusers` image-generation wrapper (installed into the managed
+/// tools dir alongside its venv). Vance runs it as `<venv-python> <script>`.
+const IMAGEGEN_PY: &str = include_str!("../assets/vance_imagegen.py");
+
+/// A commercial-use-OK default model (CreativeML Open RAIL++-M), overridable
+/// with `VANCE_SD_MODEL` (a Hugging Face model id or a local diffusers path).
+pub const DEFAULT_SD_MODEL: &str = "stabilityai/stable-diffusion-2-1-base";
+
+/// `…/Vance/tools/imagegen` — holds the diffusers wrapper script.
+pub fn imagegen_dir() -> std::io::Result<PathBuf> {
+    let d = tools_dir()?.join("imagegen");
+    std::fs::create_dir_all(&d)?;
+    Ok(d)
+}
+/// Path to the diffusers wrapper script.
+pub fn imagegen_script() -> std::io::Result<PathBuf> {
+    Ok(imagegen_dir()?.join("vance_imagegen.py"))
+}
+
+/// The installed diffusers image generator, if present: `(venv python, script)`.
+/// `None` until the "Generative images" tool is installed.
+pub fn diffusers_runner() -> Option<(PathBuf, PathBuf)> {
+    let py = venv_python()?;
+    let script = imagegen_script().ok()?;
+    script.is_file().then_some((py, script))
+}
+
+/// The model the diffusers wrapper should load: `VANCE_SD_MODEL` (HF id or local
+/// path) if set, else [`DEFAULT_SD_MODEL`].
+pub fn diffusers_model() -> String {
+    std::env::var("VANCE_SD_MODEL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_SD_MODEL.to_string())
 }
 
 // ---------------------------------------------------------------------
@@ -150,24 +187,27 @@ impl Tool {
     pub fn from_id(id: &str) -> Option<Tool> {
         Tool::all().into_iter().find(|t| t.id() == id)
     }
-    /// The PyPI package that provides this tool's CLI, if it installs via pip
-    /// into Vance's managed venv (no hosting needed — PyPI serves it). `None`
-    /// for tools that are a native binary + model download instead.
-    pub fn pip_package(self) -> Option<&'static str> {
+    /// The PyPI package(s) this tool installs into Vance's managed venv (no
+    /// hosting needed — PyPI serves them; the model comes from PyPI/HF on use).
+    /// Empty for a tool that installs as a native binary via the manifest.
+    pub fn pip_packages(self) -> &'static [&'static str] {
         match self {
-            Tool::Whisper => Some("openai-whisper"),
-            Tool::Demucs => Some("demucs"),
-            Tool::BackgroundRemover => Some("backgroundremover"),
-            Tool::StableDiffusion => None,
+            Tool::Whisper => &["openai-whisper"],
+            Tool::Demucs => &["demucs"],
+            Tool::BackgroundRemover => &["backgroundremover"],
+            // Image generation via Hugging Face diffusers + a bundled wrapper.
+            Tool::StableDiffusion => {
+                &["torch", "diffusers", "transformers", "accelerate", "safetensors"]
+            }
         }
     }
     /// How Vance installs this tool: `"pip"` (into the managed venv) or
     /// `"download"` (native binary/model via the manifest).
     pub fn install_method(self) -> &'static str {
-        if self.pip_package().is_some() {
-            "pip"
-        } else {
+        if self.pip_packages().is_empty() {
             "download"
+        } else {
+            "pip"
         }
     }
     /// A short human label for the UI.
@@ -211,18 +251,23 @@ pub fn status() -> Vec<ToolStatus> {
     Tool::all()
         .into_iter()
         .map(|t| {
-            let path = resolve(t.bin_name());
+            // SD has no `bin` — it's the diffusers wrapper; everything else
+            // resolves by executable name.
+            let path = if t == Tool::StableDiffusion {
+                diffusers_runner().map(|(_, script)| script)
+            } else {
+                resolve(t.bin_name())
+            };
             let managed = match (&path, &managed_root) {
                 (Some(p), Some(root)) => p.starts_with(root),
                 _ => false,
             };
-            let model_ready = match t {
-                Tool::StableDiffusion => sd_model().is_some(),
-                _ => true,
-            };
-            let installable = match t.pip_package() {
-                Some(_) => has_python,
-                None => has_manifest,
+            // Installing SD prewarms its model, so "installed" ⇒ ready.
+            let model_ready = path.is_some() || t != Tool::StableDiffusion;
+            let installable = if t.pip_packages().is_empty() {
+                has_manifest
+            } else {
+                has_python
             };
             ToolStatus {
                 id: t.id().into(),
@@ -356,48 +401,68 @@ pub fn install(tool: Tool) -> Result<PathBuf, InstallError> {
 /// line, download bytes) through `on` so the UI can show it instead of
 /// appearing frozen for minutes.
 pub fn install_with_progress(tool: Tool, on: &mut Progress) -> Result<PathBuf, InstallError> {
-    match tool.pip_package() {
-        Some(package) => install_via_pip(tool, package, on),
-        None => install_via_manifest(tool, on),
+    if tool.pip_packages().is_empty() {
+        install_via_manifest(tool, on)
+    } else {
+        install_via_pip(tool, on)
     }
+}
+
+/// Bootstrap the managed venv if needed and return its Python interpreter.
+fn ensure_venv(on: &mut Progress) -> Result<PathBuf, InstallError> {
+    if let Some(p) = venv_python() {
+        return Ok(p);
+    }
+    on("setup", "Creating a private Python environment…", None);
+    let sys = system_python().ok_or(InstallError::NoPython)?;
+    let venv = venv_dir()?;
+    let out = Command::new(&sys).arg("-m").arg("venv").arg(&venv).output()?;
+    if !out.status.success() {
+        return Err(pip_err("creating venv", &out));
+    }
+    venv_python().ok_or(InstallError::NoPython)
 }
 
 /// Install a pip tool into Vance's managed venv, creating the venv on first
 /// use. Uses a system Python 3 only to bootstrap the venv; the tool itself
 /// then lives entirely under `…/Vance/tools/venv` and resolves with no PATH
 /// setup.
-fn install_via_pip(tool: Tool, package: &str, on: &mut Progress) -> Result<PathBuf, InstallError> {
-    // Bootstrap the managed venv if it doesn't exist yet.
-    let vpython = match venv_python() {
-        Some(p) => p,
-        None => {
-            on("setup", "Creating a private Python environment…", None);
-            let sys = system_python().ok_or(InstallError::NoPython)?;
-            let venv = venv_dir()?;
-            let out = Command::new(&sys)
-                .arg("-m")
-                .arg("venv")
-                .arg(&venv)
-                .output()?;
-            if !out.status.success() {
-                return Err(pip_err("creating venv", &out));
-            }
-            venv_python().ok_or(InstallError::NoPython)?
-        }
-    };
-    // Keep pip itself current, then install the package. `--upgrade` makes a
+fn install_via_pip(tool: Tool, on: &mut Progress) -> Result<PathBuf, InstallError> {
+    let vpython = ensure_venv(on)?;
+    let packages = tool.pip_packages();
+
+    // Keep pip itself current, then install the package(s). `--upgrade` makes a
     // re-install idempotent (and pulls a newer tool if one shipped).
     on("pip", "Updating the package installer (pip)…", None);
     let mut up = Command::new(&vpython);
     up.args(["-m", "pip", "install", "--upgrade", "pip"]);
     run_streaming(up, "pip", "upgrading pip", on)?;
 
-    on("pip", &format!("Installing {package} and its dependencies…"), None);
+    let joined = packages.join(" ");
+    on("pip", &format!("Installing {joined} (this can take a while)…"), None);
     let mut inst = Command::new(&vpython);
-    inst.args(["-m", "pip", "install", "--upgrade", package]);
-    run_streaming(inst, "pip", &format!("installing {package}"), on)?;
+    inst.args(["-m", "pip", "install", "--upgrade"]).args(packages);
+    run_streaming(inst, "pip", &format!("installing {joined}"), on)?;
 
+    // Image generation is a bundled diffusers wrapper (no CLI on PyPI): drop the
+    // script and prewarm the model so the first generation isn't a big wait.
+    if tool == Tool::StableDiffusion {
+        return finish_diffusers(&vpython, on);
+    }
     resolve(tool.bin_name()).ok_or_else(|| InstallError::MissingAfterInstall(tool.id().into()))
+}
+
+/// Write the diffusers wrapper into the managed tools dir and prewarm (download
+/// + validate) the model. Returns the wrapper script path.
+fn finish_diffusers(vpython: &std::path::Path, on: &mut Progress) -> Result<PathBuf, InstallError> {
+    let script = imagegen_script()?;
+    std::fs::write(&script, IMAGEGEN_PY)?;
+    let model = diffusers_model();
+    on("download", &format!("Downloading the image model ({model})…"), Some(0.0));
+    let mut cmd = Command::new(vpython);
+    cmd.arg(&script).arg("--prewarm").arg("--model").arg(&model);
+    run_streaming(cmd, "download", "downloading the image model", on)?;
+    Ok(script)
 }
 
 /// Spawn a child, stream its stdout+stderr line-by-line to `on`, and turn a
@@ -705,7 +770,7 @@ fn install_cli(spec: &str) -> i32 {
     };
     // Fail fast with an actionable message if a pip tool is requested but no
     // system Python exists to bootstrap the managed venv.
-    let needs_python = tools.iter().any(|t| t.pip_package().is_some());
+    let needs_python = tools.iter().any(|t| !t.pip_packages().is_empty());
     if needs_python && !python_available() {
         eprintln!(
             "vance: Python 3 is required to install the pip-based tools \
@@ -828,14 +893,14 @@ mod tests {
     }
 
     #[test]
-    fn install_method_matches_pip_package() {
-        // The three Python tools install via pip; SD is a native download.
-        assert_eq!(Tool::Whisper.install_method(), "pip");
-        assert_eq!(Tool::Demucs.install_method(), "pip");
-        assert_eq!(Tool::BackgroundRemover.install_method(), "pip");
-        assert_eq!(Tool::StableDiffusion.install_method(), "download");
-        assert_eq!(Tool::StableDiffusion.pip_package(), None);
-        assert!(Tool::Whisper.pip_package().is_some());
+    fn install_method_matches_pip_packages() {
+        // All four now install via pip into the managed venv (SD = diffusers).
+        for t in Tool::all() {
+            assert_eq!(t.install_method(), "pip");
+            assert!(!t.pip_packages().is_empty());
+        }
+        assert!(Tool::StableDiffusion.pip_packages().contains(&"diffusers"));
+        assert!(Tool::Whisper.pip_packages().contains(&"openai-whisper"));
     }
 
     #[test]

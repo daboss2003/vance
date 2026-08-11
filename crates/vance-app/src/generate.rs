@@ -48,11 +48,12 @@ pub struct GenRequest {
 pub enum GenError {
     /// No generator configured.
     #[error(
-        "no image generator configured. Either:\n  \
+        "no image generator installed. Easiest: open the AI tools panel and \
+         install “Generative images” — Vance sets up diffusers + a model for you.\n\
+         Advanced alternatives:\n  \
          • set VANCE_IMAGEGEN_CMD to a command template using \
          {{prompt}} {{width}} {{height}} {{out}} (and optionally {{negative}} {{steps}} {{seed}}), or\n  \
-         • install `sd` (stable-diffusion.cpp) on PATH and set VANCE_SD_MODEL to the model file.\n\
-         Then retry — Vance runs it and imports the generated image."
+         • install `sd` (stable-diffusion.cpp) on PATH and set VANCE_SD_MODEL to the model file."
     )]
     NotConfigured,
     /// The command template had no program token.
@@ -76,10 +77,9 @@ pub enum GenError {
 
 /// Is a generator configured? (For the UI to enable the button.)
 pub fn available() -> bool {
-    if std::env::var_os("VANCE_IMAGEGEN_CMD").is_some() {
-        return true;
-    }
-    which("sd").is_some() && crate::tools::sd_model().is_some()
+    std::env::var_os("VANCE_IMAGEGEN_CMD").is_some()
+        || crate::tools::diffusers_runner().is_some()
+        || (which("sd").is_some() && crate::tools::sd_model().is_some())
 }
 
 /// Generate an image for `req`, returning the output path. Blocking + slow
@@ -125,12 +125,45 @@ fn resolve_command(req: &GenRequest) -> Result<(PathBuf, Vec<String>), GenError>
         let program = PathBuf::from(argv.remove(0));
         return Ok((program, argv));
     }
-    // Default: stable-diffusion.cpp `sd` + a model from the environment.
+    // Installed via the AI tools panel: the diffusers wrapper in the managed venv.
+    if let Some((python, script)) = crate::tools::diffusers_runner() {
+        return Ok((python, diffusers_args(&script, req)));
+    }
+    // Legacy: stable-diffusion.cpp `sd` + a model file from the environment.
     if let (Some(sd), Some(model)) = (which("sd"), std::env::var_os("VANCE_SD_MODEL")) {
         let args = default_sd_args(&PathBuf::from(model), req);
         return Ok((sd, args));
     }
     Err(GenError::NotConfigured)
+}
+
+/// Build the argv for the bundled diffusers wrapper: `<script> --model … --prompt
+/// … --out … --width … --height … --steps … [--negative …] [--seed …]`.
+fn diffusers_args(script: &Path, req: &GenRequest) -> Vec<String> {
+    let mut a = vec![
+        script.to_string_lossy().into_owned(),
+        "--model".into(),
+        crate::tools::diffusers_model(),
+        "--prompt".into(),
+        req.prompt.clone(),
+        "--out".into(),
+        req.out_path.to_string_lossy().into_owned(),
+        "--width".into(),
+        req.width.to_string(),
+        "--height".into(),
+        req.height.to_string(),
+        "--steps".into(),
+        req.steps.unwrap_or(25).to_string(),
+    ];
+    if let Some(neg) = req.negative.as_ref().filter(|s| !s.is_empty()) {
+        a.push("--negative".into());
+        a.push(neg.clone());
+    }
+    if let Some(seed) = req.seed.filter(|s| *s >= 0) {
+        a.push("--seed".into());
+        a.push(seed.to_string());
+    }
+    a
 }
 
 /// Build the default stable-diffusion.cpp txt2img argv.
