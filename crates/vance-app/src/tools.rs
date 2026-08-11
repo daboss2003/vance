@@ -86,9 +86,25 @@ pub fn system_python() -> Option<PathBuf> {
     which_on_path("python3").or_else(|| which_on_path("python"))
 }
 
-/// Whether a system Python is available to install the pip-based tools.
+/// Vance's own standalone Python (downloaded when the system has none), if
+/// present. `…/Vance/tools/python/{bin/python3 | python.exe}`.
+fn managed_python() -> Option<PathBuf> {
+    let dir = tools_dir().ok()?.join("python");
+    let p = if cfg!(windows) {
+        dir.join("python.exe")
+    } else {
+        dir.join("bin").join("python3")
+    };
+    p.is_file().then_some(p)
+}
+
+/// Whether the pip-based tools can be installed: a Python exists (system or
+/// managed) OR Vance can download a standalone one for this platform. So on
+/// supported platforms the AI tools are installable with NO prerequisites.
 pub fn python_available() -> bool {
     system_python().is_some()
+        || managed_python().is_some()
+        || PBS_PYTHON.iter().any(|(k, _, _)| *k == platform_key())
 }
 
 /// The stable-diffusion model path for the LEGACY `sd` (stable-diffusion.cpp)
@@ -415,14 +431,137 @@ fn ensure_venv(on: &mut Progress) -> Result<PathBuf, InstallError> {
     if let Some(p) = venv_python() {
         return Ok(p);
     }
+    let python = ensure_python(on)?;
     on("setup", "Creating a private Python environment…", None);
-    let sys = system_python().ok_or(InstallError::NoPython)?;
     let venv = venv_dir()?;
-    let out = Command::new(&sys).arg("-m").arg("venv").arg(&venv).output()?;
+    let out = Command::new(&python).arg("-m").arg("venv").arg(&venv).output()?;
     if !out.status.success() {
         return Err(pip_err("creating venv", &out));
     }
     venv_python().ok_or(InstallError::NoPython)
+}
+
+// python-build-standalone (Astral) — self-contained, relocatable CPython builds
+// used to give the pip tools a Python when the system has none. Hosted on
+// GitHub (upstream — no hosting on our side), pinned by sha256.
+const PBS_TAG: &str = "20260807";
+const PBS_VERSION: &str = "3.12.13";
+/// `(platform_key, release-triple, sha256)` for the `install_only` tarball.
+const PBS_PYTHON: &[(&str, &str, &str)] = &[
+    ("macos-aarch64", "aarch64-apple-darwin", "4201588fc5051c2ba988abbe1f033d318965ee378fadf7fb7ef79882ba7be84b"),
+    ("macos-x86_64", "x86_64-apple-darwin", "ce9dc826a3215d5deadf6d7ba409a882b8d431192c4c06deb34ff00f93ceb4f5"),
+    ("linux-aarch64", "aarch64-unknown-linux-gnu", "e2a33a26bae0f0975a9786c2e3beaee9cfeb35f856bdd273ff10ae35cf7e06ce"),
+    ("linux-x86_64", "x86_64-unknown-linux-gnu", "5bd6f36fd7ef02b909234c94dca9994ef0da06ace3bc3cece4fe27870e9cdbbe"),
+    ("windows-x86_64", "x86_64-pc-windows-msvc", "6cf2be701aa7e9470454c9c86285c1bcc1832518d63e39c3e34e9d8ea1cbb99f"),
+];
+
+/// A Python to bootstrap the venv from: the system one, else Vance's managed
+/// standalone build, else download+extract a standalone build (zero prereqs).
+fn ensure_python(on: &mut Progress) -> Result<PathBuf, InstallError> {
+    if let Some(p) = system_python() {
+        return Ok(p);
+    }
+    if let Some(p) = managed_python() {
+        return Ok(p);
+    }
+    provision_python(on)
+}
+
+/// Download + verify + extract a standalone CPython into the managed tools dir
+/// so the pip tools work with no system Python. Returns its interpreter path.
+fn provision_python(on: &mut Progress) -> Result<PathBuf, InstallError> {
+    let key = platform_key();
+    let (_, triple, sha) = PBS_PYTHON
+        .iter()
+        .find(|(k, _, _)| *k == key)
+        .ok_or_else(|| {
+            InstallError::Http(format!(
+                "no prebuilt Python available for this platform ({key}); \
+                 install Python 3 and retry"
+            ))
+        })?;
+    let url = format!(
+        "https://github.com/astral-sh/python-build-standalone/releases/download/\
+         {PBS_TAG}/cpython-{PBS_VERSION}+{PBS_TAG}-{triple}-install_only.tar.gz"
+    );
+    let tools = tools_dir()?;
+    let tgz = tools.join("python-download.tar.gz");
+    on("setup", &format!("Downloading a private Python {PBS_VERSION} runtime…"), Some(0.0));
+    download_to_file(&url, sha, &tgz, "Python runtime", "setup", on)?;
+
+    on("setup", "Unpacking Python…", None);
+    // `tar` handles .tar.gz on macOS/Linux and Windows 10+ (bsdtar). The archive
+    // extracts to a top-level `python/` dir.
+    let out = Command::new("tar")
+        .arg("-xzf")
+        .arg(&tgz)
+        .arg("-C")
+        .arg(&tools)
+        .output()?;
+    let _ = std::fs::remove_file(&tgz);
+    if !out.status.success() {
+        return Err(InstallError::Pip {
+            code: out.status.code(),
+            stderr: format!(
+                "unpacking Python: {}",
+                String::from_utf8_lossy(&out.stderr).chars().take(500).collect::<String>()
+            ),
+        });
+    }
+    managed_python().ok_or_else(|| InstallError::MissingAfterInstall("python".into()))
+}
+
+/// Stream a URL to `dest`, hashing as it goes, and verify the sha256. Emits byte
+/// progress under `phase`. Deletes `dest` on checksum mismatch.
+fn download_to_file(
+    url: &str,
+    sha256_want: &str,
+    dest: &std::path::Path,
+    label: &str,
+    phase: &str,
+    on: &mut Progress,
+) -> Result<(), InstallError> {
+    use std::io::{Read, Write};
+    let client = http_client()?;
+    let mut resp = client.get(url).send().map_err(|e| InstallError::Http(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(InstallError::Http(format!("{url} {}", resp.status())));
+    }
+    let total = resp.content_length();
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::File::create(dest)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 65536];
+    let mut done: u64 = 0;
+    let mut last_emit: u64 = 0;
+    loop {
+        let read = resp.read(&mut buf).map_err(|e| InstallError::Http(e.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+        file.write_all(&buf[..read])?;
+        done += read as u64;
+        if done - last_emit >= 1_048_576 {
+            last_emit = done;
+            let pct = total.map(|t| if t > 0 { (done as f32 / t as f32 * 100.0).min(100.0) } else { 0.0 });
+            let detail = match total {
+                Some(t) => format!("Downloading {label} — {} / {}", human_bytes(done), human_bytes(t)),
+                None => format!("Downloading {label} — {}", human_bytes(done)),
+            };
+            on(phase, &detail, pct);
+        }
+    }
+    file.flush()?;
+    drop(file);
+    let got_hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    if !got_hex.eq_ignore_ascii_case(sha256_want) {
+        let _ = std::fs::remove_file(dest);
+        return Err(InstallError::Checksum { got: got_hex, want: sha256_want.to_string() });
+    }
+    Ok(())
 }
 
 /// Install a pip tool into Vance's managed venv, creating the venv on first
@@ -945,6 +1084,31 @@ mod tests {
                 assert!(stderr.contains("boom"), "tail lost: {stderr}");
             }
             other => panic!("expected Pip error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pbs_covers_common_platforms_with_valid_hashes() {
+        for key in [
+            "macos-aarch64", "macos-x86_64", "linux-x86_64", "linux-aarch64", "windows-x86_64",
+        ] {
+            assert!(
+                PBS_PYTHON.iter().any(|(k, _, _)| *k == key),
+                "missing standalone-Python entry for {key}"
+            );
+        }
+        for (_, _, sha) in PBS_PYTHON {
+            assert_eq!(sha.len(), 64, "sha256 must be 64 hex chars");
+            assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn python_available_when_platform_is_provisionable() {
+        // On any platform we ship a standalone build for (incl. this host), the
+        // pip tools are installable with no system Python required.
+        if PBS_PYTHON.iter().any(|(k, _, _)| *k == platform_key()) {
+            assert!(python_available());
         }
     }
 
