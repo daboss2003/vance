@@ -174,12 +174,13 @@ that the sensitive endpoint requires in an `X-Step-Up` header. Optional short
   app_version, last_seen, this_device}`; per-row **Sign out** → `POST
   /v1/devices/{id}/revoke` (step-up required).
 - **Device caps (chosen):** **free effects = unlimited** machines; **paid effects
-  = a hard cap of 2 active machines** per account. Adding a 3rd machine requires
-  deactivating one (self-service in Manage-Devices, or auto-oldest-out — a policy
-  choice). Enforced server-side at activation/heartbeat: the 2 active
-  `device_installs` for a paid sku are the only ones whose lease renews. Still
-  track all devices + show Manage-Devices; layer abuse signals (many new
-  devices/hr, impossible-travel) on top.
+  = a hard cap of 2 active machines** per account. Activating a paid effect on a
+  **3rd machine auto-drops the oldest** active device (no "free a slot first"
+  step); the dropped device's lease stops renewing and it uninstalls the effect on
+  its next heartbeat/launch. Enforced server-side at activation/heartbeat: only the
+  2 most-recent active `device_installs` for a paid sku renew. Still track all
+  devices + show Manage-Devices; layer abuse signals (many new devices/hr,
+  impossible-travel) on top.
 
 ### How a removed device learns and self-uninstalls (3 tiers)
 1. **Push (SSE):** the app holds `GET /v1/events` (auth via Authorization
@@ -218,10 +219,9 @@ untouched.
   the `sale`). Nothing for the buyer to redeem or paste. Free effects create the
   entitlement on first install with no payment.
 - Server issues a **signed entitlement token** (Ed25519 JWT: `{sub, did,
-  skus:[…], iat, exp=iat+14d, ent_ver}`) on login / heartbeat /
+  skus:[…], iat, exp=iat+3d, ent_ver}`) on login / heartbeat /
   `entitlement.changed`; cached in the keychain. `exp` is the **offline grace
-  window** (buyer works ~14 days with no internet; while online it silently
-  renews).
+  window** (buyer works ~3 days with no internet; while online it silently renews).
 - **Enforce at load:** before instantiating a paid effect, `host.rs` checks a
   currently-valid entitlement token lists that sku **and** this device is one of
   the ≤2 active for it. Free effects skip both checks.
@@ -276,7 +276,7 @@ device caps all first-class — or Cryptlex/LicenseSpring). We write only the
    id only a weak secondary signal).
 3. **Activate once online.** On purchase, client sends `{license, device pubkey,
    fingerprint}`; server returns a **signed lease** (Ed25519: license id, entitled
-   skus, fingerprint, ~14-day expiry, buyer id for watermark, and the **signed
+   skus, fingerprint, 3-day expiry, buyer id for watermark, and the **signed
    sha256 of the plaintext wasm**) + the **CEK sealed to the device pubkey**
    (libsodium sealed box). Persist both in the keychain.
 4. **Decrypt inside the gate (not an `if licensed {}` branch).** Verify the lease
@@ -588,22 +588,30 @@ payouts, no fund-pooling; Vance only ever receives its 20% fee.
   (no code to paste).
 - **Device cap:** free = unlimited, paid = 2 active machines.
 
+- **Processor: Stripe Connect** (direct charges + application fee). Direct charges
+  make the connected seller the merchant of record and keep Vance out of the fund
+  flow; Apple/Google Pay come free via Stripe's hosted checkout in the system
+  browser. (PayPal can be added later to broaden reach.)
+- **3rd-machine policy: auto-drop the oldest** active device when a paid effect is
+  activated on a 3rd — no "free a slot first" friction. The dropped device
+  uninstalls the effect on its next heartbeat/launch (§5).
+- **Offline grace window: 3 days.** Short = fast revocation + tighter sharing
+  control, at the cost of offline tolerance.
+  > **[note — flag for video editors]** 3 days is aggressive for this audience:
+  > a pro editing offline on a multi-day shoot/flight/remote location would see
+  > paid effects disable until they reconnect. Free effects are unaffected. If
+  > offline complaints appear, 7 days is the usual middle ground. Keeping 3 as
+  > chosen.
+
 **Still open:**
-- **Processor:** Stripe Connect (direct charges + application fee) vs PayPal
-  Commerce vs both. *(Stripe is the smoothest for direct-charge + app-fee + Apple/
-  Google Pay; PayPal broadens reach.)*
-- **3rd-machine policy:** block until the user frees a slot vs auto-deactivate the
-  oldest device.
-- **Buy licensing:** adopt **Keygen** (self-hostable activation/leases/revocation)
-  vs build the license server ourselves.
-- **Offline grace window:** 7 vs 14 days (revocation speed ⇄ offline tolerance).
+- **Buy licensing (Keygen self-host) vs build:** which is genuinely free + fits our
+  light needs (≤2-device cap, auto-drop-oldest, 3-day lease/heartbeat, revocation).
+  *(Under research — see §16.)*
+- **Legal posture for minimal exposure:** Stripe Connect account type + charge type,
+  seller ToS / buyer EULA scope, and the marketplace-facilitator tax question.
+  *(Under research — see §16.)*
 - **Distribution:** self-installer + Microsoft Store carry the marketplace; **Mac
   App Store build ships without in-app buying** — confirm.
-- **"Marketplace facilitator" tax review:** confirm with counsel that direct
-  charges keep the *seller* as merchant of record in your target markets.
-- **Legal:** seller ToS (seller is merchant of record via their connected
-  processor; owns buyer support/refunds/their own taxes; Vance provides
-  activation + takes a 20% fee), buyer EULA, verified-seller identity surface.
 
 ---
 
