@@ -64,6 +64,10 @@
   }
 
   async function generate() {
+    if (!projectState.info) {
+      toast.error('Create or open a project first (New in the toolbar), then generate.');
+      return;
+    }
     if (!prompt.trim()) {
       toast.error('Type a description of the image you want first.');
       return;

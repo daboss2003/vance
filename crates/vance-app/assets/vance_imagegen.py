@@ -27,10 +27,14 @@ def log(msg: str) -> None:
 def start_parent_watchdog() -> None:
     """Exit if the parent process (Vance) disappears. Vance holds our stdin
     pipe; when it dies the read returns EOF immediately (works even for SIGKILL),
-    so a machine-pegging generation can't outlive the app."""
+    so a machine-pegging generation can't outlive the app.
+
+    Reads the RAW fd (os.read) rather than sys.stdin.buffer — a daemon thread
+    blocked on a BufferedReader trips a fatal "_enter_buffered_busy" at
+    interpreter shutdown; the raw fd has no such lock."""
     def watch():
         try:
-            while sys.stdin.buffer.read(1):
+            while os.read(0, 1):
                 pass
         except Exception:
             pass
@@ -162,4 +166,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _code = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # Exit hard, skipping interpreter finalization: the daemon stdin watchdog
+    # would otherwise trip a fatal "_enter_buffered_busy" during shutdown.
+    # Everything (the saved image, all log lines) is already flushed.
+    os._exit(_code)
