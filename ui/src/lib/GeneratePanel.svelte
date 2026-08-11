@@ -9,23 +9,57 @@
    */
   import { imageGenAvailable, generateImage } from '$lib/ipc';
   import { projectState } from '$lib/project.svelte';
+  import { listen } from '@tauri-apps/api/event';
 
   let available = $state(false);
   let prompt = $state('');
   let negative = $state('');
-  let width = $state(1024);
-  let height = $state(576);
+  // SD-1.5's native size; larger is much slower + heavier on memory.
+  let width = $state(512);
+  let height = $state(512);
   let steps = $state(20);
   let seed = $state('');
   let busy = $state(false);
   let error = $state<string | null>(null);
   let status = $state<string | null>(null);
 
+  // Live generation progress (streamed from the backend on gen://progress).
+  let phase = $state('');
+  let pct = $state<number | null>(null);
+  let elapsed = $state(0);
+
   $effect(() => {
     void imageGenAvailable()
       .then((v) => (available = v))
       .catch(() => {});
   });
+
+  $effect(() => {
+    let un: (() => void) | null = null;
+    void listen<{ step: number; total: number; pct: number | null; detail: string; done: boolean }>(
+      'gen://progress',
+      (e) => {
+        const p = e.payload;
+        if (!p || p.done) return;
+        pct = p.pct;
+        phase = p.total > 0 ? `Step ${p.step} / ${p.total}` : p.detail.replace('[vance-imagegen] ', '');
+      }
+    ).then((u) => (un = u));
+    return () => un?.();
+  });
+
+  $effect(() => {
+    if (!busy) return;
+    const started = Date.now();
+    elapsed = 0;
+    const t = setInterval(() => (elapsed = Math.floor((Date.now() - started) / 1000)), 1000);
+    return () => clearInterval(t);
+  });
+
+  function fmt(s: number): string {
+    const m = Math.floor(s / 60);
+    return `${m}:${String(s % 60).padStart(2, '0')}`;
+  }
 
   async function generate() {
     if (!prompt.trim()) {
@@ -34,7 +68,9 @@
     }
     busy = true;
     error = null;
-    status = 'Generating… (model inference can take a while)';
+    phase = 'Loading model…';
+    pct = null;
+    status = null;
     try {
       const seedNum = seed.trim() === '' ? null : parseInt(seed, 10);
       const info = await generateImage({
@@ -63,10 +99,21 @@
 
   {#if !available}
     <div class="hint">
-      No image generator configured. Set <code>VANCE_IMAGEGEN_CMD</code> to a command
-      template using <code>{'{prompt}'} {'{width}'} {'{height}'} {'{out}'}</code>, or install
-      <code>sd</code> (stable-diffusion.cpp) and set <code>VANCE_SD_MODEL</code>. Vance runs it
-      and imports the result.
+      Not installed. Add <strong>Generative images</strong> from the AI tools panel —
+      Vance installs it for you. (Advanced: set <code>VANCE_IMAGEGEN_CMD</code> or
+      <code>VANCE_SD_MODEL</code>.)
+    </div>
+  {/if}
+
+  {#if busy}
+    <div class="prog">
+      <div class="prog-bar" class:indet={pct == null}>
+        <i style={pct != null ? `width:${pct}%` : ''}></i>
+      </div>
+      <div class="prog-row">
+        <span>{phase || 'Working…'}</span>
+        <span class="mono">{fmt(elapsed)}</span>
+      </div>
     </div>
   {/if}
 
@@ -150,5 +197,55 @@
   .status {
     color: #7ec699;
     font-size: 11px;
+  }
+  .prog {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .prog-bar {
+    height: 6px;
+    border-radius: 999px;
+    background: #2a2b31;
+    overflow: hidden;
+    position: relative;
+  }
+  .prog-bar > i {
+    display: block;
+    height: 100%;
+    background: #6ea8fe;
+    border-radius: 999px;
+    transition: width 0.3s ease;
+  }
+  .prog-bar.indet > i {
+    width: 34%;
+    position: absolute;
+    left: 0;
+    animation: gen-slide 1.25s ease-in-out infinite;
+  }
+  @keyframes gen-slide {
+    0% {
+      left: -34%;
+    }
+    100% {
+      left: 100%;
+    }
+  }
+  .prog-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 10px;
+    opacity: 0.8;
+  }
+  .mono {
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .prog-bar.indet > i {
+      animation: none;
+      width: 100%;
+      position: static;
+    }
   }
 </style>

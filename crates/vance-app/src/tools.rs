@@ -139,6 +139,15 @@ pub fn imagegen_script() -> std::io::Result<PathBuf> {
     Ok(imagegen_dir()?.join("vance_imagegen.py"))
 }
 
+/// Write the current bundled wrapper to the managed imagegen dir (overwrite).
+/// Called before each run so a tool installed by an OLDER build picks up the
+/// latest wrapper (new flags, resource limits, progress) automatically.
+pub fn sync_imagegen_script() -> std::io::Result<PathBuf> {
+    let script = imagegen_script()?;
+    std::fs::write(&script, IMAGEGEN_PY)?;
+    Ok(script)
+}
+
 /// The installed diffusers image generator, if present: `(venv python, script)`.
 /// `None` until the "Generative images" tool is installed.
 pub fn diffusers_runner() -> Option<(PathBuf, PathBuf)> {
@@ -600,17 +609,20 @@ fn install_via_pip(tool: Tool, on: &mut Progress) -> Result<PathBuf, InstallErro
 /// Write the diffusers wrapper into the managed tools dir and prewarm (download
 /// + validate) the model. Returns the wrapper script path.
 fn finish_diffusers(vpython: &std::path::Path, on: &mut Progress) -> Result<PathBuf, InstallError> {
-    let script = imagegen_script()?;
     // The script must exist to be run for the prewarm; but if the prewarm fails
     // (bad model id, network) we REMOVE it again so the tool isn't left looking
     // installed — status()/diffusers_runner() key off the script's presence, and
     // a clean "not installed" lets the user simply re-click Install (which
     // resumes: torch/diffusers are cached, the model download resumes).
-    std::fs::write(&script, IMAGEGEN_PY)?;
+    let script = sync_imagegen_script()?;
     let model = diffusers_model();
     on("download", &format!("Downloading the image model ({model})…"), Some(0.0));
     let mut cmd = Command::new(vpython);
-    cmd.arg(&script).arg("--prewarm").arg("--model").arg(&model);
+    cmd.arg(&script)
+        .arg("--prewarm")
+        .arg("--watch-parent")
+        .arg("--model")
+        .arg(&model);
     if let Err(e) = run_streaming(cmd, "download", "downloading the image model", on) {
         let _ = std::fs::remove_file(&script);
         return Err(e);
@@ -628,7 +640,10 @@ fn run_streaming(
 ) -> Result<(), InstallError> {
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Pipe stdin and DON'T take it: any child that watches its stdin (our
+    // imagegen wrapper) then sees EOF the instant Vance dies (even on
+    // force-quit), so long jobs can't outlive the app orphaned.
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     let mut readers = Vec::new();

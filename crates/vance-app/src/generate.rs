@@ -82,23 +82,80 @@ pub fn available() -> bool {
         || (which("sd").is_some() && crate::tools::sd_model().is_some())
 }
 
+/// A generation progress reporter: `(step, total, latest line)`. `step`/`total`
+/// are 0 for non-step status lines (loading, downloading).
+pub type GenProgress<'a> = dyn FnMut(u32, u32, &str) + 'a;
+
 /// Generate an image for `req`, returning the output path. Blocking + slow
 /// (model inference) — call OFF the engine lock.
 pub fn generate(req: &GenRequest) -> Result<PathBuf, GenError> {
+    generate_with_progress(req, &mut |_, _, _| {})
+}
+
+/// Like [`generate`], but streams the runner's per-step progress through `on`
+/// so the UI can show it instead of appearing frozen.
+pub fn generate_with_progress(req: &GenRequest, on: &mut GenProgress) -> Result<PathBuf, GenError> {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
     let (program, args) = resolve_command(req)?;
     if let Some(parent) = req.out_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::remove_file(&req.out_path);
 
-    let mut cmd = Command::new(&program);
-    cmd.args(&args);
-    let out = cmd.output()?;
-    if !out.status.success() {
-        let stderr: String = String::from_utf8_lossy(&out.stderr).chars().take(2000).collect();
+    // Pipe stdin and don't take it: the diffusers wrapper (run with
+    // `--watch-parent`) exits the instant Vance dies, so a heavy generation
+    // can't keep pegging the machine after the app quits.
+    let mut child = Command::new(&program)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut readers = Vec::new();
+    for pipe in [
+        child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+        child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let tx = tx.clone();
+        readers.push(std::thread::spawn(move || {
+            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        }));
+    }
+    drop(tx);
+
+    let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    for line in rx {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        match parse_step(t) {
+            Some((n, m)) => on(n, m, t),
+            None => on(0, 0, t),
+        }
+        tail.push_back(t.to_string());
+        if tail.len() > 40 {
+            tail.pop_front();
+        }
+    }
+    for h in readers {
+        let _ = h.join();
+    }
+
+    let status = child.wait()?;
+    if !status.success() {
         return Err(GenError::Failed {
-            code: out.status.code(),
-            stderr,
+            code: status.code(),
+            stderr: tail.into_iter().collect::<Vec<_>>().join("\n"),
         });
     }
     if req.out_path.is_file() {
@@ -106,6 +163,15 @@ pub fn generate(req: &GenRequest) -> Result<PathBuf, GenError> {
     } else {
         Err(GenError::NoOutput(req.out_path.clone()))
     }
+}
+
+/// Parse a `step N/M` progress line (with or without the wrapper prefix).
+fn parse_step(line: &str) -> Option<(u32, u32)> {
+    let rest = &line[line.rfind("step ")? + 5..];
+    let mut parts = rest.split('/');
+    let n: u32 = parts.next()?.trim().parse().ok()?;
+    let m: u32 = parts.next()?.trim().split_whitespace().next()?.parse().ok()?;
+    Some((n, m))
 }
 
 /// Resolve the program + argv for a request (template or default `sd`).
@@ -127,6 +193,9 @@ fn resolve_command(req: &GenRequest) -> Result<(PathBuf, Vec<String>), GenError>
     }
     // Installed via the AI tools panel: the diffusers wrapper in the managed venv.
     if let Some((python, script)) = crate::tools::diffusers_runner() {
+        // Refresh the wrapper first so an install from an older build gets the
+        // latest script (resource limits, --watch-parent, progress).
+        let script = crate::tools::sync_imagegen_script().unwrap_or(script);
         return Ok((python, diffusers_args(&script, req)));
     }
     // Legacy: stable-diffusion.cpp `sd` + a model file from the environment.
@@ -142,6 +211,7 @@ fn resolve_command(req: &GenRequest) -> Result<(PathBuf, Vec<String>), GenError>
 fn diffusers_args(script: &Path, req: &GenRequest) -> Vec<String> {
     let mut a = vec![
         script.to_string_lossy().into_owned(),
+        "--watch-parent".into(),
         "--model".into(),
         crate::tools::diffusers_model(),
         "--prompt".into(),
