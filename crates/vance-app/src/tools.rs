@@ -106,9 +106,11 @@ pub fn sd_model() -> Option<PathBuf> {
 /// tools dir alongside its venv). Vance runs it as `<venv-python> <script>`.
 const IMAGEGEN_PY: &str = include_str!("../assets/vance_imagegen.py");
 
-/// A commercial-use-OK default model (CreativeML Open RAIL++-M), overridable
-/// with `VANCE_SD_MODEL` (a Hugging Face model id or a local diffusers path).
-pub const DEFAULT_SD_MODEL: &str = "stabilityai/stable-diffusion-2-1-base";
+/// A commercial-use-OK default model (CreativeML OpenRAIL-M), overridable with
+/// `VANCE_SD_MODEL` (a Hugging Face model id or a local diffusers path). This
+/// is the public, ungated SD-1.5 mirror — Stability's own SD-2.x repos are now
+/// gated (need an HF login), so they can't be a zero-config default.
+pub const DEFAULT_SD_MODEL: &str = "stable-diffusion-v1-5/stable-diffusion-v1-5";
 
 /// `…/Vance/tools/imagegen` — holds the diffusers wrapper script.
 pub fn imagegen_dir() -> std::io::Result<PathBuf> {
@@ -460,12 +462,20 @@ fn install_via_pip(tool: Tool, on: &mut Progress) -> Result<PathBuf, InstallErro
 /// + validate) the model. Returns the wrapper script path.
 fn finish_diffusers(vpython: &std::path::Path, on: &mut Progress) -> Result<PathBuf, InstallError> {
     let script = imagegen_script()?;
+    // The script must exist to be run for the prewarm; but if the prewarm fails
+    // (bad model id, network) we REMOVE it again so the tool isn't left looking
+    // installed — status()/diffusers_runner() key off the script's presence, and
+    // a clean "not installed" lets the user simply re-click Install (which
+    // resumes: torch/diffusers are cached, the model download resumes).
     std::fs::write(&script, IMAGEGEN_PY)?;
     let model = diffusers_model();
     on("download", &format!("Downloading the image model ({model})…"), Some(0.0));
     let mut cmd = Command::new(vpython);
     cmd.arg(&script).arg("--prewarm").arg("--model").arg(&model);
-    run_streaming(cmd, "download", "downloading the image model", on)?;
+    if let Err(e) = run_streaming(cmd, "download", "downloading the image model", on) {
+        let _ = std::fs::remove_file(&script);
+        return Err(e);
+    }
     Ok(script)
 }
 
