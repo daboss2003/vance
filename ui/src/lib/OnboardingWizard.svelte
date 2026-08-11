@@ -240,10 +240,10 @@
     background: #3a3b42;
   }
   .dot.on {
-    background: #6ea8fe;
+    background: var(--accent);
   }
   .dot.done {
-    background: #7ec699;
+    background: var(--ok);
   }
   h1 {
     font-size: 20px;
@@ -297,7 +297,7 @@
     text-align: center;
   }
   .cap:not(.missing) .mark {
-    color: #7ec699;
+    color: var(--ok);
   }
   .cap.missing .mark {
     color: #e0a458;
@@ -346,7 +346,7 @@
     padding: 6px 14px;
     border-radius: 6px;
     border: 1px solid var(--border, #3a3b42);
-    background: #6ea8fe;
+    background: var(--accent);
     color: #0b0b0d;
     font-weight: 600;
   }

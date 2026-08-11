@@ -192,7 +192,7 @@
     cursor: pointer;
   }
   .on {
-    color: #7ec699;
+    color: var(--ok);
     font-size: 11px;
   }
   code {

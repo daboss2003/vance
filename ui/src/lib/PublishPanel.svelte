@@ -172,7 +172,7 @@
     cursor: pointer;
   }
   .ok {
-    color: #7ec699;
+    color: var(--ok);
   }
   .muted {
     opacity: 0.6;
@@ -186,7 +186,7 @@
     font-size: 11px;
   }
   .status {
-    color: #7ec699;
+    color: var(--ok);
     font-size: 11px;
     word-break: break-all;
   }

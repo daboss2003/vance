@@ -495,7 +495,7 @@
     gap: 3px;
   }
   .node.isout {
-    border-color: #7ec699;
+    border-color: var(--ok);
   }
   .nhead {
     display: flex;

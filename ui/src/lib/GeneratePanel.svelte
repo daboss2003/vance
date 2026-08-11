@@ -195,7 +195,7 @@
     font-size: 11px;
   }
   .status {
-    color: #7ec699;
+    color: var(--ok);
     font-size: 11px;
   }
   .prog {
@@ -213,7 +213,7 @@
   .prog-bar > i {
     display: block;
     height: 100%;
-    background: #6ea8fe;
+    background: var(--accent);
     border-radius: 999px;
     transition: width 0.3s ease;
   }

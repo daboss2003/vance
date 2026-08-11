@@ -276,7 +276,7 @@
     text-align: center;
   }
   .tool.ok .mark {
-    color: #7ec699;
+    color: var(--ok);
   }
   .body {
     flex: 1;
@@ -302,7 +302,7 @@
     align-items: center;
   }
   .done {
-    color: #7ec699;
+    color: var(--ok);
     font-size: 11px;
     font-weight: 600;
   }
@@ -311,7 +311,7 @@
     padding: 4px 10px;
     border-radius: 5px;
     border: 1px solid var(--border, #3a3b42);
-    background: #6ea8fe;
+    background: var(--accent);
     color: #0b0b0d;
     font-weight: 600;
     font-size: 11px;
@@ -377,7 +377,7 @@
   .prog-bar > i {
     display: block;
     height: 100%;
-    background: #6ea8fe;
+    background: var(--accent);
     border-radius: 999px;
     transition: width 0.3s ease;
   }

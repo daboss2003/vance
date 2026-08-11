@@ -196,7 +196,7 @@
     font-size: 11px;
   }
   .status {
-    color: #7ec699;
+    color: var(--ok);
     font-size: 11px;
   }
 </style>

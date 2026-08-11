@@ -1420,11 +1420,15 @@
   <header
     class="border-vance-border bg-vance-panel flex h-11 flex-shrink-0 items-center gap-3 border-b px-4"
   >
-    <h1 class="text-sm font-semibold">Vance</h1>
-    <span class="text-vance-muted text-xs">Phase 6 · Color</span>
+    <h1 class="text-sm font-semibold tracking-tight">
+      Vance<span class="text-[var(--color-vance-accent)]">.</span>
+    </h1>
+    {#if projectState.sequence}
+      <span class="text-vance-muted text-xs truncate max-w-[16rem]">{projectState.sequence.name}</span>
+    {/if}
 
-    <!-- Edit / Color page toggle (Phase 6.6) -->
-    <div class="ml-1 flex items-center rounded border border-vance-border overflow-hidden text-xs">
+    <!-- Edit / Color page switcher -->
+    <div class="ml-1 flex items-center rounded-md border border-vance-border overflow-hidden text-xs">
       <button
         class="px-2 py-0.5 {activePage === 'edit'
           ? 'bg-[var(--color-vance-accent)] text-[#003040] font-semibold'
@@ -3110,11 +3114,18 @@
     <Timeline refreshTick={timelineRefreshTick} />
   </div>
 
-  <!-- Footer -->
+  <!-- Footer / status bar -->
   <footer
-    class="border-vance-border bg-vance-panel flex h-7 flex-shrink-0 items-center gap-4 border-t px-4 text-[11px]"
+    class="border-vance-border bg-vance-panel text-vance-muted flex h-7 flex-shrink-0 items-center gap-4 border-t px-4 text-[11px]"
   >
-    <span>backend: <span class="font-mono">{backend}</span></span>
+    {#if projectState.sequence}
+      <span class="font-mono">
+        {(
+          projectState.sequence.frame_rate_num / projectState.sequence.frame_rate_den
+        ).toFixed(2)} fps · {projectState.sequence.duration_seconds.toFixed(1)}s
+      </span>
+    {/if}
+    <span class="ml-auto opacity-70">{backend}</span>
   </footer>
 </div>
 
