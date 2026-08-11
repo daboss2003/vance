@@ -88,7 +88,8 @@ Backend services (vance cloud)  [new]
 Third parties  [gated]
   ├─ Seller's connected processor (Stripe/PayPal) — buyer pays the SELLER directly;
   │    Vance takes a 20% application fee + gets a "paid" webhook to auto-activate (§8a.1)
-  └─ (optional) Keygen — licensing/activation/leases/revocation, self-hostable
+  └─ (licensing/activation/leases/revocation is built in-house on this backend;
+     Keygen CE self-host is the free fallback — see §16.2)
 
   (No merchant-of-record and no payouts: money lands in the SELLER's account, never
    pools in Vance. Vance only ever receives its 20% fee and never pays anyone out.)
@@ -260,10 +261,15 @@ window; leaks become **traceable** (watermark) → identifiable, bannable leaker
 We accept this openly.
 
 ### 7.2 Recommended scheme (light, invisible, reliable)
-Prefer **buying** the licensing layer (**Keygen** — self-hostable; Ed25519-signed
-+ AES-256-GCM license files, machine activation, heartbeat/lease, revocation,
-device caps all first-class — or Cryptlex/LicenseSpring). We write only the
-**decrypt-on-load shim**.
+**Licensing layer — decided (see §16): build it into our own backend.** Our needs
+are light (per-user entitlement, 2-device cap + auto-drop-oldest, 3-day
+lease/heartbeat, revocation, Ed25519-signed offline license) — a small addition to
+the accounts/entitlements backend already built in M1–M2, using standard primitives
+(`ed25519-dalek` + libsodium sealed box), no second runtime to operate. **Keygen
+CE** (self-hostable, **free for commercial use** under the Fair Core License, and it
+ships exactly these primitives) is the documented **zero-lock-in fallback** if we'd
+rather offload the security-critical license logic than own it. Either way we write
+the **decrypt-on-load shim**.
 
 1. **Encrypt once per version.** Random 256-bit content key (CEK), XChaCha20-
    Poly1305 or AES-256-GCM (Rust `chacha20poly1305`/`aes-gcm`/`ring`). Ship the
@@ -446,9 +452,11 @@ metadata + `versions[]` + screenshots + rating + price + capabilities; `GET
 /effects/{id}/reviews`.
 
 **Publisher verification (two tiers):** email-verified free authors; **DNS-TXT
-domain-verified** brands get a badge; **paid sellers must be verified** (identity +
-a connected Stripe/PayPal account with charges enabled) — this is a core
-buyer-trust safeguard alongside auto-activation (§8, §8a).
+domain-verified** brands get a badge; **paid sellers must be verified** — which
+**Stripe Connect onboarding does for us**: for Standard accounts Stripe performs
+the seller's identity verification + KYC/AML, so Vance gates paid-seller status on
+the connected account reaching `charges_enabled=true` rather than building its own
+KYC (§16). A core buyer-trust safeguard alongside auto-activation (§8, §8a).
 
 **Reviews:** 1–5 stars + text, **gated to users who installed/purchased** (kills
 most spam), aggregate on the card, velocity limits + moderation queue.
@@ -559,8 +567,10 @@ reviews(id, sku, user_id, stars, body, created_at, UNIQUE(sku, user_id))   -- ga
    Stripe/PayPal (direct-charge + application fee), listing with price, buyer
    checkout in the system browser, **`payment.succeeded` webhook → auto-grant** to
    the buyer's account, **direct-grant entitlement**, paid-effect **encryption +
-   decrypt-on-load shim** (or adopt Keygen), 2-device cap enforcement,
-   refund/dispute-webhook → revoke.
+   decrypt-on-load shim** + in-house license endpoints (§16.2), 2-device cap with
+   auto-drop-oldest, **grant on `payment.succeeded` / revoke on
+   `charge.refunded` + `charge.dispute.created`** (Connect webhooks, signature +
+   idempotency verified).
 5. **M5 — Anti-scam + seller trust (§8a).** Verified-seller identity (required for
    paid), progressive-trust caps for new sellers, "Selling" panel (connected
    processor + sales ledger), owner-gated reviews/ratings + visible dispute rate,
@@ -604,14 +614,11 @@ payouts, no fund-pooling; Vance only ever receives its 20% fee.
   > chosen.
 
 **Still open:**
-- **Buy licensing (Keygen self-host) vs build:** which is genuinely free + fits our
-  light needs (≤2-device cap, auto-drop-oldest, 3-day lease/heartbeat, revocation).
-  *(Under research — see §16.)*
-- **Legal posture for minimal exposure:** Stripe Connect account type + charge type,
-  seller ToS / buyer EULA scope, and the marketplace-facilitator tax question.
-  *(Under research — see §16.)*
 - **Distribution:** self-installer + Microsoft Store carry the marketplace; **Mac
   App Store build ships without in-app buying** — confirm.
+
+*(Licensing build-vs-Keygen and the minimal-legal-exposure posture were researched
+and resolved — see **§16**.)*
 
 ---
 
@@ -637,8 +644,113 @@ payouts, no fund-pooling; Vance only ever receives its 20% fee.
    and report→freeze→ban (§8a). Those safeguards are **required**, not optional.
 7. **Sellers must connect a supported processor** (Stripe/PayPal) to sell paid
    effects — a creator who won't can only publish free effects.
-8. **Tax is simpler, not absent.** Direct charges make the *seller* merchant of
+8. **US tax is simpler, not immune.** Direct charges make the *seller* merchant of
    record (they own their sale's tax; Stripe Tax can run on their account), and
-   Vance owes tax only on its **20% fee** — its own revenue. But
-   **"marketplace-facilitator"** laws may still reach the platform in some US
-   states / the EU regardless — a legal-review item before GA, not a blocker.
+   Vance owes tax only on its **20% fee**. But **"marketplace-facilitator"** is a
+   *statutory* status decided per US state independent of who's MoR — a state can
+   still deem Vance a facilitator (the "indirectly…collects the payment" prong is
+   broad, and Vance runs the whole checkout + auto-grant). Seller-ToS tax
+   allocation binds the seller, **not a tax authority** (it only gives Vance an
+   indemnity claim). Real early exposure is **low**: the duty only bites once an
+   effect is taxable in a state *and* aggregate **facilitated** sales cross that
+   state's economic-nexus threshold (~$100k/200 txns, measured on sellers'
+   *combined* volume). Monitor per-state; get a state-tax opinion before nearing
+   $100k anywhere. (§16)
+9. **EU VAT is the real gate — likely a launch blocker for EU consumer sales.**
+   Under **Art. 9a** of the VAT Implementing Regulation (upheld by the CJEU in
+   *Fenix/OnlyFans*, C-695/20, 2023 — a platform that, exactly like us, took a ~20%
+   cut), a platform "facilitating" electronically-supplied services is presumed the
+   **deemed supplier** liable to collect + remit VAT on B2C EU sales. The
+   presumption is **non-rebuttable** if the platform authorises delivery or sets the
+   general terms — and our **auto-grant-on-webhook** authorises delivery and we set
+   platform T&Cs. **Stripe direct charges / seller-as-MoR do NOT help here** (Art. 9a
+   turns on control of terms/delivery, not who holds funds), and there's **no
+   small-seller cross-border threshold** to hide behind. So EU B2C either needs a
+   real VAT advisor + (non-Union) OSS registration, or a flow restructured so the
+   *seller* sets terms + authorises delivery. **Recommendation: launch US-first;
+   gate EU consumer sales on that advice.** (§16)
+10. **"Money transmitter" is a legal question, not a config flag.** Funds never
+    touching Vance's balance *lowers* the risk but is **not** a safe harbor under US
+    state MTL / FinCEN rules — a payments/fintech lawyer must confirm before launch.
+    (§16)
+
+---
+
+## 16. Decisions resolved (researched 2026-08)
+
+Grounded in a research pass (Stripe Connect docs, marketplace-facilitator statutes,
+EU VAT Art. 9a + CJEU *Fenix*, DSA, Keygen licensing) with an adversarial
+fact-check. **This is engineering orientation, not legal advice** — the two items
+tagged **[lawyer]** genuinely need a qualified advisor before GA.
+
+### 16.1 Stripe Connect — exact configuration
+- **Standard accounts + Direct charges + `application_fee_amount` = 20%**, sold via
+  **Stripe-hosted Checkout opened in the system browser**. This one combo:
+  seller = merchant of record; **buyer funds never touch Vance's balance** (only the
+  20% fee routes to Vance); refund / chargeback / negative-balance / fraud liability
+  sits with the **seller + Stripe, not Vance**; **Apple Pay / Google Pay free** on
+  hosted Checkout; **Stripe owns KYC/AML** onboarding (satisfies our verified-seller
+  requirement — gate on `charges_enabled=true`).
+- **Correction to earlier draft:** use plain **Standard** accounts. Standard/Express/
+  Custom are **not** deprecated (the Accounts-v2 "controller properties" migration is
+  *optional* + backwards-compatible) — don't over-engineer onto v2.
+- **Don't use** destination charges or separate charges-and-transfers — both make
+  **Vance** the MoR and pull buyer funds through Vance's balance.
+- **Build gotchas (bake into M4):**
+  - **Grant on `payment.succeeded`, revoke on `charge.refunded` / `charge.dispute.created`.**
+    Auto-grant + a later chargeback debits the *seller*, but the buyer keeps the
+    delivered effect unless we revoke — wire both webhooks → `entitlement.changed`.
+  - **Listen on the *connected account's* Connect webhooks** (they carry the account
+    id), **verify signatures + idempotency**.
+  - **Application fee is NOT auto-refunded** — on a seller refund, pass
+    `refund_application_fee` per our policy (decide: do we return our 20%?).
+  - **Radar blind spot:** platform Radar rules don't apply to direct charges on the
+    seller's account — fraud screening is largely Stripe-default.
+
+### 16.2 Licensing layer — build it (Keygen CE is the free fallback)
+- **"Which is free":** both. **Keygen CE** self-hosts **free for commercial use**
+  (Fair Core License; its narrow non-compete only bites if you resell *Keygen-like
+  licensing* — irrelevant to us; converts to Apache-2.0 two years post-release) and
+  ships every primitive we need (Ed25519 offline license files, machine activation +
+  limits, heartbeats/leases, revocation). Building it ourselves has no license fee
+  either.
+- **Decision: build it into our own backend.** Reasons: needs are light (~3 endpoints
+  — activate / heartbeat / revoke — plus Ed25519 signing), we already designed the
+  scheme (§7.2) and are already standing up the accounts/entitlements backend, the
+  per-version CEK-sealing is bespoke on top of Keygen anyway, and it avoids operating
+  a second runtime (Ruby + Postgres + Redis/Sidekiq). **Keygen CE stays the
+  documented, zero-lock-in fallback** if we later prefer to offload the
+  security-critical license logic.
+
+### 16.3 Legal posture — minimal-issue, honestly bounded
+- **US (minimal-issue, low early exposure):** direct charges (seller = MoR) + a
+  **Seller Agreement** that allocates all sales-tax responsibility to the seller +
+  **per-state facilitated-volume monitoring**. Real collect-and-remit duty only
+  triggers once an effect is taxable in a state *and* aggregate facilitated sales
+  cross its economic-nexus threshold — so early exposure is low, but it scales
+  silently with marketplace volume. **[lawyer]** state-tax opinion before nearing
+  $100k in any state.
+- **EU (the one hard gate):** **[lawyer]** the Art. 9a **deemed-supplier VAT** risk
+  is real and *not* fixed by the payment architecture (§15.9). **Recommended posture:
+  launch US-first (+ other non-EU markets); gate EU consumer sales** on a VAT opinion
+  and, if needed, (non-Union) **OSS** registration — or restructure so the seller
+  sets terms + authorises delivery.
+- **Money transmitter:** **[lawyer]** low-risk posture (Vance never holds/forwards
+  buyer funds) but confirm under state MTL / FinCEN.
+- **DSA trader verification (Art. 30 KYBC):** **does not apply at our size** (Art. 29
+  exempts <50 staff / ≤€10M). Still do the cheap baseline (clear T&Cs, notice-and-
+  action, a point of contact) and **capture Stripe-KYC seller data now** so the
+  Art. 30 obligation is a non-event if we grow past the threshold.
+- **Minimal legal doc set to draft (counsel-reviewed once):** Seller Agreement
+  (80/20 split, IP/originality warranty + indemnity, seller = seller-of-record
+  responsible for all tax), Buyer Marketplace ToS, a default **EULA** (applies when a
+  seller supplies none), Privacy Policy (GDPR + CCPA), refund/dispute policy
+  (seller-owned), DMCA + DSA notice-and-action + acceptable-use. Wire **Stripe
+  Connected Account Agreement** acceptance into onboarding.
+
+### 16.4 Net
+The architecture (Stripe **Standard + direct charges + 20% app fee**, licensing
+**built in-house**) is the genuinely minimal-cost, minimal-US-exposure setup and
+needs **no external vendor beyond Stripe**. The only place "minimal" still demands a
+real advisor is **EU VAT** — so **ship US-first** and treat EU B2C as a deliberate,
+advised second step.
