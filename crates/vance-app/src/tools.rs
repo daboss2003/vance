@@ -432,16 +432,20 @@ fn install_via_pip(tool: Tool, on: &mut Progress) -> Result<PathBuf, InstallErro
     let packages = tool.pip_packages();
 
     // Keep pip itself current, then install the package(s). `--upgrade` makes a
-    // re-install idempotent (and pulls a newer tool if one shipped).
+    // re-install idempotent (and pulls a newer tool if one shipped). `--retries`
+    // rides out transient network blips within a run; pip's wheel cache + the
+    // venv persist across runs, so a re-click after an interruption RESUMES —
+    // already-fetched wheels are reused rather than re-downloaded.
+    const NET: [&str; 4] = ["--retries", "10", "--timeout", "60"];
     on("pip", "Updating the package installer (pip)…", None);
     let mut up = Command::new(&vpython);
-    up.args(["-m", "pip", "install", "--upgrade", "pip"]);
+    up.args(["-m", "pip", "install", "--upgrade"]).args(NET).arg("pip");
     run_streaming(up, "pip", "upgrading pip", on)?;
 
     let joined = packages.join(" ");
     on("pip", &format!("Installing {joined} (this can take a while)…"), None);
     let mut inst = Command::new(&vpython);
-    inst.args(["-m", "pip", "install", "--upgrade"]).args(packages);
+    inst.args(["-m", "pip", "install", "--upgrade"]).args(NET).args(packages);
     run_streaming(inst, "pip", &format!("installing {joined}"), on)?;
 
     // Image generation is a bundled diffusers wrapper (no CLI on PyPI): drop the
