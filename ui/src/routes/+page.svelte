@@ -61,25 +61,56 @@
       .catch(() => {});
   });
 
-  // Feature-panel dock — tabbed so each panel gets full space instead of
-  // overflowing the transport bar. One panel is shown at a time.
-  const DOCK_PANELS = [
-    { id: 'export', label: 'Export' },
-    { id: 'history', label: 'History' },
-    { id: 'mixer', label: 'Mixer' },
-    { id: 'mograph', label: 'Titles' },
-    { id: 'magnetic', label: 'Magnetic' },
-    { id: 'captions', label: 'Captions' },
-    { id: 'aiaudio', label: 'AI Audio' },
-    { id: 'reframe', label: 'Reframe' },
-    { id: 'control', label: 'Control' },
-    { id: 'publish', label: 'Publish' },
-    { id: 'fusion', label: 'Fusion' },
-    { id: 'generate', label: 'Generate' },
-    { id: 'review', label: 'Review' },
-    { id: 'aitools', label: 'AI Tools' }
-  ];
-  let activeDock = $state('export');
+  // DaVinci-style pages, driven by the bottom page bar. The center viewers +
+  // Record viewport stay mounted across the switch. `activePage` remains the
+  // edit/color viewer mode the Color-page rendering keys off (only Color swaps
+  // the side panels); the other pages are edit-style with a page-specific dock.
+  let currentPage = $state<'edit' | 'compositor' | 'color' | 'audio' | 'deliver'>('edit');
+  let activePage = $derived<'edit' | 'color'>(currentPage === 'color' ? 'color' : 'edit');
+
+  // DaVinci-style pages: the tool panels are grouped by post-production stage
+  // rather than shown as one flat strip. Each page's dock shows only its tools.
+  const PAGES = [
+    { id: 'edit', label: 'Edit' },
+    { id: 'compositor', label: 'Compositor' },
+    { id: 'color', label: 'Color' },
+    { id: 'audio', label: 'Audio' },
+    { id: 'deliver', label: 'Deliver' }
+  ] as const;
+
+  const PAGE_PANELS: Record<string, { id: string; label: string }[]> = {
+    edit: [
+      { id: 'mograph', label: 'Titles' },
+      { id: 'captions', label: 'Captions' },
+      { id: 'generate', label: 'Generate Image' },
+      { id: 'reframe', label: 'Smart Reframe' },
+      { id: 'magnetic', label: 'Magnetic Timeline' },
+      { id: 'history', label: 'History' }
+    ],
+    compositor: [{ id: 'fusion', label: 'Compositor' }],
+    color: [],
+    audio: [
+      { id: 'mixer', label: 'Mixer' },
+      { id: 'aiaudio', label: 'Voice & Levels' },
+      { id: 'control', label: 'Control Surface' }
+    ],
+    deliver: [
+      { id: 'export', label: 'Export' },
+      { id: 'publish', label: 'Publish' },
+      { id: 'review', label: 'Review Notes' }
+    ]
+  };
+
+  // The tools shown in the dock for the current page.
+  let dockPanels = $derived(PAGE_PANELS[currentPage] ?? []);
+  let activeDock = $state('mograph');
+  // When the page changes, jump the dock to that page's first tool.
+  $effect(() => {
+    const panels = PAGE_PANELS[currentPage] ?? [];
+    if (panels.length && !panels.some((p) => p.id === activeDock)) {
+      activeDock = panels[0].id;
+    }
+  });
 
   // Native menu bar → app actions. The Rust menu emits `menu://action` with an
   // item id; map each to the same handler as the matching toolbar button.
@@ -109,13 +140,14 @@
           void projectState.redo();
           break;
         case 'page_edit':
-          activePage = 'edit';
+          currentPage = 'edit';
           break;
         case 'page_color':
-          activePage = 'color';
+          currentPage = 'color';
           break;
         case 'dock_ai_tools':
-          activeDock = 'aitools';
+          // AI add-ons install lives in Settings now, not the editing dock.
+          showOnboarding = true;
           break;
         case 'settings':
           showOnboarding = true;
@@ -166,10 +198,6 @@
   let titleDraftSize = $state<number>(96);
   let titleSubmitting = $state<boolean>(false);
 
-  // Edit ↔ Color page toggle (Phase 6.6). The center viewers + Record
-  // viewport stay mounted across the switch (only the side panels swap)
-  // so the native wgpu surface never rebinds.
-  let activePage = $state<'edit' | 'color'>('edit');
   // Which grade node's wheels are shown on the Color page.
   let selectedNodeId = $state<string | null>(null);
   // Guards the color-page auto-seek so we only decode once per
@@ -1427,26 +1455,6 @@
       <span class="text-vance-muted text-xs truncate max-w-[16rem]">{projectState.sequence.name}</span>
     {/if}
 
-    <!-- Edit / Color page switcher -->
-    <div class="ml-1 flex items-center rounded-md border border-vance-border overflow-hidden text-xs">
-      <button
-        class="px-2 py-0.5 {activePage === 'edit'
-          ? 'bg-[var(--color-vance-accent)] text-[#003040] font-semibold'
-          : 'bg-vance-bg hover:brightness-125'}"
-        onclick={() => (activePage = 'edit')}
-      >
-        Edit
-      </button>
-      <button
-        class="px-2 py-0.5 {activePage === 'color'
-          ? 'bg-[var(--color-vance-accent)] text-[#003040] font-semibold'
-          : 'bg-vance-bg hover:brightness-125'}"
-        onclick={() => (activePage = 'color')}
-      >
-        Color
-      </button>
-    </div>
-
     {#if projectState.info}
       <span class="ml-3 text-xs text-vance-muted flex items-center gap-1">
         Project: <span class="text-vance-fg font-medium">{projectState.info.name}</span>
@@ -2115,30 +2123,30 @@
         <MasterMeter />
 
         <span class="text-vance-muted ml-auto">
-          last PTS: <span class="text-vance-fg font-mono">{lastPts ?? '—'}</span>
           {#if playError}
-            <span class="ml-3 text-red-400">{playError}</span>
+            <span class="text-red-400">Engine offline</span>
           {/if}
         </span>
       </div>
 
-      <!-- Feature-panel dock. Previously these 14 panels were crammed into the
-           transport bar and overflowed off-screen; now they're a tabbed dock so
-           each gets full width. One panel shows at a time. -->
-      <div class="border-vance-border bg-vance-panel flex min-h-0 flex-shrink-0 flex-col border-t">
-        <div class="flex gap-1 overflow-x-auto px-2 py-1 text-xs">
-          {#each DOCK_PANELS as p (p.id)}
-            <button
-              class="shrink-0 rounded px-2.5 py-1 whitespace-nowrap {activeDock === p.id
-                ? 'bg-[var(--color-vance-accent)] font-semibold text-[#003040]'
-                : 'text-vance-muted hover:text-vance-fg hover:bg-vance-bg'}"
-              onclick={() => (activeDock = p.id)}
-            >
-              {p.label}
-            </button>
-          {/each}
-        </div>
-        <div class="h-56 overflow-auto border-t border-vance-border px-2 py-2">
+      <!-- Page-specific tool dock. The tools are grouped by post-production
+           stage (Edit / Compositor / Audio / Deliver) via the bottom page bar,
+           rather than shown as one flat 14-tab strip. Color has its own layout. -->
+      {#if dockPanels.length}
+        <div class="border-vance-border bg-vance-panel flex min-h-0 flex-shrink-0 flex-col border-t">
+          <div class="flex gap-1 overflow-x-auto px-2 py-1 text-xs">
+            {#each dockPanels as p (p.id)}
+              <button
+                class="shrink-0 rounded px-2.5 py-1 whitespace-nowrap {activeDock === p.id
+                  ? 'bg-[var(--color-vance-accent)] font-semibold text-[#003040]'
+                  : 'text-vance-muted hover:text-vance-fg hover:bg-vance-bg'}"
+                onclick={() => (activeDock = p.id)}
+              >
+                {p.label}
+              </button>
+            {/each}
+          </div>
+          <div class="h-56 overflow-auto border-t border-vance-border px-2 py-2">
           {#if activeDock === 'export'}
             <ExportPanel />
           {:else if activeDock === 'history'}
@@ -2165,11 +2173,10 @@
             <GeneratePanel />
           {:else if activeDock === 'review'}
             <ReviewPanel />
-          {:else if activeDock === 'aitools'}
-            <AiToolsPanel />
           {/if}
+          </div>
         </div>
-      </div>
+      {/if}
     </main>
 
     {#if titleModalOpen}
@@ -3113,6 +3120,25 @@
   >
     <Timeline refreshTick={timelineRefreshTick} />
   </div>
+
+  <!-- Page bar — DaVinci-style primary navigation by post-production stage.
+       Editing lives on Edit; compositing, grading, mixing and delivery each get
+       their own page, so the app reads left→right as the post workflow. -->
+  <nav
+    class="border-vance-border bg-vance-panel flex h-12 flex-shrink-0 items-center justify-center gap-1.5 border-t"
+    aria-label="Pages"
+  >
+    {#each PAGES as pg (pg.id)}
+      <button
+        class="rounded-md px-5 py-1.5 text-xs tracking-wide transition-colors {currentPage === pg.id
+          ? 'bg-[var(--color-vance-accent)] font-semibold text-[#003040]'
+          : 'text-vance-muted hover:text-vance-fg hover:bg-vance-bg'}"
+        onclick={() => (currentPage = pg.id)}
+      >
+        {pg.label}
+      </button>
+    {/each}
+  </nav>
 
   <!-- Footer / status bar -->
   <footer

@@ -4007,7 +4007,7 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tau
         .item(&item("page_edit", "Edit Page", Some("CmdOrCtrl+1"))?)
         .item(&item("page_color", "Color Page", Some("CmdOrCtrl+2"))?)
         .separator()
-        .item(&item("dock_ai_tools", "AI Tools Panel", None)?)
+        .item(&item("dock_ai_tools", "AI Add-ons…", None)?)
         .build()?;
 
     let window = SubmenuBuilder::new(app, "Window")

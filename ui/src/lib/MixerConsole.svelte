@@ -111,25 +111,25 @@
 
 <div class="console">
   <div class="head">
-    <span>Mixer — Buses</span>
+    <span>Mixer — Groups</span>
     <button
       onclick={() => {
         const name = window.prompt('Bus name (e.g. "Dialogue", "Music", "Reverb")');
         if (name) void act(() => addBus(name));
       }}
-      disabled={busy}>＋ Bus</button
+      disabled={busy}>＋ Group</button
     >
   </div>
   {#if error}<div class="err">{error}</div>{/if}
   {#if strips.length === 0}
-    <div class="empty">No buses — every track routes straight to Master.</div>
+    <div class="empty">No groups yet — every track goes straight to the Master mix.</div>
   {:else}
     <div class="strips">
       {#each strips as b (b.id)}
         <div class="strip" class:muted={b.mute}>
           <div class="name" title={b.id}>{b.name}</div>
           <label class="row">
-            <span>Gain</span>
+            <span>Volume</span>
             <input
               type="range"
               min="-60"
@@ -171,11 +171,11 @@
           </div>
           <div class="section">
             <div class="sec-head">
-              <span>Inserts</span>
+              <span>Effects</span>
               <span class="add-group">
                 <button disabled={busy} title="Add EQ" onclick={() => addInsert(b, 'eq')}>＋EQ</button>
-                <button disabled={busy} title="Add Compressor" onclick={() => addInsert(b, 'comp')}>＋Cmp</button>
-                <button disabled={busy} title="Add Limiter" onclick={() => addInsert(b, 'limit')}>＋Lim</button>
+                <button disabled={busy} title="Add Compressor" onclick={() => addInsert(b, 'comp')}>＋ Compressor</button>
+                <button disabled={busy} title="Add Limiter" onclick={() => addInsert(b, 'limit')}>＋ Limiter</button>
               </span>
             </div>
             {#if b.inserts.length === 0}
@@ -191,7 +191,7 @@
           </div>
           <div class="section">
             <div class="sec-head">
-              <span>Sends</span>
+              <span>Aux / FX</span>
               <select
                 disabled={busy}
                 value=""

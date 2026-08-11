@@ -1,0 +1,629 @@
+{
+  "summary": "Research DaVinci/pro-NLE UX + editor terminology, audit Vance UI jargon, synthesize a redesign plan",
+  "agentCount": 5,
+  "logs": [],
+  "result": {
+    "layout_plan": [
+      {
+        "change": "Replace the two structural anchors that fight DaVinci muscle memory — the buried 2-button Edit/Color toggle in the top header (+page.svelte lines 1431-1448) and the flat 14-tab bottom 'dock' (lines 2128-2170) — with ONE full-width bottom PAGE BAR pinned to the very bottom of the window. Six pages in pipeline order, mirroring DaVinci's Media·Edit·Fusion·Color·Fairlight·Deliver: Media · Edit · Compositor · Color · Audio · Deliver (drop Cut for now). Center the row; each button is icon-on-top + small-caps label; active page gets the amber (vance-accent) fill, the rest dim grey; add a chevron to minimize the bar. This single move converts a developer tab-soup into the layout every Resolve user already navigates by reflex.",
+        "why": "The page bar IS the DaVinci mental model. Right now a video editor sees 14 undifferentiated tabs and a hidden page toggle and has no idea the app follows the post-production pipeline. Making the pipeline the primary navigation is the highest-familiarity change available.",
+        "effort": "L"
+      },
+      {
+        "change": "Distribute the 14 dock panels into those pages instead of listing them flat. Deliver = ExportPanel + PublishPanel + ReviewPanel (render settings → queue → review). Audio (Fairlight) = MixerConsole + AiAudioPanel + ControlPanel + MasterMeter as a full-height right-edge channel-strip page. Compositor (Fusion) = FusionPanel. Edit-page tools = MographPanel (Titles), CaptionsPanel, GeneratePanel, ReframePanel, MagneticPanel, HistoryPanel — reachable from the Edit page's left dock / toolbar, not as peer pages. Color page already exists (Nodes + Scopes) and just folds under the Color button.",
+        "why": "DaVinci groups tools by workflow stage; an editor looks for the mixer under an audio page, not tab #3. Grouping by pipeline stage is what makes the app 'read left-to-right = post-production order.'",
+        "effort": "L"
+      },
+      {
+        "change": "Move the AiToolsPanel (install/setup of pip/Python/model components) OUT of the page and dock flow entirely into Settings → 'Add-ons'. Render it as DaVinci-plain feature cards: name + size ('AI Image Generation — 4.2 GB') + [Install] + progress bar + 'Ready.' No terminal, no PATH, no Python, no pip badges, no raw log lines.",
+        "why": "Installing components is setup, not a stage of editing — it should never be a peer of Edit/Color. And it is the single densest source of developer jargon in the app, so relocating + reskinning it kills a whole class of confusion at once.",
+        "effort": "M"
+      },
+      {
+        "change": "Make the Edit page's top-LEFT dock a TABBED region that swaps Media Pool / Effects / Edit Index, exactly like DaVinci. Today the left column only shows 'Browser' (media, line 1780) or 'Nodes' on the color page (line 1681). Add an 'Effects' tab that surfaces the existing EffectsBrowser.svelte as a Toolbox tree — Transitions, Titles, Generators, Effects — with drag-onto-timeline as the application model, and an 'Edit Index' tab listing every clip in the timeline. All three occupy the same corner and swap via toolbar toggles.",
+        "why": "The Effects Library is how Resolve users add every transition, title, and filter — drag from the library, drop on the timeline, tweak in the Inspector. Vance has the browser component but never exposes it as the familiar tabbed left dock, so editors can't find effects where they expect them.",
+        "effort": "M"
+      },
+      {
+        "change": "Convert the single flat Inspector panel (line 2623) into a TABBED, context-sensitive Inspector like DaVinci's: tabs across the top for Video (Transform/Crop/Composite/Retime), Audio (Volume/Pan/EQ), Effects, Transition, and File, auto-selecting the tab that matches the current selection. Keep it docked top-right, full-height.",
+        "why": "Resolve users expect selecting a clip vs a transition vs a title to reveal different parameter tabs in the same top-right corner. A single undifferentiated Inspector forces them to relearn where each control lives.",
+        "effort": "M"
+      },
+      {
+        "change": "Add the center COMMAND CLUSTER between the Source and Timeline viewers — Insert, Overwrite, Append, Replace, Snap toggle — as icon buttons. The handlers already exist (insertFromSource at lines 428/436, source mark in/out at 406-420), they're just not surfaced as the familiar between-viewers button strip. Confirm the two viewers read as equal-width 'Source' (left, line 1897) and 'Timeline/Program' (right) with a per-viewer transport row beneath each.",
+        "why": "The dual-viewer + middle edit-command cluster is the visual signature of Resolve's Edit page; wiring existing actions into that cluster gives editors the exact three-finger workflow (mark in/out on Source → Insert/Overwrite to Timeline) they already know.",
+        "effort": "S"
+      },
+      {
+        "change": "Add an INTERFACE TOOLBAR strip (~32px) at the top of the Edit page holding the panel toggles (Media Pool / Effects / Edit Index on the left; Inspector / Mixer on the right) as monochrome glyphs that light amber when active, plus a thin EDIT TOOLBAR strip between the timeline viewer and the timeline for tool-mode (Select / Trim / Blade) and toggles (Snapping, Linked Selection, Marker).",
+        "why": "DaVinci's fixed-dock toggles let editors show/hide panels into known corners rather than hunting menus; the tool/snapping strip above the timeline is where their hands expect the blade and snap controls.",
+        "effort": "M"
+      },
+      {
+        "change": "Align visual tokens to the Resolve grading-suite look: near-black wells (~#0C0C0E) for the two viewers and the timeline canvas; ~#1E1E1E–#242424 panel bodies; ~#2A2A2E panel headers/toolbars; 1px DARK seams (~#0A0A0A) between panels instead of light borders; keep amber (vance-accent) as the single active accent; add a RED outline for selected timeline clips and an orange track-destination (V1/A1) highlight; 2-3px corner radii everywhere (nothing pill-shaped); 11-13px type; 16px grey→white glyphs. Audit the current vance-border/vance-panel/vance-bg tokens against these values.",
+        "why": "The dark, flat, low-chroma palette is what signals 'professional NLE' and keeps the UI from biasing the eye against footage; red clip-selection and amber destination are the two color cues Resolve editors read without thinking.",
+        "effort": "M"
+      }
+    ],
+    "dejargon": [
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "Fusion",
+        "to": "Compositor"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "Magnetic",
+        "to": "Magnetic Timeline"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "Control",
+        "to": "Control Surface"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "vance-app 0.1.0 (rust 1.88)",
+        "to": "Vance 0.1.0"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "checking…",
+        "to": "Starting…"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "error: {e}",
+        "to": "Engine offline"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "last PTS: 128000",
+        "to": "Position 00:00:04:00"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "Seek to TC",
+        "to": "Go to timecode"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "invalid timecode (expected HH:MM:SS:FF)",
+        "to": "That timecode isn't valid — use HH:MM:SS:FF (hours:minutes:seconds:frames)."
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "Project working color space (Phase 6.2)",
+        "to": "Project working color space"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "OCIO not enabled in this build (rebuild with --features ocio)",
+        "to": "Advanced color management isn't available in this version."
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "OCIO:",
+        "to": "Advanced color"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "Config (.ocio, blank = $OCIO env)",
+        "to": "Color config file (leave blank to use the system default)"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "$OCIO",
+        "to": "System default"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "View LUT:",
+        "to": "Preview look"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "Pick a .cube / .3dl monitoring LUT",
+        "to": "Load a color preview look (.cube / .3dl file)"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "Working space:",
+        "to": "Color space"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "h264",
+        "to": "H.264"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "hevc",
+        "to": "HEVC / H.265"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "format  →  yuv420p",
+        "to": "Color: 8-bit color"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "rate  →  30/1",
+        "to": "Frame rate: 30 fps"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "tb  →  1/15360",
+        "to": "(remove row)"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte",
+        "from": "dur (pts)  →  1843200",
+        "to": "Duration 00:02:04:00"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/AiToolsPanel.svelte",
+        "from": "Found on system PATH",
+        "to": "Already installed on your computer"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/AiToolsPanel.svelte",
+        "from": "Installed (managed by Vance)",
+        "to": "Installed by Vance"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/AiToolsPanel.svelte",
+        "from": "Runner installed — model missing",
+        "to": "Almost ready — click Download to get the image pack"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/AiToolsPanel.svelte",
+        "from": "Needs Python 3 — install it, then reopen this panel.",
+        "to": "This tool needs an extra component Vance can't set up automatically here — see Help to finish setup."
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/AiToolsPanel.svelte",
+        "from": "Needs a download source (set VANCE_TOOLS_MANIFEST_URL).",
+        "to": "Not available to download right now."
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/AiToolsPanel.svelte",
+        "from": "Python 3 not found — needed for the pip tools below. Install it from python.org (or your package manager), then reopen this panel.",
+        "to": "Some tools need an extra component that isn't set up yet. Click Set up, or see Help to finish."
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/AiToolsPanel.svelte",
+        "from": "Vance installs them into its own managed folder",
+        "to": "Vance keeps them in its own folder"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/AiToolsPanel.svelte",
+        "from": "Get model",
+        "to": "Download"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/AiToolsPanel.svelte",
+        "from": "several minutes each; models are large",
+        "to": "several minutes each; the downloads are large"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/GeneratePanel.svelte",
+        "from": "(Advanced: set VANCE_IMAGEGEN_CMD or VANCE_SD_MODEL.)",
+        "to": "(remove)"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/GeneratePanel.svelte",
+        "from": "Negative prompt (optional)",
+        "to": "Things to leave out (optional)"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/GeneratePanel.svelte",
+        "from": "steps",
+        "to": "Detail (higher = slower)"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/GeneratePanel.svelte",
+        "from": "seed",
+        "to": "Variation (leave blank for random)"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/GeneratePanel.svelte",
+        "from": "W",
+        "to": "Width"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/GeneratePanel.svelte",
+        "from": "H",
+        "to": "Height"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/GeneratePanel.svelte",
+        "from": "img2img / inpaint from a clip frame is a planned follow-up.",
+        "to": "(remove)"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/GeneratePanel.svelte",
+        "from": "Loading model…",
+        "to": "Getting ready…"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/CaptionsPanel.svelte",
+        "from": "Auto-transcribe (Whisper)",
+        "to": "Auto-transcribe (speech to text)"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/CaptionsPanel.svelte",
+        "from": "Install a Whisper CLI to enable: pip install -U openai-whisper (or whisper.cpp).",
+        "to": "Auto-transcribe needs an extra component. Set it up in AI Add-ons — see Help."
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/CaptionsPanel.svelte",
+        "from": "Whisper model",
+        "to": "Transcription quality"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/CaptionsPanel.svelte",
+        "from": "tiny / base / small / medium / large-v3",
+        "to": "Fastest / Fast / Balanced / Better / Best (slowest)"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/CaptionsPanel.svelte",
+        "from": "lang (auto)",
+        "to": "Language (auto-detect)"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/CaptionsPanel.svelte",
+        "from": "— media —",
+        "to": "Choose a clip"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/CaptionsPanel.svelte",
+        "from": "＋ Cue",
+        "to": "＋ Caption"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/AiAudioPanel.svelte",
+        "from": "Install Demucs to enable: pip install -U demucs",
+        "to": "Voice isolation needs an extra component. Set it up in AI Add-ons — see Help."
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/AiAudioPanel.svelte",
+        "from": "Imported isolated stem:",
+        "to": "Added the isolated vocal track:"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/AiAudioPanel.svelte",
+        "from": "LUFS",
+        "to": "Target loudness (LUFS — −16 is good for YouTube)"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/AiAudioPanel.svelte",
+        "from": "— media —",
+        "to": "Choose a clip"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/OnboardingWizard.svelte",
+        "from": "Aggregate, no personal data, documented schema. Helps prioritize features.",
+        "to": "Aggregate numbers only, never personal data. Helps us decide what to build next."
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/OnboardingWizard.svelte",
+        "from": "A required component is missing — install it (see the hint below), then press Re-check.",
+        "to": "Something Vance needs isn't set up yet — follow the tip below, then press Re-check."
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/OnboardingWizard.svelte",
+        "from": "The AI setup (choose a provider, paste a key) lives in Settings",
+        "to": "To use AI features you can connect an AI service (pick one and paste its key) later in Settings"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/OnboardingWizard.svelte",
+        "from": "Export to ProRes/DNxHR/H.264/HEVC/AV1",
+        "to": "Export to common formats like ProRes and H.264, plus HEVC, AV1 and DNxHR"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/ExportPanel.svelte",
+        "from": "AV1 (svt-av1)",
+        "to": "AV1 (smallest files)"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/ExportPanel.svelte",
+        "from": "ProRes 4444 (alpha)",
+        "to": "ProRes 4444 (with transparency)"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/ExportPanel.svelte",
+        "from": "H.264 (hardware)",
+        "to": "H.264 (fast)"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/ExportPanel.svelte",
+        "from": "HEVC / H.265 (hardware)",
+        "to": "HEVC / H.265 (fast)"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/ExportPanel.svelte",
+        "from": "CRF",
+        "to": "Quality"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/ExportPanel.svelte",
+        "from": "HEVC Main10 · Rec.2020 PQ",
+        "to": "(remove caption)"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/ExportPanel.svelte",
+        "from": "10-bit HEVC Main10, Rec.2020 PQ. Forces software HEVC.",
+        "to": "Export in HDR (brighter highlights, richer color)."
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/ExportPanel.svelte",
+        "from": "/tmp/vance-export.mov",
+        "to": "~/Movies/vance-export.mov"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/ExportPanel.svelte",
+        "from": "Out",
+        "to": "Save to"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/MixerConsole.svelte",
+        "from": "Mixer — Buses",
+        "to": "Mixer — Groups"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/MixerConsole.svelte",
+        "from": "＋ Bus",
+        "to": "＋ Group"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/MixerConsole.svelte",
+        "from": "Bus name (e.g. \"Dialogue\", \"Music\", \"Reverb\")",
+        "to": "Group name (e.g. Dialogue, Music, Reverb)"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/MixerConsole.svelte",
+        "from": "No buses — every track routes straight to Master.",
+        "to": "No groups yet — every track goes straight to the Master mix."
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/MixerConsole.svelte",
+        "from": "Gain",
+        "to": "Volume"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/MixerConsole.svelte",
+        "from": "Inserts",
+        "to": "Effects"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/MixerConsole.svelte",
+        "from": "＋Cmp",
+        "to": "＋ Compressor"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/MixerConsole.svelte",
+        "from": "＋Lim",
+        "to": "＋ Limiter"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/MixerConsole.svelte",
+        "from": "Sends",
+        "to": "Aux / FX routing"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/MixerConsole.svelte",
+        "from": "(pre)",
+        "to": "(before volume)"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/FusionPanel.svelte",
+        "from": "Fusion — Node Compositor",
+        "to": "Compositor"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/FusionPanel.svelte",
+        "from": "＋ New Comp",
+        "to": "New Composition"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/FusionPanel.svelte",
+        "from": "Drag the comp from the Browser onto the timeline. The graph animates as the playhead crosses it.",
+        "to": "Drag the composition from the Browser onto the timeline — it animates as the playhead crosses it."
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/FusionPanel.svelte",
+        "from": "MediaIn",
+        "to": "Video / Image"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/FusionPanel.svelte",
+        "from": "ColorCorrect",
+        "to": "Color Correct"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/FusionPanel.svelte",
+        "from": "gamma",
+        "to": "Midtones"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/FusionPanel.svelte",
+        "from": "L,T,R,B",
+        "to": "Left / Top / Right / Bottom"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/FusionPanel.svelte",
+        "from": "Alpha",
+        "to": "Transparency"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/FusionPanel.svelte",
+        "from": "Luminance",
+        "to": "Brightness"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/FusionPanel.svelte",
+        "from": "Contain",
+        "to": "Fit inside"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/FusionPanel.svelte",
+        "from": "Cover",
+        "to": "Fill frame"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/PublishPanel.svelte",
+        "from": "Enter your OAuth Client ID (from the platform developer console).",
+        "to": "Sign in with {platform} to connect your account."
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/PublishPanel.svelte",
+        "from": "Register an OAuth app in the {platform} developer console and add this redirect URI.",
+        "to": "(remove — replace with a 'Sign in with {platform}' button)"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/PublishPanel.svelte",
+        "from": "Rendered file path (.mp4)",
+        "to": "Choose the video file to upload"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/PublishPanel.svelte",
+        "from": "Opening the consent page in your browser…",
+        "to": "Opening {platform} sign-in in your browser…"
+      },
+      {
+        "file": "/Users/mac/Desktop/video editor/vance/ui/src/lib/PublishPanel.svelte",
+        "from": "Waiting for you to approve in the browser…",
+        "to": "Waiting for you to approve access…"
+      }
+    ],
+    "quick_wins": [
+      "Ship the bottom PAGE BAR first (Media · Edit · Compositor · Color · Audio · Deliver). Replacing the buried Edit/Color toggle + 14-tab dock with a Resolve-style bottom bar is the single change that makes the whole app read as familiar to a DaVinci editor — do it before any panel-level polish.",
+      "Purge developer-console leakage app-wide: wrap every raw `String(e)` error (all five panels + onboarding) in a friendly message with the raw text behind a 'Details' toggle; change backend_version() output to just 'Vance 0.1.0'; replace the 'last PTS: 128000' readout with a timecode Position; delete the '(Phase 6.2)' milestone tag. These are the most embarrassing dev tells and the cheapest to fix.",
+      "Reskin ExportPanel around outcomes: destination presets named by intent ('Web & social (H.264)', 'High-quality master (ProRes 422 HQ)', 'Editing / archival (DNxHR HQ)'), a 'Quality' slider replacing the 'CRF' field, friendly HDR wording, '(fast)' instead of '(hardware)', 'Save to' instead of 'Out', and a real Movies/Desktop default instead of /tmp. Export is where editors have the most real vocabulary, so this pays off immediately.",
+      "Move all install/setup plumbing out of the workflow: relocate AiToolsPanel into Settings → 'Add-ons' as feature cards (name + size + Install + progress + Ready), and strip every pip/Python/PATH/manifest/env-var/Whisper/Demucs string from CaptionsPanel, AiAudioPanel, GeneratePanel and OnboardingWizard. No terminal command or 'Python' should survive anywhere in the UI.",
+      "Do the flat label renames that need zero logic changes: dock/page tabs Fusion→Compositor, Magnetic→Magnetic Timeline, Control→Control Surface; MixerConsole Buses→Groups, Gain→Volume, Inserts→Effects, Cmp/Lim→Compressor/Limiter; GeneratePanel steps→Detail, seed→Variation, negative prompt→Things to leave out, W/H→Width/Height. High familiarity payoff, trivial diff."
+    ]
+  },
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Research"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 2,
+      "title": "Audit"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 3,
+      "title": "Synthesize"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "research:davinci-layout",
+      "phaseIndex": 1,
+      "phaseTitle": "Research",
+      "agentId": "a614cfc9713a8d27f",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1786451991591,
+      "queuedAt": 1786451991543,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "DAVINCI RESOLVE UI — STRUCTURAL REFERENCE (for mirroring in…",
+      "promptPreview": "Research DaVinci Resolve's UI so we can make a video editor FAMILIAR to its users. Use web search/fetch. Cover concretely:\n1. The bottom PAGE navigation bar (Media, Cut, Edit, Fusion, Color, Fairlight, Deliver) — what each page is for.\n2. The EDIT page layout in detail: where the Media Pool / Effects Library / Sound Library live (top-left, tabbed), the Source + Timeline viewers (top center), the I…",
+      "lastProgressAt": 1786453141824,
+      "tokens": 31459,
+      "toolCalls": 20,
+      "durationMs": 1150231,
+      "resultPreview": "{\"findings\":\"DAVINCI RESOLVE UI — STRUCTURAL REFERENCE (for mirroring in Tauri/Svelte)\\n\\nSources are listed at the bottom. Where the web sources were thin (exact colors/radii), I combined them with direct knowledge of Resolve 17–20's UI; those spots are marked \\\"(approx)\\\".\\n\\n====================================================================\\n1. BOTTOM PAGE NAVIGATION BAR\\n====================…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "research:terminology",
+      "phaseIndex": 1,
+      "phaseTitle": "Research",
+      "agentId": "aa41a11769200a28e",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1786451991595,
+      "queuedAt": 1786451991543,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "# Terminology mapping: developer jargon → video-editor-frie…",
+      "promptPreview": "We are building a consumer/pro video editor for VIDEO EDITORS (not developers). Research what terminology real editors understand vs. developer jargon we must hide/rename. Use web search where useful. Produce a mapping (jargon → editor-friendly label, or \"hide behind Advanced\") for these areas:\n- Installing optional AI features: terms like \"pip\", \"venv\", \"PATH\", \"Python 3\", \"manifest\", \"download s…",
+      "lastProgressAt": 1786452140084,
+      "tokens": 20128,
+      "toolCalls": 6,
+      "durationMs": 148489,
+      "resultPreview": "{\"findings\":\"\\n\\n\\n\\n\\n# Terminology mapping: developer jargon → video-editor-friendly labels\\n\\n## Governing principle: HIDE INTERNALS, SHOW OUTCOMES\\nVideo editors reason in **deliverables and destinations** (\\\"a file I can upload to YouTube,\\\" \\\"a clean voice level,\\\" \\\"make me an image of X\\\"), never in implementations. Rules:\\n1. **A control earns its place only if the user can act on it to c…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "audit:ai-panels",
+      "phaseIndex": 2,
+      "phaseTitle": "Audit",
+      "agentId": "a54a4f7a39f6b2f93",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1786453141852,
+      "queuedAt": 1786453141827,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "Read these Vance UI files and list EVERY piece of user-facing text that is developer jargon, dev artifact, or would confuse a non-technical video editor (with a concrete friendly fix each):\n/Users/mac/Desktop/video editor/vance/ui/src/lib/AiToolsPanel.svelte, /Users/mac/Desktop/video editor/vance/ui/src/lib/GeneratePanel.svelte, /Users/mac/Desktop/video editor/vance/ui/src/lib/OnboardingWizard.sve…",
+      "lastProgressAt": 1786453292898,
+      "tokens": 34358,
+      "toolCalls": 6,
+      "durationMs": 151046,
+      "resultPreview": "{\"items\":[{\"file\":\"/Users/mac/Desktop/video editor/vance/ui/src/lib/AiToolsPanel.svelte\",\"shown\":\"Found on system PATH\",\"problem\":\"'system PATH' is developer jargon; a non-technical editor has no idea what PATH is.\",\"fix\":\"Already installed on your computer\"},{\"file\":\"/Users/mac/Desktop/video editor/vance/ui/src/lib/AiToolsPanel.svelte\",\"shown\":\"Installed (managed by Vance)\",\"problem\":\"'managed' i…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 4,
+      "label": "audit:main-panels",
+      "phaseIndex": 2,
+      "phaseTitle": "Audit",
+      "agentId": "a63c88d2f6ad04d99",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1786453141853,
+      "queuedAt": 1786453141828,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "Read these Vance UI files and list EVERY user-facing developer-jargon term / dev artifact / confusing wording for a non-technical video editor, each with a concrete friendly fix:\n/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte (header, footer 'backend: …', transport 'last PTS', the tabbed panel dock, Seek to TC), /Users/mac/Desktop/video editor/vance/ui/src/lib/ExportPanel.svelte …",
+      "lastProgressAt": 1786453420525,
+      "tokens": 76375,
+      "toolCalls": 14,
+      "durationMs": 278672,
+      "resultPreview": "{\"items\":[{\"file\":\"/Users/mac/Desktop/video editor/vance/ui/src/routes/+page.svelte\",\"shown\":\"vance-app 0.1.0 (rust 1.88)  (footer status bar, from backend_version())\",\"problem\":\"Footer prints the raw engine version string: internal crate name 'vance-app', the word 'rust', and the compiler version. All meaningless dev/version jargon to an editor.\",\"fix\":\"Show 'Vance v0.1.0' only. Drop the crate na…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 5,
+      "label": "synthesize",
+      "phaseIndex": 3,
+      "phaseTitle": "Synthesize",
+      "agentId": "aa7b7647f934a1591",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1786453420547,
+      "queuedAt": 1786453420528,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "Synthesize a redesign plan for the Vance video editor so it is (a) FAMILIAR to DaVinci Resolve users and (b) written for VIDEO EDITORS, not developers.\n\nDaVinci layout research:\nDAVINCI RESOLVE UI — STRUCTURAL REFERENCE (for mirroring in Tauri/Svelte)\n\nSources are listed at the bottom. Where the web sources were thin (exact colors/radii), I combined them with direct knowledge of Resolve 17–20's UI…",
+      "lastProgressAt": 1786453651282,
+      "tokens": 47873,
+      "toolCalls": 7,
+      "durationMs": 230734,
+      "resultPreview": "{\"layout_plan\":[{\"change\":\"Replace the two structural anchors that fight DaVinci muscle memory — the buried 2-button Edit/Color toggle in the top header (+page.svelte lines 1431-1448) and the flat 14-tab bottom 'dock' (lines 2128-2170) — with ONE full-width bottom PAGE BAR pinned to the very bottom of the window. Six pages in pipeline order, mirroring DaVinci's Media·Edit·Fusion·Color·Fairlight·De…"
+    }
+  ],
+  "totalTokens": 210193,
+  "totalToolCalls": 53
+}

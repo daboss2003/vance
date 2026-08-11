@@ -19,6 +19,7 @@
   let height = $state(512);
   let steps = $state(20);
   let seed = $state('');
+  let showAdvanced = $state(false);
   let busy = $state(false);
   let error = $state<string | null>(null);
   let status = $state<string | null>(null);
@@ -93,15 +94,14 @@
 </script>
 
 <div class="panel">
-  <div class="head">Generate (AI Image)</div>
+  <div class="head">Generate Image</div>
   {#if error}<div class="err">{error}</div>{/if}
   {#if status}<div class="status">{status}</div>{/if}
 
   {#if !available}
     <div class="hint">
-      Not installed. Add <strong>Generative images</strong> from the AI tools panel —
-      Vance installs it for you. (Advanced: set <code>VANCE_IMAGEGEN_CMD</code> or
-      <code>VANCE_SD_MODEL</code>.)
+      Not set up yet. Add <strong>Image generation</strong> from
+      <strong>Settings → AI add-ons</strong> — Vance sets it up for you.
     </div>
   {/if}
 
@@ -117,19 +117,27 @@
     </div>
   {/if}
 
-  <textarea placeholder="Prompt" rows="2" bind:value={prompt} disabled={busy}></textarea>
-  <textarea placeholder="Negative prompt (optional)" rows="1" bind:value={negative} disabled={busy}></textarea>
+  <textarea placeholder="Describe the image you want…" rows="2" bind:value={prompt} disabled={busy}></textarea>
+  <textarea placeholder="Things to leave out (optional)" rows="1" bind:value={negative} disabled={busy}></textarea>
 
   <div class="row">
-    <label>W<input type="number" min="64" max="4096" step="8" bind:value={width} disabled={busy} /></label>
-    <label>H<input type="number" min="64" max="4096" step="8" bind:value={height} disabled={busy} /></label>
-    <label>steps<input type="number" min="1" max="150" bind:value={steps} disabled={busy} /></label>
+    <label>Width<input type="number" min="64" max="4096" step="8" bind:value={width} disabled={busy} /></label>
+    <label>Height<input type="number" min="64" max="4096" step="8" bind:value={height} disabled={busy} /></label>
   </div>
-  <div class="row">
-    <label class="seed">seed<input type="text" placeholder="random" bind:value={seed} disabled={busy} /></label>
-    <button onclick={generate} disabled={busy || !available}>✨ Generate</button>
-  </div>
-  <div class="hint">img2img / inpaint from a clip frame is a planned follow-up.</div>
+
+  <button class="adv-toggle" onclick={() => (showAdvanced = !showAdvanced)}>
+    {showAdvanced ? '▾' : '▸'} Advanced
+  </button>
+  {#if showAdvanced}
+    <div class="row">
+      <label title="Higher = more detail, but slower">
+        Detail<input type="number" min="1" max="150" bind:value={steps} disabled={busy} /></label>
+      <label class="seed" title="Leave blank for a new image each time">
+        Variation<input type="text" placeholder="random" bind:value={seed} disabled={busy} /></label>
+    </div>
+  {/if}
+
+  <button class="gen" onclick={generate} disabled={busy || !available}>✨ Generate</button>
 </div>
 
 <style>
@@ -140,6 +148,32 @@
     padding: 6px;
     font-size: 12px;
     color: var(--fg, #ddd);
+  }
+  .adv-toggle {
+    align-self: flex-start;
+    background: none;
+    border: none;
+    color: var(--muted, #8a8a92);
+    font-size: 11px;
+    cursor: pointer;
+    padding: 2px 0;
+  }
+  .adv-toggle:hover {
+    color: var(--fg, #ddd);
+  }
+  button.gen {
+    margin-top: 2px;
+    padding: 6px 12px;
+    border-radius: 6px;
+    border: none;
+    background: var(--accent, #4c9dff);
+    color: #071522;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button.gen:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
   .head {
     font-weight: 600;

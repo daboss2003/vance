@@ -15,8 +15,8 @@
 
   import { renderSequence, type EncoderPresetKey, type RenderOutcome } from '$lib/ipc';
 
-  let outputPath = $state('/tmp/vance-export.mov');
-  let preset = $state<EncoderPresetKey>('ProRes422HQ');
+  let outputPath = $state('vance-export.mp4');
+  let preset = $state<EncoderPresetKey>('H264');
   let width = $state<number | null>(1920);
   let height = $state<number | null>(1080);
   let startSeconds = $state<number | null>(null);
@@ -30,15 +30,15 @@
 
   /** Pretty label for each preset key. */
   const PRESETS: { value: EncoderPresetKey; label: string }[] = [
-    { value: 'ProRes422HQ', label: 'ProRes 422 HQ' },
-    { value: 'ProRes422', label: 'ProRes 422' },
-    { value: 'ProRes4444', label: 'ProRes 4444 (alpha)' },
-    { value: 'DnxhrHq', label: 'DNxHR HQ' },
-    { value: 'DnxhrSq', label: 'DNxHR SQ' },
-    { value: 'DnxhrLb', label: 'DNxHR LB' },
-    { value: 'H264', label: 'H.264 (hardware)' },
-    { value: 'Hevc', label: 'HEVC / H.265 (hardware)' },
-    { value: 'Av1', label: 'AV1 (svt-av1)' }
+    { value: 'H264', label: 'Web & social — H.264 (fast)' },
+    { value: 'Hevc', label: 'Smaller file — HEVC / H.265 (fast)' },
+    { value: 'Av1', label: 'Smallest file — AV1' },
+    { value: 'ProRes422HQ', label: 'High-quality master — ProRes 422 HQ' },
+    { value: 'ProRes422', label: 'Master — ProRes 422' },
+    { value: 'ProRes4444', label: 'Master with transparency — ProRes 4444' },
+    { value: 'DnxhrHq', label: 'Editing / archival — DNxHR HQ' },
+    { value: 'DnxhrSq', label: 'Editing — DNxHR SQ' },
+    { value: 'DnxhrLb', label: 'Editing (light) — DNxHR LB' }
   ];
 
   const needsCrf = $derived(preset === 'H264' || preset === 'Hevc' || preset === 'Av1');
@@ -70,17 +70,17 @@
   <div class="text-vance-muted mb-1 uppercase tracking-wider">Export</div>
 
   <label class="mb-1 flex items-center gap-1">
-    <span class="text-vance-muted w-12">Out</span>
+    <span class="text-vance-muted w-12">Save to</span>
     <input
       type="text"
       bind:value={outputPath}
       class="border-vance-border flex-1 rounded border bg-vance-panel px-1 font-mono text-[10px]"
-      placeholder="/path/to/out.mov"
+      placeholder="my-video.mp4"
     />
   </label>
 
   <label class="mb-1 flex items-center gap-1">
-    <span class="text-vance-muted w-12">Preset</span>
+    <span class="text-vance-muted w-12">Format</span>
     <select
       bind:value={preset}
       class="border-vance-border flex-1 rounded border bg-vance-panel px-1 text-[10px]"
@@ -92,8 +92,8 @@
   </label>
 
   {#if needsCrf}
-    <label class="mb-1 flex items-center gap-1">
-      <span class="text-vance-muted w-12">CRF</span>
+    <label class="mb-1 flex items-center gap-1" title="Lower number = higher quality (and larger file)">
+      <span class="text-vance-muted w-12">Quality</span>
       <input
         type="number"
         bind:value={crf}
@@ -101,13 +101,13 @@
         max="63"
         class="border-vance-border w-16 rounded border bg-vance-panel px-1 font-mono text-[10px]"
       />
+      <span class="text-vance-muted text-[10px]">lower = better</span>
     </label>
   {/if}
 
-  <label class="mb-1 flex items-center gap-1" title="10-bit HEVC Main10, Rec.2020 PQ. Forces software HEVC.">
-    <span class="text-vance-muted w-12">HDR10</span>
+  <label class="mb-1 flex items-center gap-1" title="Export in HDR — brighter highlights and richer color (HEVC 10-bit).">
+    <span class="text-vance-muted w-12">HDR</span>
     <input type="checkbox" bind:checked={hdr} />
-    {#if hdr}<span class="text-vance-muted text-[10px]">HEVC Main10 · Rec.2020 PQ</span>{/if}
   </label>
 
   <div class="mb-1 flex items-center gap-1">

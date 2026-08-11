@@ -110,16 +110,16 @@
   }
 
   function stateLabel(t: AiToolStatus): string {
-    if (!t.installed) return 'Not installed';
-    if (t.id === 'sd' && !t.model_ready) return 'Runner installed — model missing';
-    return t.managed ? 'Installed (managed by Vance)' : 'Found on system PATH';
+    if (!t.installed) return 'Not added yet';
+    if (t.id === 'sd' && !t.model_ready) return 'Almost ready — click Download to finish';
+    return t.managed ? 'Added' : 'Already on your computer';
   }
 
   function blockedReason(t: AiToolStatus): string | null {
     if (t.installable) return null;
     return t.method === 'pip'
-      ? 'Needs Python 3 — install it, then reopen this panel.'
-      : 'Needs a download source (set VANCE_TOOLS_MANIFEST_URL).';
+      ? "Needs an extra component Vance can't set up here — see Help."
+      : 'Not available to download right now.';
   }
 
   /** Queue a tool for install. Multiple can be queued and install one at a
@@ -153,12 +153,8 @@
   {#if !embedded}<div class="head">AI tools</div>{/if}
 
   <p class="lead">
-    Optional AI helpers. Add the ones you want — Vance installs them into its own
-    managed folder, so nothing else on your system changes and they need no setup.
-    {#if !pythonOk && loaded}
-      <br /><strong class="warn">Python 3 not found</strong> — needed for the pip
-      tools below. Install it from python.org (or your package manager), then reopen this panel.
-    {/if}
+    Optional AI features. Add the ones you want — Vance keeps them in its own
+    folder, so nothing else on your computer changes.
   </p>
 
   {#if errors._load}<div class="err">{errors._load}</div>{/if}
@@ -172,10 +168,7 @@
       <div class="tool" class:ok={ready(t)}>
         <span class="mark">{ready(t) ? '✓' : t.installed ? '◐' : '○'}</span>
         <div class="body">
-          <div class="name">
-            {t.label}
-            <span class="method">{t.method === 'pip' ? 'pip' : 'download'}</span>
-          </div>
+          <div class="name">{t.label}</div>
           <div class="sub">{stateLabel(t)}</div>
           {#if errors[t.id]}<div class="err small">{errors[t.id]}</div>{/if}
           {#if blockedReason(t) && !ready(t)}
@@ -191,7 +184,7 @@
             <button disabled>Queued…</button>
           {:else}
             <button onclick={() => enqueue(t)} disabled={!t.installable}>
-              {t.installed && t.id === 'sd' ? 'Get model' : 'Install'}
+              {t.installed && t.id === 'sd' ? 'Download' : 'Add'}
             </button>
           {/if}
         </div>
@@ -200,9 +193,8 @@
   </div>
 
   <div class="hint foot">
-    Click Install on as many as you want — they queue and install one at a time in
-    the background (several minutes each; models are large). You can keep going
-    meanwhile, and installs continue even after you close setup.
+    Add as many as you want — they download one at a time in the background (a few
+    minutes each; the downloads are large). You can keep working meanwhile.
   </div>
 </div>
 
