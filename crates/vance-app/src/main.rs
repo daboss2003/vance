@@ -4462,6 +4462,11 @@ fn main() {
             accounts::entitlement_install,
             accounts::entitlement_uninstall,
             accounts::entitlements_reconcile,
+            accounts::catalog_browse,
+            accounts::catalog_detail,
+            accounts::catalog_reviews,
+            accounts::catalog_install,
+            accounts::catalog_review,
         ])
         .build(tauri::generate_context!())
         .expect("tauri failed to start")

@@ -646,9 +646,14 @@ impl AccountsState {
         self.refresh_gate_with(&owned);
     }
 
-    /// Download + verify + place a sku's artifact, recording it locally.
-    fn install_sku(&self, sku: &str) -> Result<(), String> {
-        let art = self.send_authed("POST", &format!("/v1/artifacts/{sku}"), Some(json!({})))?;
+    /// Download + verify (sha256 pin) + atomically place an artifact response,
+    /// recording it locally. Shared by paid (§6) and free-catalog (§9) install.
+    fn place_from_artifact(
+        &self,
+        art: &Value,
+        sku: &str,
+        requires_entitlement: bool,
+    ) -> Result<(), String> {
         let url = art["download_url"].as_str().ok_or("no download URL")?;
         let sha = art["sha256"].as_str().ok_or("no checksum")?;
         let dest = art["dest"].as_str().ok_or("no destination")?.to_string();
@@ -677,11 +682,57 @@ impl AccountsState {
             InstallRecord {
                 dest,
                 version,
-                requires_entitlement: true,
+                requires_entitlement,
             },
         );
         save_registry(&reg)?;
         Ok(())
+    }
+
+    /// Install an owned (paid/gated) effect via the auth'd artifact endpoint.
+    fn install_sku(&self, sku: &str) -> Result<(), String> {
+        let art = self.send_authed("POST", &format!("/v1/artifacts/{sku}"), Some(json!({})))?;
+        self.place_from_artifact(&art, sku, true)
+    }
+
+    // --- catalog (§9) ------------------------------------------------------
+
+    /// Unauthenticated GET (catalog browse/detail/reviews are public).
+    fn get_public(&self, path: &str) -> Result<Value, String> {
+        let resp = http()
+            .get(format!("{}{}", self.base(), path))
+            .send()
+            .map_err(|e| format!("network: {e}"))?;
+        if !resp.status().is_success() {
+            let v: Value = resp.json().unwrap_or(Value::Null);
+            return Err(v
+                .get("error")
+                .and_then(|s| s.as_str())
+                .unwrap_or("request failed")
+                .to_string());
+        }
+        resp.json().map_err(|e| e.to_string())
+    }
+
+    /// Install a FREE catalog effect (no entitlement). Sends the bearer when
+    /// signed in so the install is recorded (enables reviewing).
+    fn catalog_install(&self, sku: &str) -> Result<(), String> {
+        let url = format!("{}/v1/catalog/{}/artifact", self.base(), sku);
+        let mut req = http().post(&url).json(&json!({}));
+        if let Ok(access) = self.access_token() {
+            req = req.bearer_auth(access);
+        }
+        let resp = req.send().map_err(|e| format!("network: {e}"))?;
+        if !resp.status().is_success() {
+            let v: Value = resp.json().unwrap_or(Value::Null);
+            return Err(v
+                .get("error")
+                .and_then(|s| s.as_str())
+                .unwrap_or("install failed")
+                .to_string());
+        }
+        let art: Value = resp.json().map_err(|e| e.to_string())?;
+        self.place_from_artifact(&art, sku, false)
     }
 
     fn uninstall_sku(&self, sku: &str) {
@@ -1008,6 +1059,84 @@ pub async fn entitlements_reconcile(
         .map_err(|e| e.to_string())?;
     engine.lock().rescan_plugins();
     Ok(report)
+}
+
+// --- M3 catalog commands ---------------------------------------------------
+
+#[tauri::command]
+pub async fn catalog_browse(
+    state: St<'_>,
+    q: Option<String>,
+    category: Option<String>,
+    sort: Option<String>,
+    page: Option<i64>,
+) -> Result<Value, String> {
+    let mut path = format!("/v1/catalog?page={}", page.unwrap_or(0));
+    if let Some(q) = q.filter(|s| !s.is_empty()) {
+        path.push_str(&format!("&q={}", vance_publish::form_encode(&q)));
+    }
+    if let Some(c) = category.filter(|s| !s.is_empty()) {
+        path.push_str(&format!("&category={}", vance_publish::form_encode(&c)));
+    }
+    if let Some(s) = sort {
+        path.push_str(&format!("&sort={}", vance_publish::form_encode(&s)));
+    }
+    let st = state.inner().clone();
+    tokio::task::spawn_blocking(move || st.get_public(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn catalog_detail(state: St<'_>, sku: String) -> Result<Value, String> {
+    let st = state.inner().clone();
+    let path = format!("/v1/catalog/{}", vance_publish::form_encode(&sku));
+    tokio::task::spawn_blocking(move || st.get_public(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn catalog_reviews(state: St<'_>, sku: String) -> Result<Value, String> {
+    let st = state.inner().clone();
+    let path = format!("/v1/catalog/{}/reviews", vance_publish::form_encode(&sku));
+    tokio::task::spawn_blocking(move || st.get_public(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn catalog_install(
+    state: St<'_>,
+    engine: State<'_, EngineHandle>,
+    sku: String,
+) -> Result<(), String> {
+    let st = state.inner().clone();
+    tokio::task::spawn_blocking(move || st.catalog_install(&sku))
+        .await
+        .map_err(|e| e.to_string())??;
+    engine.lock().rescan_plugins();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn catalog_review(
+    state: St<'_>,
+    sku: String,
+    stars: i64,
+    body: Option<String>,
+) -> Result<(), String> {
+    let st = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        st.send_authed(
+            "POST",
+            &format!("/v1/catalog/{sku}/reviews"),
+            Some(json!({ "stars": stars, "body": body })),
+        )
+        .map(|_| ())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[cfg(test)]
