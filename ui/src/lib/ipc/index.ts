@@ -1967,3 +1967,59 @@ export type PeaksProgressPayload = {
   samples_total: number | null;
   reason: string | null;
 };
+
+// --- Accounts (M1) ---------------------------------------------------------
+
+export type AccountUser = {
+  id: string;
+  email: string | null;
+  email_verified?: boolean;
+  password_set: boolean;
+};
+
+export type AccountStatus = {
+  signed_in: boolean;
+  user?: AccountUser;
+};
+
+export type DeviceInfo = {
+  id: string;
+  device_name: string;
+  platform: string;
+  app_version: string | null;
+  created_at: number;
+  last_seen_at: number;
+  this_device: boolean;
+};
+
+/** Current sign-in status (calls the accounts service if a session exists). */
+export const accountStatus = (): Promise<AccountStatus> => invoke('account_status');
+/** Run the loopback sign-in flow for a provider (opens the system browser). */
+export const accountSignIn = (provider: string): Promise<AccountUser | null> =>
+  invoke('account_sign_in', { provider });
+/** Sign out this device and clear local tokens. */
+export const accountSignOut = (): Promise<void> => invoke('account_sign_out');
+/** List the devices signed in to this account. */
+export const accountListDevices = (): Promise<{ devices: DeviceInfo[] }> =>
+  invoke('account_list_devices');
+/** Prove identity (password) for a sensitive action; returns a step-up token. */
+export const accountStepup = (args: {
+  action: 'remove_device' | 'change_password' | 'purchase';
+  targetRef?: string | null;
+  password: string;
+}): Promise<{ stepup_token: string }> =>
+  invoke('account_stepup', {
+    action: args.action,
+    targetRef: args.targetRef ?? null,
+    password: args.password
+  });
+/** Remotely sign a device out (requires a remove_device step-up token). */
+export const accountRevokeDevice = (deviceId: string, stepupToken: string): Promise<void> =>
+  invoke('account_revoke_device', { deviceId, stepupToken });
+/** Set or change the account password (change requires a step-up token). */
+export const accountSetPassword = (password: string, stepupToken?: string | null): Promise<void> =>
+  invoke('account_set_password', { password, stepupToken: stepupToken ?? null });
+/** The accounts service base URL. */
+export const accountBaseUrl = (): Promise<string> => invoke('account_base_url');
+export const accountSetBaseUrl = (url: string): Promise<void> =>
+  invoke('account_set_base_url', { url });

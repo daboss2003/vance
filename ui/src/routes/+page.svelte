@@ -59,6 +59,8 @@
   import { addWasmPlugin } from '$lib/ipc';
   import { getCurrentWebview } from '@tauri-apps/api/webview';
   import EffectsMarketplace from '$lib/EffectsMarketplace.svelte';
+  import SettingsDialog from '$lib/SettingsDialog.svelte';
+  import { openSettings, onRevoked } from '$lib/account.svelte';
   import { market, importEffectPaths } from '$lib/effectsMarket.svelte';
 
   // Phase 11 — show the first-run wizard until the user finishes/skips it.
@@ -126,6 +128,14 @@
     if (panels.length && !panels.some((p) => p.id === activeDock)) {
       activeDock = panels[0].id;
     }
+  });
+
+  // Backend push (spec §5): this device was signed out remotely → drop the UI
+  // to signed-out and let the user know.
+  $effect(() => {
+    let un: (() => void) | null = null;
+    void listen('account://revoked', () => onRevoked()).then((u) => (un = u));
+    return () => un?.();
   });
 
   // Native menu bar → app actions. The Rust menu emits `menu://action` with an
@@ -214,9 +224,11 @@
         case 'page_deliver':
           currentPage = 'deliver';
           break;
-        case 'dock_ai_tools':
         case 'settings':
-          // AI add-ons + settings live in the setup panel, not the editing dock.
+          void openSettings('account');
+          break;
+        case 'dock_ai_tools':
+          // AI add-ons live in the setup panel, not the editing dock.
           showOnboarding = true;
           break;
         case 'shortcuts':
@@ -1612,6 +1624,7 @@
 <Toasts />
 <Dialogs />
 <EffectsMarketplace />
+<SettingsDialog />
 
 {#if dropActive && !market.open}
   <div
