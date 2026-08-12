@@ -1,0 +1,60 @@
+[package]
+name = "vance-accounts"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "Apache-2.0 OR MIT"
+publish = false
+description = "Vance accounts service — OAuth-via-backend, password, sessions, devices, entitlements. The marketplace source of truth (docs/marketplace-spec.md §4-§6, M1)."
+
+# Standalone service: NOT a member of the desktop app's cargo workspace, so
+# building the editor never drags in axum/sqlx. It has its own lockfile.
+[workspace]
+
+[lib]
+name = "vance_accounts"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vance-accounts"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP
+axum = { version = "0.7", features = ["json", "query"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] } # BroadcastStream for SSE
+
+# Storage — SQLite for local dev (zero setup); portable SQL so the Postgres
+# prod target (spec §12) is a contained follow-up.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "migrate",
+] }
+
+# Crypto
+ed25519-dalek = { version = "2", features = ["rand_core"] } # access-token signing (spec §4.3)
+argon2 = "0.5"                                              # password hashing (spec §4.2)
+rand = "0.8"                                                # tokens, PKCE state, keypair seed
+sha2 = "0.10"                                               # refresh-token hashing (store only the hash)
+base64 = "0.22"
+
+# Serde / misc
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Real OAuth provider token exchange (dev provider needs no network).
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+urlencoding = "2"
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] } # ServiceExt::oneshot in tests

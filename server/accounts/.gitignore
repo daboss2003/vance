@@ -1,0 +1,5 @@
+/target
+*.db
+*.db-*
+.env
+signing_key.bin
