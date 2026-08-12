@@ -11,6 +11,7 @@ pub mod providers;
 pub mod r_account;
 pub mod r_auth;
 pub mod r_devices;
+pub mod r_entitlements;
 pub mod r_events;
 pub mod state;
 pub mod util;
@@ -56,5 +57,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/devices/:id/revoke", post(r_devices::revoke))
         .route("/v1/heartbeat", post(r_events::heartbeat))
         .route("/v1/events", get(r_events::events))
+        .route("/v1/entitlements", get(r_entitlements::list))
+        .route("/v1/entitlement-token", get(r_entitlements::token))
+        .route("/v1/artifacts/:sku", post(r_entitlements::artifact))
+        .route("/download/:token", get(r_entitlements::download))
+        .route("/v1/dev/publish", post(r_entitlements::dev_publish))
+        .route("/v1/dev/revoke", post(r_entitlements::dev_revoke))
+        .route("/v1/dev/installs/:sku", get(r_entitlements::dev_installs))
         .with_state(state)
 }

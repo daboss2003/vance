@@ -44,18 +44,19 @@ pub fn load_or_create_signing_key(path: &Path) -> std::io::Result<SigningKey> {
     }
 }
 
-pub fn sign_access(key: &SigningKey, claims: &Claims) -> String {
-    // Fixed header for EdDSA; base64url(header).base64url(payload).base64url(sig)
+/// Generic EdDSA compact token: base64url(header).base64url(payload).base64url(sig)
+/// with a fixed EdDSA/JWT header. Used for access, entitlement, and download tokens.
+pub fn sign_payload(key: &SigningKey, payload_json: &[u8]) -> String {
     let header = B64.encode(br#"{"alg":"EdDSA","typ":"JWT"}"#);
-    let payload = B64.encode(serde_json::to_vec(claims).expect("claims serialize"));
+    let payload = B64.encode(payload_json);
     let signing_input = format!("{header}.{payload}");
     let sig = key.sign(signing_input.as_bytes());
     format!("{signing_input}.{}", B64.encode(sig.to_bytes()))
 }
 
-/// Verify signature + structure and return the claims. Does NOT check `exp` —
-/// the caller does, so tests stay deterministic.
-pub fn verify_access(vk: &VerifyingKey, token: &str) -> Option<Claims> {
+/// Verify signature + structure; returns the raw payload bytes. Does NOT check
+/// any `exp` — the caller does, so tests stay deterministic.
+pub fn verify_payload(vk: &VerifyingKey, token: &str) -> Option<Vec<u8>> {
     let mut parts = token.split('.');
     let header = parts.next()?;
     let payload = parts.next()?;
@@ -67,8 +68,52 @@ pub fn verify_access(vk: &VerifyingKey, token: &str) -> Option<Claims> {
     let sig_bytes = B64.decode(sig).ok()?;
     let signature = Signature::from_slice(&sig_bytes).ok()?;
     vk.verify(signing_input.as_bytes(), &signature).ok()?;
-    let claims: Claims = serde_json::from_slice(&B64.decode(payload).ok()?).ok()?;
-    Some(claims)
+    B64.decode(payload).ok()
+}
+
+pub fn sign_access(key: &SigningKey, claims: &Claims) -> String {
+    sign_payload(key, &serde_json::to_vec(claims).expect("claims serialize"))
+}
+
+pub fn verify_access(vk: &VerifyingKey, token: &str) -> Option<Claims> {
+    serde_json::from_slice(&verify_payload(vk, token)?).ok()
+}
+
+// --- Entitlement token (spec §6) — signed list of owned skus, cached on the
+// --- client and verified OFFLINE. `exp` is the 3-day offline grace window.
+
+pub const ENTITLEMENT_GRACE_SECS: i64 = 3 * 24 * 3600;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct EntitlementClaims {
+    pub sub: String,
+    pub did: String,
+    pub skus: Vec<String>,
+    pub iat: i64,
+    pub exp: i64,
+    pub ent_ver: i64,
+}
+
+pub fn sign_entitlement(key: &SigningKey, claims: &EntitlementClaims) -> String {
+    sign_payload(key, &serde_json::to_vec(claims).expect("entitlement serialize"))
+}
+
+// --- Download token — a short-lived signed URL's proof (spec §6): the artifact
+// --- endpoint mints it only after an entitlement re-check.
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DownloadClaims {
+    pub sku: String,
+    pub platform: String,
+    pub exp: i64,
+}
+
+pub fn sign_download(key: &SigningKey, claims: &DownloadClaims) -> String {
+    sign_payload(key, &serde_json::to_vec(claims).expect("download serialize"))
+}
+
+pub fn verify_download(vk: &VerifyingKey, token: &str) -> Option<DownloadClaims> {
+    serde_json::from_slice(&verify_payload(vk, token)?).ok()
 }
 
 pub fn public_key_b64(vk: &VerifyingKey) -> String {
@@ -79,10 +124,14 @@ pub fn public_key_b64(vk: &VerifyingKey) -> String {
 // Refresh tokens — opaque 256-bit; we store only sha256(token).
 // ---------------------------------------------------------------------------
 
-pub fn hash_token(token: &str) -> String {
+pub fn sha256_b64(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
-    h.update(token.as_bytes());
+    h.update(bytes);
     B64.encode(h.finalize())
+}
+
+pub fn hash_token(token: &str) -> String {
+    sha256_b64(token.as_bytes())
 }
 
 // ---------------------------------------------------------------------------
