@@ -37,6 +37,10 @@ pub struct AppSettings {
     /// server; overridable so a build can point at a hosted deployment.
     #[serde(default)]
     pub accounts_base_url: Option<String>,
+    /// M2 — when on, owned effects auto-install in the background on this device
+    /// (spec §6). Defaults OFF; the user opts in per device.
+    #[serde(default)]
+    pub auto_install_purchases: bool,
 }
 
 /// The `…/Vance` config base directory (created if missing).
@@ -108,6 +112,7 @@ mod tests {
             telemetry_opt_in: false,
             ai_provider: Some("ollama".into()),
             accounts_base_url: Some("http://127.0.0.1:8787".into()),
+            auto_install_purchases: true,
         };
         let j = serde_json::to_string(&s).unwrap();
         let back: AppSettings = serde_json::from_str(&j).unwrap();

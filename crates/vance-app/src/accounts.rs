@@ -10,19 +10,24 @@
 //! the new refresh token is persisted BEFORE the new access token is used
 //! (spec §4.3 trap).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+use base64::Engine as _;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, State};
 
+use crate::engine::{EngineHandle, EntitlementGate};
 use crate::settings;
 
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8787";
@@ -219,6 +224,11 @@ pub struct AccountsState {
     /// Serialises refresh so concurrent commands don't rotate in parallel.
     refresh_guard: Mutex<()>,
     watcher_started: AtomicBool,
+    /// M2 — shared with the engine; enforces the load-time entitlement gate.
+    gate: Arc<EntitlementGate>,
+    /// Last entitlement version seen from the server, so the heartbeat can
+    /// detect a change and prompt a reconcile. -1 = unknown.
+    last_ent_ver: AtomicI64,
 }
 
 /// Construct the managed accounts state (called once at app setup).
@@ -240,6 +250,8 @@ pub fn new_state() -> Arc<AccountsState> {
         platform_str: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
         refresh_guard: Mutex::new(()),
         watcher_started: AtomicBool::new(false),
+        gate: Arc::new(EntitlementGate::default()),
+        last_ent_ver: AtomicI64::new(-1),
     })
 }
 
@@ -419,8 +431,11 @@ impl AccountsState {
 
     fn status(&self) -> Value {
         if !self.signed_in() {
+            self.gate.set_state(HashSet::new(), HashSet::new());
             return json!({ "signed_in": false });
         }
+        // Enforce the gate from the cached token straight away (offline-capable).
+        self.refresh_gate();
         match self.send_authed("GET", "/v1/me", None) {
             Ok(user) => json!({ "signed_in": true, "user": user }),
             Err(_) => json!({ "signed_in": false }),
@@ -452,17 +467,284 @@ impl AccountsState {
                     if !this.signed_in() {
                         break;
                     }
-                    if let Err(_e) = this.send_authed("POST", "/v1/heartbeat", Some(json!({}))) {
-                        if !this.signed_in() {
-                            // send_authed wiped tokens → session ended remotely.
-                            let _ = app.emit("account://revoked", ());
-                            break;
+                    match this.send_authed("POST", "/v1/heartbeat", Some(json!({}))) {
+                        Ok(v) => {
+                            // Entitlement changed on the server → nudge the UI to
+                            // reconcile (install new / uninstall revoked).
+                            if let Some(ev) = v.get("ent_ver").and_then(|x| x.as_i64()) {
+                                let prev = this.last_ent_ver.swap(ev, Ordering::SeqCst);
+                                if prev != -1 && prev != ev {
+                                    let _ = app.emit("account://entitlements-changed", ());
+                                }
+                            }
                         }
-                        // Transient network error: keep polling.
+                        Err(_) => {
+                            if !this.signed_in() {
+                                // send_authed wiped tokens → session ended remotely.
+                                let _ = app.emit("account://revoked", ());
+                                break;
+                            }
+                            // Transient network error: keep polling.
+                        }
                     }
                 }
                 this.watcher_started.store(false, Ordering::SeqCst);
             });
+    }
+}
+
+// ===========================================================================
+// M2 — entitlements + install pipeline (spec §6)
+// ===========================================================================
+
+/// Claims of the backend's signed entitlement token (verified OFFLINE here).
+#[derive(Deserialize)]
+struct EntTokenClaims {
+    skus: Vec<String>,
+    exp: i64,
+    ent_ver: i64,
+}
+
+/// Local record of one installed marketplace effect (`installed.json`).
+#[derive(Serialize, Deserialize, Clone)]
+struct InstallRecord {
+    dest: String,
+    version: String,
+    requires_entitlement: bool,
+}
+type Registry = HashMap<String, InstallRecord>; // sku -> record (sku == manifest id)
+
+fn registry_path() -> PathBuf {
+    settings::config_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("installed.json")
+}
+fn load_registry() -> Registry {
+    std::fs::read(registry_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+fn save_registry(reg: &Registry) -> Result<(), String> {
+    let json = serde_json::to_vec_pretty(reg).map_err(|e| e.to_string())?;
+    std::fs::write(registry_path(), json).map_err(|e| e.to_string())
+}
+
+fn sha256_b64(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    B64.encode(h.finalize())
+}
+
+fn parse_vk(b64: &str) -> Option<VerifyingKey> {
+    let bytes = B64.decode(b64).ok()?;
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    VerifyingKey::from_bytes(&arr).ok()
+}
+
+/// Pure core of entitlement-token verification: EdDSA signature + not-past-grace.
+/// Must mirror the server's `sign_entitlement` (header.payload.sig, fixed header).
+fn verify_ent_token_with(vk: &VerifyingKey, token: &str) -> Option<EntTokenClaims> {
+    let mut parts = token.split('.');
+    let (h, p, s) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    let signing_input = format!("{h}.{p}");
+    let sig = Signature::from_slice(&B64.decode(s).ok()?).ok()?;
+    vk.verify(signing_input.as_bytes(), &sig).ok()?;
+    let claims: EntTokenClaims = serde_json::from_slice(&B64.decode(p).ok()?).ok()?;
+    if claims.exp < now() {
+        return None; // offline grace window lapsed
+    }
+    Some(claims)
+}
+
+/// A plugin `dest` must be a plain filename (no path separators / traversal).
+fn safe_plugin_dest(dir: &std::path::Path, dest: &str) -> Result<PathBuf, String> {
+    if dest.is_empty() || dest.contains('/') || dest.contains('\\') || dest.contains("..") {
+        return Err("invalid effect filename".into());
+    }
+    Ok(dir.join(dest))
+}
+
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("wasm.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+impl AccountsState {
+    /// The shared gate (installed on the engine at startup).
+    pub fn gate(&self) -> Arc<EntitlementGate> {
+        self.gate.clone()
+    }
+
+    /// The backend's Ed25519 public key, cached, for offline token verification.
+    fn server_pubkey(&self) -> Option<VerifyingKey> {
+        if let Some(pk) = self.store.get("server_pubkey") {
+            if let Some(vk) = parse_vk(&pk) {
+                return Some(vk);
+            }
+        }
+        let resp = http().get(format!("{}/auth/pubkey", self.base())).send().ok()?;
+        let v: Value = resp.json().ok()?;
+        let pk = v["public_key"].as_str()?.to_string();
+        let vk = parse_vk(&pk)?;
+        let _ = self.store.set("server_pubkey", &pk);
+        Some(vk)
+    }
+
+    /// Verify a cached entitlement token (signature + not-past-grace) and return
+    /// its claims. This is the OFFLINE boundary.
+    fn verify_ent_token(&self, token: &str) -> Option<EntTokenClaims> {
+        let vk = self.server_pubkey()?;
+        verify_ent_token_with(&vk, token)
+    }
+
+    fn owned_offline(&self) -> Vec<String> {
+        self.store
+            .get("entitlement_token")
+            .and_then(|t| self.verify_ent_token(&t))
+            .map(|c| c.skus)
+            .unwrap_or_default()
+    }
+
+    /// Fetch a fresh entitlement token (online), cache it, and return owned skus.
+    /// Falls back to the cached token when offline.
+    fn fetch_owned(&self) -> Vec<String> {
+        if let Ok(v) = self.send_authed("GET", "/v1/entitlement-token", None) {
+            if let Some(tok) = v["token"].as_str() {
+                let _ = self.store.set("entitlement_token", tok);
+                if let Some(c) = self.verify_ent_token(tok) {
+                    self.last_ent_ver.store(c.ent_ver, Ordering::SeqCst);
+                    return c.skus;
+                }
+            }
+        }
+        self.owned_offline()
+    }
+
+    fn refresh_gate_with(&self, owned: &HashSet<String>) {
+        let reg = load_registry();
+        let mut gated = HashSet::new();
+        let mut entitled = HashSet::new();
+        for (sku, rec) in &reg {
+            if rec.requires_entitlement {
+                gated.insert(sku.clone());
+                if owned.contains(sku) {
+                    entitled.insert(sku.clone());
+                }
+            }
+        }
+        self.gate.set_state(gated, entitled);
+    }
+
+    /// Recompute the gate from the cached token (offline, cheap).
+    pub fn refresh_gate(&self) {
+        let owned: HashSet<String> = self.owned_offline().into_iter().collect();
+        self.refresh_gate_with(&owned);
+    }
+
+    /// Download + verify + place a sku's artifact, recording it locally.
+    fn install_sku(&self, sku: &str) -> Result<(), String> {
+        let art = self.send_authed("POST", &format!("/v1/artifacts/{sku}"), Some(json!({})))?;
+        let url = art["download_url"].as_str().ok_or("no download URL")?;
+        let sha = art["sha256"].as_str().ok_or("no checksum")?;
+        let dest = art["dest"].as_str().ok_or("no destination")?.to_string();
+        let version = art["version"].as_str().unwrap_or("1").to_string();
+
+        let bytes = http()
+            .get(url)
+            .send()
+            .map_err(|e| format!("download: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("download: {e}"))?
+            .bytes()
+            .map_err(|e| format!("download: {e}"))?;
+        if sha256_b64(bytes.as_ref()) != sha {
+            return Err("the downloaded effect failed its checksum check".into());
+        }
+        let dir = vance_plugin_sdk::discovery::user_plugins_dir()
+            .ok_or_else(|| "couldn't locate the add-ons folder".to_string())?;
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = safe_plugin_dest(&dir, &dest)?;
+        write_atomic(&path, bytes.as_ref()).map_err(|e| e.to_string())?;
+
+        let mut reg = load_registry();
+        reg.insert(
+            sku.to_string(),
+            InstallRecord {
+                dest,
+                version,
+                requires_entitlement: true,
+            },
+        );
+        save_registry(&reg)?;
+        Ok(())
+    }
+
+    fn uninstall_sku(&self, sku: &str) {
+        let mut reg = load_registry();
+        if let Some(rec) = reg.remove(sku) {
+            if let Some(dir) = vance_plugin_sdk::discovery::user_plugins_dir() {
+                if let Ok(path) = safe_plugin_dest(&dir, &rec.dest) {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            let _ = save_registry(&reg);
+        }
+    }
+
+    /// Install owned-but-missing (if auto), uninstall installed-but-revoked, and
+    /// refresh the gate. Returns a report for the UI.
+    fn reconcile(&self, auto_install: bool) -> Value {
+        let owned_vec = self.fetch_owned();
+        let owned: HashSet<String> = owned_vec.iter().cloned().collect();
+
+        let mut uninstalled = vec![];
+        for (sku, rec) in load_registry() {
+            if rec.requires_entitlement && !owned.contains(&sku) {
+                self.uninstall_sku(&sku);
+                uninstalled.push(sku);
+            }
+        }
+        let mut installed = vec![];
+        if auto_install {
+            let reg = load_registry();
+            for sku in &owned {
+                if !reg.contains_key(sku) {
+                    match self.install_sku(sku) {
+                        Ok(()) => installed.push(sku.clone()),
+                        Err(e) => tracing::warn!("auto-install {sku}: {e}"),
+                    }
+                }
+            }
+        }
+        self.refresh_gate_with(&owned);
+        json!({ "installed": installed, "uninstalled": uninstalled, "owned": owned_vec })
+    }
+
+    /// Owned effects for the "My Effects" UI, with local install status.
+    fn list_owned(&self) -> Result<Value, String> {
+        let v = self.send_authed("GET", "/v1/entitlements", None)?;
+        let reg = load_registry();
+        let effects: Vec<Value> = v["entitlements"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|e| {
+                        let sku = e["sku"].as_str().unwrap_or("");
+                        json!({
+                            "sku": sku,
+                            "display_name": e.get("display_name").cloned().unwrap_or(Value::Null),
+                            "installed": reg.contains_key(sku),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(json!({ "effects": effects }))
     }
 }
 
@@ -666,6 +948,68 @@ pub fn account_set_base_url(state: St<'_>, url: String) -> Result<(), String> {
     settings::save(&s).map_err(|e| e.to_string())
 }
 
+// --- M2 entitlement commands ----------------------------------------------
+
+/// Owned effects + local install status, for the "My Effects" UI.
+#[tauri::command]
+pub async fn entitlements_list(state: St<'_>) -> Result<Value, String> {
+    let st = state.inner().clone();
+    tokio::task::spawn_blocking(move || st.list_owned())
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn entitlement_install(
+    state: St<'_>,
+    engine: State<'_, EngineHandle>,
+    sku: String,
+) -> Result<(), String> {
+    let st = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        st.install_sku(&sku)?;
+        st.refresh_gate();
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    engine.lock().rescan_plugins();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn entitlement_uninstall(
+    state: St<'_>,
+    engine: State<'_, EngineHandle>,
+    sku: String,
+) -> Result<(), String> {
+    let st = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        st.uninstall_sku(&sku);
+        st.refresh_gate();
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    engine.lock().rescan_plugins();
+    Ok(())
+}
+
+/// Reconcile with the server: (auto-)install owned, uninstall revoked, update the
+/// gate, then rescan so the engine sees the change.
+#[tauri::command]
+pub async fn entitlements_reconcile(
+    state: St<'_>,
+    engine: State<'_, EngineHandle>,
+) -> Result<Value, String> {
+    let auto = settings::load().auto_install_purchases;
+    let st = state.inner().clone();
+    let report = tokio::task::spawn_blocking(move || st.reconcile(auto))
+        .await
+        .map_err(|e| e.to_string())?;
+    engine.lock().rescan_plugins();
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,6 +1019,41 @@ mod tests {
         let req = "GET /callback?code=abc-123_XYZ&foo=bar HTTP/1.1\r\nHost: x\r\n\r\n";
         assert_eq!(parse_code(req), Some("abc-123_XYZ".to_string()));
         assert_eq!(parse_code("GET /callback?state=x HTTP/1.1\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn entitlement_token_verifies_and_rejects_tamper_and_expiry() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let vk = sk.verifying_key();
+
+        // Build a token exactly the way the server's sign_entitlement does.
+        let sign = |payload: serde_json::Value| {
+            let header = B64.encode(br#"{"alg":"EdDSA","typ":"JWT"}"#);
+            let p = B64.encode(serde_json::to_vec(&payload).unwrap());
+            let input = format!("{header}.{p}");
+            let sig = sk.sign(input.as_bytes());
+            format!("{input}.{}", B64.encode(sig.to_bytes()))
+        };
+
+        let good = sign(json!({
+            "sub": "u", "did": "d", "skus": ["com.x.glow"],
+            "iat": 0, "exp": now() + 1000, "ent_ver": 2
+        }));
+        assert_eq!(
+            verify_ent_token_with(&vk, &good).unwrap().skus,
+            vec!["com.x.glow".to_string()]
+        );
+
+        // Tampered signing input → rejected.
+        let mut chars: Vec<char> = good.chars().collect();
+        chars[10] = if chars[10] == 'A' { 'B' } else { 'A' };
+        let bad: String = chars.into_iter().collect();
+        assert!(verify_ent_token_with(&vk, &bad).is_none());
+
+        // Past the offline grace window → rejected.
+        let expired = sign(json!({ "skus": ["x"], "exp": now() - 10, "ent_ver": 1 }));
+        assert!(verify_ent_token_with(&vk, &expired).is_none());
     }
 
     #[test]

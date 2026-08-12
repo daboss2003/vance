@@ -1116,8 +1116,39 @@ pub struct RenderState {
     pub source_surface_config: Option<wgpu::SurfaceConfiguration>,
 }
 
+/// M2 — load-time entitlement gate (spec §6). Shared (via `Arc`) between the
+/// engine and the accounts layer: the accounts layer keeps the two sets current
+/// (which plugin ids are marketplace-gated, and which are currently entitled),
+/// and the engine consults `allowed()` immediately before instantiating a plugin.
+#[derive(Default)]
+pub struct EntitlementGate {
+    gated: parking_lot::RwLock<std::collections::HashSet<String>>,
+    entitled: parking_lot::RwLock<std::collections::HashSet<String>>,
+}
+
+impl EntitlementGate {
+    /// Replace the current view of gated + entitled plugin ids.
+    pub fn set_state(
+        &self,
+        gated: std::collections::HashSet<String>,
+        entitled: std::collections::HashSet<String>,
+    ) {
+        *self.gated.write() = gated;
+        *self.entitled.write() = entitled;
+    }
+
+    /// A non-gated (side-loaded / free) plugin always loads; a gated one only
+    /// while its entitlement is currently valid.
+    pub fn allowed(&self, id: &str) -> bool {
+        !self.gated.read().contains(id) || self.entitled.read().contains(id)
+    }
+}
+
 #[derive(Default)]
 pub struct Engine {
+    /// M2 — load-time entitlement gate. `None` until the accounts layer installs
+    /// one; side-loaded plugins are never gated (spec §6).
+    pub(crate) entitlement_gate: Option<Arc<EntitlementGate>>,
     /// Set once after the Tauri window exists. This is the *Record*
     /// monitor — the timeline preview. Phase 4.8 adds a parallel
     /// `source_viewport` for the Source monitor.
@@ -9821,12 +9852,26 @@ impl Engine {
         }
     }
 
+    /// Install the shared entitlement gate consulted at plugin load (M2, §6).
+    pub fn set_entitlement_gate(&mut self, gate: Arc<EntitlementGate>) {
+        self.entitlement_gate = Some(gate);
+    }
+
     /// Ensure the plugin with manifest `id` is loaded + fresh. Reloads
     /// when the source `.wasm` file's mtime changed since the cached
     /// instance was built (so an in-place edit between exports is
     /// picked up without an explicit rescan). Returns whether a usable
     /// instance is now cached.
     fn ensure_plugin_loaded(&mut self, id: &str) -> bool {
+        // M2 — load-time entitlement gate (spec §6): the single choke point in
+        // front of `WasmPlugin::load`. A marketplace-gated effect whose
+        // entitlement isn't currently valid refuses to instantiate.
+        if let Some(gate) = &self.entitlement_gate {
+            if !gate.allowed(id) {
+                tracing::warn!(plugin = %id, "blocked: this effect needs a valid entitlement");
+                return false;
+            }
+        }
         let Some(disc) = self.plugin_registry.by_id(id).cloned() else {
             tracing::warn!(plugin = %id, "wasm effect references unknown plugin");
             return false;

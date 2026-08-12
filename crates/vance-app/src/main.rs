@@ -4177,6 +4177,11 @@ fn main() {
     let control_hub: ControlHandle = Arc::new(PMutex::new(control::ControlHub::default()));
     let publish_hub: PublishHandle = Arc::new(PMutex::new(publish::PublishHub::default()));
 
+    // M2 — share one entitlement gate between the accounts layer (which keeps it
+    // current) and the engine (which consults it at plugin load, spec §6).
+    let accounts_state = accounts::new_state();
+    engine.lock().set_entitlement_gate(accounts_state.gate());
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .menu(|handle| build_app_menu(handle))
@@ -4190,7 +4195,7 @@ fn main() {
         .manage(peaks_handle.clone())
         .manage(control_hub.clone())
         .manage(publish_hub.clone())
-        .manage(accounts::new_state())
+        .manage(accounts_state)
         .setup(move |app| {
             let window = app
                 .get_webview_window("main")
@@ -4453,6 +4458,10 @@ fn main() {
             accounts::account_set_password,
             accounts::account_base_url,
             accounts::account_set_base_url,
+            accounts::entitlements_list,
+            accounts::entitlement_install,
+            accounts::entitlement_uninstall,
+            accounts::entitlements_reconcile,
         ])
         .build(tauri::generate_context!())
         .expect("tauri failed to start")
