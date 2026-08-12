@@ -406,6 +406,10 @@
         backend = `error: ${e}`;
       });
 
+    // Populate the load-time gate + renew paid-effect leases at startup, so owned
+    // effects work (and auto-install runs) without opening Settings first (§6/§7).
+    void reconcileEffects();
+
     if (!viewportEl) return;
     const observer = new ResizeObserver(reportBounds);
     observer.observe(viewportEl);

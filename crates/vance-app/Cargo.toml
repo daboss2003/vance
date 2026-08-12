@@ -97,6 +97,8 @@ tokio = { workspace = true } # spawn_blocking for accounts network calls
 # M2 — verify the backend's Ed25519 entitlement token OFFLINE (spec §6).
 ed25519-dalek = "2"
 base64 = "0.22"
+# M4 — unseal the per-device content key + decrypt paid effects at load (spec §7).
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

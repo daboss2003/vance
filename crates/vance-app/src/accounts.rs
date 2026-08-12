@@ -506,13 +506,46 @@ struct EntTokenClaims {
 }
 
 /// Local record of one installed marketplace effect (`installed.json`).
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 struct InstallRecord {
     dest: String,
     version: String,
     requires_entitlement: bool,
+    /// M4 — paid effect stored as an encrypted `.vef`.
+    #[serde(default)]
+    encrypted: bool,
+    /// The device-sealed CEK (JSON of {eph_pub,nonce,ct}) + the signed lease +
+    /// the lease's plaintext hash — re-verified on startup to re-derive the key.
+    #[serde(default)]
+    sealed_cek: Option<String>,
+    #[serde(default)]
+    lease: Option<String>,
+    #[serde(default)]
+    plaintext_sha256: Option<String>,
 }
 type Registry = HashMap<String, InstallRecord>; // sku -> record (sku == manifest id)
+
+/// Client view of the server's lease claims (spec §7).
+#[derive(Deserialize)]
+struct LeaseClaims {
+    sku: String,
+    device_id: String,
+    exp: i64,
+    plaintext_sha256: String,
+}
+
+/// AES-256-GCM open of `nonce(12) || ciphertext`.
+fn aes_open(key: &[u8; 32], nonce_prefixed: &[u8]) -> Option<Vec<u8>> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Key, Nonce};
+    if nonce_prefixed.len() < 12 {
+        return None;
+    }
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    cipher
+        .decrypt(Nonce::from_slice(&nonce_prefixed[..12]), &nonce_prefixed[12..])
+        .ok()
+}
 
 fn registry_path() -> PathBuf {
     settings::config_dir()
@@ -629,6 +662,7 @@ impl AccountsState {
         let reg = load_registry();
         let mut gated = HashSet::new();
         let mut entitled = HashSet::new();
+        let mut keys: HashMap<String, ([u8; 32], String)> = HashMap::new();
         for (sku, rec) in &reg {
             if rec.requires_entitlement {
                 gated.insert(sku.clone());
@@ -636,8 +670,25 @@ impl AccountsState {
                     entitled.insert(sku.clone());
                 }
             }
+            // Encrypted + owned + a still-valid lease → re-derive the content key
+            // (offline-capable within the grace window). Otherwise no key → the
+            // effect can't decrypt (blocked).
+            if rec.encrypted && owned.contains(sku) {
+                if let (Some(sealed_str), Some(lease), Some(pt_sha)) =
+                    (&rec.sealed_cek, &rec.lease, &rec.plaintext_sha256)
+                {
+                    if self.verify_lease(lease).map(|c| c.sku == *sku).unwrap_or(false) {
+                        if let Ok(sealed) = serde_json::from_str::<Value>(sealed_str) {
+                            if let Some(cek) = self.unseal_cek(&sealed) {
+                                keys.insert(sku.clone(), (cek, pt_sha.clone()));
+                            }
+                        }
+                    }
+                }
+            }
         }
         self.gate.set_state(gated, entitled);
+        self.gate.set_keys(keys);
     }
 
     /// Recompute the gate from the cached token (offline, cheap).
@@ -683,16 +734,169 @@ impl AccountsState {
                 dest,
                 version,
                 requires_entitlement,
+                ..Default::default()
             },
         );
         save_registry(&reg)?;
         Ok(())
     }
 
-    /// Install an owned (paid/gated) effect via the auth'd artifact endpoint.
+    /// Install an owned (paid) effect. Paid effects come back encrypted (§7);
+    /// free-but-gated ones fall back to plain placement.
     fn install_sku(&self, sku: &str) -> Result<(), String> {
-        let art = self.send_authed("POST", &format!("/v1/artifacts/{sku}"), Some(json!({})))?;
-        self.place_from_artifact(&art, sku, true)
+        let art = self.send_authed(
+            "POST",
+            &format!("/v1/artifacts/{sku}"),
+            Some(json!({ "device_pubkey": self.device_pubkey_b64() })),
+        )?;
+        if art["encrypted"].as_bool().unwrap_or(false) {
+            self.install_encrypted(sku, &art)
+        } else {
+            self.place_from_artifact(&art, sku, true)
+        }
+    }
+
+    // --- M4 paid-effect decryption (spec §7) -------------------------------
+
+    /// The device's static X25519 secret (persisted in the keychain; created on
+    /// first use). Its public key is sent to the server to seal the CEK.
+    fn device_secret(&self) -> x25519_dalek::StaticSecret {
+        use rand::RngCore;
+        use x25519_dalek::StaticSecret;
+        if let Some(b64) = self.store.get("device_x25519_priv") {
+            if let Some(bytes) = B64.decode(&b64).ok().and_then(|v| <[u8; 32]>::try_from(v).ok()) {
+                return StaticSecret::from(bytes);
+            }
+        }
+        let mut seed = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut seed);
+        let _ = self.store.set("device_x25519_priv", &B64.encode(seed));
+        StaticSecret::from(seed)
+    }
+
+    fn device_pubkey_b64(&self) -> String {
+        B64.encode(x25519_dalek::PublicKey::from(&self.device_secret()).as_bytes())
+    }
+
+    /// Unseal a CEK sealed to this device (ECIES: ECDH → sha256 KDF → AES-open).
+    fn unseal_cek(&self, sealed: &Value) -> Option<[u8; 32]> {
+        let eph_pub: [u8; 32] = B64.decode(sealed["eph_pub"].as_str()?).ok()?.try_into().ok()?;
+        let nonce = B64.decode(sealed["nonce"].as_str()?).ok()?;
+        let ct = B64.decode(sealed["ct"].as_str()?).ok()?;
+        let shared = self
+            .device_secret()
+            .diffie_hellman(&x25519_dalek::PublicKey::from(eph_pub));
+        let mut h = Sha256::new();
+        h.update(b"vance-cek-seal-v1");
+        h.update(shared.as_bytes());
+        let key: [u8; 32] = h.finalize().into();
+        let mut blob = nonce;
+        blob.extend_from_slice(&ct);
+        aes_open(&key, &blob)?.try_into().ok()
+    }
+
+    /// Verify a lease: Ed25519 signature (server key), not expired, bound to this
+    /// device. Returns the claims on success.
+    fn verify_lease(&self, lease: &str) -> Option<LeaseClaims> {
+        let vk = self.server_pubkey()?;
+        let mut parts = lease.split('.');
+        let (h, p, s) = (parts.next()?, parts.next()?, parts.next()?);
+        if parts.next().is_some() {
+            return None;
+        }
+        let sig = Signature::from_slice(&B64.decode(s).ok()?).ok()?;
+        vk.verify(format!("{h}.{p}").as_bytes(), &sig).ok()?;
+        let claims: LeaseClaims = serde_json::from_slice(&B64.decode(p).ok()?).ok()?;
+        if claims.exp < now() || claims.device_id != self.device_id {
+            return None;
+        }
+        Some(claims)
+    }
+
+    /// Install a paid effect: download the ciphertext, verify + unseal the key,
+    /// decrypt IN MEMORY only to read the manifest + verify integrity, then write
+    /// a `.vef` (manifest header + ciphertext). Plaintext never touches disk.
+    fn install_encrypted(&self, sku: &str, art: &Value) -> Result<(), String> {
+        let url = art["download_url"].as_str().ok_or("no download URL")?;
+        let pin = art["sha256"].as_str().ok_or("no checksum")?;
+        let version = art["version"].as_str().unwrap_or("1").to_string();
+        let sealed = art.get("sealed_cek").ok_or("no sealed key")?;
+        let lease = art["lease"].as_str().ok_or("no license")?.to_string();
+
+        let ciphertext = http()
+            .get(url)
+            .send()
+            .map_err(|e| format!("download: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("download: {e}"))?
+            .bytes()
+            .map_err(|e| format!("download: {e}"))?;
+        if sha256_b64(ciphertext.as_ref()) != pin {
+            return Err("the downloaded effect failed its checksum check".into());
+        }
+
+        let claims = self
+            .verify_lease(&lease)
+            .ok_or("this effect's license is invalid or expired")?;
+        if claims.sku != sku {
+            return Err("the license doesn't match this effect".into());
+        }
+        let cek = self.unseal_cek(sealed).ok_or("couldn't unseal the effect key")?;
+        let plaintext = aes_open(&cek, ciphertext.as_ref()).ok_or("couldn't decrypt the effect")?;
+        if sha256_b64(&plaintext) != claims.plaintext_sha256 {
+            return Err("the effect failed its integrity check".into());
+        }
+        let manifest = vance_plugin_sdk::host::WasmPlugin::load(&plaintext)
+            .map_err(|e| format!("the effect didn't load: {e}"))?
+            .manifest()
+            .clone();
+        if manifest.id != sku {
+            return Err("this effect's id doesn't match its listing".into());
+        }
+
+        // Persist ONLY the encrypted container.
+        let vef = vance_plugin_sdk::container::build(&manifest, ciphertext.as_ref());
+        let dir = vance_plugin_sdk::discovery::user_plugins_dir()
+            .ok_or_else(|| "couldn't locate the add-ons folder".to_string())?;
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let dest = format!("{sku}.vef");
+        let path = safe_plugin_dest(&dir, &dest)?;
+        write_atomic(&path, &vef).map_err(|e| e.to_string())?;
+
+        let mut reg = load_registry();
+        reg.insert(
+            sku.to_string(),
+            InstallRecord {
+                dest,
+                version,
+                requires_entitlement: true,
+                encrypted: true,
+                sealed_cek: serde_json::to_string(sealed).ok(),
+                lease: Some(lease),
+                plaintext_sha256: Some(claims.plaintext_sha256),
+            },
+        );
+        save_registry(&reg)?;
+        Ok(())
+    }
+
+    /// Re-fetch a fresh sealed CEK + lease for an installed paid effect (renews
+    /// the offline grace window + keeps this device in the active-2). No download.
+    fn reactivate_encrypted(&self, sku: &str) {
+        if let Ok(art) = self.send_authed(
+            "POST",
+            &format!("/v1/artifacts/{sku}"),
+            Some(json!({ "device_pubkey": self.device_pubkey_b64() })),
+        ) {
+            if let (Some(sealed), Some(lease)) = (art.get("sealed_cek"), art["lease"].as_str()) {
+                let mut reg = load_registry();
+                if let Some(rec) = reg.get_mut(sku) {
+                    rec.sealed_cek = serde_json::to_string(sealed).ok();
+                    rec.lease = Some(lease.to_string());
+                    let _ = save_registry(&reg);
+                }
+            }
+        }
     }
 
     // --- catalog (§9) ------------------------------------------------------
@@ -770,6 +974,12 @@ impl AccountsState {
                         Err(e) => tracing::warn!("auto-install {sku}: {e}"),
                     }
                 }
+            }
+        }
+        // Renew leases + keys for installed paid effects (online). No re-download.
+        for (sku, rec) in load_registry() {
+            if rec.encrypted && owned.contains(&sku) {
+                self.reactivate_encrypted(&sku);
             }
         }
         self.refresh_gate_with(&owned);

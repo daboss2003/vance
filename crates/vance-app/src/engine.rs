@@ -1116,14 +1116,25 @@ pub struct RenderState {
     pub source_surface_config: Option<wgpu::SurfaceConfiguration>,
 }
 
-/// M2 — load-time entitlement gate (spec §6). Shared (via `Arc`) between the
-/// engine and the accounts layer: the accounts layer keeps the two sets current
-/// (which plugin ids are marketplace-gated, and which are currently entitled),
-/// and the engine consults `allowed()` immediately before instantiating a plugin.
+/// One paid effect's decryption material (spec §7): the unsealed content key +
+/// the lease-signed plaintext hash to check the decrypted bytes against.
+#[derive(Clone)]
+struct CekEntry {
+    cek: [u8; 32],
+    plaintext_sha256: String,
+}
+
+/// M2/M4 — load-time entitlement gate (spec §6–§7). Shared (via `Arc`) between the
+/// engine and the accounts layer: the accounts layer keeps it current (which
+/// plugin ids are marketplace-gated, which are entitled, and — for paid effects —
+/// the per-device content keys), and the engine consults it immediately before
+/// instantiating a plugin. For encrypted effects the boundary is cryptographic:
+/// without a valid key the `.vef` body can't be decrypted, so it can't run.
 #[derive(Default)]
 pub struct EntitlementGate {
     gated: parking_lot::RwLock<std::collections::HashSet<String>>,
     entitled: parking_lot::RwLock<std::collections::HashSet<String>>,
+    keys: parking_lot::RwLock<std::collections::HashMap<String, CekEntry>>,
 }
 
 impl EntitlementGate {
@@ -1137,10 +1148,88 @@ impl EntitlementGate {
         *self.entitled.write() = entitled;
     }
 
+    /// Replace the per-effect content keys `(sku → (cek, plaintext_sha256))`.
+    pub fn set_keys(&self, keys: std::collections::HashMap<String, ([u8; 32], String)>) {
+        *self.keys.write() = keys
+            .into_iter()
+            .map(|(k, (cek, plaintext_sha256))| {
+                (
+                    k,
+                    CekEntry {
+                        cek,
+                        plaintext_sha256,
+                    },
+                )
+            })
+            .collect();
+    }
+
     /// A non-gated (side-loaded / free) plugin always loads; a gated one only
     /// while its entitlement is currently valid.
     pub fn allowed(&self, id: &str) -> bool {
         !self.gated.read().contains(id) || self.entitled.read().contains(id)
+    }
+
+    /// Decrypt an encrypted effect's `.vef` body (`nonce || AEAD ciphertext`) to
+    /// the plaintext `.wasm`. Returns `None` if we hold no valid key for `id` or
+    /// the decrypted bytes don't match the lease-signed hash. The key only
+    /// materialises here — never persisted in plaintext.
+    pub fn decrypt(&self, id: &str, body: &[u8]) -> Option<Vec<u8>> {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes256Gcm, Key, Nonce};
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+
+        let entry = self.keys.read().get(id)?.clone();
+        if body.len() < 12 {
+            return None;
+        }
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&entry.cek));
+        let plaintext = cipher
+            .decrypt(Nonce::from_slice(&body[..12]), &body[12..])
+            .ok()?;
+        let got = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(&plaintext));
+        if got != entry.plaintext_sha256 {
+            return None;
+        }
+        Some(plaintext)
+    }
+}
+
+#[cfg(test)]
+mod entitlement_gate_tests {
+    use super::EntitlementGate;
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Key, Nonce};
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn decrypt_recovers_plaintext_rejects_wrong_key_and_hash() {
+        let cek = [3u8; 32];
+        let plaintext = b"\x00asm\x01\x00\x00\x00-plaintext-effect".to_vec();
+        let nonce = [5u8; 12];
+        let ct = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&cek))
+            .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
+            .unwrap();
+        let mut body = nonce.to_vec();
+        body.extend_from_slice(&ct); // .vef body layout: nonce || ciphertext
+        let sha = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(&plaintext));
+
+        let gate = EntitlementGate::default();
+        gate.set_keys(std::collections::HashMap::from([(
+            "com.x.a".to_string(),
+            (cek, sha),
+        )]));
+        assert_eq!(gate.decrypt("com.x.a", &body).unwrap(), plaintext);
+        assert!(gate.decrypt("com.x.other", &body).is_none(), "no key for id");
+
+        // A key whose lease-signed hash disagrees with the plaintext → rejected.
+        gate.set_keys(std::collections::HashMap::from([(
+            "com.x.a".to_string(),
+            (cek, "not-the-hash".to_string()),
+        )]));
+        assert!(gate.decrypt("com.x.a", &body).is_none(), "hash mismatch");
     }
 }
 
@@ -9885,11 +9974,35 @@ impl Engine {
             // Stale — drop it so we reload below.
             self.loaded_plugins.remove(id);
         }
-        match std::fs::read(&disc.path)
-            .map_err(|e| e.to_string())
-            .and_then(|b| {
-                vance_plugin_sdk::host::WasmPlugin::load(&b).map_err(|e| e.to_string())
-            }) {
+        let raw = match std::fs::read(&disc.path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(plugin = %id, error = %e, "wasm plugin read failed");
+                return false;
+            }
+        };
+        // Encrypted (paid) effects are `.vef` containers: strip the manifest
+        // header, decrypt the body via the gate (spec §7). A missing/invalid key
+        // means no plaintext ever materialises → the effect can't run.
+        let wasm_bytes: std::borrow::Cow<[u8]> = if disc.encrypted {
+            let body = match vance_plugin_sdk::container::parse(&raw) {
+                Ok(c) => c.body,
+                Err(e) => {
+                    tracing::warn!(plugin = %id, error = %e, "bad .vef container");
+                    return false;
+                }
+            };
+            match self.entitlement_gate.as_ref().and_then(|g| g.decrypt(id, &body)) {
+                Some(pt) => std::borrow::Cow::Owned(pt),
+                None => {
+                    tracing::warn!(plugin = %id, "blocked: paid effect couldn't be decrypted");
+                    return false;
+                }
+            }
+        } else {
+            std::borrow::Cow::Borrowed(&raw[..])
+        };
+        match vance_plugin_sdk::host::WasmPlugin::load(&wasm_bytes).map_err(|e| e.to_string()) {
             Ok(p) => {
                 self.loaded_plugins
                     .insert(id.to_string(), (p, current_mtime));
