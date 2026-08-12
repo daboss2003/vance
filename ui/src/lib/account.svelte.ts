@@ -11,12 +11,19 @@ import {
   accountSetPassword,
   accountBaseUrl,
   accountSetBaseUrl,
+  entitlementsList,
+  entitlementInstall,
+  entitlementUninstall,
+  entitlementsReconcile,
+  getAppSettings,
+  setAppSettings,
   type AccountUser,
-  type DeviceInfo
+  type DeviceInfo,
+  type OwnedEffect
 } from '$lib/ipc';
 import { toast } from '$lib/toast.svelte';
 
-type Tab = 'account' | 'devices' | 'advanced';
+type Tab = 'account' | 'effects' | 'devices' | 'advanced';
 
 interface AccountUI {
   open: boolean;
@@ -26,6 +33,9 @@ interface AccountUI {
   user: AccountUser | null;
   devices: DeviceInfo[];
   devicesLoaded: boolean;
+  effects: OwnedEffect[];
+  effectsLoaded: boolean;
+  autoInstall: boolean;
   busy: boolean;
   baseUrl: string;
 }
@@ -38,6 +48,9 @@ export const account = $state<AccountUI>({
   user: null,
   devices: [],
   devicesLoaded: false,
+  effects: [],
+  effectsLoaded: false,
+  autoInstall: false,
   busy: false,
   baseUrl: ''
 });
@@ -66,6 +79,7 @@ export async function openSettings(tab: Tab = 'account'): Promise<void> {
   }
   await refreshStatus();
   if (account.signedIn && tab === 'devices') await loadDevices();
+  if (account.signedIn && tab === 'effects') await loadEffects();
 }
 
 export function closeSettings(): void {
@@ -161,11 +175,73 @@ export async function saveBaseUrl(url: string): Promise<void> {
   }
 }
 
+// --- My Effects (M2) -------------------------------------------------------
+
+export async function loadEffects(): Promise<void> {
+  try {
+    const [r, s] = await Promise.all([entitlementsList(), getAppSettings()]);
+    account.effects = r.effects ?? [];
+    account.autoInstall = s.auto_install_purchases ?? false;
+    account.effectsLoaded = true;
+  } catch (e) {
+    toast.error(`Couldn’t load your effects.\n${String(e)}`);
+  }
+}
+
+export async function installEffect(sku: string, name: string): Promise<void> {
+  account.busy = true;
+  try {
+    await entitlementInstall(sku);
+    toast.success(`Installed “${name}”.`);
+    await loadEffects();
+  } catch (e) {
+    toast.error(`Couldn’t install “${name}”.\n${String(e)}`);
+  } finally {
+    account.busy = false;
+  }
+}
+
+export async function uninstallEffect(sku: string, name: string): Promise<void> {
+  account.busy = true;
+  try {
+    await entitlementUninstall(sku);
+    toast.info(`Removed “${name}” from this device.`);
+    await loadEffects();
+  } catch (e) {
+    toast.error(String(e));
+  } finally {
+    account.busy = false;
+  }
+}
+
+/** Reconcile with the server (called on the entitlements-changed push). */
+export async function reconcileEffects(): Promise<void> {
+  try {
+    await entitlementsReconcile();
+    if (account.open && account.tab === 'effects') await loadEffects();
+  } catch {
+    /* transient; the next open/reconcile will catch up */
+  }
+}
+
+export async function setAutoInstall(on: boolean): Promise<void> {
+  try {
+    const s = await getAppSettings();
+    await setAppSettings({ ...s, auto_install_purchases: on });
+    account.autoInstall = on;
+    if (on) await reconcileEffects();
+  } catch (e) {
+    toast.error(String(e));
+  }
+}
+
 function resetSignedOut(): void {
   account.signedIn = false;
   account.user = null;
   account.devices = [];
   account.devicesLoaded = false;
+  account.effects = [];
+  account.effectsLoaded = false;
 }
 
 /** Called when the backend pushes `account://revoked` (remote sign-out). */

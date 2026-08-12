@@ -60,7 +60,7 @@
   import { getCurrentWebview } from '@tauri-apps/api/webview';
   import EffectsMarketplace from '$lib/EffectsMarketplace.svelte';
   import SettingsDialog from '$lib/SettingsDialog.svelte';
-  import { openSettings, onRevoked } from '$lib/account.svelte';
+  import { openSettings, onRevoked, reconcileEffects } from '$lib/account.svelte';
   import { market, importEffectPaths } from '$lib/effectsMarket.svelte';
 
   // Phase 11 — show the first-run wizard until the user finishes/skips it.
@@ -135,6 +135,14 @@
   $effect(() => {
     let un: (() => void) | null = null;
     void listen('account://revoked', () => onRevoked()).then((u) => (un = u));
+    return () => un?.();
+  });
+
+  // Backend push: owned effects changed (grant/revoke/refund) → reconcile so
+  // installs + the load-time gate track the server (spec §6).
+  $effect(() => {
+    let un: (() => void) | null = null;
+    void listen('account://entitlements-changed', () => reconcileEffects()).then((u) => (un = u));
     return () => un?.();
   });
 

@@ -12,7 +12,11 @@
     loadDevices,
     removeDevice,
     setPassword,
-    saveBaseUrl
+    saveBaseUrl,
+    loadEffects,
+    installEffect,
+    uninstallEffect,
+    setAutoInstall
   } from '$lib/account.svelte';
   import type { DeviceInfo } from '$lib/ipc';
 
@@ -36,6 +40,12 @@
   $effect(() => {
     if (account.open && account.tab === 'devices' && account.signedIn && !account.devicesLoaded) {
       void loadDevices();
+    }
+  });
+  // Load owned effects when the My Effects tab is shown while signed in.
+  $effect(() => {
+    if (account.open && account.tab === 'effects' && account.signedIn && !account.effectsLoaded) {
+      void loadEffects();
     }
   });
   $effect(() => {
@@ -101,6 +111,9 @@
         <button class:active={account.tab === 'account'} onclick={() => (account.tab = 'account')}>
           Account
         </button>
+        <button class:active={account.tab === 'effects'} onclick={() => (account.tab = 'effects')}>
+          My Effects
+        </button>
         <button class:active={account.tab === 'devices'} onclick={() => (account.tab = 'devices')}>
           Devices
         </button>
@@ -162,6 +175,54 @@
           <button class="primary" disabled={account.busy || !newPassword} onclick={submitPassword}>
             {account.user?.password_set ? 'Change password' : 'Set password'}
           </button>
+        {/if}
+
+      <!-- MY EFFECTS -->
+      {:else if account.tab === 'effects'}
+        {#if !account.signedIn}
+          <div class="muted">Sign in to see the effects you own.</div>
+        {:else}
+          <label class="toggle">
+            <input
+              type="checkbox"
+              checked={account.autoInstall}
+              onchange={(e) => setAutoInstall(e.currentTarget.checked)}
+            />
+            <span>Automatically install effects I own on this device</span>
+          </label>
+          {#if !account.effectsLoaded}
+            <div class="muted">Loading…</div>
+          {:else if account.effects.length === 0}
+            <div class="muted small">You don’t own any add-on effects yet.</div>
+          {:else}
+            <ul class="devs">
+              {#each account.effects as fx (fx.sku)}
+                <li>
+                  <div class="min0">
+                    <div class="dname">{fx.display_name ?? fx.sku}</div>
+                    <div class="muted small">{fx.sku}</div>
+                  </div>
+                  {#if fx.installed}
+                    <button
+                      class="ghost"
+                      disabled={account.busy}
+                      onclick={() => uninstallEffect(fx.sku, fx.display_name ?? fx.sku)}
+                    >
+                      Remove
+                    </button>
+                  {:else}
+                    <button
+                      class="primary"
+                      disabled={account.busy}
+                      onclick={() => installEffect(fx.sku, fx.display_name ?? fx.sku)}
+                    >
+                      Install
+                    </button>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+          {/if}
         {/if}
 
       <!-- DEVICES -->
@@ -426,6 +487,17 @@
   }
   .ghost.tiny {
     padding: 4px 8px;
+  }
+  .toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12.5px;
+    margin-bottom: 12px;
+    cursor: pointer;
+  }
+  .toggle input {
+    accent-color: var(--accent, #4c9dff);
   }
   .devs {
     list-style: none;

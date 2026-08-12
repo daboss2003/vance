@@ -26,6 +26,24 @@ desktop client points at during development.
 cargo test        # 3 unit + 4 end-to-end tests
 ```
 
+## Testing the marketplace pipeline (M2) locally
+
+There's no catalog (M3) or payments (M4) yet, so a helper publishes a `.wasm` as a
+paid effect and grants it to the dev user (the same user the app's "Local dev
+sign-in" uses):
+
+```bash
+# with the server running, and a built effect .wasm:
+./scripts/dev-effects.sh publish path/to/effect.wasm com.you.glow "Glow"
+./scripts/dev-effects.sh list
+./scripts/dev-effects.sh revoke com.you.glow
+```
+
+Then in the app: Settings → **My Effects** → Install. The effect appears under
+Add-on effects and applies to clips. `revoke` uninstalls it and the load-time gate
+refuses to run it. **The effect's manifest `id` must equal the `<sku>`** (that's
+how the gate maps them; the real catalog enforces this at publish).
+
 ## What's implemented (M1)
 
 - **Sign-in** — loopback-PKCE handshake: `GET /auth/start` → provider →

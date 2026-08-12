@@ -705,6 +705,10 @@ export interface AppSettings {
   crash_reports_opt_in: boolean;
   telemetry_opt_in: boolean;
   ai_provider: string | null;
+  /** M1 — accounts service base URL (optional; defaults to the local dev server). */
+  accounts_base_url?: string | null;
+  /** M2 — auto-install owned effects in the background on this device. */
+  auto_install_purchases?: boolean;
 }
 
 /** Load app settings. */
@@ -2023,3 +2027,27 @@ export const accountSetPassword = (password: string, stepupToken?: string | null
 export const accountBaseUrl = (): Promise<string> => invoke('account_base_url');
 export const accountSetBaseUrl = (url: string): Promise<void> =>
   invoke('account_set_base_url', { url });
+
+// --- Entitlements / My Effects (M2) ----------------------------------------
+
+export type OwnedEffect = {
+  sku: string;
+  display_name: string | null;
+  installed: boolean;
+};
+
+/** Owned effects with local install status, for "My Effects". */
+export const entitlementsList = (): Promise<{ effects: OwnedEffect[] }> =>
+  invoke('entitlements_list');
+/** Download + install an owned effect on this device. */
+export const entitlementInstall = (sku: string): Promise<void> =>
+  invoke('entitlement_install', { sku });
+/** Remove an installed effect from this device. */
+export const entitlementUninstall = (sku: string): Promise<void> =>
+  invoke('entitlement_uninstall', { sku });
+/** Reconcile with the server: (auto-)install owned, uninstall revoked, refresh the gate. */
+export const entitlementsReconcile = (): Promise<{
+  installed: string[];
+  uninstalled: string[];
+  owned: string[];
+}> => invoke('entitlements_reconcile');
