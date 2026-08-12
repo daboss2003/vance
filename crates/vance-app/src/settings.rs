@@ -30,9 +30,13 @@ pub struct AppSettings {
     pub telemetry_opt_in: bool,
     /// Forward-looking: the AI assistant provider the user chose in the
     /// wizard (e.g. "anthropic", "ollama"), if any. The key itself is NOT
-    /// stored here — it belongs in the OS keychain (a later milestone).
+    /// stored here — it belongs in the OS keychain (see `accounts.rs`).
     #[serde(default)]
     pub ai_provider: Option<String>,
+    /// Base URL of the Vance accounts service (M1). Defaults to the local dev
+    /// server; overridable so a build can point at a hosted deployment.
+    #[serde(default)]
+    pub accounts_base_url: Option<String>,
 }
 
 /// The `…/Vance` config base directory (created if missing).
@@ -103,6 +107,7 @@ mod tests {
             crash_reports_opt_in: true,
             telemetry_opt_in: false,
             ai_provider: Some("ollama".into()),
+            accounts_base_url: Some("http://127.0.0.1:8787".into()),
         };
         let j = serde_json::to_string(&s).unwrap();
         let back: AppSettings = serde_json::from_str(&j).unwrap();

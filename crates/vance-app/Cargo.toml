@@ -87,6 +87,13 @@ vance-project = { workspace = true }
 vance-peaks = { workspace = true }
 uuid = { workspace = true }
 arc-swap = "1"
+# M1 — accounts client: OS keychain for tokens (spec §4.3), with an
+# app-managed AES-256-GCM file fallback when no keychain is present (Linux
+# headless / minimal — closes the flagged gap), and OS randomness for PKCE.
+keyring = "3"
+aes-gcm = "0.10"
+rand = "0.8"
+tokio = { workspace = true } # spawn_blocking for accounts network calls
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

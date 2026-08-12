@@ -9,6 +9,7 @@
     windows_subsystem = "windows"
 )]
 
+mod accounts;
 mod audio_bounce;
 mod cached_decode;
 mod capabilities;
@@ -4189,6 +4190,7 @@ fn main() {
         .manage(peaks_handle.clone())
         .manage(control_hub.clone())
         .manage(publish_hub.clone())
+        .manage(accounts::new_state())
         .setup(move |app| {
             let window = app
                 .get_webview_window("main")
@@ -4442,6 +4444,15 @@ fn main() {
             peaks_use_untitled_cache_dir,
             peaks_service_status,
             peaks_backfill_video_audio,
+            accounts::account_status,
+            accounts::account_sign_in,
+            accounts::account_sign_out,
+            accounts::account_list_devices,
+            accounts::account_stepup,
+            accounts::account_revoke_device,
+            accounts::account_set_password,
+            accounts::account_base_url,
+            accounts::account_set_base_url,
         ])
         .build(tauri::generate_context!())
         .expect("tauri failed to start")
