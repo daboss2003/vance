@@ -116,6 +116,88 @@ pub fn verify_download(vk: &VerifyingKey, token: &str) -> Option<DownloadClaims>
     serde_json::from_slice(&verify_payload(vk, token)?).ok()
 }
 
+// ---------------------------------------------------------------------------
+// M4 — paid-effect encryption (spec §7).
+// ---------------------------------------------------------------------------
+
+/// A device-sealed content key (ECIES): the client unseals it with its X25519
+/// private key. All fields base64url.
+#[derive(Serialize, Debug, Clone)]
+pub struct SealedCek {
+    pub eph_pub: String,
+    pub nonce: String,
+    pub ct: String,
+}
+
+/// The lease bound into an activation (spec §7.2 step 3): signed with the same
+/// Ed25519 key the client already trusts, so it verifies offline.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LeaseClaims {
+    pub sku: String,
+    pub device_id: String,
+    pub exp: i64,
+    pub plaintext_sha256: String,
+    pub buyer_id: String, // watermark: identifies the buyer a leak came from
+}
+
+pub fn sign_lease(key: &SigningKey, claims: &LeaseClaims) -> String {
+    sign_payload(key, &serde_json::to_vec(claims).expect("lease serialize"))
+}
+
+fn aead(key: &[u8; 32]) -> aes_gcm::Aes256Gcm {
+    use aes_gcm::{aead::KeyInit, Aes256Gcm, Key};
+    Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key))
+}
+
+/// Encrypt an effect's plaintext `.wasm` with a fresh CEK (AES-256-GCM, nonce
+/// prefixed). Returns `(cek, nonce||ciphertext)`.
+pub fn encrypt_effect(plaintext: &[u8]) -> ([u8; 32], Vec<u8>) {
+    use aes_gcm::{aead::Aead, Nonce};
+    use rand::RngCore;
+    let mut cek = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut cek);
+    let mut nonce = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let ct = aead(&cek)
+        .encrypt(Nonce::from_slice(&nonce), plaintext)
+        .expect("aead encrypt");
+    let mut out = Vec::with_capacity(12 + ct.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    (cek, out)
+}
+
+/// The KDF over an X25519 shared secret → 32-byte AES key.
+fn seal_kdf(shared: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"vance-cek-seal-v1");
+    h.update(shared);
+    h.finalize().into()
+}
+
+/// Seal a CEK to a device's X25519 public key (ephemeral-static ECIES).
+pub fn seal_cek(device_pub_b64: &str, cek: &[u8; 32]) -> Option<SealedCek> {
+    use aes_gcm::{aead::Aead, Nonce};
+    use rand::RngCore;
+    use x25519_dalek::{EphemeralSecret, PublicKey};
+
+    let dev_bytes: [u8; 32] = B64.decode(device_pub_b64).ok()?.try_into().ok()?;
+    let dev_pub = PublicKey::from(dev_bytes);
+    let eph = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
+    let eph_pub = PublicKey::from(&eph);
+    let key = seal_kdf(eph.diffie_hellman(&dev_pub).as_bytes());
+    let mut nonce = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let ct = aead(&key)
+        .encrypt(Nonce::from_slice(&nonce), cek.as_ref())
+        .ok()?;
+    Some(SealedCek {
+        eph_pub: B64.encode(eph_pub.as_bytes()),
+        nonce: B64.encode(nonce),
+        ct: B64.encode(ct),
+    })
+}
+
 pub fn public_key_b64(vk: &VerifyingKey) -> String {
     B64.encode(vk.to_bytes())
 }
@@ -128,6 +210,14 @@ pub fn sha256_b64(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
     B64.encode(h.finalize())
+}
+
+pub fn b64(bytes: &[u8]) -> String {
+    B64.encode(bytes)
+}
+
+pub fn unb64_32(s: &str) -> Option<[u8; 32]> {
+    B64.decode(s).ok()?.try_into().ok()
 }
 
 pub fn hash_token(token: &str) -> String {

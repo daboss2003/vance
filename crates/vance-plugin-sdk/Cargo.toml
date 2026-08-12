@@ -15,12 +15,13 @@ publish = false
 default = []
 # `host` pulls in the wasmtime runtime + frame-processing host. Enabled
 # by vance-app / vance-effects.
-host = ["dep:wasmtime", "dep:anyhow"]
+host = ["dep:wasmtime", "dep:anyhow", "dep:serde_json"]
 # `guest` provides the export-glue helpers a plugin author uses.
 guest = []
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true, optional = true } # `.vef` container header (host-only)
 ron = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

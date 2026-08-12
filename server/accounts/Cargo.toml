@@ -39,6 +39,8 @@ argon2 = "0.5"                                              # password hashing (
 rand = "0.8"                                                # tokens, PKCE state, keypair seed
 sha2 = "0.10"                                               # refresh-token hashing (store only the hash)
 base64 = "0.22"
+aes-gcm = "0.10"                                            # M4 — encrypt effect artifacts + seal CEKs
+x25519-dalek = { version = "2", features = ["static_secrets"] } # M4 — seal the CEK to a device pubkey (ECIES)
 
 # Serde / misc
 serde = { version = "1", features = ["derive"] }

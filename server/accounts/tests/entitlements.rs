@@ -119,17 +119,27 @@ async fn full_entitlement_and_install_flow() {
     let ents = body_json(get(&app, "/v1/entitlements", Some(&access)).await).await;
     assert_eq!(ents["entitlements"].as_array().unwrap().len(), 1);
 
-    // Artifact endpoint issues a signed URL with the matching pin.
-    let art = body_json(post(&app, "/v1/artifacts/com.test.glow", Some(&access), serde_json::json!({})).await).await;
+    // Artifact endpoint issues a signed URL with the matching pin. Paid effects
+    // are encrypted, so activation needs a device key (any 32 bytes is a valid
+    // X25519 pubkey) and returns a sealed CEK + lease.
+    let dev_pub = B64.encode([7u8; 32]);
+    let art = body_json(
+        post(&app, "/v1/artifacts/com.test.glow", Some(&access), serde_json::json!({ "device_pubkey": dev_pub })).await,
+    )
+    .await;
     assert_eq!(art["sha256"], published_sha);
     assert_eq!(art["dest"], "glow.wasm");
+    assert_eq!(art["encrypted"], true);
+    assert!(art["sealed_cek"].is_object() && art["lease"].is_string());
     let url = art["download_url"].as_str().unwrap();
     let path = format!("/download/{}", url.split("/download/").nth(1).unwrap());
 
-    // The signed URL downloads the exact bytes (no bearer needed).
+    // The signed URL downloads the CIPHERTEXT; its sha256 matches the pin.
     let dl = get(&app, &path, None).await;
     assert_eq!(dl.status(), StatusCode::OK);
-    assert_eq!(body_bytes(dl).await, bytes);
+    let ct = body_bytes(dl).await;
+    assert_eq!(B64.encode(Sha256::digest(&ct)), published_sha);
+    assert_ne!(ct, bytes, "on-disk artifact is ciphertext, not the plaintext");
 
     // Revoke removes it from the token and forbids the artifact.
     let rev = post(&app, "/v1/dev/revoke", Some(&access), serde_json::json!({ "sku": "com.test.glow" })).await;
@@ -152,13 +162,14 @@ async fn device_cap_auto_drops_oldest() {
     publish(&app, &access_a, "com.test.fx", &wasm).await; // entitles the (shared) user
 
     // Install on A, then B → both active (cap = 2).
-    post(&app, "/v1/artifacts/com.test.fx", Some(&access_a), serde_json::json!({})).await;
-    post(&app, "/v1/artifacts/com.test.fx", Some(&access_b), serde_json::json!({})).await;
+    let dev_pub = serde_json::json!({ "device_pubkey": B64.encode([7u8; 32]) });
+    post(&app, "/v1/artifacts/com.test.fx", Some(&access_a), dev_pub.clone()).await;
+    post(&app, "/v1/artifacts/com.test.fx", Some(&access_b), dev_pub.clone()).await;
     let active = body_json(get(&app, "/v1/dev/installs/com.test.fx", Some(&access_a)).await).await;
     assert_eq!(active["active"].as_array().unwrap().len(), 2);
 
     // Install on C → cap exceeded, oldest (A) auto-dropped.
-    post(&app, "/v1/artifacts/com.test.fx", Some(&access_c), serde_json::json!({})).await;
+    post(&app, "/v1/artifacts/com.test.fx", Some(&access_c), dev_pub.clone()).await;
     let active = body_json(get(&app, "/v1/dev/installs/com.test.fx", Some(&access_c)).await).await;
     let ids: Vec<String> = active["active"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
     assert_eq!(ids.len(), 2, "cap holds at 2");

@@ -79,6 +79,9 @@ pub async fn token(State(st): State<AppState>, user: AuthUser) -> AppResult<Json
 pub struct ArtifactParams {
     #[allow(dead_code)]
     platform: Option<String>,
+    /// The device's X25519 public key (base64url) — required to seal an
+    /// encrypted (paid) effect's content key to this machine (spec §7).
+    device_pubkey: Option<String>,
 }
 
 pub async fn artifact(
@@ -87,9 +90,10 @@ pub async fn artifact(
     Path(sku): Path<String>,
     body: Option<Json<ArtifactParams>>,
 ) -> AppResult<Json<Value>> {
-    let _ = body; // platform is currently 'any' (wasm is universal)
+    let device_pubkey = body.and_then(|Json(b)| b.device_pubkey);
     let row = sqlx::query(
-        "SELECT version, platform, sha256, dest, requires_entitlement FROM plugin_artifacts WHERE sku=?",
+        "SELECT version, platform, sha256, dest, requires_entitlement, encrypted, cek, plaintext_sha256
+         FROM plugin_artifacts WHERE sku=?",
     )
     .bind(&sku)
     .fetch_optional(&st.pool)
@@ -97,6 +101,7 @@ pub async fn artifact(
     .ok_or_else(|| AppError::NotFound("no artifact for that effect".into()))?;
 
     let requires: bool = row.get::<i64, _>("requires_entitlement") != 0;
+    let encrypted: bool = row.get::<i64, _>("encrypted") != 0;
     let version: String = row.get("version");
     let platform: String = row.get("platform");
     let sha256: String = row.get("sha256");
@@ -106,6 +111,9 @@ pub async fn artifact(
         if !is_entitled(&st, &user.claims.sub, &sku).await? {
             return Err(AppError::Forbidden("you don't own this effect".into()));
         }
+        // Records this device + enforces the 2-device cap (auto-drop-oldest). For
+        // encrypted effects this is the HARD boundary: a dropped device stops
+        // getting a fresh sealed CEK, so its lease lapses after the grace window.
         record_install_and_enforce_cap(&st, &user, &sku, &version).await?;
     }
 
@@ -115,13 +123,41 @@ pub async fn artifact(
         exp: now() + DOWNLOAD_TTL_SECS,
     };
     let token = crypto::sign_download(&st.signing, &dl);
-    let url = format!("{}/download/{}", st.config.public_url, token);
-    Ok(Json(json!({
-        "download_url": url,
+    let mut resp = json!({
+        "download_url": format!("{}/download/{}", st.config.public_url, token),
         "sha256": sha256,
         "dest": dest,
         "version": version,
-    })))
+        "encrypted": encrypted,
+    });
+
+    if encrypted {
+        let device_pubkey = device_pubkey
+            .ok_or_else(|| AppError::BadRequest("device_pubkey required for a paid effect".into()))?;
+        let cek_b64 = row
+            .get::<Option<String>, _>("cek")
+            .ok_or_else(|| AppError::Internal("artifact missing cek".into()))?;
+        let cek = crypto::unb64_32(&cek_b64).ok_or_else(|| AppError::Internal("bad cek".into()))?;
+        let plaintext_sha256 = row
+            .get::<Option<String>, _>("plaintext_sha256")
+            .unwrap_or_default();
+        let sealed = crypto::seal_cek(&device_pubkey, &cek)
+            .ok_or_else(|| AppError::BadRequest("invalid device_pubkey".into()))?;
+        let lease = crypto::sign_lease(
+            &st.signing,
+            &crypto::LeaseClaims {
+                sku: sku.clone(),
+                device_id: user.claims.did.clone(),
+                exp: now() + ENTITLEMENT_GRACE_SECS,
+                plaintext_sha256,
+                buyer_id: user.claims.sub.clone(),
+            },
+        );
+        let obj = resp.as_object_mut().unwrap();
+        obj.insert("sealed_cek".into(), serde_json::to_value(sealed).unwrap());
+        obj.insert("lease".into(), json!(lease));
+    }
+    Ok(Json(resp))
 }
 
 // ---------------------------------------------------------------------------
@@ -161,7 +197,6 @@ pub struct PublishParams {
     file_path: String,
     dest: String,
     display_name: Option<String>,
-    requires_entitlement: Option<bool>,
 }
 
 pub async fn dev_publish(
@@ -170,25 +205,37 @@ pub async fn dev_publish(
     Json(p): Json<PublishParams>,
 ) -> AppResult<Json<Value>> {
     dev_only(&st)?;
-    let bytes = tokio::fs::read(&p.file_path)
+    let plaintext = tokio::fs::read(&p.file_path)
         .await
         .map_err(|e| AppError::BadRequest(format!("can't read {}: {e}", p.file_path)))?;
-    let sha = crypto::sha256_b64(&bytes);
-    let requires = p.requires_entitlement.unwrap_or(true);
+
+    // Paid effects are encrypted at rest (spec §7): store the CIPHERTEXT; the pin
+    // (sha256) is over the ciphertext; the CEK + plaintext hash are held to seal
+    // per-device at activation.
+    let plaintext_sha = crypto::sha256_b64(&plaintext);
+    let (cek, ciphertext) = crypto::encrypt_effect(&plaintext);
+    let ct_path = format!("{}.enc", p.file_path);
+    tokio::fs::write(&ct_path, &ciphertext)
+        .await
+        .map_err(|e| AppError::Internal(format!("write ciphertext: {e}")))?;
+    let pin = crypto::sha256_b64(&ciphertext);
 
     sqlx::query(
-        "INSERT INTO plugin_artifacts (sku, version, platform, object_key, sha256, dest, requires_entitlement, display_name)
-         VALUES (?, '1', 'any', ?, ?, ?, ?, ?)
+        "INSERT INTO plugin_artifacts
+            (sku, version, platform, object_key, sha256, dest, requires_entitlement, display_name, encrypted, cek, plaintext_sha256)
+         VALUES (?, '1', 'any', ?, ?, ?, 1, ?, 1, ?, ?)
          ON CONFLICT(sku) DO UPDATE SET
             object_key=excluded.object_key, sha256=excluded.sha256, dest=excluded.dest,
-            requires_entitlement=excluded.requires_entitlement, display_name=excluded.display_name",
+            requires_entitlement=1, display_name=excluded.display_name,
+            encrypted=1, cek=excluded.cek, plaintext_sha256=excluded.plaintext_sha256",
     )
     .bind(&p.sku)
-    .bind(&p.file_path)
-    .bind(&sha)
+    .bind(&ct_path)
+    .bind(&pin)
     .bind(&p.dest)
-    .bind(requires as i64)
     .bind(&p.display_name)
+    .bind(crypto::b64(&cek))
+    .bind(&plaintext_sha)
     .execute(&st.pool)
     .await?;
 
@@ -212,7 +259,7 @@ pub async fn dev_publish(
         kind: "entitlement.changed".into(),
         data: json!({ "sku": p.sku, "state": "active", "ent_ver": ent_ver }),
     });
-    Ok(Json(json!({ "sku": p.sku, "sha256": sha, "ent_ver": ent_ver })))
+    Ok(Json(json!({ "sku": p.sku, "sha256": pin, "encrypted": true, "ent_ver": ent_ver })))
 }
 
 #[derive(Deserialize)]

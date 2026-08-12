@@ -21,10 +21,14 @@ use std::path::{Path, PathBuf};
 /// One discovered plugin: where it lives + its manifest.
 #[derive(Clone, Debug)]
 pub struct DiscoveredPlugin {
-    /// Absolute path to the `.wasm` file.
+    /// Absolute path to the `.wasm` (plaintext) or `.vef` (encrypted) file.
     pub path: PathBuf,
-    /// Parsed + validated manifest.
+    /// Parsed + validated manifest. For a `.vef`, read from its plaintext header
+    /// without decrypting the body.
     pub manifest: PluginManifest,
+    /// True for a `.vef` paid effect: the body is encrypted and the host must
+    /// decrypt it (via the entitlement gate) at load. False for a plain `.wasm`.
+    pub encrypted: bool,
 }
 
 /// Registry of discovered plugins, de-duplicated by manifest id.
@@ -65,12 +69,30 @@ impl PluginRegistry {
         let mut paths: Vec<PathBuf> = entries
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("wasm"))
+            .filter(|p| {
+                matches!(
+                    p.extension().and_then(|e| e.to_str()),
+                    Some("wasm") | Some(crate::container::VEF_EXTENSION)
+                )
+            })
             .collect();
         paths.sort();
         for path in paths {
-            match load_manifest(&path) {
-                Ok(manifest) => self.add(DiscoveredPlugin { path, manifest }),
+            let encrypted =
+                path.extension().and_then(|e| e.to_str()) == Some(crate::container::VEF_EXTENSION);
+            let loaded = if encrypted {
+                std::fs::read(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|b| crate::container::parse_manifest(&b).map_err(|e| e.to_string()))
+            } else {
+                load_manifest(&path).map_err(|e| e.to_string())
+            };
+            match loaded {
+                Ok(manifest) => self.add(DiscoveredPlugin {
+                    path,
+                    manifest,
+                    encrypted,
+                }),
                 Err(e) => {
                     tracing::warn!(?path, error = %e, "skipping unloadable plugin");
                 }
