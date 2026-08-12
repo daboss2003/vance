@@ -2345,6 +2345,7 @@ dependencies = [
  "axum",
  "base64",
  "ed25519-dalek",
+ "hmac",
  "rand 0.8.7",
  "reqwest",
  "serde",

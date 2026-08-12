@@ -31,6 +31,8 @@ async fn mk_app() -> (Router, tempfile::TempDir) {
         google: None,
         apple: None,
         meta: None,
+        stripe_secret: None,
+        stripe_webhook_secret: None,
     };
     let state = init_state(cfg).await.unwrap();
     (build_router(state), dir)

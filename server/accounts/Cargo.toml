@@ -41,6 +41,7 @@ sha2 = "0.10"                                               # refresh-token hash
 base64 = "0.22"
 aes-gcm = "0.10"                                            # M4 — encrypt effect artifacts + seal CEKs
 x25519-dalek = { version = "2", features = ["static_secrets"] } # M4 — seal the CEK to a device pubkey (ECIES)
+hmac = "0.12"                                               # M4 — verify Stripe webhook signatures
 
 # Serde / misc
 serde = { version = "1", features = ["derive"] }

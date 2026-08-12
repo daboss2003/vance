@@ -14,6 +14,7 @@ pub mod r_catalog;
 pub mod r_devices;
 pub mod r_entitlements;
 pub mod r_events;
+pub mod r_payments;
 pub mod state;
 pub mod util;
 
@@ -73,5 +74,9 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/v1/catalog/:sku/artifact", post(r_catalog::free_artifact))
         .route("/v1/dev/catalog-publish", post(r_catalog::dev_catalog_publish))
+        .route("/webhooks/stripe", post(r_payments::webhook))
+        .route("/v1/checkout", post(r_payments::checkout))
+        .route("/v1/connect/onboard", post(r_payments::connect_onboard))
+        .route("/v1/connect/status", get(r_payments::connect_status))
         .with_state(state)
 }

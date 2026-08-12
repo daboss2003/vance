@@ -36,6 +36,11 @@ pub struct Config {
     pub google: Option<ProviderCreds>,
     pub apple: Option<ProviderCreds>,
     pub meta: Option<ProviderCreds>,
+    /// M4 — Stripe (test or live) secret key + webhook signing secret. When
+    /// unset, the payment endpoints report "not configured" rather than failing
+    /// obscurely (the go-live gate: your Stripe account + keys).
+    pub stripe_secret: Option<String>,
+    pub stripe_webhook_secret: Option<String>,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -60,6 +65,12 @@ impl Config {
             google: ProviderCreds::from_env("GOOGLE"),
             apple: ProviderCreds::from_env("APPLE"),
             meta: ProviderCreds::from_env("META"),
+            stripe_secret: std::env::var("VANCE_STRIPE_SECRET_KEY")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            stripe_webhook_secret: std::env::var("VANCE_STRIPE_WEBHOOK_SECRET")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
         }
     }
 }
