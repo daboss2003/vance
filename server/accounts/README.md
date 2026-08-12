@@ -53,14 +53,30 @@ for dev; the SQL is portable toward the Postgres prod target (spec §12).
 
 ## Real OAuth providers  ⟵ externally gated (you provide credentials)
 
-A provider is active only when its client id + secret are set. **GitHub** and
-**Google** exchanges are implemented; **Apple** and **Meta** are plumbed but their
-token exchange is wired in **M1e** (Apple's client secret is itself a signed JWT).
+All four exchanges are implemented (**GitHub, Google, Meta, Apple**). A provider is
+active only when its client id + secret are set; until then it returns a clear
+"not configured" error rather than a fake login. For every provider, register the
+redirect URI **`{VANCE_ACCOUNTS_PUBLIC_URL}/auth/callback?provider=<name>`** (in
+dev: `http://127.0.0.1:8787/auth/callback?provider=github`, etc.).
 
-To enable one, create the developer app with the redirect URI
-`{VANCE_ACCOUNTS_PUBLIC_URL}/auth/callback?provider=<name>` and set the env vars
-(see `.env.example`). Until you do, that provider returns a clear
-"not configured" error rather than a fake login.
+| Provider | Where to create the app | Set |
+|---|---|---|
+| **GitHub** | Settings → Developer settings → OAuth Apps → New | `VANCE_GITHUB_CLIENT_ID`, `VANCE_GITHUB_CLIENT_SECRET` |
+| **Google** | Cloud Console → APIs & Services → Credentials → OAuth client ID → **Web application** | `VANCE_GOOGLE_CLIENT_ID`, `VANCE_GOOGLE_CLIENT_SECRET` |
+| **Meta** | developers.facebook.com → Create App → **Facebook Login** → add Valid OAuth Redirect URI | `VANCE_META_CLIENT_ID`, `VANCE_META_CLIENT_SECRET` |
+| **Apple** | developer.apple.com → Certificates, IDs & Profiles → Identifiers → **Services ID** (+ a Sign-in key `.p8`) | `VANCE_APPLE_CLIENT_ID` (the Services ID), `VANCE_APPLE_CLIENT_SECRET` |
+
+**Apple caveat (honest):** Apple's "client secret" is itself an **ES256-signed JWT**
+you generate from your Sign-in key `.p8` (with your Team ID + Key ID), valid **≤6
+months**. Generate it out-of-band and put the whole JWT in
+`VANCE_APPLE_CLIENT_SECRET`; **it must be regenerated before it expires**.
+Auto-minting the secret from the `.p8` in-process is a planned enhancement. Also
+note Apple usually returns a **private-relay email** and sends the email only on
+first consent — the account is keyed on the stable `sub`, never the email (§4.1).
+
+**Hardening TODO:** Google/Apple `id_token` signatures are currently trusted
+because they arrive over TLS directly from the provider's token endpoint;
+verifying them against the provider JWKS is a planned defense-in-depth step.
 
 ## Not yet (later milestones)
 

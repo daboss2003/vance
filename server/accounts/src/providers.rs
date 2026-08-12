@@ -104,13 +104,8 @@ pub async fn exchange(provider: Provider, cfg: &Config, code: &str) -> AppResult
     match provider {
         Provider::Github => github_exchange(creds, code, &redirect).await,
         Provider::Google => google_exchange(creds, code, &redirect).await,
-        // Meta and Apple credentials plumb through, but their exchange is wired
-        // in M1e (Apple's client secret is itself a signed JWT). Fail loudly
-        // rather than silently — never fake a login.
-        Provider::Meta | Provider::Apple => Err(AppError::Internal(format!(
-            "{} sign-in exchange is not wired yet (M1e)",
-            provider.as_str()
-        ))),
+        Provider::Meta => meta_exchange(creds, code, &redirect).await,
+        Provider::Apple => apple_exchange(creds, code, &redirect).await,
         Provider::Dev => Err(AppError::BadRequest("dev is handled inline".into())),
     }
 }
@@ -188,9 +183,14 @@ async fn google_exchange(
         .get("id_token")
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::BadRequest("google returned no id_token".into()))?;
-    // The id_token came directly from Google's token endpoint over TLS, so we
-    // read its claims. Verifying the JWT signature against Google's JWKS is a
-    // hardening follow-up (defense-in-depth), noted here deliberately.
+    id_token_identity(id_token)
+}
+
+/// Read `(sub, email)` from an OIDC `id_token`. The token arrives directly from
+/// the provider's token endpoint over TLS in a server-to-server call, so we read
+/// its claims; verifying the JWT signature against the provider's JWKS is a
+/// deliberate hardening follow-up (defense-in-depth). Shared by Google + Apple.
+fn id_token_identity(id_token: &str) -> AppResult<ProviderIdentity> {
     let payload = id_token
         .split('.')
         .nth(1)
@@ -210,4 +210,79 @@ async fn google_exchange(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     Ok(ProviderIdentity { subject, email })
+}
+
+async fn meta_exchange(
+    creds: &ProviderCreds,
+    code: &str,
+    redirect: &str,
+) -> AppResult<ProviderIdentity> {
+    let client = reqwest::Client::new();
+    let token: serde_json::Value = client
+        .get("https://graph.facebook.com/v19.0/oauth/access_token")
+        .query(&[
+            ("client_id", creds.client_id.as_str()),
+            ("redirect_uri", redirect),
+            ("client_secret", creds.client_secret.as_str()),
+            ("code", code),
+        ])
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("meta token: {e}")))?
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("meta token json: {e}")))?;
+    let access = token
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::BadRequest("meta returned no access_token".into()))?;
+
+    let me: serde_json::Value = client
+        .get("https://graph.facebook.com/me")
+        .query(&[("fields", "id,email"), ("access_token", access)])
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("meta me: {e}")))?
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("meta me json: {e}")))?;
+    let subject = me
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::BadRequest("meta profile had no id".into()))?
+        .to_string();
+    let email = me.get("email").and_then(|v| v.as_str()).map(str::to_string);
+    Ok(ProviderIdentity { subject, email })
+}
+
+async fn apple_exchange(
+    creds: &ProviderCreds,
+    code: &str,
+    redirect: &str,
+) -> AppResult<ProviderIdentity> {
+    // Apple's "client secret" is itself an ES256-signed JWT the operator
+    // generates from their .p8 key (valid ≤6 months) — supplied whole via
+    // VANCE_APPLE_CLIENT_SECRET. Auto-minting it from the .p8 is a later
+    // enhancement; see the README.
+    let client = reqwest::Client::new();
+    let token: serde_json::Value = client
+        .post("https://appleid.apple.com/auth/token")
+        .form(&[
+            ("client_id", creds.client_id.as_str()),
+            ("client_secret", creds.client_secret.as_str()),
+            ("code", code),
+            ("grant_type", "authorization_code"),
+            ("redirect_uri", redirect),
+        ])
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("apple token: {e}")))?
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("apple token json: {e}")))?;
+    let id_token = token
+        .get("id_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::BadRequest("apple returned no id_token".into()))?;
+    id_token_identity(id_token)
 }
