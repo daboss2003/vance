@@ -2051,3 +2051,47 @@ export const entitlementsReconcile = (): Promise<{
   uninstalled: string[];
   owned: string[];
 }> => invoke('entitlements_reconcile');
+
+// --- Catalog / Browse (M3) -------------------------------------------------
+
+export type CatalogCard = {
+  sku: string;
+  publisher: string;
+  display_name: string;
+  description: string | null;
+  kind: string;
+  categories: string[];
+  tags: string[];
+  price_cents: number;
+  icon: string | null;
+  downloads: number;
+  rating: number | null;
+  ratings_count: number;
+};
+
+export type CatalogDetail = CatalogCard & {
+  capabilities: string[];
+  installable: boolean;
+  version?: string;
+};
+
+export type CatalogReview = { stars: number; body: string | null; created_at: number };
+
+export const catalogBrowse = (args: {
+  q?: string;
+  category?: string;
+  sort?: string;
+  page?: number;
+}): Promise<{ effects: CatalogCard[]; page: number; has_more: boolean }> =>
+  invoke('catalog_browse', args);
+export const catalogDetail = (sku: string): Promise<CatalogDetail> =>
+  invoke('catalog_detail', { sku });
+export const catalogReviews = (
+  sku: string
+): Promise<{ reviews: CatalogReview[]; rating: number | null; count: number }> =>
+  invoke('catalog_reviews', { sku });
+/** Install a free catalog effect on this device. */
+export const catalogInstall = (sku: string): Promise<void> => invoke('catalog_install', { sku });
+/** Post/update a 1–5 star review (must own or have installed the effect). */
+export const catalogReview = (sku: string, stars: number, body?: string): Promise<void> =>
+  invoke('catalog_review', { sku, stars, body: body ?? null });

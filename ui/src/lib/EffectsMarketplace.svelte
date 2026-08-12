@@ -1,22 +1,41 @@
 <script lang="ts">
   /**
-   * Add-on effects marketplace / manager. A modal with:
-   *  - an Import area (drag a .wasm in, or Select a file) — the drop is a
-   *    window-level Tauri drop routed here while this modal is open,
-   *  - the list of installed effects with a Remove action,
-   *  - guidance on getting / creating effects.
-   *
-   * A hosted "browse" catalog is a future step (needs a catalog server); the
-   * Import flow works today.
+   * Add-on effects marketplace. Two tabs:
+   *  - Browse (M3): search the hosted catalog, open an effect, install free ones
+   *    (with a capability-consent prompt), and read/leave reviews.
+   *  - Installed: the current library + Import (drag a .wasm in, or Select a file)
+   *    and a Remove action.
    */
   import { market, closeMarket, importEffectPaths, uninstallEffect } from '$lib/effectsMarket.svelte';
+  import {
+    catalog,
+    browse,
+    loadMore,
+    openDetail,
+    closeDetail,
+    install,
+    submitReview,
+    CATEGORIES
+  } from '$lib/catalog.svelte';
   import { pluginsFolder } from '$lib/ipc';
   import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 
+  let tab = $state<'browse' | 'installed'>('browse');
   let folder = $state('');
+  let reviewStars = $state(5);
+  let reviewBody = $state('');
+
   $effect(() => {
     if (market.open && !folder) void pluginsFolder().then((f) => (folder = f)).catch(() => {});
   });
+  // Load the catalog the first time Browse is shown.
+  $effect(() => {
+    if (market.open && tab === 'browse' && !catalog.loaded && !catalog.loading) void browse();
+  });
+
+  function installedLocally(sku: string): boolean {
+    return market.installed.some((p) => p.id === sku);
+  }
 
   async function selectFile() {
     const picked = await openFileDialog({
@@ -25,6 +44,11 @@
     });
     if (!picked) return;
     await importEffectPaths(Array.isArray(picked) ? picked : [picked]);
+  }
+
+  function ratingLabel(rating: number | null, count: number): string {
+    if (!rating || count === 0) return 'No ratings yet';
+    return `★ ${rating.toFixed(1)} · ${count}`;
   }
 </script>
 
@@ -44,46 +68,176 @@
         <button class="x" onclick={closeMarket} aria-label="Close">✕</button>
       </div>
 
-      <!-- Import area -->
-      <div class="drop" class:hot={market.dragOver}>
-        <div class="drop-title">Add an effect</div>
-        <div class="drop-sub">Drag an effect file (.wasm) here, or</div>
-        <button class="select" onclick={selectFile} disabled={market.busy}>
-          {market.busy ? 'Adding…' : 'Select a file…'}
+      <div class="tabs">
+        <button class:active={tab === 'browse'} onclick={() => (tab = 'browse')}>Browse</button>
+        <button class:active={tab === 'installed'} onclick={() => (tab = 'installed')}>
+          Installed
         </button>
       </div>
 
-      <!-- Installed -->
-      <div class="sec-title">Installed</div>
-      {#if !market.loaded}
-        <div class="muted">Loading…</div>
-      {:else if market.installed.length === 0}
-        <div class="muted">Nothing yet — add an effect above.</div>
-      {:else}
-        <ul class="list">
-          {#each market.installed as p (p.id)}
-            <li>
-              <div class="pinfo">
-                <div class="pname">{p.name}</div>
-                <div class="pmeta">{p.kind} · {p.author} · v{p.version}</div>
-              </div>
-              <button class="rm" onclick={() => uninstallEffect(p.id, p.name)} disabled={market.busy}>
-                Remove
+      <!-- ============================ BROWSE ============================ -->
+      {#if tab === 'browse'}
+        {#if catalog.selected}
+          {@const d = catalog.selected}
+          <button class="back" onclick={closeDetail}>← Back to Browse</button>
+          <div class="detail-head">
+            <div class="min0">
+              <div class="d-name">{d.display_name}</div>
+              <div class="muted small">by {d.publisher} · {ratingLabel(d.rating, d.ratings_count)}</div>
+            </div>
+            {#if installedLocally(d.sku)}
+              <button class="primary" disabled>Installed ✓</button>
+            {:else if d.installable}
+              <button class="primary" disabled={catalog.busy} onclick={() => install(d)}>
+                {catalog.busy ? 'Installing…' : d.price_cents === 0 ? 'Get (Free)' : 'Buy'}
               </button>
-            </li>
-          {/each}
-        </ul>
-      {/if}
+            {:else}
+              <button class="primary" disabled>Unavailable</button>
+            {/if}
+          </div>
 
-      <!-- Guidance -->
-      <div class="sec-title">Where to get effects</div>
-      <ul class="tips">
-        <li><b>Download one</b> shared by a creator (an <span class="mono">.wasm</span> file), then add it above.</li>
-        <li><b>Make one</b> with the Vance effect SDK and export a <span class="mono">.wasm</span> to share or sell.</li>
-        <li>A built-in effects marketplace to browse &amp; install is coming.</li>
-      </ul>
-      {#if folder}
-        <div class="folder">Installed effects are kept in <span class="mono">{folder}</span></div>
+          {#if d.description}<p class="desc">{d.description}</p>{/if}
+
+          {#if (d.capabilities ?? []).length > 0}
+            <div class="sec-title">This effect can</div>
+            <ul class="caps">
+              {#each d.capabilities as c (c)}<li>{c}</li>{/each}
+            </ul>
+          {/if}
+
+          <div class="sec-title">Reviews</div>
+          {#if installedLocally(d.sku)}
+            <div class="review-form">
+              <div class="stars">
+                {#each [1, 2, 3, 4, 5] as n (n)}
+                  <button
+                    class="star"
+                    class:on={n <= reviewStars}
+                    onclick={() => (reviewStars = n)}
+                    aria-label={`${n} stars`}>★</button
+                  >
+                {/each}
+              </div>
+              <textarea class="rbody" bind:value={reviewBody} placeholder="Share what you think (optional)"></textarea>
+              <button
+                class="primary"
+                disabled={catalog.busy}
+                onclick={async () => {
+                  await submitReview(d.sku, reviewStars, reviewBody);
+                  reviewBody = '';
+                }}
+              >
+                Post review
+              </button>
+            </div>
+          {:else}
+            <div class="muted small">Install this effect to leave a review.</div>
+          {/if}
+
+          {#if catalog.reviewsLoading}
+            <div class="muted small">Loading reviews…</div>
+          {:else if catalog.reviews.length === 0}
+            <div class="muted small">No reviews yet — be the first.</div>
+          {:else}
+            <ul class="reviews">
+              {#each catalog.reviews as r, i (i)}
+                <li>
+                  <div class="rstars">{'★'.repeat(r.stars)}{'☆'.repeat(5 - r.stars)}</div>
+                  {#if r.body}<div class="rtext">{r.body}</div>{/if}
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        {:else}
+          <!-- Search + filters -->
+          <div class="filters">
+            <input
+              class="search"
+              type="text"
+              placeholder="Search effects…"
+              bind:value={catalog.query}
+              onkeydown={(e) => e.key === 'Enter' && browse()}
+            />
+            <select class="sort" bind:value={catalog.sort} onchange={() => browse()}>
+              <option value="popular">Popular</option>
+              <option value="newest">Newest</option>
+              <option value="name">Name</option>
+            </select>
+          </div>
+          <div class="chips">
+            <button class:on={catalog.category === ''} onclick={() => ((catalog.category = ''), browse())}>
+              All
+            </button>
+            {#each CATEGORIES as c (c)}
+              <button class:on={catalog.category === c} onclick={() => ((catalog.category = c), browse())}>
+                {c}
+              </button>
+            {/each}
+          </div>
+
+          {#if catalog.loading && catalog.effects.length === 0}
+            <div class="muted">Loading…</div>
+          {:else if catalog.effects.length === 0}
+            <div class="muted small">
+              No effects found. {catalog.query || catalog.category
+                ? 'Try a different search.'
+                : 'The catalog is empty on this server.'}
+            </div>
+          {:else}
+            <div class="grid">
+              {#each catalog.effects as fx (fx.sku)}
+                <button class="tile" onclick={() => openDetail(fx.sku)}>
+                  <div class="t-name">{fx.display_name}</div>
+                  <div class="muted t-pub">{fx.publisher}</div>
+                  <div class="t-foot">
+                    <span class="muted small">{ratingLabel(fx.rating, fx.ratings_count)}</span>
+                    <span class="price">{fx.price_cents === 0 ? 'Free' : `$${(fx.price_cents / 100).toFixed(2)}`}</span>
+                  </div>
+                </button>
+              {/each}
+            </div>
+            {#if catalog.hasMore}
+              <button class="more" disabled={catalog.loading} onclick={loadMore}>
+                {catalog.loading ? 'Loading…' : 'Load more'}
+              </button>
+            {/if}
+          {/if}
+        {/if}
+
+      <!-- ============================ INSTALLED ============================ -->
+      {:else}
+        <div class="drop" class:hot={market.dragOver}>
+          <div class="drop-title">Add an effect file</div>
+          <div class="drop-sub">Drag an effect file (.wasm) here, or</div>
+          <button class="select" onclick={selectFile} disabled={market.busy}>
+            {market.busy ? 'Adding…' : 'Select a file…'}
+          </button>
+        </div>
+
+        <div class="sec-title">On this device</div>
+        {#if !market.loaded}
+          <div class="muted">Loading…</div>
+        {:else if market.installed.length === 0}
+          <div class="muted small">Nothing yet — browse the catalog or add a file above.</div>
+        {:else}
+          <ul class="list">
+            {#each market.installed as p (p.id)}
+              <li>
+                <div class="min0">
+                  <div class="pname">{p.name}</div>
+                  <div class="pmeta">{p.kind} · {p.author} · v{p.version}</div>
+                </div>
+                <button class="rm" onclick={() => uninstallEffect(p.id, p.name)} disabled={market.busy}>
+                  Remove
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+
+        {#if folder}
+          <div class="folder">Installed effects are kept in <span class="mono">{folder}</span></div>
+        {/if}
       {/if}
     </div>
   </div>
@@ -101,7 +255,7 @@
     padding: 20px;
   }
   .card {
-    width: 500px;
+    width: 640px;
     max-width: 94vw;
     max-height: 88vh;
     overflow: auto;
@@ -116,7 +270,7 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 14px;
+    margin-bottom: 12px;
   }
   h2 {
     font-size: 16px;
@@ -132,6 +286,201 @@
   }
   .x:hover {
     color: var(--fg, #dfe3e9);
+  }
+  .tabs {
+    display: flex;
+    gap: 4px;
+    border-bottom: 1px solid var(--border, #30353d);
+    margin-bottom: 14px;
+  }
+  .tabs button {
+    background: none;
+    border: none;
+    color: var(--muted, #949bab);
+    padding: 7px 12px;
+    font-size: 13px;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+  }
+  .tabs button.active {
+    color: var(--fg, #dfe3e9);
+    border-bottom-color: var(--accent, #4c9dff);
+  }
+  .filters {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .search {
+    flex: 1;
+    padding: 8px 10px;
+    border-radius: 7px;
+    border: 1px solid var(--border-strong, #3a4150);
+    background: var(--vance-bg, #17191d);
+    color: var(--fg, #dfe3e9);
+    font-size: 13px;
+  }
+  .sort {
+    border-radius: 7px;
+    border: 1px solid var(--border-strong, #3a4150);
+    background: var(--vance-bg, #17191d);
+    color: var(--fg, #dfe3e9);
+    font-size: 13px;
+    padding: 0 8px;
+  }
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 14px;
+  }
+  .chips button {
+    font-size: 11.5px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--border-strong, #3a4150);
+    background: transparent;
+    color: var(--muted, #949bab);
+    cursor: pointer;
+  }
+  .chips button.on {
+    color: #071522;
+    background: var(--accent, #4c9dff);
+    border-color: var(--accent, #4c9dff);
+    font-weight: 600;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 10px;
+  }
+  .tile {
+    text-align: left;
+    border: 1px solid var(--border, #30353d);
+    border-radius: 10px;
+    background: var(--panel-2, #262a31);
+    padding: 12px;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .tile:hover {
+    border-color: var(--accent, #4c9dff);
+  }
+  .t-name {
+    font-weight: 600;
+    font-size: 13px;
+  }
+  .t-pub {
+    font-size: 11px;
+  }
+  .t-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 6px;
+  }
+  .price {
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--ok, #5ac37d);
+  }
+  .more {
+    margin: 12px auto 0;
+    display: block;
+    padding: 7px 16px;
+    border-radius: 7px;
+    border: 1px solid var(--border-strong, #3a4150);
+    background: transparent;
+    color: var(--fg, #dfe3e9);
+    cursor: pointer;
+    font-size: 12.5px;
+  }
+  .back {
+    background: none;
+    border: none;
+    color: var(--accent, #4c9dff);
+    cursor: pointer;
+    font-size: 12.5px;
+    padding: 0 0 10px;
+  }
+  .detail-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    justify-content: space-between;
+  }
+  .d-name {
+    font-size: 15px;
+    font-weight: 700;
+  }
+  .desc {
+    font-size: 13px;
+    line-height: 1.5;
+    margin: 10px 0;
+  }
+  .caps {
+    margin: 0 0 6px;
+    padding-left: 18px;
+    font-size: 12.5px;
+    color: var(--fg, #dfe3e9);
+  }
+  .review-form {
+    border: 1px solid var(--border, #30353d);
+    border-radius: 8px;
+    padding: 10px;
+    margin-bottom: 12px;
+  }
+  .stars {
+    display: flex;
+    gap: 2px;
+    margin-bottom: 6px;
+  }
+  .star {
+    background: none;
+    border: none;
+    color: var(--muted, #949bab);
+    font-size: 18px;
+    cursor: pointer;
+    padding: 0;
+  }
+  .star.on {
+    color: #f2c14e;
+  }
+  .rbody {
+    width: 100%;
+    box-sizing: border-box;
+    resize: vertical;
+    min-height: 46px;
+    border-radius: 7px;
+    border: 1px solid var(--border-strong, #3a4150);
+    background: var(--vance-bg, #17191d);
+    color: var(--fg, #dfe3e9);
+    font-size: 13px;
+    padding: 7px 9px;
+    margin-bottom: 8px;
+  }
+  .reviews {
+    list-style: none;
+    margin: 8px 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .reviews li {
+    border-top: 1px solid var(--border, #30353d);
+    padding-top: 8px;
+  }
+  .rstars {
+    color: #f2c14e;
+    font-size: 12px;
+  }
+  .rtext {
+    font-size: 12.5px;
+    margin-top: 2px;
   }
   .drop {
     border: 2px dashed var(--border-strong, #3a4150);
@@ -163,8 +512,19 @@
     font-weight: 600;
     font-size: 13px;
   }
-  .select:disabled {
-    opacity: 0.6;
+  .primary {
+    padding: 8px 16px;
+    border-radius: 7px;
+    border: none;
+    background: var(--accent, #4c9dff);
+    color: #071522;
+    font-weight: 600;
+    font-size: 13px;
+    cursor: pointer;
+    flex: none;
+  }
+  .primary:disabled {
+    opacity: 0.55;
     cursor: default;
   }
   .sec-title {
@@ -173,12 +533,18 @@
     letter-spacing: 0.06em;
     color: var(--muted, #949bab);
     font-weight: 600;
-    margin: 18px 0 7px;
+    margin: 16px 0 7px;
   }
   .muted {
     font-size: 12.5px;
     color: var(--muted, #949bab);
-    font-style: italic;
+  }
+  .small {
+    font-size: 11.5px;
+  }
+  .min0 {
+    min-width: 0;
+    flex: 1;
   }
   .list {
     display: flex;
@@ -196,10 +562,6 @@
     border-radius: 8px;
     padding: 8px 10px;
   }
-  .pinfo {
-    flex: 1;
-    min-width: 0;
-  }
   .pname {
     font-weight: 600;
     font-size: 13px;
@@ -216,23 +578,14 @@
     background: transparent;
     color: var(--muted, #949bab);
     font-size: 12px;
+    flex: none;
   }
   .rm:hover {
     color: var(--err, #f2686f);
     border-color: var(--err, #f2686f);
   }
-  .tips {
-    margin: 0;
-    padding-left: 18px;
-    font-size: 12.5px;
-    line-height: 1.55;
-    color: var(--fg, #dfe3e9);
-  }
-  .tips li {
-    margin-bottom: 3px;
-  }
   .folder {
-    margin-top: 10px;
+    margin-top: 12px;
     font-size: 11px;
     color: var(--muted, #949bab);
   }
