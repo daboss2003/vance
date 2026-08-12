@@ -56,23 +56,40 @@ PY
   catalog)
     WASM="${1:?path to .wasm required}"; SKU="${2:?sku required}"
     PUBLISHER="${3:?publisher required}"; NAME="${4:?display name required}"
-    DESC="${5:-}"; CATEGORY="${6:-}"
+    DESC="${5:-}"; CATEGORY="${6:-}"; PRICE="${7:-0}"
     ABS=$(python3 -c "import os,sys;print(os.path.abspath(sys.argv[1]))" "$WASM")
     [ -f "$ABS" ] || { echo "no such file: $ABS" >&2; exit 1; }
     DEST="$(basename "$ABS")"
-    BODY=$(python3 - "$SKU" "$ABS" "$DEST" "$PUBLISHER" "$NAME" "$DESC" "$CATEGORY" <<'PY'
+    BODY=$(python3 - "$SKU" "$ABS" "$DEST" "$PUBLISHER" "$NAME" "$DESC" "$CATEGORY" "$PRICE" <<'PY'
 import json, sys
-sku, path, dest, publisher, name, desc, category = sys.argv[1:8]
+sku, path, dest, publisher, name, desc, category, price = sys.argv[1:9]
 print(json.dumps({
     "sku": sku, "file_path": path, "dest": dest, "publisher": publisher,
     "display_name": name, "description": desc or None, "kind": "effect",
-    "categories": [category] if category else [], "tags": [], "capabilities": []
+    "categories": [category] if category else [], "tags": [], "capabilities": [],
+    "price_cents": int(price)
 }))
 PY
 )
-    curl -s -X POST "$BASE/v1/dev/catalog-publish" -H 'content-type: application/json' -d "$BODY"
+    curl -s -X POST "$BASE/v1/dev/catalog-publish" -H "authorization: Bearer $ACCESS" -H 'content-type: application/json' -d "$BODY"
     echo
-    echo "Listed '$SKU' (free) in the catalog. Open the app → add-on effects → Browse."
+    echo "Listed '$SKU' ($([ "$PRICE" -gt 0 ] && echo "\$$((PRICE/100)) paid, encrypted" || echo free)). Open the app → add-on effects → Browse. (Paid needs 'verify' first.)"
+    ;;
+  verify)
+    # Stand-in for Stripe KYC in dev: mark yourself verified + trusted so you can
+    # list paid effects above the new-seller cap.
+    curl -s -X POST "$BASE/v1/dev/seller" -H "authorization: Bearer $ACCESS" \
+      -H 'content-type: application/json' -d '{"verified":true,"trusted":true}'
+    echo; echo "You're a verified + trusted seller now."
+    ;;
+  report)
+    SKU="${1:?sku required}"
+    curl -s -X POST "$BASE/v1/catalog/$SKU/report" -H "authorization: Bearer $ACCESS" \
+      -H 'content-type: application/json' -d '{"reason":"testing"}'
+    echo
+    ;;
+  seller)
+    curl -s "$BASE/v1/seller" -H "authorization: Bearer $ACCESS"; echo
     ;;
   revoke)
     SKU="${1:?sku required}"
@@ -85,7 +102,7 @@ PY
     curl -s "$BASE/v1/entitlements" -H "authorization: Bearer $ACCESS"; echo
     ;;
   *)
-    echo "usage: $0 {publish <wasm> <sku> [name] | catalog <wasm> <sku> <publisher> <name> [desc] [category] | revoke <sku> | list}" >&2
+    echo "usage: $0 {publish <wasm> <sku> [name] | catalog <wasm> <sku> <publisher> <name> [desc] [category] [price_cents] | verify | report <sku> | seller | revoke <sku> | list}" >&2
     exit 2
     ;;
 esac

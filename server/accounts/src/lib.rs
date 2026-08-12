@@ -15,6 +15,7 @@ pub mod r_devices;
 pub mod r_entitlements;
 pub mod r_events;
 pub mod r_payments;
+pub mod r_sellers;
 pub mod state;
 pub mod util;
 
@@ -78,5 +79,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/checkout", post(r_payments::checkout))
         .route("/v1/connect/onboard", post(r_payments::connect_onboard))
         .route("/v1/connect/status", get(r_payments::connect_status))
+        .route("/v1/catalog/:sku/report", post(r_sellers::report))
+        .route("/v1/seller", get(r_sellers::status))
+        .route("/v1/seller/effects", get(r_sellers::my_effects))
+        .route("/v1/dev/seller", post(r_sellers::dev_set))
         .with_state(state)
 }

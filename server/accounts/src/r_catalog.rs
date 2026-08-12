@@ -44,27 +44,34 @@ pub async fn browse(
     let size = p.page_size.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, 100);
 
     let mut sql = String::from(
-        "SELECT sku, publisher, display_name, description, kind, categories, tags, price_cents, icon, downloads,
+        "SELECT c.sku, c.publisher, c.display_name, c.description, c.kind, c.categories, c.tags, c.price_cents, c.icon, c.downloads,
                 (SELECT AVG(stars) FROM catalog_reviews r WHERE r.sku=c.sku) AS rating,
-                (SELECT COUNT(*)   FROM catalog_reviews r WHERE r.sku=c.sku) AS ratings_count
-         FROM catalog_effects c WHERE listed=1",
+                (SELECT COUNT(*)   FROM catalog_reviews r WHERE r.sku=c.sku) AS ratings_count,
+                (SELECT COUNT(*)   FROM reports rp WHERE rp.sku=c.sku) AS report_count,
+                COALESCE(s.verified,0) AS seller_verified,
+                COALESCE(s.trusted,0)  AS seller_trusted
+         FROM catalog_effects c
+         LEFT JOIN sellers s ON s.user_id = c.seller_id
+         WHERE c.listed=1
+           AND COALESCE(s.frozen,0)=0 AND COALESCE(s.banned,0)=0
+           AND (c.price_cents=0 OR COALESCE(s.verified,0)=1)",
     );
     let mut binds: Vec<String> = Vec::new();
     if let Some(q) = p.q.as_ref().filter(|s| !s.trim().is_empty()) {
-        sql.push_str(" AND (display_name LIKE ? OR description LIKE ? OR tags LIKE ?)");
+        sql.push_str(" AND (c.display_name LIKE ? OR c.description LIKE ? OR c.tags LIKE ?)");
         let like = format!("%{q}%");
         binds.push(like.clone());
         binds.push(like.clone());
         binds.push(like);
     }
     if let Some(cat) = p.category.as_ref().filter(|s| !s.trim().is_empty()) {
-        sql.push_str(" AND categories LIKE ?");
+        sql.push_str(" AND c.categories LIKE ?");
         binds.push(format!("%\"{cat}\"%"));
     }
     sql.push_str(match p.sort.as_deref() {
-        Some("newest") => " ORDER BY created_at DESC",
-        Some("name") => " ORDER BY display_name COLLATE NOCASE ASC",
-        _ => " ORDER BY downloads DESC, display_name COLLATE NOCASE ASC",
+        Some("newest") => " ORDER BY c.created_at DESC",
+        Some("name") => " ORDER BY c.display_name COLLATE NOCASE ASC",
+        _ => " ORDER BY c.downloads DESC, c.display_name COLLATE NOCASE ASC",
     });
     sql.push_str(" LIMIT ? OFFSET ?");
 
@@ -88,6 +95,15 @@ pub async fn browse(
 }
 
 fn row_to_card(r: &sqlx::sqlite::SqliteRow) -> Value {
+    let downloads: i64 = r.get("downloads");
+    let reports: i64 = r.try_get("report_count").unwrap_or(0);
+    let verified = r.try_get::<i64, _>("seller_verified").unwrap_or(0) != 0;
+    let trusted = r.try_get::<i64, _>("seller_trusted").unwrap_or(0) != 0;
+    let dispute_rate = if downloads > 0 {
+        reports as f64 / downloads as f64
+    } else {
+        0.0
+    };
     json!({
         "sku": r.get::<String,_>("sku"),
         "publisher": r.get::<String,_>("publisher"),
@@ -98,9 +114,14 @@ fn row_to_card(r: &sqlx::sqlite::SqliteRow) -> Value {
         "tags": parse_json_array(&r.get::<String,_>("tags")),
         "price_cents": r.get::<i64,_>("price_cents"),
         "icon": r.get::<Option<String>,_>("icon"),
-        "downloads": r.get::<i64,_>("downloads"),
+        "downloads": downloads,
         "rating": r.get::<Option<f64>,_>("rating"),
         "ratings_count": r.get::<i64,_>("ratings_count"),
+        // M5 — seller trust surfaced to buyers (spec §8a).
+        "verified_seller": verified,
+        "new_seller": !trusted,
+        "reports": reports,
+        "dispute_rate": dispute_rate,
     })
 }
 
@@ -110,11 +131,18 @@ fn row_to_card(r: &sqlx::sqlite::SqliteRow) -> Value {
 
 pub async fn detail(State(st): State<AppState>, Path(sku): Path<String>) -> AppResult<Json<Value>> {
     let row = sqlx::query(
-        "SELECT sku, publisher, display_name, description, kind, categories, tags, capabilities,
-                price_cents, icon, downloads,
+        "SELECT c.sku, c.publisher, c.display_name, c.description, c.kind, c.categories, c.tags, c.capabilities,
+                c.price_cents, c.icon, c.downloads,
                 (SELECT AVG(stars) FROM catalog_reviews r WHERE r.sku=c.sku) AS rating,
-                (SELECT COUNT(*)   FROM catalog_reviews r WHERE r.sku=c.sku) AS ratings_count
-         FROM catalog_effects c WHERE sku=? AND listed=1",
+                (SELECT COUNT(*)   FROM catalog_reviews r WHERE r.sku=c.sku) AS ratings_count,
+                (SELECT COUNT(*)   FROM reports rp WHERE rp.sku=c.sku) AS report_count,
+                COALESCE(s.verified,0) AS seller_verified,
+                COALESCE(s.trusted,0)  AS seller_trusted
+         FROM catalog_effects c
+         LEFT JOIN sellers s ON s.user_id = c.seller_id
+         WHERE c.sku=? AND c.listed=1
+           AND COALESCE(s.frozen,0)=0 AND COALESCE(s.banned,0)=0
+           AND (c.price_cents=0 OR COALESCE(s.verified,0)=1)",
     )
     .bind(&sku)
     .fetch_optional(&st.pool)
@@ -314,46 +342,92 @@ pub struct CatalogPublishBody {
     categories: Option<Vec<String>>,
     tags: Option<Vec<String>>,
     capabilities: Option<Vec<String>>,
+    /// > 0 → a PAID (encrypted) listing; needs a verified seller (spec §8a).
+    price_cents: Option<i64>,
 }
 
 pub async fn dev_catalog_publish(
     State(st): State<AppState>,
+    user: AuthUser,
     Json(p): Json<CatalogPublishBody>,
 ) -> AppResult<Json<Value>> {
     if !st.config.dev_provider {
         return Err(AppError::Forbidden("dev endpoints are disabled".into()));
     }
-    let bytes = tokio::fs::read(&p.file_path)
+    let price = p.price_cents.unwrap_or(0).max(0);
+    let seller_id = user.claims.sub.clone();
+
+    // Ensure a seller row exists; enforce the paid-listing trust rules (§8a).
+    crate::r_sellers::upsert_seller(&st, &seller_id, Some(&p.publisher), None, None, None, None).await?;
+    let flags = crate::r_sellers::load_flags(&st, &seller_id).await?;
+    if price > 0 {
+        if !flags.verified {
+            return Err(AppError::Forbidden(
+                "get verified (connect payouts) before selling paid effects".into(),
+            ));
+        }
+        if !flags.trusted && price > crate::r_sellers::NEW_SELLER_PRICE_CAP_CENTS {
+            return Err(AppError::BadRequest(format!(
+                "new sellers can list up to ${:.0} until they've earned trust",
+                crate::r_sellers::NEW_SELLER_PRICE_CAP_CENTS as f64 / 100.0
+            )));
+        }
+    }
+
+    let plaintext = tokio::fs::read(&p.file_path)
         .await
         .map_err(|e| AppError::BadRequest(format!("can't read {}: {e}", p.file_path)))?;
-    let sha = crypto::sha256_b64(&bytes);
+
+    // Paid → encrypt at rest (spec §7); free → plaintext.
+    if price > 0 {
+        let plaintext_sha = crypto::sha256_b64(&plaintext);
+        let (cek, ciphertext) = crypto::encrypt_effect(&plaintext);
+        let ct_path = format!("{}.enc", p.file_path);
+        tokio::fs::write(&ct_path, &ciphertext)
+            .await
+            .map_err(|e| AppError::Internal(format!("write ciphertext: {e}")))?;
+        let pin = crypto::sha256_b64(&ciphertext);
+        sqlx::query(
+            "INSERT INTO plugin_artifacts (sku, version, platform, object_key, sha256, dest, requires_entitlement, display_name, encrypted, cek, plaintext_sha256)
+             VALUES (?, '1', 'any', ?, ?, ?, 1, ?, 1, ?, ?)
+             ON CONFLICT(sku) DO UPDATE SET object_key=excluded.object_key, sha256=excluded.sha256, dest=excluded.dest,
+                requires_entitlement=1, display_name=excluded.display_name, encrypted=1, cek=excluded.cek, plaintext_sha256=excluded.plaintext_sha256",
+        )
+        .bind(&p.sku).bind(&ct_path).bind(&pin).bind(&p.dest).bind(&p.display_name)
+        .bind(crypto::b64(&cek)).bind(&plaintext_sha)
+        .execute(&st.pool).await?;
+    } else {
+        let sha = crypto::sha256_b64(&plaintext);
+        sqlx::query(
+            "INSERT INTO plugin_artifacts (sku, version, platform, object_key, sha256, dest, requires_entitlement, display_name, encrypted)
+             VALUES (?, '1', 'any', ?, ?, ?, 0, ?, 0)
+             ON CONFLICT(sku) DO UPDATE SET object_key=excluded.object_key, sha256=excluded.sha256,
+                dest=excluded.dest, requires_entitlement=0, display_name=excluded.display_name, encrypted=0",
+        )
+        .bind(&p.sku).bind(&p.file_path).bind(&sha).bind(&p.dest).bind(&p.display_name)
+        .execute(&st.pool).await?;
+    }
+
     let kind = p.kind.unwrap_or_else(|| "effect".into());
     let cats = serde_json::to_string(&p.categories.unwrap_or_default()).unwrap();
     let tags = serde_json::to_string(&p.tags.unwrap_or_default()).unwrap();
     let caps = serde_json::to_string(&p.capabilities.unwrap_or_default()).unwrap();
-
-    // Free artifact (requires_entitlement = 0) + a listed catalog entry.
-    sqlx::query(
-        "INSERT INTO plugin_artifacts (sku, version, platform, object_key, sha256, dest, requires_entitlement, display_name)
-         VALUES (?, '1', 'any', ?, ?, ?, 0, ?)
-         ON CONFLICT(sku) DO UPDATE SET object_key=excluded.object_key, sha256=excluded.sha256,
-            dest=excluded.dest, requires_entitlement=0, display_name=excluded.display_name",
-    )
-    .bind(&p.sku)
-    .bind(&p.file_path)
-    .bind(&sha)
-    .bind(&p.dest)
-    .bind(&p.display_name)
-    .execute(&st.pool)
-    .await?;
+    // The connected account to charge (the seller's), if they've connected one.
+    let stripe_account: Option<String> =
+        sqlx::query("SELECT account_id FROM stripe_connected_accounts WHERE user_id=?")
+            .bind(&seller_id)
+            .fetch_optional(&st.pool)
+            .await?
+            .map(|r| r.get::<String, _>("account_id"));
 
     sqlx::query(
         "INSERT INTO catalog_effects
-            (sku, publisher, display_name, description, kind, categories, tags, capabilities, price_cents, listed, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,0,1,?,?)
+            (sku, publisher, display_name, description, kind, categories, tags, capabilities, price_cents, listed, created_at, updated_at, seller_id, stripe_account)
+         VALUES (?,?,?,?,?,?,?,?,?,1,?,?,?,?)
          ON CONFLICT(sku) DO UPDATE SET publisher=excluded.publisher, display_name=excluded.display_name,
             description=excluded.description, kind=excluded.kind, categories=excluded.categories,
-            tags=excluded.tags, capabilities=excluded.capabilities, updated_at=excluded.updated_at",
+            tags=excluded.tags, capabilities=excluded.capabilities, price_cents=excluded.price_cents,
+            updated_at=excluded.updated_at, seller_id=excluded.seller_id, stripe_account=excluded.stripe_account",
     )
     .bind(&p.sku)
     .bind(&p.publisher)
@@ -363,12 +437,15 @@ pub async fn dev_catalog_publish(
     .bind(&cats)
     .bind(&tags)
     .bind(&caps)
+    .bind(price)
     .bind(now())
     .bind(now())
+    .bind(&seller_id)
+    .bind(&stripe_account)
     .execute(&st.pool)
     .await?;
 
-    Ok(Json(json!({ "sku": p.sku, "sha256": sha, "listed": true })))
+    Ok(Json(json!({ "sku": p.sku, "price_cents": price, "encrypted": price > 0, "listed": true })))
 }
 
 // ---------------------------------------------------------------------------

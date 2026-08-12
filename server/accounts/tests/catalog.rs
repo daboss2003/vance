@@ -75,11 +75,12 @@ async fn browse_install_and_gated_review() {
     let bytes = b"\x00asm\x01\x00\x00\x00free-blur".to_vec();
     std::fs::write(&wasm, &bytes).unwrap();
 
-    // Publish a FREE listing (dev).
+    // Publish a FREE listing (dev; seller = the publishing user).
+    let publisher = sign_in(&app, "publisher").await;
     let resp = post(
         &app,
         "/v1/dev/catalog-publish",
-        None,
+        Some(&publisher),
         serde_json::json!({
             "sku": "com.free.blur", "file_path": wasm.to_str().unwrap(), "dest": "blur.wasm",
             "publisher": "Vance", "display_name": "Soft Blur", "description": "A gentle blur.",
