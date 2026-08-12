@@ -10,6 +10,7 @@ pub mod error;
 pub mod providers;
 pub mod r_account;
 pub mod r_auth;
+pub mod r_catalog;
 pub mod r_devices;
 pub mod r_entitlements;
 pub mod r_events;
@@ -64,5 +65,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/dev/publish", post(r_entitlements::dev_publish))
         .route("/v1/dev/revoke", post(r_entitlements::dev_revoke))
         .route("/v1/dev/installs/:sku", get(r_entitlements::dev_installs))
+        .route("/v1/catalog", get(r_catalog::browse))
+        .route("/v1/catalog/:sku", get(r_catalog::detail))
+        .route(
+            "/v1/catalog/:sku/reviews",
+            get(r_catalog::reviews).post(r_catalog::post_review),
+        )
+        .route("/v1/catalog/:sku/artifact", post(r_catalog::free_artifact))
+        .route("/v1/dev/catalog-publish", post(r_catalog::dev_catalog_publish))
         .with_state(state)
 }

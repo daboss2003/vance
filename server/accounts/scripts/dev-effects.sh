@@ -7,7 +7,8 @@
 # app's "Local dev sign-in" uses — so anything published here shows up in the
 # app's Settings → My Effects.
 #
-#   ./dev-effects.sh publish <path-to.wasm> <sku> [display name]
+#   ./dev-effects.sh publish <path-to.wasm> <sku> [display name]   # paid (M2 gate)
+#   ./dev-effects.sh catalog <path-to.wasm> <sku> <publisher> <name> [desc] [category]
 #   ./dev-effects.sh revoke  <sku>
 #   ./dev-effects.sh list
 #
@@ -52,6 +53,27 @@ PY
     echo
     echo "Published '$SKU' and granted it to the dev user. Open the app → Settings → My Effects."
     ;;
+  catalog)
+    WASM="${1:?path to .wasm required}"; SKU="${2:?sku required}"
+    PUBLISHER="${3:?publisher required}"; NAME="${4:?display name required}"
+    DESC="${5:-}"; CATEGORY="${6:-}"
+    ABS=$(python3 -c "import os,sys;print(os.path.abspath(sys.argv[1]))" "$WASM")
+    [ -f "$ABS" ] || { echo "no such file: $ABS" >&2; exit 1; }
+    DEST="$(basename "$ABS")"
+    BODY=$(python3 - "$SKU" "$ABS" "$DEST" "$PUBLISHER" "$NAME" "$DESC" "$CATEGORY" <<'PY'
+import json, sys
+sku, path, dest, publisher, name, desc, category = sys.argv[1:8]
+print(json.dumps({
+    "sku": sku, "file_path": path, "dest": dest, "publisher": publisher,
+    "display_name": name, "description": desc or None, "kind": "effect",
+    "categories": [category] if category else [], "tags": [], "capabilities": []
+}))
+PY
+)
+    curl -s -X POST "$BASE/v1/dev/catalog-publish" -H 'content-type: application/json' -d "$BODY"
+    echo
+    echo "Listed '$SKU' (free) in the catalog. Open the app → add-on effects → Browse."
+    ;;
   revoke)
     SKU="${1:?sku required}"
     curl -s -X POST "$BASE/v1/dev/revoke" -H "authorization: Bearer $ACCESS" \
@@ -63,7 +85,7 @@ PY
     curl -s "$BASE/v1/entitlements" -H "authorization: Bearer $ACCESS"; echo
     ;;
   *)
-    echo "usage: $0 {publish <wasm> <sku> [name] | revoke <sku> | list}" >&2
+    echo "usage: $0 {publish <wasm> <sku> [name] | catalog <wasm> <sku> <publisher> <name> [desc] [category] | revoke <sku> | list}" >&2
     exit 2
     ;;
 esac
