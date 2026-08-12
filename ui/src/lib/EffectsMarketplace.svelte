@@ -14,6 +14,7 @@
     openDetail,
     closeDetail,
     install,
+    buy,
     submitReview,
     CATEGORIES
   } from '$lib/catalog.svelte';
@@ -87,9 +88,13 @@
             </div>
             {#if installedLocally(d.sku)}
               <button class="primary" disabled>Installed ✓</button>
-            {:else if d.installable}
+            {:else if d.price_cents === 0 && d.installable}
               <button class="primary" disabled={catalog.busy} onclick={() => install(d)}>
-                {catalog.busy ? 'Installing…' : d.price_cents === 0 ? 'Get (Free)' : 'Buy'}
+                {catalog.busy ? 'Installing…' : 'Get (Free)'}
+              </button>
+            {:else if d.price_cents > 0}
+              <button class="primary" disabled={catalog.busy} onclick={() => buy(d)}>
+                {catalog.busy ? 'Opening…' : `Buy · $${(d.price_cents / 100).toFixed(2)}`}
               </button>
             {:else}
               <button class="primary" disabled>Unavailable</button>

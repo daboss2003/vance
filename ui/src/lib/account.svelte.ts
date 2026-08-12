@@ -15,6 +15,8 @@ import {
   entitlementInstall,
   entitlementUninstall,
   entitlementsReconcile,
+  paymentConnect,
+  paymentConnectStatus,
   getAppSettings,
   setAppSettings,
   type AccountUser,
@@ -23,7 +25,7 @@ import {
 } from '$lib/ipc';
 import { toast } from '$lib/toast.svelte';
 
-type Tab = 'account' | 'effects' | 'devices' | 'advanced';
+type Tab = 'account' | 'effects' | 'selling' | 'devices' | 'advanced';
 
 interface AccountUI {
   open: boolean;
@@ -36,6 +38,9 @@ interface AccountUI {
   effects: OwnedEffect[];
   effectsLoaded: boolean;
   autoInstall: boolean;
+  sellerConnected: boolean;
+  sellerChargesEnabled: boolean;
+  sellingLoaded: boolean;
   busy: boolean;
   baseUrl: string;
 }
@@ -51,6 +56,9 @@ export const account = $state<AccountUI>({
   effects: [],
   effectsLoaded: false,
   autoInstall: false,
+  sellerConnected: false,
+  sellerChargesEnabled: false,
+  sellingLoaded: false,
   busy: false,
   baseUrl: ''
 });
@@ -80,6 +88,30 @@ export async function openSettings(tab: Tab = 'account'): Promise<void> {
   await refreshStatus();
   if (account.signedIn && tab === 'devices') await loadDevices();
   if (account.signedIn && tab === 'effects') await loadEffects();
+  if (account.signedIn && tab === 'selling') await loadSelling();
+}
+
+export async function loadSelling(): Promise<void> {
+  try {
+    const s = await paymentConnectStatus();
+    account.sellerConnected = s.connected;
+    account.sellerChargesEnabled = s.charges_enabled;
+    account.sellingLoaded = true;
+  } catch {
+    account.sellingLoaded = true;
+  }
+}
+
+export async function connectPayouts(): Promise<void> {
+  account.busy = true;
+  try {
+    await paymentConnect();
+    toast.info('Finish connecting payouts in the browser, then reopen this tab.');
+  } catch (e) {
+    toast.error(String(e));
+  } finally {
+    account.busy = false;
+  }
 }
 
 export function closeSettings(): void {

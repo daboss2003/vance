@@ -1349,6 +1349,45 @@ pub async fn catalog_review(
     .map_err(|e| e.to_string())?
 }
 
+// --- M4 payment commands ---------------------------------------------------
+
+/// Start a purchase: open the seller's Stripe checkout in the system browser.
+/// On success, the webhook auto-grants the effect and it appears in My Effects.
+#[tauri::command]
+pub async fn payment_checkout(state: St<'_>, sku: String) -> Result<(), String> {
+    let st = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let v = st.send_authed("POST", "/v1/checkout", Some(json!({ "sku": sku })))?;
+        let url = v["checkout_url"].as_str().ok_or("no checkout URL")?;
+        open_browser(url);
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Open Stripe Connect onboarding (for a seller to receive payouts).
+#[tauri::command]
+pub async fn payment_connect(state: St<'_>) -> Result<(), String> {
+    let st = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let v = st.send_authed("POST", "/v1/connect/onboard", None)?;
+        let url = v["onboard_url"].as_str().ok_or("no onboarding URL")?;
+        open_browser(url);
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn payment_connect_status(state: St<'_>) -> Result<Value, String> {
+    let st = state.inner().clone();
+    tokio::task::spawn_blocking(move || st.send_authed("GET", "/v1/connect/status", None))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

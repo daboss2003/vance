@@ -4467,6 +4467,9 @@ fn main() {
             accounts::catalog_reviews,
             accounts::catalog_install,
             accounts::catalog_review,
+            accounts::payment_checkout,
+            accounts::payment_connect,
+            accounts::payment_connect_status,
         ])
         .build(tauri::generate_context!())
         .expect("tauri failed to start")

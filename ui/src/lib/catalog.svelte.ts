@@ -7,6 +7,7 @@ import {
   catalogReviews,
   catalogInstall,
   catalogReview,
+  paymentCheckout,
   type CatalogCard,
   type CatalogDetail,
   type CatalogReview
@@ -146,6 +147,20 @@ export async function install(d: CatalogDetail): Promise<void> {
     await refreshInstalled();
   } catch (e) {
     toast.error(`Couldn’t install “${d.display_name}”.\n${String(e)}`);
+  } finally {
+    catalog.busy = false;
+  }
+}
+
+/** Buy a paid effect: opens Stripe checkout in the browser. The webhook grants
+ *  it on payment, and it appears in My Effects (spec §8). */
+export async function buy(d: CatalogDetail): Promise<void> {
+  catalog.busy = true;
+  try {
+    await paymentCheckout(d.sku);
+    toast.info('Finish your purchase in the browser — the effect appears in My Effects once it’s paid.');
+  } catch (e) {
+    toast.error(String(e));
   } finally {
     catalog.busy = false;
   }

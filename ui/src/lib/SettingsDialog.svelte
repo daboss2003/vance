@@ -16,7 +16,9 @@
     loadEffects,
     installEffect,
     uninstallEffect,
-    setAutoInstall
+    setAutoInstall,
+    loadSelling,
+    connectPayouts
   } from '$lib/account.svelte';
   import type { DeviceInfo } from '$lib/ipc';
 
@@ -46,6 +48,12 @@
   $effect(() => {
     if (account.open && account.tab === 'effects' && account.signedIn && !account.effectsLoaded) {
       void loadEffects();
+    }
+  });
+  // Load seller/payout status when the Selling tab is shown while signed in.
+  $effect(() => {
+    if (account.open && account.tab === 'selling' && account.signedIn && !account.sellingLoaded) {
+      void loadSelling();
     }
   });
   $effect(() => {
@@ -113,6 +121,9 @@
         </button>
         <button class:active={account.tab === 'effects'} onclick={() => (account.tab = 'effects')}>
           My Effects
+        </button>
+        <button class:active={account.tab === 'selling'} onclick={() => (account.tab = 'selling')}>
+          Selling
         </button>
         <button class:active={account.tab === 'devices'} onclick={() => (account.tab = 'devices')}>
           Devices
@@ -222,6 +233,36 @@
                 </li>
               {/each}
             </ul>
+          {/if}
+        {/if}
+
+      <!-- SELLING -->
+      {:else if account.tab === 'selling'}
+        {#if !account.signedIn}
+          <div class="muted">Sign in to sell your effects.</div>
+        {:else}
+          <p class="muted small">
+            Sell effects you make. Buyers pay you directly through Stripe; Vance
+            takes a 20% fee and never holds your money.
+          </p>
+          {#if !account.sellingLoaded}
+            <div class="muted">Checking…</div>
+          {:else if account.sellerChargesEnabled}
+            <div class="who">
+              <div class="avatar">$</div>
+              <div class="min0">
+                <div class="email">Payouts connected</div>
+                <div class="muted small">You're ready to sell paid effects.</div>
+              </div>
+            </div>
+          {:else}
+            <button class="primary" disabled={account.busy} onclick={connectPayouts}>
+              {account.sellerConnected ? 'Finish connecting payouts' : 'Connect payouts with Stripe'}
+            </button>
+            <p class="muted small" style="margin-top:10px">
+              Opens Stripe in your browser to set up how you get paid. Requires the
+              marketplace server to have Stripe configured.
+            </p>
           {/if}
         {/if}
 

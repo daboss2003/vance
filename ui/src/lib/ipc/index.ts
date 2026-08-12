@@ -2095,3 +2095,12 @@ export const catalogInstall = (sku: string): Promise<void> => invoke('catalog_in
 /** Post/update a 1–5 star review (must own or have installed the effect). */
 export const catalogReview = (sku: string, stars: number, body?: string): Promise<void> =>
   invoke('catalog_review', { sku, stars, body: body ?? null });
+
+// --- Payments (M4) ---------------------------------------------------------
+
+/** Buy a paid effect: opens the seller's Stripe checkout in the system browser. */
+export const paymentCheckout = (sku: string): Promise<void> => invoke('payment_checkout', { sku });
+/** Open Stripe Connect onboarding to receive payouts as a seller. */
+export const paymentConnect = (): Promise<void> => invoke('payment_connect');
+export const paymentConnectStatus = (): Promise<{ connected: boolean; charges_enabled: boolean }> =>
+  invoke('payment_connect_status');
