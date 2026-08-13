@@ -1,0 +1,30 @@
+[package]
+name = "vance-buildsvc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Vance hosted build/review service (spec §10 Phase 3, §9): validate + sign submitted effects; orchestrate source→wasm builds in an isolated worker."
+
+[lib]
+name = "vance_buildsvc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vance-buildsvc"
+path = "src/main.rs"
+
+[dependencies]
+vance-plugin-sdk = { workspace = true, features = ["host"] } # validate .wasm effects
+vance-effects = { workspace = true }                         # validate .vsfx shaders
+ed25519-dalek = { version = "2", features = ["rand_core"] }  # sign approved artifacts
+sha2 = "0.10"
+base64 = "0.22"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

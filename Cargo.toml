@@ -42,6 +42,7 @@ members = [
     "crates/vance-app",
     "crates/vance-cli",
     "crates/vance-bench",
+    "crates/vance-buildsvc",
 ]
 # Phase 10 — sample WASM plugins. Excluded from the host workspace
 # build because they only target wasm32-unknown-unknown (cdylib). Build
