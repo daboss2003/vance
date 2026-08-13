@@ -16,6 +16,7 @@
     install,
     buy,
     submitReview,
+    report,
     CATEGORIES
   } from '$lib/catalog.svelte';
   import { pluginsFolder } from '$lib/ipc';
@@ -84,7 +85,14 @@
           <div class="detail-head">
             <div class="min0">
               <div class="d-name">{d.display_name}</div>
-              <div class="muted small">by {d.publisher} · {ratingLabel(d.rating, d.ratings_count)}</div>
+              <div class="muted small">
+                by {d.publisher} · {ratingLabel(d.rating, d.ratings_count)}
+                {#if d.verified_seller}<span class="badge ok">✓ Verified</span>{/if}
+                {#if d.new_seller}<span class="badge warn">New seller</span>{/if}
+              </div>
+              {#if d.dispute_rate > 0.05}
+                <div class="warn-line">⚠ Some buyers have reported issues with this effect.</div>
+              {/if}
             </div>
             {#if installedLocally(d.sku)}
               <button class="primary" disabled>Installed ✓</button>
@@ -153,6 +161,7 @@
               {/each}
             </ul>
           {/if}
+          <button class="report" onclick={() => report(d)}>Report this effect</button>
         {:else}
           <!-- Search + filters -->
           <div class="filters">
@@ -193,7 +202,11 @@
               {#each catalog.effects as fx (fx.sku)}
                 <button class="tile" onclick={() => openDetail(fx.sku)}>
                   <div class="t-name">{fx.display_name}</div>
-                  <div class="muted t-pub">{fx.publisher}</div>
+                  <div class="muted t-pub">
+                    {fx.publisher}
+                    {#if fx.verified_seller}<span class="badge ok">✓</span>{/if}
+                    {#if fx.new_seller}<span class="badge warn">New</span>{/if}
+                  </div>
                   <div class="t-foot">
                     <span class="muted small">{ratingLabel(fx.rating, fx.ratings_count)}</span>
                     <span class="price">{fx.price_cents === 0 ? 'Free' : `$${(fx.price_cents / 100).toFixed(2)}`}</span>
@@ -391,6 +404,40 @@
     font-size: 11.5px;
     font-weight: 600;
     color: var(--ok, #5ac37d);
+  }
+  .badge {
+    font-size: 9.5px;
+    font-weight: 700;
+    border-radius: 999px;
+    padding: 0 5px;
+    margin-left: 4px;
+    white-space: nowrap;
+  }
+  .badge.ok {
+    color: var(--ok, #5ac37d);
+    border: 1px solid var(--ok, #5ac37d);
+  }
+  .badge.warn {
+    color: #f2c14e;
+    border: 1px solid #f2c14e;
+  }
+  .warn-line {
+    font-size: 11.5px;
+    color: #f2c14e;
+    margin-top: 4px;
+  }
+  .report {
+    margin-top: 14px;
+    background: none;
+    border: none;
+    color: var(--muted, #949bab);
+    font-size: 11.5px;
+    cursor: pointer;
+    text-decoration: underline;
+    padding: 0;
+  }
+  .report:hover {
+    color: var(--err, #f2686f);
   }
   .more {
     margin: 12px auto 0;

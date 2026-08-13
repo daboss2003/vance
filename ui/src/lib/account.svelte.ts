@@ -17,11 +17,14 @@ import {
   entitlementsReconcile,
   paymentConnect,
   paymentConnectStatus,
+  sellerStatus,
+  sellerEffects,
   getAppSettings,
   setAppSettings,
   type AccountUser,
   type DeviceInfo,
-  type OwnedEffect
+  type OwnedEffect,
+  type SellerListing
 } from '$lib/ipc';
 import { toast } from '$lib/toast.svelte';
 
@@ -40,6 +43,10 @@ interface AccountUI {
   autoInstall: boolean;
   sellerConnected: boolean;
   sellerChargesEnabled: boolean;
+  sellerVerified: boolean;
+  sellerTrusted: boolean;
+  sellerFrozen: boolean;
+  sellerListings: SellerListing[];
   sellingLoaded: boolean;
   busy: boolean;
   baseUrl: string;
@@ -58,6 +65,10 @@ export const account = $state<AccountUI>({
   autoInstall: false,
   sellerConnected: false,
   sellerChargesEnabled: false,
+  sellerVerified: false,
+  sellerTrusted: false,
+  sellerFrozen: false,
+  sellerListings: [],
   sellingLoaded: false,
   busy: false,
   baseUrl: ''
@@ -93,11 +104,20 @@ export async function openSettings(tab: Tab = 'account'): Promise<void> {
 
 export async function loadSelling(): Promise<void> {
   try {
-    const s = await paymentConnectStatus();
-    account.sellerConnected = s.connected;
-    account.sellerChargesEnabled = s.charges_enabled;
-    account.sellingLoaded = true;
+    const [conn, status, listings] = await Promise.all([
+      paymentConnectStatus(),
+      sellerStatus(),
+      sellerEffects()
+    ]);
+    account.sellerConnected = conn.connected;
+    account.sellerChargesEnabled = conn.charges_enabled;
+    account.sellerVerified = status.verified;
+    account.sellerTrusted = status.trusted;
+    account.sellerFrozen = status.frozen;
+    account.sellerListings = listings.effects ?? [];
   } catch {
+    /* leave last */
+  } finally {
     account.sellingLoaded = true;
   }
 }

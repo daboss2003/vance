@@ -1388,6 +1388,42 @@ pub async fn payment_connect_status(state: St<'_>) -> Result<Value, String> {
         .map_err(|e| e.to_string())?
 }
 
+// --- M5 seller-trust commands ----------------------------------------------
+
+/// Report a bad / mis-described / impersonating effect (spec §8a).
+#[tauri::command]
+pub async fn catalog_report(state: St<'_>, sku: String, reason: Option<String>) -> Result<(), String> {
+    let st = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        st.send_authed(
+            "POST",
+            &format!("/v1/catalog/{sku}/report"),
+            Some(json!({ "reason": reason })),
+        )
+        .map(|_| ())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The caller's seller badges (verified/trusted/frozen/new_seller).
+#[tauri::command]
+pub async fn seller_status(state: St<'_>) -> Result<Value, String> {
+    let st = state.inner().clone();
+    tokio::task::spawn_blocking(move || st.send_authed("GET", "/v1/seller", None))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The caller's listings with downloads + report counts (Selling ledger).
+#[tauri::command]
+pub async fn seller_effects(state: St<'_>) -> Result<Value, String> {
+    let st = state.inner().clone();
+    tokio::task::spawn_blocking(move || st.send_authed("GET", "/v1/seller/effects", None))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

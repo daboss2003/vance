@@ -247,22 +247,54 @@
           </p>
           {#if !account.sellingLoaded}
             <div class="muted">Checking…</div>
-          {:else if account.sellerChargesEnabled}
-            <div class="who">
-              <div class="avatar">$</div>
-              <div class="min0">
-                <div class="email">Payouts connected</div>
-                <div class="muted small">You're ready to sell paid effects.</div>
-              </div>
-            </div>
           {:else}
-            <button class="primary" disabled={account.busy} onclick={connectPayouts}>
-              {account.sellerConnected ? 'Finish connecting payouts' : 'Connect payouts with Stripe'}
-            </button>
-            <p class="muted small" style="margin-top:10px">
-              Opens Stripe in your browser to set up how you get paid. Requires the
-              marketplace server to have Stripe configured.
-            </p>
+            {#if account.sellerFrozen}
+              <div class="warn-banner">
+                Your listings are paused pending review after buyer reports.
+              </div>
+            {/if}
+            {#if account.sellerChargesEnabled}
+              <div class="who">
+                <div class="avatar">$</div>
+                <div class="min0">
+                  <div class="email">
+                    Payouts connected
+                    <span class="badge">{account.sellerTrusted ? 'Trusted' : 'New seller'}</span>
+                  </div>
+                  <div class="muted small">
+                    {account.sellerTrusted
+                      ? "You're ready to sell paid effects."
+                      : 'New sellers can list paid effects up to $20 until they build a track record.'}
+                  </div>
+                </div>
+              </div>
+            {:else}
+              <button class="primary" disabled={account.busy} onclick={connectPayouts}>
+                {account.sellerConnected ? 'Finish connecting payouts' : 'Connect payouts with Stripe'}
+              </button>
+              <p class="muted small" style="margin-top:10px">
+                Opens Stripe in your browser to set up how you get paid. Requires the
+                marketplace server to have Stripe configured.
+              </p>
+            {/if}
+
+            {#if account.sellerListings.length > 0}
+              <div class="sec-title">Your effects</div>
+              <ul class="devs">
+                {#each account.sellerListings as l (l.sku)}
+                  <li>
+                    <div class="min0">
+                      <div class="dname">{l.display_name}</div>
+                      <div class="muted small">
+                        {l.price_cents === 0 ? 'Free' : `$${(l.price_cents / 100).toFixed(2)}`} ·
+                        {l.downloads} installs{#if l.reports > 0} ·
+                          <span style="color:#f2c14e">{l.reports} reports</span>{/if}
+                      </div>
+                    </div>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
           {/if}
         {/if}
 
@@ -570,6 +602,14 @@
     border: 1px solid var(--accent, #4c9dff);
     border-radius: 999px;
     padding: 0 6px;
+  }
+  .warn-banner {
+    border: 1px solid #f2c14e;
+    color: #f2c14e;
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 12px;
+    margin-bottom: 12px;
   }
   .confirm {
     display: flex;

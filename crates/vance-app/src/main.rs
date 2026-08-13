@@ -4470,6 +4470,9 @@ fn main() {
             accounts::payment_checkout,
             accounts::payment_connect,
             accounts::payment_connect_status,
+            accounts::catalog_report,
+            accounts::seller_status,
+            accounts::seller_effects,
         ])
         .build(tauri::generate_context!())
         .expect("tauri failed to start")

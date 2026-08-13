@@ -7,6 +7,7 @@ import {
   catalogReviews,
   catalogInstall,
   catalogReview,
+  catalogReport,
   paymentCheckout,
   type CatalogCard,
   type CatalogDetail,
@@ -185,4 +186,25 @@ export async function submitReview(sku: string, stars: number, body: string): Pr
 
 export function isInstalled(sku: string): boolean {
   return catalog.installedSkus.includes(sku);
+}
+
+/** Report a bad/mis-described/impersonating effect (spec §8a). */
+export async function report(d: CatalogDetail): Promise<void> {
+  const reason = await openDialog({
+    title: `Report “${d.display_name}”?`,
+    body: 'What’s wrong with this effect?',
+    actions: [
+      { label: 'It doesn’t work', value: 'broken' },
+      { label: 'Not as described', value: 'misleading' },
+      { label: 'Impersonation / stolen', value: 'impersonation', kind: 'danger' },
+      { label: 'Cancel', value: 'cancel' }
+    ]
+  });
+  if (!reason || reason === 'cancel') return;
+  try {
+    await catalogReport(d.sku, reason);
+    toast.success('Thanks — we’ll review this effect.');
+  } catch (e) {
+    toast.error(String(e));
+  }
 }

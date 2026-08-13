@@ -2067,6 +2067,11 @@ export type CatalogCard = {
   downloads: number;
   rating: number | null;
   ratings_count: number;
+  /** M5 — seller trust surfaced to buyers. */
+  verified_seller: boolean;
+  new_seller: boolean;
+  reports: number;
+  dispute_rate: number;
 };
 
 export type CatalogDetail = CatalogCard & {
@@ -2104,3 +2109,30 @@ export const paymentCheckout = (sku: string): Promise<void> => invoke('payment_c
 export const paymentConnect = (): Promise<void> => invoke('payment_connect');
 export const paymentConnectStatus = (): Promise<{ connected: boolean; charges_enabled: boolean }> =>
   invoke('payment_connect_status');
+
+// --- Seller trust / reporting (M5) -----------------------------------------
+
+export type SellerStatus = {
+  verified: boolean;
+  trusted: boolean;
+  frozen: boolean;
+  banned: boolean;
+  new_seller: boolean;
+  price_cap_cents: number | null;
+};
+
+export type SellerListing = {
+  sku: string;
+  display_name: string;
+  price_cents: number;
+  downloads: number;
+  reports: number;
+};
+
+/** Report a bad / mis-described / impersonating effect. */
+export const catalogReport = (sku: string, reason?: string): Promise<void> =>
+  invoke('catalog_report', { sku, reason: reason ?? null });
+/** The signed-in user's seller status (badges). */
+export const sellerStatus = (): Promise<SellerStatus> => invoke('seller_status');
+/** The seller's own listings with downloads + report counts. */
+export const sellerEffects = (): Promise<{ effects: SellerListing[] }> => invoke('seller_effects');
