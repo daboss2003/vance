@@ -4463,6 +4463,7 @@ fn main() {
             accounts::account_set_password,
             accounts::account_base_url,
             accounts::account_set_base_url,
+            accounts::account_providers,
             accounts::entitlements_list,
             accounts::entitlement_install,
             accounts::entitlement_uninstall,

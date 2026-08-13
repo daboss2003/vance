@@ -140,15 +140,20 @@
         {:else if !account.signedIn}
           <p class="lead">Sign in to buy, sell, and sync add-on effects across your machines.</p>
           <div class="providers">
-            {#each PROVIDERS as p (p.id)}
+            {#each PROVIDERS.filter((p) => account.providers[p.id as 'github' | 'google' | 'apple' | 'meta']) as p (p.id)}
               <button class="provider" disabled={account.busy} onclick={() => signIn(p.id)}>
                 {p.label}
               </button>
             {/each}
           </div>
-          <button class="dev" disabled={account.busy} onclick={() => signIn('dev')}>
-            {account.busy ? 'Opening your browser…' : 'Local dev sign-in (for testing)'}
-          </button>
+          {#if account.providers.dev}
+            <button class="dev" disabled={account.busy} onclick={() => signIn('dev')}>
+              {account.busy ? 'Opening your browser…' : 'Local dev sign-in (for testing)'}
+            </button>
+          {/if}
+          {#if !account.providers.dev && !account.providers.github && !account.providers.google && !account.providers.apple && !account.providers.meta}
+            <p class="muted small">No sign-in methods are configured on this server yet.</p>
+          {/if}
         {:else}
           <div class="who">
             <div class="avatar">{(account.user?.email ?? 'V').slice(0, 1).toUpperCase()}</div>

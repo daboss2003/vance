@@ -35,6 +35,19 @@ pub async fn healthz() -> impl IntoResponse {
     Json(json!({ "ok": true }))
 }
 
+/// Which sign-in providers this server actually has configured (so the app shows
+/// only working buttons, not dead ones).
+pub async fn providers(State(st): State<AppState>) -> impl IntoResponse {
+    let c = &st.config;
+    Json(json!({
+        "dev": c.dev_provider,
+        "github": c.github.is_some(),
+        "google": c.google.is_some(),
+        "apple": c.apple.is_some(),
+        "meta": c.meta.is_some(),
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // /auth/start
 // ---------------------------------------------------------------------------

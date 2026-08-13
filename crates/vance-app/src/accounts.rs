@@ -1192,6 +1192,15 @@ pub async fn account_set_password(
     .map_err(|e| e.to_string())?
 }
 
+/// Which sign-in providers the configured server supports (public endpoint).
+#[tauri::command]
+pub async fn account_providers(state: St<'_>) -> Result<Value, String> {
+    let st = state.inner().clone();
+    tokio::task::spawn_blocking(move || st.get_public("/v1/providers"))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 pub fn account_base_url(state: St<'_>) -> String {
     state.base()

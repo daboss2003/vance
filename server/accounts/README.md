@@ -92,9 +92,9 @@ Auto-minting the secret from the `.p8` in-process is a planned enhancement. Also
 note Apple usually returns a **private-relay email** and sends the email only on
 first consent — the account is keyed on the stable `sub`, never the email (§4.1).
 
-**Hardening TODO:** Google/Apple `id_token` signatures are currently trusted
-because they arrive over TLS directly from the provider's token endpoint;
-verifying them against the provider JWKS is a planned defense-in-depth step.
+**Signature verification:** Google/Apple `id_token`s are verified against the
+provider **JWKS (RS256)** — issuer, audience (your client id), and expiry are all
+checked — not merely trusted for arriving over TLS.
 
 ## Not yet (later milestones)
 

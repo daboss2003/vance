@@ -48,6 +48,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(r_auth::healthz))
         .route("/auth/pubkey", get(r_auth::pubkey))
+        .route("/v1/providers", get(r_auth::providers))
         .route("/auth/start", get(r_auth::start))
         .route("/auth/callback", get(r_auth::callback))
         .route("/auth/token", post(r_auth::token))

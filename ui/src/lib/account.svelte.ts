@@ -11,6 +11,7 @@ import {
   accountSetPassword,
   accountBaseUrl,
   accountSetBaseUrl,
+  accountProviders,
   entitlementsList,
   entitlementInstall,
   entitlementUninstall,
@@ -48,6 +49,7 @@ interface AccountUI {
   sellerFrozen: boolean;
   sellerListings: SellerListing[];
   sellingLoaded: boolean;
+  providers: { dev: boolean; github: boolean; google: boolean; apple: boolean; meta: boolean };
   busy: boolean;
   baseUrl: string;
 }
@@ -70,6 +72,7 @@ export const account = $state<AccountUI>({
   sellerFrozen: false,
   sellerListings: [],
   sellingLoaded: false,
+  providers: { dev: true, github: false, google: false, apple: false, meta: false },
   busy: false,
   baseUrl: ''
 });
@@ -95,6 +98,11 @@ export async function openSettings(tab: Tab = 'account'): Promise<void> {
     account.baseUrl = await accountBaseUrl();
   } catch {
     /* ignore */
+  }
+  try {
+    account.providers = await accountProviders();
+  } catch {
+    /* keep defaults (server unreachable) */
   }
   await refreshStatus();
   if (account.signedIn && tab === 'devices') await loadDevices();

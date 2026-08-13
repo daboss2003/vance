@@ -1998,6 +1998,16 @@ export type DeviceInfo = {
   this_device: boolean;
 };
 
+export type ProviderAvailability = {
+  dev: boolean;
+  github: boolean;
+  google: boolean;
+  apple: boolean;
+  meta: boolean;
+};
+
+/** Which sign-in providers the configured server supports (so we hide dead buttons). */
+export const accountProviders = (): Promise<ProviderAvailability> => invoke('account_providers');
 /** Current sign-in status (calls the accounts service if a session exists). */
 export const accountStatus = (): Promise<AccountStatus> => invoke('account_status');
 /** Run the loopback sign-in flow for a provider (opens the system browser). */

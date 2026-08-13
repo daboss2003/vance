@@ -183,32 +183,110 @@ async fn google_exchange(
         .get("id_token")
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::BadRequest("google returned no id_token".into()))?;
-    id_token_identity(id_token)
+    verify_id_token(id_token, &creds.client_id, GOOGLE_JWKS, GOOGLE_ISS).await
 }
 
-/// Read `(sub, email)` from an OIDC `id_token`. The token arrives directly from
-/// the provider's token endpoint over TLS in a server-to-server call, so we read
-/// its claims; verifying the JWT signature against the provider's JWKS is a
-/// deliberate hardening follow-up (defense-in-depth). Shared by Google + Apple.
-fn id_token_identity(id_token: &str) -> AppResult<ProviderIdentity> {
-    let payload = id_token
-        .split('.')
-        .nth(1)
-        .ok_or_else(|| AppError::BadRequest("malformed id_token".into()))?;
-    let claims: serde_json::Value = serde_json::from_slice(
-        &B64.decode(payload)
-            .map_err(|_| AppError::BadRequest("id_token base64".into()))?,
+const GOOGLE_JWKS: &str = "https://www.googleapis.com/oauth2/v3/certs";
+const GOOGLE_ISS: &[&str] = &["https://accounts.google.com", "accounts.google.com"];
+const APPLE_JWKS: &str = "https://appleid.apple.com/auth/keys";
+const APPLE_ISS: &[&str] = &["https://appleid.apple.com"];
+
+/// Verify an OIDC `id_token` against the provider's JWKS (RS256 signature) and
+/// its `iss`/`aud`/`exp` claims — defense-in-depth beyond the TLS token
+/// exchange. Shared by Google + Apple.
+async fn verify_id_token(
+    id_token: &str,
+    aud: &str,
+    jwks_url: &str,
+    iss_allow: &[&str],
+) -> AppResult<ProviderIdentity> {
+    let parts: Vec<&str> = id_token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(AppError::BadRequest("malformed id_token".into()));
+    }
+    let header: serde_json::Value = serde_json::from_slice(
+        &B64.decode(parts[0]).map_err(|_| AppError::BadRequest("id_token header".into()))?,
     )
-    .map_err(|_| AppError::BadRequest("id_token json".into()))?;
-    let subject = claims
-        .get("sub")
-        .and_then(|v| v.as_str())
+    .map_err(|_| AppError::BadRequest("id_token header json".into()))?;
+    let kid = header["kid"]
+        .as_str()
+        .ok_or_else(|| AppError::BadRequest("id_token has no kid".into()))?;
+
+    let jwks: serde_json::Value = reqwest::Client::new()
+        .get(jwks_url)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("jwks fetch: {e}")))?
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("jwks json: {e}")))?;
+    let key = jwks["keys"]
+        .as_array()
+        .and_then(|ks| ks.iter().find(|k| k["kid"].as_str() == Some(kid)))
+        .ok_or_else(|| AppError::BadRequest("id_token signing key not in JWKS".into()))?;
+    let n = key["n"].as_str().ok_or_else(|| AppError::Internal("jwk n".into()))?;
+    let e = key["e"].as_str().ok_or_else(|| AppError::Internal("jwk e".into()))?;
+    verify_rs256(n, e, id_token, aud, iss_allow)
+}
+
+/// Pure RS256 verification: check the signature with the JWK `(n, e)` and the
+/// `iss`/`aud`/`exp` claims. Returns the verified `(sub, email)`.
+fn verify_rs256(
+    n_b64: &str,
+    e_b64: &str,
+    id_token: &str,
+    aud: &str,
+    iss_allow: &[&str],
+) -> AppResult<ProviderIdentity> {
+    use rsa::{BigUint, Pkcs1v15Sign, RsaPublicKey};
+    use sha2::{Digest, Sha256};
+
+    let parts: Vec<&str> = id_token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(AppError::BadRequest("malformed id_token".into()));
+    }
+    let n = BigUint::from_bytes_be(
+        &B64.decode(n_b64).map_err(|_| AppError::Internal("jwk n b64".into()))?,
+    );
+    let e = BigUint::from_bytes_be(
+        &B64.decode(e_b64).map_err(|_| AppError::Internal("jwk e b64".into()))?,
+    );
+    let pubkey =
+        RsaPublicKey::new(n, e).map_err(|_| AppError::Internal("jwk not a valid RSA key".into()))?;
+
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let hashed = Sha256::digest(signing_input.as_bytes());
+    let sig = B64
+        .decode(parts[2])
+        .map_err(|_| AppError::BadRequest("id_token signature b64".into()))?;
+    pubkey
+        .verify(Pkcs1v15Sign::new::<Sha256>(), hashed.as_slice(), &sig)
+        .map_err(|_| AppError::BadRequest("id_token signature is invalid".into()))?;
+
+    let claims: serde_json::Value = serde_json::from_slice(
+        &B64.decode(parts[1]).map_err(|_| AppError::BadRequest("id_token payload".into()))?,
+    )
+    .map_err(|_| AppError::BadRequest("id_token payload json".into()))?;
+    let iss = claims["iss"].as_str().unwrap_or("");
+    if !iss_allow.contains(&iss) {
+        return Err(AppError::BadRequest("id_token issuer mismatch".into()));
+    }
+    let aud_ok = match &claims["aud"] {
+        serde_json::Value::String(s) => s == aud,
+        serde_json::Value::Array(a) => a.iter().any(|v| v.as_str() == Some(aud)),
+        _ => false,
+    };
+    if !aud_ok {
+        return Err(AppError::BadRequest("id_token audience mismatch".into()));
+    }
+    if claims["exp"].as_i64().unwrap_or(0) < crate::util::now() {
+        return Err(AppError::BadRequest("id_token expired".into()));
+    }
+    let subject = claims["sub"]
+        .as_str()
         .ok_or_else(|| AppError::BadRequest("id_token had no sub".into()))?
         .to_string();
-    let email = claims
-        .get("email")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let email = claims["email"].as_str().map(str::to_string);
     Ok(ProviderIdentity { subject, email })
 }
 
@@ -284,5 +362,48 @@ async fn apple_exchange(
         .get("id_token")
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::BadRequest("apple returned no id_token".into()))?;
-    id_token_identity(id_token)
+    verify_id_token(id_token, &creds.client_id, APPLE_JWKS, APPLE_ISS).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rs256_verifies_and_rejects_tamper_and_wrong_aud() {
+        use rsa::traits::PublicKeyParts;
+        use rsa::{Pkcs1v15Sign, RsaPrivateKey};
+        use sha2::{Digest, Sha256};
+
+        let mut rng = rand::rngs::OsRng;
+        let priv_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let pub_key = priv_key.to_public_key();
+        let n_b64 = B64.encode(pub_key.n().to_bytes_be());
+        let e_b64 = B64.encode(pub_key.e().to_bytes_be());
+
+        let header = B64.encode(br#"{"alg":"RS256","kid":"test"}"#);
+        let payload = B64.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "sub": "u1", "email": "a@b.com", "aud": "client-123",
+                "iss": "https://accounts.google.com", "exp": crate::util::now() + 600
+            }))
+            .unwrap(),
+        );
+        let signing_input = format!("{header}.{payload}");
+        let hashed = Sha256::digest(signing_input.as_bytes());
+        let sig = priv_key
+            .sign(Pkcs1v15Sign::new::<Sha256>(), hashed.as_slice())
+            .unwrap();
+        let token = format!("{signing_input}.{}", B64.encode(&sig));
+
+        let id = verify_rs256(&n_b64, &e_b64, &token, "client-123", GOOGLE_ISS).unwrap();
+        assert_eq!(id.subject, "u1");
+        assert_eq!(id.email.as_deref(), Some("a@b.com"));
+
+        // Wrong audience → rejected.
+        assert!(verify_rs256(&n_b64, &e_b64, &token, "someone-else", GOOGLE_ISS).is_err());
+        // Tampered signing input → signature fails.
+        let bad = format!("{header}.{payload}x.{}", B64.encode(&sig));
+        assert!(verify_rs256(&n_b64, &e_b64, &bad, "client-123", GOOGLE_ISS).is_err());
+    }
 }
