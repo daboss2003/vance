@@ -59,9 +59,10 @@ impl ShaderEffect {
         validate_wgsl(&assemble(effect_body))
     }
 
-    /// Compile with a fresh headless GPU context (used by tests + preview).
+    /// Compile on the shared headless GPU context (created once, then reused —
+    /// used by tests + the Effect Studio's live preview).
     pub fn compile(effect_body: &str) -> Result<ShaderEffect, String> {
-        let (device, queue) = headless_device()?;
+        let (device, queue) = shared_device().ok_or_else(|| "no GPU adapter available".to_string())?;
         Self::compile_with(device, queue, effect_body)
     }
 
@@ -333,6 +334,16 @@ fn validate_wgsl(src: &str) -> Result<(), String> {
 fn bytemuck_f32_bytes(v: &[f32]) -> &[u8] {
     // Safe: f32 has no padding/invalid bit patterns for read as bytes.
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+/// A single headless GPU context, created on first use and reused thereafter —
+/// so a live preview that recompiles on every keystroke doesn't pay the (slow)
+/// adapter/device request each time. Device + Queue are Arc-backed, so cloning
+/// them out is cheap. Returns `None` if there's no GPU adapter.
+pub fn shared_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+    static SHARED: std::sync::OnceLock<Option<(wgpu::Device, wgpu::Queue)>> =
+        std::sync::OnceLock::new();
+    SHARED.get_or_init(|| headless_device().ok()).clone()
 }
 
 fn headless_device() -> Result<(wgpu::Device, wgpu::Queue), String> {
