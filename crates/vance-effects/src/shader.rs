@@ -53,6 +53,12 @@ pub struct ShaderEffect {
 }
 
 impl ShaderEffect {
+    /// Validate the user's `effect()` (naga only — no GPU). Cheap; used by the
+    /// Effect Studio's save path to surface compile errors.
+    pub fn validate(effect_body: &str) -> Result<(), String> {
+        validate_wgsl(&assemble(effect_body))
+    }
+
     /// Compile with a fresh headless GPU context (used by tests + preview).
     pub fn compile(effect_body: &str) -> Result<ShaderEffect, String> {
         let (device, queue) = headless_device()?;

@@ -25,6 +25,7 @@ mod proxy;
 mod publish;
 mod separate;
 mod settings;
+mod studio;
 mod tools;
 mod transcribe;
 
@@ -4477,6 +4478,9 @@ fn main() {
             accounts::catalog_report,
             accounts::seller_status,
             accounts::seller_effects,
+            studio::shader_preview,
+            studio::shader_save,
+            studio::shader_template,
         ])
         .build(tauri::generate_context!())
         .expect("tauri failed to start")

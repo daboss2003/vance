@@ -2138,3 +2138,35 @@ export const catalogReport = (sku: string, reason?: string): Promise<void> =>
 export const sellerStatus = (): Promise<SellerStatus> => invoke('seller_status');
 /** The seller's own listings with downloads + report counts. */
 export const sellerEffects = (): Promise<{ effects: SellerListing[] }> => invoke('seller_effects');
+
+// --- Effect Studio (M6) ----------------------------------------------------
+
+export type StudioParam = {
+  key: string;
+  label: string;
+  min: number;
+  max: number;
+  default: number;
+};
+
+/** Compile + render the shader on a sample image → base64 RGBA (or a compile error). */
+export const shaderPreview = (
+  body: string,
+  params: number[]
+): Promise<{ width: number; height: number; rgba: string }> =>
+  invoke('shader_preview', { body, params });
+/** Validate + save the shader as a `.vsfx` add-on effect; rescans so it's usable. */
+export const shaderSave = (args: {
+  id: string;
+  name: string;
+  author: string;
+  body: string;
+  params: StudioParam[];
+}): Promise<{ id: string; installed: number }> => invoke('shader_save', args);
+/** A starter template so the editor isn't blank. */
+export const shaderTemplate = (): Promise<{
+  id: string;
+  name: string;
+  body: string;
+  params: StudioParam[];
+}> => invoke('shader_template');

@@ -19,6 +19,7 @@
     report,
     CATEGORIES
   } from '$lib/catalog.svelte';
+  import { openStudio } from '$lib/studio.svelte';
   import { pluginsFolder } from '$lib/ipc';
   import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 
@@ -224,6 +225,7 @@
 
       <!-- ============================ INSTALLED ============================ -->
       {:else}
+        <button class="create" onclick={openStudio}>✨ Create your own effect (no code)</button>
         <div class="drop" class:hot={market.dragOver}>
           <div class="drop-title">Add an effect file</div>
           <div class="drop-sub">Drag an effect file (.wasm) here, or</div>
@@ -425,6 +427,21 @@
     font-size: 11.5px;
     color: #f2c14e;
     margin-top: 4px;
+  }
+  .create {
+    width: 100%;
+    padding: 10px;
+    margin-bottom: 12px;
+    border-radius: 8px;
+    border: 1px solid var(--accent, #4c9dff);
+    background: color-mix(in srgb, var(--accent, #4c9dff) 12%, transparent);
+    color: var(--fg, #dfe3e9);
+    font-weight: 600;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .create:hover {
+    background: color-mix(in srgb, var(--accent, #4c9dff) 20%, transparent);
   }
   .report {
     margin-top: 14px;

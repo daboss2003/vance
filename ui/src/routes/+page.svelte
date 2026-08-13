@@ -60,6 +60,7 @@
   import { getCurrentWebview } from '@tauri-apps/api/webview';
   import EffectsMarketplace from '$lib/EffectsMarketplace.svelte';
   import SettingsDialog from '$lib/SettingsDialog.svelte';
+  import EffectStudio from '$lib/EffectStudio.svelte';
   import { openSettings, onRevoked, reconcileEffects } from '$lib/account.svelte';
   import { market, importEffectPaths } from '$lib/effectsMarket.svelte';
 
@@ -1637,6 +1638,7 @@
 <Dialogs />
 <EffectsMarketplace />
 <SettingsDialog />
+<EffectStudio />
 
 {#if dropActive && !market.open}
   <div
