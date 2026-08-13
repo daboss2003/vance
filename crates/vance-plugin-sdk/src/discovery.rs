@@ -29,6 +29,9 @@ pub struct DiscoveredPlugin {
     /// True for a `.vef` paid effect: the body is encrypted and the host must
     /// decrypt it (via the entitlement gate) at load. False for a plain `.wasm`.
     pub encrypted: bool,
+    /// True for a `.vsfx` shader effect (M6): the manifest here is plaintext and
+    /// the app compiles the WGSL body via `vance-effects` at load.
+    pub shader: bool,
 }
 
 /// Registry of discovered plugins, de-duplicated by manifest id.
@@ -72,15 +75,22 @@ impl PluginRegistry {
             .filter(|p| {
                 matches!(
                     p.extension().and_then(|e| e.to_str()),
-                    Some("wasm") | Some(crate::container::VEF_EXTENSION)
+                    Some("wasm")
+                        | Some(crate::container::VEF_EXTENSION)
+                        | Some(crate::shaderpkg::SHADER_EXTENSION)
                 )
             })
             .collect();
         paths.sort();
         for path in paths {
-            let encrypted =
-                path.extension().and_then(|e| e.to_str()) == Some(crate::container::VEF_EXTENSION);
-            let loaded = if encrypted {
+            let ext = path.extension().and_then(|e| e.to_str());
+            let encrypted = ext == Some(crate::container::VEF_EXTENSION);
+            let shader = ext == Some(crate::shaderpkg::SHADER_EXTENSION);
+            let loaded = if shader {
+                std::fs::read(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|b| crate::shaderpkg::parse(&b).map(|p| p.manifest))
+            } else if encrypted {
                 std::fs::read(&path)
                     .map_err(|e| e.to_string())
                     .and_then(|b| crate::container::parse_manifest(&b).map_err(|e| e.to_string()))
@@ -92,6 +102,7 @@ impl PluginRegistry {
                     path,
                     manifest,
                     encrypted,
+                    shader,
                 }),
                 Err(e) => {
                     tracing::warn!(?path, error = %e, "skipping unloadable plugin");

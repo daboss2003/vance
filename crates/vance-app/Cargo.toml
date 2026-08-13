@@ -63,6 +63,7 @@ vance-plugin-sdk = { workspace = true, features = ["host"] }
 vance-ofx = { workspace = true }
 tracing-chrome = { workspace = true }
 vance-render = { workspace = true }
+vance-effects = { workspace = true } # M6 — GPU shader effects
 vance-mograph = { workspace = true }
 vance-fusion = { workspace = true }
 vance-captions = { workspace = true }

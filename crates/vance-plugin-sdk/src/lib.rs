@@ -29,4 +29,7 @@ pub mod discovery;
 #[cfg(feature = "host")]
 pub mod container;
 
+#[cfg(feature = "host")]
+pub mod shaderpkg;
+
 pub use manifest::{ManifestError, ParamSpec, PluginKind, PluginManifest};

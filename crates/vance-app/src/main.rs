@@ -1633,6 +1633,9 @@ struct UiWasmPlugin {
     author: String,
     /// "effect" | "transition"
     kind: &'static str,
+    /// M6 — "wasm" | "shader": how the effect runs, so the UI applies the right
+    /// `wasm:<id>` / `shader:<id>` effect kind.
+    runtime: &'static str,
     params: Vec<UiWasmPluginParam>,
 }
 
@@ -1653,6 +1656,7 @@ fn ui_wasm_plugin(d: &vance_plugin_sdk::discovery::DiscoveredPlugin) -> UiWasmPl
             vance_plugin_sdk::manifest::PluginKind::Effect => "effect",
             vance_plugin_sdk::manifest::PluginKind::Transition => "transition",
         },
+        runtime: if d.shader { "shader" } else { "wasm" },
         params: d
             .manifest
             .params

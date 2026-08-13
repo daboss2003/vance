@@ -1430,6 +1430,8 @@ export type WasmPlugin = {
   version: string;
   author: string;
   kind: 'effect' | 'transition';
+  /** M6 — how the effect runs; picks the wasm:/shader: effect kind on apply. */
+  runtime?: 'wasm' | 'shader';
   params: WasmPluginParam[];
 };
 
@@ -1462,7 +1464,7 @@ export const applyWasmPlugin = (
 ): Promise<string> => {
   const params: Record<string, EffectValue> = {};
   for (const p of plugin.params) params[p.key] = p.default;
-  return addEffectToClip(trackId, clipId, `wasm:${plugin.id}`, params);
+  return addEffectToClip(trackId, clipId, `${plugin.runtime ?? 'wasm'}:${plugin.id}`, params);
 };
 
 /** Phase 10.7 — one installed OFX plugin (read-only catalog entry). */

@@ -1318,6 +1318,15 @@ pub struct Engine {
         String,
         (vance_plugin_sdk::host::WasmPlugin, Option<std::time::SystemTime>),
     >,
+    /// M6 — compiled shader effects (`shader:<id>`), keyed by id, with the source
+    /// `.vsfx` mtime for edit-reload. Parallel to `loaded_plugins`.
+    pub(crate) loaded_shaders: std::collections::HashMap<
+        String,
+        (vance_effects::ShaderEffect, Option<std::time::SystemTime>),
+    >,
+    /// M6 — the render device/queue, cloned at viewport install, so a shader
+    /// effect can compile without re-locking `render_state` from the render path.
+    pub(crate) gpu: Option<(wgpu::Device, wgpu::Queue)>,
     /// Phase 10 — transient hand-off from `decode_sequence_at` to
     /// `decode_and_render_at`: the active clip's effect chain + its
     /// clip-relative time, so the live preview can apply WASM effects
@@ -1619,6 +1628,10 @@ impl Engine {
                 )?;
             }
         }
+
+        // M6 — cache the (Arc-backed, cheap-to-clone) device/queue so shader
+        // effects compile without locking render_state from the render path.
+        self.gpu = Some((renderer.device().clone(), renderer.queue().clone()));
 
         self.viewport = Some(Arc::new(viewport));
         self.source_viewport = Some(Arc::new(source_viewport));
@@ -1992,7 +2005,7 @@ impl Engine {
             Some((effects, clip_t))
                 if effects
                     .iter()
-                    .any(|e| e.enabled && e.kind.starts_with("wasm:")) =>
+                    .any(|e| e.enabled && (e.kind.starts_with("wasm:") || e.kind.starts_with("shader:"))) =>
             {
                 self.upload_render_with_wasm(
                     &render_state,
@@ -4840,7 +4853,7 @@ impl Engine {
                 .filter(|effects| {
                     effects
                         .iter()
-                        .any(|e| e.enabled && e.kind.starts_with("wasm:"))
+                        .any(|e| e.enabled && (e.kind.starts_with("wasm:") || e.kind.starts_with("shader:")))
                 })
                 .map(|effects| (effects, clip_t))
         };
@@ -9757,29 +9770,90 @@ impl Engine {
             if !e.enabled {
                 continue;
             }
-            let Some(id) = e.kind.strip_prefix("wasm:") else {
-                continue;
-            };
-            if !self.ensure_plugin_loaded(id) {
-                continue;
-            }
-            let Some((plugin, _)) = self.loaded_plugins.get_mut(id) else {
-                continue;
-            };
-            let manifest = plugin.manifest().clone();
             // Evaluate each param at the clip-relative time so keyframed
-            // (animated) values are honoured, not dropped to the
-            // manifest default. Non-finite (NaN/Inf) values fall back to
-            // the default rather than poisoning the guest.
-            let packed = manifest.pack_params(&|key| {
-                e.params
-                    .get(key)
-                    .and_then(|v| v.eval_number(clip_t))
-                    .filter(|n| n.is_finite())
-                    .map(|n| n as f32)
-            });
-            if let Err(err) = plugin.process(rgba, w, h, &packed) {
-                tracing::warn!(plugin = %id, ?err, "wasm effect process failed; skipping");
+            // (animated) values are honoured, not dropped to the manifest
+            // default. Non-finite (NaN/Inf) values fall back to the default.
+            let eval = |manifest: &vance_plugin_sdk::manifest::PluginManifest| {
+                manifest.pack_params(&|key| {
+                    e.params
+                        .get(key)
+                        .and_then(|v| v.eval_number(clip_t))
+                        .filter(|n| n.is_finite())
+                        .map(|n| n as f32)
+                })
+            };
+            if let Some(id) = e.kind.strip_prefix("wasm:") {
+                if !self.ensure_plugin_loaded(id) {
+                    continue;
+                }
+                let Some((plugin, _)) = self.loaded_plugins.get_mut(id) else {
+                    continue;
+                };
+                let packed = eval(&plugin.manifest().clone());
+                if let Err(err) = plugin.process(rgba, w, h, &packed) {
+                    tracing::warn!(plugin = %id, ?err, "wasm effect process failed; skipping");
+                }
+            } else if let Some(id) = e.kind.strip_prefix("shader:") {
+                // M6 — GPU shader effect, same RGBA process contract.
+                if !self.ensure_shader_loaded(id) {
+                    continue;
+                }
+                let Some(disc) = self.plugin_registry.by_id(id).cloned() else {
+                    continue;
+                };
+                let packed = eval(&disc.manifest);
+                if let Some((fx, _)) = self.loaded_shaders.get(id) {
+                    if let Err(err) = fx.process(rgba, w, h, &packed) {
+                        tracing::warn!(plugin = %id, %err, "shader effect process failed; skipping");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ensure the `.vsfx` shader effect `id` is compiled + fresh (reloads on an
+    /// in-place edit, like `ensure_plugin_loaded`). Needs the render device
+    /// (available once the viewport is installed).
+    fn ensure_shader_loaded(&mut self, id: &str) -> bool {
+        let Some(disc) = self
+            .plugin_registry
+            .by_id(id)
+            .filter(|d| d.shader)
+            .cloned()
+        else {
+            return false;
+        };
+        let current_mtime = std::fs::metadata(&disc.path)
+            .and_then(|m| m.modified())
+            .ok();
+        if let Some((_, cached)) = self.loaded_shaders.get(id) {
+            if *cached == current_mtime {
+                return true;
+            }
+            self.loaded_shaders.remove(id);
+        }
+        let Some((device, queue)) = self.gpu.clone() else {
+            tracing::warn!(plugin = %id, "no render device yet for shader effect");
+            return false;
+        };
+        let body = match std::fs::read(&disc.path)
+            .map_err(|e| e.to_string())
+            .and_then(|b| vance_plugin_sdk::shaderpkg::parse(&b).map(|p| p.shader))
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(plugin = %id, error = %e, "bad shader package");
+                return false;
+            }
+        };
+        match vance_effects::ShaderEffect::compile_with(device, queue, &body) {
+            Ok(fx) => {
+                self.loaded_shaders.insert(id.to_string(), (fx, current_mtime));
+                true
+            }
+            Err(err) => {
+                tracing::warn!(plugin = %id, %err, "shader effect compile failed");
+                false
             }
         }
     }
