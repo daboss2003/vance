@@ -7,3 +7,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
+
+[dependencies]
+# M6 — GPU shader effects (the no-code Effect Studio's engine).
+wgpu = "29"
+pollster = "0.4"
+naga = { version = "29", features = ["wgsl-in"] } # validate user WGSL → clean compile errors

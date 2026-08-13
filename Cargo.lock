@@ -6671,6 +6671,11 @@ dependencies = [
 [[package]]
 name = "vance-effects"
 version = "0.0.0"
+dependencies = [
+ "naga",
+ "pollster",
+ "wgpu",
+]
 
 [[package]]
 name = "vance-encoder"
