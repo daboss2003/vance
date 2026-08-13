@@ -26,6 +26,7 @@ interface CatalogState {
   hasMore: boolean;
   page: number;
   loaded: boolean;
+  error: string | null;
   selected: CatalogDetail | null;
   reviews: CatalogReview[];
   reviewsLoading: boolean;
@@ -42,6 +43,7 @@ export const catalog = $state<CatalogState>({
   hasMore: false,
   page: 0,
   loaded: false,
+  error: null,
   selected: null,
   reviews: [],
   reviewsLoading: false,
@@ -79,6 +81,7 @@ export async function browse(reset = true): Promise<void> {
     catalog.effects = [];
   }
   catalog.loading = true;
+  catalog.error = null;
   try {
     const r = await catalogBrowse({
       q: catalog.query || undefined,
@@ -88,11 +91,15 @@ export async function browse(reset = true): Promise<void> {
     });
     catalog.effects = reset ? r.effects : [...catalog.effects, ...r.effects];
     catalog.hasMore = r.has_more;
-    catalog.loaded = true;
+    catalog.error = null;
   } catch (e) {
-    toast.error(`Couldn’t load the effects catalog.\n${String(e)}`);
+    // Surface inline (see EffectsMarketplace) — NOT as a toast. The auto-load
+    // effect keys off `loaded`, set in `finally`, so one failure can't spiral
+    // into a retry loop that buries the app in toasts.
+    catalog.error = String(e);
   } finally {
     catalog.loading = false;
+    catalog.loaded = true;
   }
 }
 

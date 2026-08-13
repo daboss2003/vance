@@ -12,13 +12,25 @@ export interface Toast {
 
 let nextId = 0;
 
+/** Never let the overlay grow past this — a misbehaving caller (e.g. a retry
+ *  loop) can't bury the app under a stack of cards. Oldest are dropped first. */
+const MAX_TOASTS = 4;
+
 /** The live toast queue (rendered by Toasts.svelte). */
 export const toasts = $state<Toast[]>([]);
 
-/** Push a toast; returns its id. `ms = 0` keeps it until dismissed. */
+/** Push a toast; returns its id. `ms = 0` keeps it until dismissed.
+ *  Identical (same message + kind) toasts are coalesced instead of stacking. */
 export function pushToast(message: string, kind: ToastKind = 'info', ms = 5000): number {
+  const msg = String(message);
+  // Coalesce: if the same message is already showing, don't add a duplicate.
+  const existing = toasts.find((t) => t.message === msg && t.kind === kind);
+  if (existing) return existing.id;
+
   const id = ++nextId;
-  toasts.push({ id, message: String(message), kind });
+  toasts.push({ id, message: msg, kind });
+  // Cap the queue: drop the oldest until we're within the limit.
+  while (toasts.length > MAX_TOASTS) toasts.shift();
   if (ms > 0) setTimeout(() => dismissToast(id), ms);
   return id;
 }

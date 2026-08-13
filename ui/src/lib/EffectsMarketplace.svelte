@@ -192,6 +192,15 @@
 
           {#if catalog.loading && catalog.effects.length === 0}
             <div class="muted">Loading…</div>
+          {:else if catalog.error && catalog.effects.length === 0}
+            <div class="offline">
+              <div class="offline-title">Marketplace unavailable</div>
+              <div class="muted small">Couldn’t reach the effects store. It may be offline.</div>
+              <div class="muted tiny">{catalog.error}</div>
+              <button class="retry" disabled={catalog.loading} onclick={() => browse()}>
+                {catalog.loading ? 'Retrying…' : 'Retry'}
+              </button>
+            </div>
           {:else if catalog.effects.length === 0}
             <div class="muted small">
               No effects found. {catalog.query || catalog.category
@@ -610,6 +619,41 @@
   }
   .small {
     font-size: 11.5px;
+  }
+  .tiny {
+    font-size: 10.5px;
+    opacity: 0.75;
+    word-break: break-word;
+  }
+  .offline {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    text-align: center;
+    padding: 28px 18px;
+    border: 1px solid var(--border, #30353d);
+    border-radius: 10px;
+    background: var(--vance-bg, #17191d);
+  }
+  .offline-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--fg, #dfe3e9);
+  }
+  .retry {
+    margin-top: 8px;
+    padding: 6px 18px;
+    border-radius: 7px;
+    border: 1px solid var(--border-strong, #3a4150);
+    background: var(--panel-2, #262a31);
+    color: var(--fg, #dfe3e9);
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .retry:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
   .min0 {
     min-width: 0;

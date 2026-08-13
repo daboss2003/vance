@@ -27,6 +27,8 @@
     flex-direction: column;
     gap: 8px;
     max-width: min(420px, 92vw);
+    max-height: calc(100vh - 32px);
+    overflow-y: auto;
     pointer-events: none;
   }
   .toast {

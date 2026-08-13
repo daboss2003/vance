@@ -190,6 +190,13 @@
     grid-template-columns: 1fr 360px;
     gap: 18px;
   }
+  /* Grid items default to min-width:auto, so wide content (the code box, or the
+     preview canvas's intrinsic buffer size) can blow a column past its track and
+     spill over the card. min-width:0 lets them shrink to their track instead. */
+  .left,
+  .right {
+    min-width: 0;
+  }
   @media (max-width: 720px) {
     .cols {
       grid-template-columns: 1fr;
@@ -318,8 +325,10 @@
     justify-content: center;
   }
   .preview canvas {
-    max-width: 100%;
-    max-height: 100%;
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
     image-rendering: auto;
   }
   .spin {
