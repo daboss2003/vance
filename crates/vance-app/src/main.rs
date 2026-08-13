@@ -4121,6 +4121,8 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tau
         .item(&item("page_audio", "Audio", Some("CmdOrCtrl+4"))?)
         .item(&item("page_deliver", "Deliver", Some("CmdOrCtrl+5"))?)
         .separator()
+        .item(&item("marketplace", "Effects Marketplace…", None)?)
+        .item(&item("create_effect", "Create an Effect…", None)?)
         .item(&item("dock_ai_tools", "AI Add-ons…", None)?)
         .build()?;
 

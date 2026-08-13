@@ -62,7 +62,8 @@
   import SettingsDialog from '$lib/SettingsDialog.svelte';
   import EffectStudio from '$lib/EffectStudio.svelte';
   import { openSettings, onRevoked, reconcileEffects } from '$lib/account.svelte';
-  import { market, importEffectPaths } from '$lib/effectsMarket.svelte';
+  import { market, importEffectPaths, openMarket } from '$lib/effectsMarket.svelte';
+  import { openStudio } from '$lib/studio.svelte';
 
   // Phase 11 — show the first-run wizard until the user finishes/skips it.
   let showOnboarding = $state(false);
@@ -235,6 +236,12 @@
           break;
         case 'settings':
           void openSettings('account');
+          break;
+        case 'marketplace':
+          void openMarket();
+          break;
+        case 'create_effect':
+          void openStudio();
           break;
         case 'dock_ai_tools':
           // AI add-ons live in the setup panel, not the editing dock.
