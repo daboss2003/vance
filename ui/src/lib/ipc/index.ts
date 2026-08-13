@@ -2180,3 +2180,24 @@ export const shaderTemplate = (): Promise<{
   body: string;
   params: StudioParam[];
 }> => invoke('shader_template');
+
+// --- Node graph (M6 Phase 2) -----------------------------------------------
+
+export type NodeKindDef = {
+  key: string;
+  label: string;
+  inputs: string[];
+  params: StudioParam[];
+};
+export type NodeGraph = {
+  nodes: { id: string; kind: string; params: { key: string; value: number }[] }[];
+  edges: { from: string; to: string; to_input: string }[];
+};
+
+/** The node palette (kinds + their inputs + params), so the editor stays in sync. */
+export const nodegraphPalette = (): Promise<{ kinds: NodeKindDef[] }> =>
+  invoke('nodegraph_palette');
+/** Compile a node graph → { body, params } for the Studio preview/save pipeline. */
+export const nodegraphCompile = (
+  graph: NodeGraph
+): Promise<{ body: string; params: StudioParam[] }> => invoke('nodegraph_compile', { graph });

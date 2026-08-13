@@ -12,8 +12,10 @@
     removeParam,
     save
   } from '$lib/studio.svelte';
+  import NodeGraphEditor from '$lib/NodeGraphEditor.svelte';
 
   let canvasEl = $state<HTMLCanvasElement | null>(null);
+  let mode = $state<'code' | 'nodes'>('code');
 
   // Draw the preview RGBA whenever it changes.
   $effect(() => {
@@ -53,38 +55,47 @@
           </div>
           <input class="in" placeholder="Your name (author)" bind:value={studio.author} />
 
-          <div class="sec">Effect code (WGSL)</div>
-          <textarea
-            class="code"
-            spellcheck="false"
-            bind:value={studio.body}
-            oninput={schedulePreview}
-          ></textarea>
-          <div class="hint">
-            Write <span class="mono">fn effect(color, uv) -&gt; vec4&lt;f32&gt;</span>. Read your
-            sliders with <span class="mono">param(0)</span>, <span class="mono">param(1)</span>…
+          <div class="modes">
+            <button class:on={mode === 'code'} onclick={() => (mode = 'code')}>Code</button>
+            <button class:on={mode === 'nodes'} onclick={() => (mode = 'nodes')}>Nodes</button>
           </div>
 
-          <div class="sec row">
-            <span>Controls (sliders)</span>
-            <button class="mini" onclick={addParam}>+ Add</button>
-          </div>
-          {#each studio.params as p, i (i)}
-            <div class="param">
-              <input class="in tiny" placeholder="Label" bind:value={p.label} />
-              <input class="in num" type="number" step="any" bind:value={p.min} title="min" />
-              <input class="in num" type="number" step="any" bind:value={p.max} title="max" />
-              <input
-                class="in num"
-                type="number"
-                step="any"
-                bind:value={p.default}
-                title="default"
-                oninput={schedulePreview}
-              />
-              <button class="rm" onclick={() => removeParam(i)} aria-label="Remove">✕</button>
+          {#if mode === 'code'}
+            <div class="sec">Effect code (WGSL)</div>
+            <textarea
+              class="code"
+              spellcheck="false"
+              bind:value={studio.body}
+              oninput={schedulePreview}
+            ></textarea>
+            <div class="hint">
+              Write <span class="mono">fn effect(color, uv) -&gt; vec4&lt;f32&gt;</span>. Read your
+              sliders with <span class="mono">param(0)</span>, <span class="mono">param(1)</span>…
             </div>
-          {/each}
+
+            <div class="sec row">
+              <span>Controls (sliders)</span>
+              <button class="mini" onclick={addParam}>+ Add</button>
+            </div>
+            {#each studio.params as p, i (i)}
+              <div class="param">
+                <input class="in tiny" placeholder="Label" bind:value={p.label} />
+                <input class="in num" type="number" step="any" bind:value={p.min} title="min" />
+                <input class="in num" type="number" step="any" bind:value={p.max} title="max" />
+                <input
+                  class="in num"
+                  type="number"
+                  step="any"
+                  bind:value={p.default}
+                  title="default"
+                  oninput={schedulePreview}
+                />
+                <button class="rm" onclick={() => removeParam(i)} aria-label="Remove">✕</button>
+              </div>
+            {/each}
+          {:else}
+            <NodeGraphEditor />
+          {/if}
         </div>
 
         <!-- Right: preview + save -->
@@ -95,20 +106,22 @@
             {#if studio.busy}<div class="spin">rendering…</div>{/if}
           </div>
 
-          {#each studio.params as p (p.key)}
-            <label class="slider">
-              <span>{p.label}</span>
-              <input
-                type="range"
-                min={p.min}
-                max={p.max}
-                step="any"
-                bind:value={p.value}
-                oninput={schedulePreview}
-              />
-              <span class="val">{p.value.toFixed(2)}</span>
-            </label>
-          {/each}
+          {#if mode === 'code'}
+            {#each studio.params as p (p.key)}
+              <label class="slider">
+                <span>{p.label}</span>
+                <input
+                  type="range"
+                  min={p.min}
+                  max={p.max}
+                  step="any"
+                  bind:value={p.value}
+                  oninput={schedulePreview}
+                />
+                <span class="val">{p.value.toFixed(2)}</span>
+              </label>
+            {/each}
+          {/if}
 
           {#if studio.error}
             <pre class="err">{studio.error}</pre>
@@ -210,6 +223,29 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
+  }
+  .modes {
+    display: inline-flex;
+    gap: 2px;
+    background: var(--vance-bg, #17191d);
+    border: 1px solid var(--border-strong, #3a4150);
+    border-radius: 8px;
+    padding: 2px;
+    margin: 4px 0 4px;
+  }
+  .modes button {
+    border: none;
+    background: none;
+    color: var(--muted, #949bab);
+    font-size: 12px;
+    padding: 4px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .modes button.on {
+    background: var(--accent, #4c9dff);
+    color: #071522;
+    font-weight: 600;
   }
   .code {
     width: 100%;

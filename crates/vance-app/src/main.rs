@@ -18,6 +18,7 @@ mod crash;
 mod engine;
 mod generate;
 mod magicmask;
+mod nodegraph;
 mod peaks;
 mod prefetch;
 mod profiling;
@@ -4482,6 +4483,8 @@ fn main() {
             studio::shader_preview,
             studio::shader_save,
             studio::shader_template,
+            nodegraph::nodegraph_palette,
+            nodegraph::nodegraph_compile,
         ])
         .build(tauri::generate_context!())
         .expect("tauri failed to start")
