@@ -108,6 +108,16 @@ export function deleteEdge(i: number): void {
   compileSoon();
 }
 
+/** Commit a dragged wire: connect `from`'s output → `to`'s `toInput`. One edge
+ *  per (target, input) — a new wire replaces any existing one there. */
+export function connect(from: string, to: string, toInput: string): void {
+  if (!from || !to || from === to) return;
+  graph.pendingFrom = null;
+  graph.edges = graph.edges.filter((e) => !(e.to === to && e.to_input === toInput));
+  graph.edges = [...graph.edges, { from, to, to_input: toInput }];
+  compileSoon();
+}
+
 export function setParam(id: string, key: string, value: number): void {
   const n = graph.nodes.find((m) => m.id === id);
   if (n) n.params[key] = value;
