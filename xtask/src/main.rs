@@ -163,8 +163,34 @@ fn build_plugins() -> Result<(), String> {
         c.arg(dir.join("Cargo.toml"));
         run(c)?;
     }
+
+    // Stage the built plugins next to where the app binary runs, so the
+    // co-located `<exe-dir>/plugins` scan root (see Engine::rescan_plugins)
+    // discovers the default pack with no manual install. Cover both host
+    // profiles so `cargo run`/`build` (debug) and packaged (release) find them.
+    let stage_dirs = [root.join("target/debug/plugins"), root.join("target/release/plugins")];
+    for d in &stage_dirs {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let mut staged = 0usize;
+    for dir in &dirs {
+        let rel = dir.join("target/wasm32-unknown-unknown/release");
+        let Ok(rd) = std::fs::read_dir(&rel) else { continue };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("wasm") {
+                continue;
+            }
+            if let Some(name) = p.file_name() {
+                for d in &stage_dirs {
+                    let _ = std::fs::copy(&p, d.join(name));
+                }
+                staged += 1;
+            }
+        }
+    }
     eprintln!(
-        "xtask: built {} sample WASM plugin(s) for wasm32-unknown-unknown",
+        "xtask: built {} WASM plugin(s); staged {staged} into target/{{debug,release}}/plugins",
         dirs.len()
     );
     Ok(())

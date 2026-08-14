@@ -9731,6 +9731,14 @@ impl Engine {
         if let Some(dir) = vance_plugin_sdk::discovery::user_plugins_dir() {
             roots.push(dir);
         }
+        // Bundled default pack ships next to the executable (same place as the
+        // sidecars). Lowest precedence, so a user/project plugin of the same id
+        // overrides it.
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                roots.push(parent.join("plugins"));
+            }
+        }
         self.plugin_registry = vance_plugin_sdk::discovery::PluginRegistry::scan(&roots);
         self.loaded_plugins.clear();
         self.plugin_registry.len()
