@@ -55,15 +55,15 @@
   import Toasts from '$lib/Toasts.svelte';
   import { toast, pushToast } from '$lib/toast.svelte';
   import Dialogs from '$lib/Dialogs.svelte';
-  import { openDialog } from '$lib/dialog.svelte';
+  import { openDialog, dialogs } from '$lib/dialog.svelte';
   import { addWasmPlugin } from '$lib/ipc';
   import { getCurrentWebview } from '@tauri-apps/api/webview';
   import EffectsMarketplace from '$lib/EffectsMarketplace.svelte';
   import SettingsDialog from '$lib/SettingsDialog.svelte';
   import EffectStudio from '$lib/EffectStudio.svelte';
-  import { openSettings, onRevoked, reconcileEffects } from '$lib/account.svelte';
+  import { openSettings, onRevoked, reconcileEffects, account } from '$lib/account.svelte';
   import { market, importEffectPaths, openMarket } from '$lib/effectsMarket.svelte';
-  import { openStudio } from '$lib/studio.svelte';
+  import { openStudio, studio } from '$lib/studio.svelte';
 
   // Phase 11 — show the first-run wizard until the user finishes/skips it.
   let showOnboarding = $state(false);
@@ -703,13 +703,21 @@
     setter(x, y, w, h).catch((e) => console.error(label, e));
   }
 
+  // Any full-window HTML overlay that must sit ABOVE the native video windows.
+  // The onboarding wizard, plus every modal (marketplace, Effect Studio,
+  // Settings, confirm dialogs). While one is up we collapse the native windows
+  // so it isn't punched through — see reportBounds().
+  const overlayBlocking = $derived(
+    showOnboarding || market.open || studio.open || account.open || dialogs.length > 0
+  );
+
   function reportBounds() {
     // The Source/Record viewports are NATIVE GPU child windows that float
-    // ABOVE the webview, so any full-screen webview overlay (the first-run
-    // wizard) would be occluded by them and its buttons unreachable. While a
+    // ABOVE the webview, so any full-window webview overlay (the first-run
+    // wizard, or any modal) would be occluded by them and unreachable. While a
     // blocking overlay is up, collapse the native windows to 0×0 (invisible)
     // so the overlay is fully visible + clickable; restore real bounds after.
-    if (showOnboarding) {
+    if (overlayBlocking) {
       setViewportBounds(0, 0, 0, 0).catch(() => {});
       setSourceViewportBounds(0, 0, 0, 0).catch(() => {});
       return;
@@ -719,10 +727,10 @@
       reportBoundsFor(sourceViewportEl, setSourceViewportBounds, 'set_source_viewport_bounds');
   }
 
-  // Re-sync the native viewports whenever the onboarding overlay opens/closes
-  // (hide while it's up, restore its real position when dismissed).
+  // Re-sync the native viewports whenever a blocking overlay opens/closes
+  // (hide while one is up, restore real position when the last one is dismissed).
   $effect(() => {
-    void showOnboarding;
+    void overlayBlocking;
     requestAnimationFrame(reportBounds);
   });
 
