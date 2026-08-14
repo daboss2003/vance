@@ -1,0 +1,17 @@
+[package]
+name = "vance-plugin-whippan"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+vance-plugin-sdk = { path = "../../crates/vance-plugin-sdk", features = ["guest"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+strip = true

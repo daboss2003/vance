@@ -52,6 +52,11 @@ members = [
 exclude = [
     "plugins/stylize",
     "plugins/dissolve",
+    "plugins/zoom",
+    "plugins/spin",
+    "plugins/glitch",
+    "plugins/rgbsplit",
+    "plugins/whippan",
     "vendor/lv2-sys",
 ]
 
