@@ -6,7 +6,12 @@
 //! Add new tests as a module here (`mod my_test;` + `it/my_test.rs`), not as
 //! a new top-level `tests/*.rs` file. Run one module with:
 //!   cargo test -p vance-plugin-host --test it <module>::
+//!
+//! Exception — tests that mutate process-wide environment variables
+//! (`std::env::set_var`) must stay in their OWN binary
+//! (`tests/clap_discovery_e2e.rs`): `set_var` racing another thread's env
+//! read (any `Command::spawn` copies the environment) is undefined behaviour,
+//! and modules in this binary run concurrently and spawn sidecars.
 
-mod clap_discovery_e2e;
 mod clap_processing_e2e;
 mod lv2_processing_e2e;
