@@ -63,7 +63,12 @@ struct KWeighting {
 impl KWeighting {
     fn new(sample_rate: f32) -> Self {
         let mut prefilter = Biquad::identity();
-        prefilter.set(BiquadShape::HighShelf, sample_rate, 1681.974, 4.0, 0.7071);
+        // Intentional: 0.7071 is the shelf Q fitted to the BS.1770
+        // reference coefficients (≈0.70718, like f0 and gain above), not
+        // an approximation of 1/√2; keep it so readings stay unchanged.
+        #[allow(clippy::approx_constant)]
+        let shelf_q = 0.7071;
+        prefilter.set(BiquadShape::HighShelf, sample_rate, 1681.974, 4.0, shelf_q);
         let mut rlb = Biquad::identity();
         // RLB: highpass at 38.13547 Hz, Q=0.5. RBJ's HPF is a 12 dB/oct
         // shape that matches the BS.1770 reference numerator.
@@ -152,6 +157,8 @@ pub struct LoudnessMeter {
 }
 
 impl LoudnessMeter {
+    /// New meter for a stream at `sample_rate` Hz, with empty
+    /// momentary, short-term and integrated history.
     pub fn new(sample_rate: f32) -> Self {
         let hop_frames = ((sample_rate * HOP_MS as f32) / 1000.0).max(1.0).round() as u32;
         let hops_per_block = (BLOCK_MS / HOP_MS).max(1);
@@ -331,6 +338,8 @@ const FIR_75: [f32; 12] = [
 ];
 
 impl TruePeakDetector {
+    /// New detector with cleared filter history and both channel peaks
+    /// at zero.
     pub fn new() -> Self {
         Self {
             hist_l: [0.0; 12],

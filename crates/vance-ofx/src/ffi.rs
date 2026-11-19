@@ -107,7 +107,7 @@ pub fn enumerate(binary_path: &std::path::Path) -> Result<Vec<OfxPluginInfo>, Of
             .map_err(|_| OfxFfiError::MissingSymbol("OfxGetNumberOfPlugins"))?;
         f()
     };
-    if count < 0 || count > 10_000 {
+    if !(0..=10_000).contains(&count) {
         return Err(OfxFfiError::BadData(format!(
             "implausible plugin count {count}"
         )));

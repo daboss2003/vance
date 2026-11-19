@@ -7,7 +7,7 @@
 use crate::{Cue, CueId};
 
 /// Sort cues by start time (stable on ties).
-pub fn sort_cues(cues: &mut Vec<Cue>) {
+pub fn sort_cues(cues: &mut [Cue]) {
     cues.sort_by_key(|c| c.start_ms);
 }
 
@@ -41,7 +41,7 @@ pub fn set_text(cues: &mut [Cue], id: CueId, text: impl Into<String>) -> bool {
 
 /// Set a cue's `[start, end)` (clamped to `start >= 0`, `end >= start`),
 /// then re-sort. Returns true if the cue exists.
-pub fn set_timing(cues: &mut Vec<Cue>, id: CueId, start_ms: i64, end_ms: i64) -> bool {
+pub fn set_timing(cues: &mut [Cue], id: CueId, start_ms: i64, end_ms: i64) -> bool {
     let found = if let Some(c) = cues.iter_mut().find(|c| c.id == id) {
         c.start_ms = start_ms.max(0);
         c.end_ms = end_ms.max(c.start_ms);
@@ -57,7 +57,7 @@ pub fn set_timing(cues: &mut Vec<Cue>, id: CueId, start_ms: i64, end_ms: i64) ->
 
 /// Shift one cue by `delta_ms` (start + end), clamped to `start >= 0`,
 /// then re-sort. Returns true if the cue exists.
-pub fn shift_cue(cues: &mut Vec<Cue>, id: CueId, delta_ms: i64) -> bool {
+pub fn shift_cue(cues: &mut [Cue], id: CueId, delta_ms: i64) -> bool {
     let found = if let Some(c) = cues.iter_mut().find(|c| c.id == id) {
         let new_start = (c.start_ms + delta_ms).max(0);
         let applied = new_start - c.start_ms;

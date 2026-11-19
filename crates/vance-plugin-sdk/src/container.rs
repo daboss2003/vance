@@ -12,7 +12,9 @@
 
 use crate::manifest::PluginManifest;
 
+/// Magic bytes that open every `.vef` container.
 pub const VEF_MAGIC: &[u8; 4] = b"VEF1";
+/// File extension (without the dot) of an encrypted effect container.
 pub const VEF_EXTENSION: &str = "vef";
 
 /// Error parsing a `.vef` container.

@@ -271,8 +271,8 @@ fn run_one(
         if tb_n <= 0 {
             return Err("invalid stream time_base".into());
         }
-        let num = tb_d as i64 * stream.frame_rate.1 as i64;
-        let den = tb_n as i64 * stream.frame_rate.0 as i64;
+        let num = tb_d * stream.frame_rate.1;
+        let den = tb_n * stream.frame_rate.0;
         if den == 0 {
             return Err("step_pts division by zero".into());
         }
@@ -291,13 +291,9 @@ fn run_one(
             }
         })
         .unwrap_or(0);
-    loop {
-        // Decode at next_pts. If we ran past the duration_pts, the
-        // decoder will return Err — treat that as natural EOS.
-        let frame = match decoder.decode_at(next_pts) {
-            Ok(f) => f,
-            Err(_e) => break,
-        };
+    // Decode at next_pts. If we ran past the duration_pts, the
+    // decoder will return Err — treat that as natural EOS.
+    while let Ok(frame) = decoder.decode_at(next_pts) {
         // Convert YUV (or NV12) → RGBA via a simple in-Rust BT.709
         // pass. This is the SLOW path; future work routes through
         // the GPU renderer's readback. For v1 we want correctness
@@ -317,7 +313,7 @@ fn run_one(
         next_pts += step_pts;
 
         // Surface progress to the UI every 12 frames.
-        if frame_index % 12 == 0 {
+        if frame_index.is_multiple_of(12) {
             set_status(
                 status,
                 &job.id,

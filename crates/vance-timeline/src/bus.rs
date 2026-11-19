@@ -3,8 +3,8 @@
 //! Phase 7 gave every track gain/pan/mute/solo + an insert chain straight
 //! to the master. This adds the routing a real console needs:
 //!
-//! - **Buses** ([`AudioBus`]): named submixes with their own gain/pan/mute
-//!   + insert chain. A track (or another bus) routes its output to a bus;
+//! - **Buses** ([`AudioBus`]): named submixes with their own gain/pan/mute +
+//!   insert chain. A track (or another bus) routes its output to a bus;
 //!   buses route to the master or to another bus (a DAG — cycles rejected).
 //! - **Sends** ([`Send`]): a track/bus taps a COPY of its signal to a bus
 //!   at an independent level, pre- or post-fader — the classic reverb/aux

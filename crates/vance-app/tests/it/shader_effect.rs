@@ -54,7 +54,7 @@ fn vsfx_discovers_compiles_and_renders() {
         }
         Err(e) => panic!("compile failed: {e}"),
     };
-    let mut rgba = vec![100u8, 100, 100, 255].repeat(4); // 2×2 gray
+    let mut rgba = [100u8, 100, 100, 255].repeat(4); // 2×2 gray
     fx.process(&mut rgba, 2, 2, &[0.5]).unwrap();
     assert!(
         (rgba[0] as i32 - 50).abs() <= 1,

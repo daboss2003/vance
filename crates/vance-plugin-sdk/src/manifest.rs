@@ -142,7 +142,8 @@ impl PluginManifest {
                     p.key
                 )));
             }
-            if !(p.min <= p.max) {
+            // NaN bounds are rejected along with min > max.
+            if p.min > p.max || p.min.is_nan() || p.max.is_nan() {
                 return Err(ManifestError::Invalid(format!(
                     "param `{}` has min > max",
                     p.key

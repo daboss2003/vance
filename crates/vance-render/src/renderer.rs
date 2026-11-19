@@ -83,6 +83,10 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// GPU renderer for decoded video frames. Holds A- and B-side YUV plane
+/// textures (B feeds cross-dissolves), applies the per-clip color
+/// pipeline (grades, curves, LUTs, keys, crop/transform), and draws the
+/// result to a surface view or reads it back as an RGBA buffer.
 pub struct Renderer {
     adapter: wgpu::Adapter,
     device: wgpu::Device,
@@ -403,6 +407,7 @@ impl CurveSet {
             && self.ll.is_empty()
     }
     /// True when both the tone and HSL halves are identity.
+    #[cfg(test)]
     fn is_identity(&self) -> bool {
         self.is_tone_identity() && self.is_hsl_identity()
     }
@@ -756,6 +761,7 @@ fn eval_curve_or_identity(points: &[vance_timeline::Keyframe], x: f64) -> f64 {
 ///   * clamp the OUTPUT to `[0, 1]` (the displayable / LUT range), making
 ///     the otherwise-silent bake-time clamp explicit at the data edge;
 ///   * sort ascending by input level so the segment search is correct.
+///
 /// The input level is left unclamped: a control point past `x = 1` is
 /// simply never reached by the `[0, 1]` sampling (eval clamps at the
 /// endpoints), so clamping it would only distort the last segment.
@@ -2934,6 +2940,9 @@ mod layout_tests {
         let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
         t * t * (3.0 - 2.0 * t)
     }
+    // Intentional: test-only mirror that takes the shader's `GradeNode`
+    // window fields as separate arguments, so each test sets them directly.
+    #[allow(clippy::too_many_arguments)]
     fn window_mask_cpu(
         uv: [f32; 2],
         shape: f32,

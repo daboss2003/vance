@@ -68,7 +68,8 @@ impl Fade {
 /// `(t/d)²`. Defense-in-depth duplicate of `vance-audio`'s
 /// `eval_fade_in_audio` — both crates agree on the shape family.
 pub fn eval_fade_in(duration_seconds: f64, curve: FadeCurve, t_clip_seconds: f64) -> f32 {
-    if !(duration_seconds > 0.0) {
+    // A NaN duration is treated as "no fade" too.
+    if duration_seconds <= 0.0 || duration_seconds.is_nan() {
         return 1.0;
     }
     if t_clip_seconds <= 0.0 {
@@ -95,7 +96,8 @@ pub fn eval_fade_out(
     clip_duration_seconds: f64,
     t_clip_seconds: f64,
 ) -> f32 {
-    if !(duration_seconds > 0.0) {
+    // A NaN duration is treated as "no fade" too.
+    if duration_seconds <= 0.0 || duration_seconds.is_nan() {
         return 1.0;
     }
     let fade_start = clip_duration_seconds - duration_seconds;

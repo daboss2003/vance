@@ -418,7 +418,7 @@ mod tests {
         std::fs::write(base.join("nested/B.clap"), b"not a real lib").unwrap();
         std::fs::write(base.join("c.txt"), b"ignore me").unwrap();
 
-        let found = scan_bundles(&[base.clone()]);
+        let found = scan_bundles(std::slice::from_ref(&base));
         let names: Vec<String> = found
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
@@ -466,7 +466,7 @@ mod tests {
         std::fs::create_dir_all(base.join("deep")).unwrap();
         symlink(&base, base.join("deep/up")).unwrap();
 
-        let found = scan_bundles(&[base.clone()]);
+        let found = scan_bundles(std::slice::from_ref(&base));
         // The bundle is discovered (via real/ and/or link/) but the
         // canonical dedup means it is reported exactly once.
         let clap_count = found
@@ -487,7 +487,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("Synth.clap"), b"x").unwrap();
-        let descs: Vec<_> = scan_bundles(&[base.clone()])
+        let descs: Vec<_> = scan_bundles(std::slice::from_ref(&base))
             .iter()
             .flat_map(|p| enumerate_bundle_inproc(p))
             .collect();

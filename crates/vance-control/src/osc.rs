@@ -140,7 +140,7 @@ mod tests {
     fn push_string(p: &mut Vec<u8>, s: &str) {
         p.extend_from_slice(s.as_bytes());
         p.push(0);
-        while p.len() % 4 != 0 {
+        while !p.len().is_multiple_of(4) {
             p.push(0);
         }
     }

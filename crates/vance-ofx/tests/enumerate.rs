@@ -90,7 +90,7 @@ fn discovery_plus_sidecar_lists_synthetic_bundle() {
     std::fs::copy(&lib, bin_dir.join("Invert.ofx")).unwrap();
 
     // Sanity: the discovery layer sees the bundle + resolves its binary.
-    let bundles = bundle::discover(&[root.clone()]);
+    let bundles = bundle::discover(std::slice::from_ref(&root));
     assert_eq!(bundles.len(), 1);
     assert_eq!(bundles[0].name, "Invert");
     assert!(bundles[0].binary_path.is_some());

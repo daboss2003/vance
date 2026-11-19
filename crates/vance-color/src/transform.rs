@@ -74,6 +74,10 @@ impl Transform {
 
 /// `RGB → XYZ` matrix for each supported `Primaries`. White points:
 /// D65 except DCI-P3 which uses sRGB's D65 (a.k.a. "Display P3").
+// Intentional: the matrices are the published values digit-for-digit (ITU-R
+// BT.709/BT.2020, ACES S-2014-004) so they can be checked against the specs;
+// rounding them to f32 precision would change nothing at runtime.
+#[allow(clippy::excessive_precision)]
 pub fn primaries_to_xyz(p: Primaries) -> Transform {
     match p {
         // Rec.709 / sRGB primaries, D65 white. From ITU-R BT.709.

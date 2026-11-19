@@ -70,6 +70,9 @@ pub enum EngineError {
     #[error("viewport not yet installed")]
     NoViewport,
 
+    // Intentional: public variant named in `start_playback`'s docs; nothing
+    // constructs it today, and removing it would change the public enum.
+    #[allow(dead_code)]
     #[error("playback in progress")]
     PlaybackInProgress,
 
@@ -1438,6 +1441,10 @@ pub struct ClipAnchor {
     /// Product of every "opacity" effect's `value` param on the
     /// active clip (clamped to [0, 1]). 1.0 when no opacity effects
     /// are attached. Phase 5.2's wiring.
+    // Intentional: public field recorded with each anchor; the value is
+    // applied via `Renderer::set_opacity` when the anchor is built, so
+    // nothing reads it back from here yet.
+    #[allow(dead_code)]
     pub opacity: f32,
 }
 
@@ -1863,6 +1870,9 @@ impl Engine {
 
     /// Stream info from the last `load_source`. Used by the UI to
     /// format the time display and scrub bar.
+    // Intentional: public lib API with no caller today (the UI reads
+    // `source_state`, which carries the same info).
+    #[allow(dead_code)]
     pub fn source_stream_info(&self) -> Option<&StreamInfo> {
         self.source_stream_info.as_ref()
     }
@@ -3126,6 +3136,7 @@ impl Engine {
     ///   live or scopes are disabled — no lock attempt, no readback;
     /// - otherwise `try_lock`s the render state and, if it's momentarily
     ///   contended, returns the cache rather than blocking the scheduler.
+    ///
     /// The GPU readback runs while holding the render lock; the (pure)
     /// accumulation runs AFTER the lock is released.
     ///
@@ -4471,7 +4482,7 @@ impl Engine {
             let gated = snapshot
                 .tracks
                 .get(track_id)
-                .map_or(true, |t| t.mute || (snapshot.solo_anywhere && !t.solo));
+                .is_none_or(|t| t.mute || (snapshot.solo_anywhere && !t.solo));
             if gated {
                 continue;
             }
@@ -5087,6 +5098,9 @@ impl Engine {
     /// * no template update (drift on long shots);
     /// * existing win_cx / win_cy keyframes INSIDE the tracked range are
     ///   replaced; keyframes outside the range are preserved.
+    // Intentional: mirrors the `track_window` Tauri command's argument
+    // list one-to-one (target clip/effect, range and tracker tuning).
+    #[allow(clippy::too_many_arguments)]
     pub fn track_window(
         &mut self,
         track_id: TrackId,
@@ -6997,6 +7011,9 @@ impl Engine {
 
     /// The media item referenced by a clip on `track_id` (for off-lock
     /// loudness analysis).
+    // Intentional: public lib API with no caller today (leveling moved to
+    // `clip_media_and_range` to measure only the trimmed range).
+    #[allow(dead_code)]
     pub fn clip_media_id(
         &self,
         track_id: TrackId,
@@ -7661,6 +7678,9 @@ impl AudioMixerOwner {
     }
 
     /// Snapshot of the live mixer counters.
+    // Intentional: public lib API for the UI / logs (see the `stats` field);
+    // nothing reads the counters yet.
+    #[allow(dead_code)]
     pub fn stats(&self) -> Arc<vance_audio::MixerStats> {
         self.stats.clone()
     }
@@ -8489,6 +8509,10 @@ fn op_touches_mixer(op: &EditOp) -> bool {
 /// OS temp dir (which the reaper wipes and which the isolation runner
 /// clears on each run), files here persist so a project that references
 /// them reopens intact. Created on demand.
+// Intentional: engine.rs is compiled into both the lib and the bin
+// target; this is only called from bin-only modules, so the lib build
+// alone sees it as unused.
+#[allow(dead_code)]
 pub(crate) fn persistent_media_dir() -> std::io::Result<PathBuf> {
     let base = if cfg!(windows) {
         std::env::var_os("APPDATA")
@@ -8511,15 +8535,23 @@ pub(crate) fn persistent_media_dir() -> std::io::Result<PathBuf> {
 
 /// GOAT-8 — measure a media file's whole-file integrated loudness (LUFS).
 /// Convenience wrapper over [`measure_loudness_range`].
+// Intentional: engine.rs is compiled into both the lib and the bin
+// target; this is only called from bin-only modules, so the lib build
+// alone sees it as unused.
+#[allow(dead_code)]
 pub(crate) fn measure_loudness(media_path: &std::path::Path) -> Option<f32> {
     measure_loudness_range(media_path, 0.0, None)
 }
 
-/// GOAT-8 — measure integrated loudness (LUFS) over `[start_sec, start_sec
-/// + dur_sec)` of a media file's audio (or the whole file when `dur_sec`
+/// GOAT-8 — measure integrated loudness (LUFS) over `[start_sec, start_sec +
+/// dur_sec)` of a media file's audio (or the whole file when `dur_sec`
 /// is `None`) via the BS.1770 meter. Slow (decodes) — run OFF the engine
 /// lock. Measuring only the clip's active source range makes dialogue
 /// leveling correct for trimmed clips.
+// Intentional: engine.rs is compiled into both the lib and the bin
+// target; this is only called from bin-only modules, so the lib build
+// alone sees it as unused.
+#[allow(dead_code)]
 pub(crate) fn measure_loudness_range(
     media_path: &std::path::Path,
     start_sec: f64,
@@ -8544,20 +8576,15 @@ pub(crate) fn measure_loudness_range(
     // material past the clip's out-point.
     let max_frames = dur_sec.map(|d| (d.max(0.0) * info.sample_rate as f64).ceil() as u64);
     let mut frames: u64 = 0;
-    'decode: loop {
-        match audio.next_chunk() {
-            Ok(Some(chunk)) => {
-                for frame in chunk.samples.chunks_exact(2) {
-                    meter.ingest(frame[0], frame[1]);
-                    frames += 1;
-                    if let Some(cap) = max_frames {
-                        if frames >= cap {
-                            break 'decode;
-                        }
-                    }
+    'decode: while let Ok(Some(chunk)) = audio.next_chunk() {
+        for frame in chunk.samples.chunks_exact(2) {
+            meter.ingest(frame[0], frame[1]);
+            frames += 1;
+            if let Some(cap) = max_frames {
+                if frames >= cap {
+                    break 'decode;
                 }
             }
-            Ok(None) | Err(_) => break,
         }
     }
     let _ = audio.stop_stream();
@@ -8689,7 +8716,7 @@ impl PlaybackPrimary {
     /// Initial PTS — 0 for synthetic, the stream's chosen start
     /// otherwise. Logged only; the loop's own per-frame timing
     /// derives from the actual frame PTS.
-    fn from_pts(&self) -> i64 {
+    fn start_pts(&self) -> i64 {
         match self {
             PlaybackPrimary::Decoder { from_pts, .. } => *from_pts,
             PlaybackPrimary::Title { .. }
@@ -8776,7 +8803,7 @@ fn playback_loop(
             (pts as f64) * (tb_num as f64) / (tb_den as f64)
         }
     };
-    let from_pts = primary.from_pts();
+    let from_pts = primary.start_pts();
 
     // Anchor wall clock to the moment we receive the FIRST frame, mapped
     // to its PTS. Subsequent frames' target time = anchor + (pts - first).
@@ -9328,6 +9355,9 @@ pub struct RenderOptions {
     /// Output resolution.
     pub height: Option<u32>,
     /// Render-and-replace target track. `None` = full export.
+    // Intentional: public field set by `render_and_replace`;
+    // `render_sequence` does not consult it yet.
+    #[allow(dead_code)]
     pub render_and_replace_track: Option<vance_timeline::TrackId>,
     /// Start time in seconds. `None` = sequence start.
     pub start_seconds: Option<f64>,
@@ -9695,7 +9725,7 @@ impl Engine {
                                 rs.renderer.set_mix_factor(0.0);
                             }
                             self.apply_clip_render_params(clip_id, media_id, entry_clip_t);
-                            let mut rs = render_state_arc.lock();
+                            let rs = render_state_arc.lock();
                             let readback = if opts.hdr {
                                 rs.renderer.render_to_rgba64_buffer(width, height)
                             } else {
@@ -9938,6 +9968,9 @@ impl Engine {
     /// Reset the cache hit/miss counters (occupancy untouched). Lets the
     /// UI — or a test — measure the hit ratio over a specific window (e.g.
     /// one scrub gesture) instead of the cache's whole lifetime.
+    // Intentional: public lib API for windowed hit-ratio measurement (see
+    // above); no caller in the app or the tests yet.
+    #[allow(dead_code)]
     pub fn reset_frame_cache_stats(&self) {
         if let Some(c) = self.frame_cache.as_ref() {
             c.reset_hit_stats();
@@ -10030,6 +10063,9 @@ impl Engine {
     /// plugin registry (e.g. a user-added custom folder). Returns the
     /// new total count. Also drops cached instances so an edited
     /// plugin reloads.
+    // Intentional: lib API driven by the integration tests (tests/it); the
+    // bin target, which compiles this file too, never calls it.
+    #[allow(dead_code)]
     pub fn add_plugin_dir(&mut self, dir: std::path::PathBuf) -> usize {
         self.plugin_registry.scan_dir(&dir);
         self.loaded_plugins.clear();
@@ -10140,8 +10176,8 @@ impl Engine {
     }
 
     /// Phase 9.6 — render-cache-wrapped [`Self::apply_wasm_effects`].
-    /// Keys the cache on `hash(input RGBA) ⊕ hash(effect chain @ clip_t
-    /// + dims)`; a hit returns the previously-processed output without
+    /// Keys the cache on `hash(input RGBA) ⊕ hash(effect chain @ clip_t +
+    /// dims)`; a hit returns the previously-processed output without
     /// re-running the (CPU-expensive) WASM plugins. Used by the live
     /// preview so scrubbing back to an already-seen (frame, effects)
     /// pair is instant. The export path stays uncached (linear, every
@@ -10248,7 +10284,7 @@ impl Engine {
         // Pushes opacity/transform/grades/etc. for this clip (self-locks).
         self.apply_clip_render_params(clip_id, media_id, clip_t);
         let mut out = {
-            let mut rs = rs_arc.lock();
+            let rs = rs_arc.lock();
             rs.renderer.render_to_rgba_buffer(width, height).ok()?
         };
         let effects = self.clip_effects(clip_id);
@@ -10264,6 +10300,10 @@ impl Engine {
     /// come from `params` (keyframed, evaluated at `t`) or the manifest
     /// defaults. On any failure the A buffer is left unchanged (the
     /// transition shows clip A).
+    // Intentional: both frames, their size, the plugin and its param
+    // inputs are each independent per call (preview and export pass
+    // different buffers), so they stay separate arguments.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_wasm_transition(
         &mut self,
         a_rgba: &mut [u8],
@@ -10551,8 +10591,8 @@ impl Engine {
                 }
                 // step = (tb_d / tb_n) * (frame_rate.1 / frame_rate.0)
                 // → represented as i64 to fit AtomicI64.
-                let num = tb_d as i64 * info.frame_rate.1 as i64;
-                let den = tb_n as i64 * info.frame_rate.0 as i64;
+                let num = tb_d * info.frame_rate.1;
+                let den = tb_n * info.frame_rate.0;
                 if den == 0 {
                     return;
                 }
@@ -10604,10 +10644,6 @@ fn locate_encoder_binary() -> Result<PathBuf, EngineError> {
     )))
 }
 
-/// Try a list of locations for the `vance-decoder` binary:
-/// 1. Right next to the running `vance-app` executable (production layout).
-/// 2. Same directory under `cargo build` (`target/<profile>/`).
-/// 3. Fallback: `target/debug/vance-decoder` from a workspace-detected root.
 /// Best-effort locate the `vance-plugin-host` sidecar (out-of-process
 /// plugin sandbox). Returns `None` if it can't be found — CLAP/LV2
 /// effects then bypass rather than failing playback. Mirrors the
@@ -10632,17 +10668,18 @@ fn locate_plugin_host_binary() -> Option<PathBuf> {
             }
         }
     }
-    for c in [
+    [
         PathBuf::from("target/debug").join(exe_name),
         PathBuf::from("target/release").join(exe_name),
-    ] {
-        if c.exists() {
-            return Some(c);
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .find(|c| c.exists())
 }
 
+/// Try a list of locations for the `vance-decoder` binary:
+/// 1. Right next to the running `vance-app` executable (production layout).
+/// 2. Same directory under `cargo build` (`target/<profile>/`).
+/// 3. Fallback: `target/debug/vance-decoder` from a workspace-detected root.
 fn locate_decoder_binary() -> Result<PathBuf, EngineError> {
     let exe_name = if cfg!(windows) {
         "vance-decoder.exe"
@@ -10685,6 +10722,10 @@ fn locate_decoder_binary() -> Result<PathBuf, EngineError> {
 /// Phase 11 — presence of the bundled media sidecars, for the capability
 /// report: `(decoder, encoder, audio)`. Each is located the same way the
 /// engine locates it at runtime, so a positive here means it will spawn.
+// Intentional: engine.rs is compiled into both the lib and the bin
+// target; this is only called from bin-only modules, so the lib build
+// alone sees it as unused.
+#[allow(dead_code)]
 pub(crate) fn sidecar_presence() -> (bool, bool, bool) {
     (
         locate_decoder_binary().is_ok(),
@@ -10784,7 +10825,7 @@ mod tests {
         e.checkpoint_history("loud".into()).expect("checkpoint");
         let other = *tips.iter().find(|&&id| !h[id].is_current).unwrap();
         assert!(e.goto_history(other).expect("goto other branch"));
-        assert_eq!(e.edit_history()[other].is_current, true);
+        assert!(e.edit_history()[other].is_current);
         // Out-of-range goto is a clean false, not an error.
         assert!(!e.goto_history(999).expect("goto oob is Ok(false)"));
     }
@@ -11069,7 +11110,7 @@ mod tests {
         // 1.5 <= 0.0 + 2.0 → in window.
         let c = sched(1.5, 5.0);
         let live = std::collections::HashSet::new();
-        let plan = compute_sched_plan(&[c.clone()], &live, 0.0, 0.05, 2.0, 16);
+        let plan = compute_sched_plan(std::slice::from_ref(&c), &live, 0.0, 0.05, 2.0, 16);
         assert_eq!(plan.to_add.len(), 1);
         assert_eq!(plan.to_add[0].0, c.clip_id);
         assert!(plan.to_remove.is_empty());
@@ -11092,7 +11133,7 @@ mod tests {
         let mut c = sched(10.0, 10.0);
         c.source_in_seconds = 3.0;
         let plan = compute_sched_plan(
-            &[c.clone()],
+            std::slice::from_ref(&c),
             &std::collections::HashSet::new(),
             12.0,
             0.05,
@@ -11121,7 +11162,7 @@ mod tests {
         let c = sched(0.0, 1.0);
         let mut live = std::collections::HashSet::new();
         live.insert(c.clip_id);
-        let plan = compute_sched_plan(&[c.clone()], &live, 1.02, 0.05, 2.0, 16);
+        let plan = compute_sched_plan(std::slice::from_ref(&c), &live, 1.02, 0.05, 2.0, 16);
         // Within grace: c is still wanted, so it stays — to_remove empty.
         assert!(plan.to_remove.is_empty());
         // And not in to_add (already live).
@@ -11134,7 +11175,7 @@ mod tests {
         let mut live = std::collections::HashSet::new();
         live.insert(c.clip_id);
         // playhead past grace: t=1.06, grace=0.05 → removed.
-        let plan = compute_sched_plan(&[c.clone()], &live, 1.06, 0.05, 2.0, 16);
+        let plan = compute_sched_plan(std::slice::from_ref(&c), &live, 1.06, 0.05, 2.0, 16);
         assert_eq!(plan.to_remove, vec![c.clip_id]);
     }
 
@@ -11166,7 +11207,7 @@ mod tests {
     fn compute_sched_plan_no_cap_drops_under_cap() {
         let c0 = sched(0.0, 5.0);
         let plan = compute_sched_plan(
-            &[c0.clone()],
+            std::slice::from_ref(&c0),
             &std::collections::HashSet::new(),
             0.0,
             0.05,
@@ -11181,7 +11222,7 @@ mod tests {
         let c = sched(0.0, 5.0);
         let mut live = std::collections::HashSet::new();
         live.insert(c.clip_id);
-        let plan = compute_sched_plan(&[c.clone()], &live, 2.0, 0.05, 2.0, 16);
+        let plan = compute_sched_plan(std::slice::from_ref(&c), &live, 2.0, 0.05, 2.0, 16);
         assert!(plan.to_add.is_empty());
         assert!(plan.to_remove.is_empty());
     }
@@ -11193,7 +11234,7 @@ mod tests {
         // tick (so the fold thread starts mixing on the next batch).
         let c = sched(10.0, 5.0);
         let plan = compute_sched_plan(
-            &[c.clone()],
+            std::slice::from_ref(&c),
             &std::collections::HashSet::new(),
             10.0,
             0.05,
@@ -11295,7 +11336,7 @@ mod tests {
         let c = sched(0.0, 5.0);
         let mut live = std::collections::HashSet::new();
         live.insert(c.clip_id);
-        let plan = compute_sched_plan(&[c.clone()], &live, 0.0, 0.05, 2.0, 16);
+        let plan = compute_sched_plan(std::slice::from_ref(&c), &live, 0.0, 0.05, 2.0, 16);
         assert!(
             plan.to_add.is_empty(),
             "seeded live set must suppress respawn"

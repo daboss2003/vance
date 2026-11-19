@@ -74,6 +74,7 @@ impl EqBandSpec {
 /// high shelf @ 12 kHz — a sensible starting curve for music + dialog.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Eq6Spec {
+    /// The six bands; by default a low shelf, four peaks, then a high shelf.
     pub bands: [EqBandSpec; 6],
 }
 

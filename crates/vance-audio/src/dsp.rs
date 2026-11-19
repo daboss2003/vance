@@ -214,6 +214,9 @@ pub struct Compressor {
 }
 
 impl Compressor {
+    /// A compressor at unity gain: 1:1 ratio, 0 dB makeup and a frozen
+    /// envelope, so audio passes through untouched until [`Self::set`]
+    /// configures it.
     pub fn passthrough() -> Self {
         Self {
             threshold_lin: 1.0,
@@ -229,6 +232,9 @@ impl Compressor {
 
     /// Reconfigure parameters. State (`env_gr_db`) is preserved so the
     /// user can sweep a knob mid-signal without an audible "reset."
+    // Intentional: one argument per compressor knob (plus sample rate),
+    // matching the track compressor's parameter set one-to-one.
+    #[allow(clippy::too_many_arguments)]
     pub fn set(
         &mut self,
         threshold_db: f32,
@@ -241,7 +247,12 @@ impl Compressor {
     ) {
         self.threshold_db = threshold_db.clamp(-60.0, 0.0);
         self.threshold_lin = 10f32.powf(self.threshold_db / 20.0);
-        self.ratio = ratio.max(1.0).min(20.0);
+        // Intentional: max/min rather than clamp — a NaN ratio maps to
+        // 1.0 (no compression) here, where clamp would propagate NaN
+        // into the gain computer and the output samples.
+        #[allow(clippy::manual_clamp)]
+        let ratio = ratio.max(1.0).min(20.0);
+        self.ratio = ratio;
         self.knee_db = knee_db.clamp(0.0, 18.0);
         self.makeup_lin = 10f32.powf(makeup_db.clamp(-12.0, 24.0) / 20.0);
         let a_ms = attack_ms.max(0.1);
@@ -328,10 +339,15 @@ impl Limiter {
         self.alpha_r = (-1.0 / (r_ms * 0.001 * sample_rate.max(1.0))).exp();
     }
 
+    /// Length of the look-ahead delay in samples (frames). Output lags
+    /// input by exactly this many ticks.
     pub fn lookahead_samples(&self) -> usize {
         self.delay.len()
     }
 
+    /// Process one stereo sample. Returns the sample from
+    /// [`Self::lookahead_samples`] ticks ago, scaled so its peak stays
+    /// at or below the ceiling.
     #[inline]
     pub fn tick_stereo(&mut self, l_in: f32, r_in: f32) -> (f32, f32) {
         // Read the delayed sample (output slot) and overwrite with the

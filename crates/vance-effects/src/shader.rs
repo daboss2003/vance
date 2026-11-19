@@ -392,7 +392,7 @@ mod tests {
             return;
         };
         // 2×2 solid gray (100), alpha 255.
-        let mut rgba = vec![100u8, 100, 100, 255].repeat(4);
+        let mut rgba = [100u8, 100, 100, 255].repeat(4);
         fx.process(&mut rgba, 2, 2, &[0.5]).unwrap();
         // 100/255 * 0.5 * 255 ≈ 50 (allow GPU rounding).
         assert!((rgba[0] as i32 - 50).abs() <= 1, "got {}", rgba[0]);

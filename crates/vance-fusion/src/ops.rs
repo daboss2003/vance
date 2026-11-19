@@ -190,8 +190,8 @@ pub fn color_correct(
         }
         if (sat - 1.0).abs() > 1e-6 {
             let l = luma(c[0], c[1], c[2]);
-            for k in 0..3 {
-                c[k] = (l + (c[k] - l) * sat).clamp(0.0, 1.0);
+            for ck in &mut c {
+                *ck = (l + (*ck - l) * sat).clamp(0.0, 1.0);
             }
         }
         out.pixels[i] = to_u8(c[0]);
@@ -263,7 +263,7 @@ pub fn apply_mask(
 pub fn blur(input: &RgbaImage, radius: f64, passes: u32) -> RgbaImage {
     let w = input.width as usize;
     let h = input.height as usize;
-    let max_r = (w.min(h) / 2).max(0);
+    let max_r = w.min(h) / 2;
     let r = (radius.round() as usize).min(max_r);
     if r == 0 || passes == 0 {
         return input.clone();

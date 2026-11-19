@@ -284,7 +284,7 @@ fn compute_child_screen_frame(parent: &NSWindow, bounds: &ViewportBounds, scale:
     //
     // `contentLayoutRect` returns a rect in *window* coordinates
     // (bottom-left origin). Its top-left corresponds to chrome y=0.
-    let layout_rect: NSRect = unsafe { msg_send![&*parent, contentLayoutRect] };
+    let layout_rect: NSRect = unsafe { msg_send![parent, contentLayoutRect] };
     let layout_top_in_window = layout_rect.origin.y + layout_rect.size.height;
 
     // Convert chrome-reported pixels → points.

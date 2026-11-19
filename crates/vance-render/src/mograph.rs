@@ -88,7 +88,8 @@ mod tests {
         assert_eq!(out.len(), 2 * 2 * 3);
         let (w, h, _) = crop_even(&vec![1u8; 3 * 100 * 3], 3, 100);
         assert_eq!((w, h), (2, 100));
-        let (w, h, _) = crop_even(&vec![1u8; 5 * 1 * 3], 5, 1);
+        // 5×1 RGB source.
+        let (w, h, _) = crop_even(&[1u8; 5 * 3], 5, 1);
         assert_eq!((w, h), (4, 2));
     }
 

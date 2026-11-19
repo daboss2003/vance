@@ -47,13 +47,8 @@ impl Prop {
             }),
             Prop::Bind(id) => match inst.value(id) {
                 Some(ControlValue::Number(v)) => v,
-                Some(ControlValue::Bool(b)) => {
-                    if b {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                }
+                Some(ControlValue::Bool(true)) => 1.0,
+                Some(ControlValue::Bool(false)) => 0.0,
                 Some(ControlValue::Choice(i)) => i as f64,
                 _ => 0.0,
             },

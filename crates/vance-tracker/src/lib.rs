@@ -70,14 +70,6 @@ pub enum TrackError {
 }
 
 #[inline]
-fn px_at(view: &LumaView, x: i32, y: i32) -> u8 {
-    let xi = x as u32;
-    let yi = y as u32;
-    let i = (yi * view.stride + xi) as usize;
-    view.bytes[i]
-}
-
-#[inline]
 fn check_view(view: &LumaView) -> Result<(), TrackError> {
     let need = (view.stride as usize) * (view.h as usize);
     if view.bytes.len() < need {

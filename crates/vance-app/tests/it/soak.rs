@@ -226,7 +226,7 @@ fn soak_cycle_keeps_cache_within_budget() {
     // the first post-warmup sample; assert no later sample exceeds it by
     // more than the headroom (ring budget + allocator slack). A real leak
     // accumulates across cycles and trips this on a long run.
-    if rss_samples.iter().any(|&r| r == 0) {
+    if rss_samples.contains(&0) {
         // RSS sampling failed on this platform — make the SKIP loud rather
         // than letting the leak gate pass without measuring memory.
         eprintln!(

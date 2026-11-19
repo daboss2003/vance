@@ -515,21 +515,20 @@ impl TrackDspState {
                 (EffectUnit::DeHum(notches), AudioEffectKind::DeHum { params, .. }) => {
                     configure_dehum(notches, params, sample_rate);
                 }
-                (EffectUnit::Plugin(slot), AudioEffectKind::Plugin { params, .. }) => {
-                    // Remote slots apply a param change live via set_param
-                    // (no rebuild). Built-ins already absorbed it via the
-                    // rebuild above; nothing to push.
-                    if slot.params != *params {
-                        if let SlotKind::Remote(rs) = &slot.kind {
-                            if let (Some(h), Some((inst, gen))) = (host.as_deref_mut(), rs.instance)
-                            {
-                                for (pid, val) in params.iter() {
-                                    h.set_param(inst, gen, *pid, *val);
-                                }
+                // Remote slots apply a param change live via set_param
+                // (no rebuild). Built-ins already absorbed it via the
+                // rebuild above; nothing to push.
+                (EffectUnit::Plugin(slot), AudioEffectKind::Plugin { params, .. })
+                    if slot.params != *params =>
+                {
+                    if let SlotKind::Remote(rs) = &slot.kind {
+                        if let (Some(h), Some((inst, gen))) = (host.as_deref_mut(), rs.instance) {
+                            for (pid, val) in params.iter() {
+                                h.set_param(inst, gen, *pid, *val);
                             }
                         }
-                        slot.params = params.clone();
                     }
+                    slot.params = params.clone();
                 }
                 _ => {}
             }
@@ -2120,7 +2119,6 @@ impl MeterAccum {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn fold_loop(
     initial_sources: Vec<SourceStream>,

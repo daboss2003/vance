@@ -1841,15 +1841,12 @@ fn locate_ofx_host_binary() -> Option<std::path::PathBuf> {
             }
         }
     }
-    for c in [
+    [
         std::path::PathBuf::from("target/debug").join(name),
         std::path::PathBuf::from("target/release").join(name),
-    ] {
-        if c.exists() {
-            return Some(c);
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .find(|c| c.exists())
 }
 
 /// Phase 9.5 — toggle the project-level "use proxies" flag.
@@ -2142,12 +2139,7 @@ fn locate_plugin_host_binary() -> Option<std::path::PathBuf> {
         std::path::PathBuf::from("target/debug").join(name),
         std::path::PathBuf::from("target/release").join(name),
     ];
-    for c in candidates {
-        if c.exists() {
-            return Some(c);
-        }
-    }
-    None
+    candidates.into_iter().find(|c| c.exists())
 }
 
 /// Phase 7.9 — fire a short audio scrub burst at the given timeline
@@ -2710,6 +2702,9 @@ fn grading_command_schema() -> serde_json::Value {
 }
 
 #[tauri::command]
+// Intentional: a Tauri command's arguments are the named fields of its
+// IPC payload, so grouping them would change the frontend contract.
+#[allow(clippy::too_many_arguments)]
 fn track_window(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -2813,6 +2808,9 @@ fn compute_scopes(
 }
 
 #[tauri::command]
+// Intentional: a Tauri command's arguments are the named fields of its
+// IPC payload, so grouping them would change the frontend contract.
+#[allow(clippy::too_many_arguments)]
 fn create_title_media(
     state: tauri::State<'_, EngineHandle>,
     display_name: String,
@@ -3634,6 +3632,9 @@ struct GenProgressEvent {
 /// import it as a held Image media item. Streams per-step progress on
 /// `gen://progress`. Returns the new item's info.
 #[tauri::command]
+// Intentional: a Tauri command's arguments are the named fields of its
+// IPC payload, so grouping them would change the frontend contract.
+#[allow(clippy::too_many_arguments)]
 async fn generate_image(
     app: tauri::AppHandle,
     state: tauri::State<'_, EngineHandle>,
@@ -4203,7 +4204,7 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .menu(|handle| build_app_menu(handle))
+        .menu(build_app_menu)
         .on_menu_event(|app, event| {
             // Custom items carry a known id; forward it to the frontend, which
             // maps it to the same action as the corresponding toolbar button.

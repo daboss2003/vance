@@ -44,6 +44,9 @@ pub struct Stems {
     /// The isolated vocal/dialogue stem.
     pub vocals: PathBuf,
     /// The accompaniment (everything else), when two-stem mode produced it.
+    // Intentional: the two-stem run produces both stems and the result
+    // reports both; the current voice-isolation import only uses `vocals`.
+    #[allow(dead_code)]
     pub accompaniment: Option<PathBuf>,
 }
 

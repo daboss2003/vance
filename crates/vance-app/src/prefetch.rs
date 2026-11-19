@@ -105,6 +105,9 @@ impl PrefetchWorker {
     }
 
     /// Signal the worker to exit at its next iteration.
+    // Intentional: lib API driven by the integration tests (tests/it); the
+    // bin target, which compiles this file too, never calls it.
+    #[allow(dead_code)]
     pub fn shutdown(mut self) {
         self.shutdown.store(true, Ordering::Release);
         self.target_pts.store(NO_TARGET, Ordering::Release);

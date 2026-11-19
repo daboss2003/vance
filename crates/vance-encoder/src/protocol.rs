@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 
 /// Wire protocol version. Bump on breaking changes.
 pub const PROTOCOL_VERSION: u32 = 1;
+// Compile-time guard: protocol versions start at 1.
+const _: () = assert!(PROTOCOL_VERSION >= 1);
 
 /// Video pixel format the encoder accepts on the IPC boundary. The
 /// sidecar converts to the codec's required format internally.
@@ -528,11 +530,6 @@ impl EncoderError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn protocol_version_constants() {
-        assert!(PROTOCOL_VERSION >= 1);
-    }
 
     #[test]
     fn hdr10_signaling_ffmpeg_args() {

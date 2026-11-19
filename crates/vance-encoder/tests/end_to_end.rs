@@ -32,12 +32,7 @@ fn sidecar_binary() -> Option<PathBuf> {
         PathBuf::from("target/debug/vance-encoder"),
         PathBuf::from("target/release/vance-encoder"),
     ];
-    for c in candidates {
-        if c.exists() {
-            return Some(c);
-        }
-    }
-    None
+    candidates.into_iter().find(|c| c.exists())
 }
 
 /// Phase 8.4 — exercise the audio codec variants (PCM_S16, AAC, FLAC)

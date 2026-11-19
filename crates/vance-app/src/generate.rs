@@ -87,13 +87,9 @@ pub fn available() -> bool {
 pub type GenProgress<'a> = dyn FnMut(u32, u32, &str) + 'a;
 
 /// Generate an image for `req`, returning the output path. Blocking + slow
-/// (model inference) — call OFF the engine lock.
-pub fn generate(req: &GenRequest) -> Result<PathBuf, GenError> {
-    generate_with_progress(req, &mut |_, _, _| {})
-}
-
-/// Like [`generate`], but streams the runner's per-step progress through `on`
-/// so the UI can show it instead of appearing frozen.
+/// (model inference) — call OFF the engine lock. Streams the runner's
+/// per-step progress through `on` so the UI can show it instead of appearing
+/// frozen.
 pub fn generate_with_progress(req: &GenRequest, on: &mut GenProgress) -> Result<PathBuf, GenError> {
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;
@@ -176,13 +172,7 @@ fn parse_step(line: &str) -> Option<(u32, u32)> {
     let rest = &line[line.rfind("step ")? + 5..];
     let mut parts = rest.split('/');
     let n: u32 = parts.next()?.trim().parse().ok()?;
-    let m: u32 = parts
-        .next()?
-        .trim()
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()?;
+    let m: u32 = parts.next()?.split_whitespace().next()?.parse().ok()?;
     Some((n, m))
 }
 

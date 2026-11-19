@@ -260,7 +260,7 @@ mod tests {
         cache
             .put(
                 &CacheKey::for_source_frame("file:///x.mp4", 1, 0),
-                &vec![0u8; 100],
+                &[0u8; 100],
             )
             .unwrap();
         let s = cache.stats();

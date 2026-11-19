@@ -5,20 +5,25 @@
 
 use crate::manifest::PluginManifest;
 
+/// File extension (without the dot) of a shader-effect package.
 pub const SHADER_EXTENSION: &str = "vsfx";
 
 /// A shader effect on disk: its manifest + the user's WGSL body.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ShaderPackage {
+    /// Plaintext plugin manifest (id, name, params) read at discovery.
     pub manifest: PluginManifest,
     /// The user's WGSL `fn effect(color: vec4<f32>, uv: vec2<f32>) -> vec4<f32>`.
     pub shader: String,
 }
 
+/// Parse a package from its JSON bytes; the error is a readable message.
 pub fn parse(bytes: &[u8]) -> Result<ShaderPackage, String> {
     serde_json::from_slice(bytes).map_err(|e| format!("shader package: {e}"))
 }
 
+/// Serialize a package to pretty-printed JSON bytes (the inverse of
+/// [`parse`]).
 pub fn build(pkg: &ShaderPackage) -> Vec<u8> {
     serde_json::to_vec_pretty(pkg).expect("shader package serialize")
 }

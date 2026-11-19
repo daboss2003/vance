@@ -55,6 +55,9 @@ pub enum PublishError {
     Api(String),
 }
 
+/// Shared slot the redirect listener fills with the redirect's `(code, state)`.
+type RedirectSlot = Arc<Mutex<Option<(String, String)>>>;
+
 /// In-flight OAuth state (one at a time).
 struct Pending {
     platform: Platform,
@@ -62,7 +65,7 @@ struct Pending {
     pkce: Pkce,
     state: String,
     /// Filled by the redirect listener with `(code, state)`.
-    slot: Arc<Mutex<Option<(String, String)>>>,
+    slot: RedirectSlot,
     stop: Arc<AtomicBool>,
     /// The redirect-listener thread. Joined on teardown so its loopback
     /// socket is released BEFORE any subsequent flow rebinds the same port.
@@ -137,7 +140,7 @@ impl PublishHub {
     }
 
     /// Snapshot the in-flight redirect slot (for polling without the lock).
-    pub fn pending_slot(&self) -> Option<(Arc<Mutex<Option<(String, String)>>>, String)> {
+    pub fn pending_slot(&self) -> Option<(RedirectSlot, String)> {
         self.pending
             .as_ref()
             .map(|p| (p.slot.clone(), p.state.clone()))
@@ -418,11 +421,7 @@ fn redirect_port(uri: &str) -> Option<u16> {
 /// the caller can join it and free the port deterministically).
 fn spawn_redirect_listener(
     port: u16,
-) -> std::io::Result<(
-    Arc<Mutex<Option<(String, String)>>>,
-    Arc<AtomicBool>,
-    JoinHandle<()>,
-)> {
+) -> std::io::Result<(RedirectSlot, Arc<AtomicBool>, JoinHandle<()>)> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     listener.set_nonblocking(true)?;
     let slot = Arc::new(Mutex::new(None));

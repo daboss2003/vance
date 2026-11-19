@@ -184,6 +184,9 @@ impl Compositor {
     /// Rasterize one node given its already-resolved input images (keyed by
     /// slot). Sources ignore `slot_imgs`; a filter/combiner reads its slots,
     /// treating a missing slot as a transparent canvas.
+    // Intentional: the per-node render context (time, anim ctx, external
+    // inputs, canvas size) is passed flat, as the render loop holds it.
+    #[allow(clippy::too_many_arguments)]
     fn compute_node(
         &self,
         node: &Node,

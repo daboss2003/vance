@@ -104,12 +104,6 @@ pub fn detect() -> Vec<Capability> {
     ]
 }
 
-/// True when every `required` capability is present (core editing/export will
-/// work). Optional AI tools don't affect this.
-pub fn core_ready() -> bool {
-    detect().iter().filter(|c| c.required).all(|c| c.present)
-}
-
 /// Find an executable on PATH (honours PATHEXT on Windows).
 fn which(bin: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;

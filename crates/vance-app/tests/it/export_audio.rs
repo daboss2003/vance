@@ -11,7 +11,7 @@
 //! Skips gracefully without ffmpeg/ffprobe, the sidecars, or fixtures.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use vance_app_lib::engine::{Engine, RenderOptions};
 use vance_encoder::EncoderPreset;
@@ -134,7 +134,7 @@ fn export_and_measure_rms(engine: &mut Engine) -> Option<f64> {
 
 fn setup(
     engine: &mut Engine,
-    av: &PathBuf,
+    av: &Path,
 ) -> Option<(vance_timeline::TrackId, vance_timeline::ClipId)> {
     engine.new_project("audio-export".into()).ok()?;
     let media = engine

@@ -234,11 +234,12 @@ impl DiskLru {
     }
 }
 
+/// In-memory state rebuilt from the index log: live entries, LRU order
+/// (oldest first) and total bytes.
+type ReplayedIndex = (HashMap<String, DiskEntry>, Vec<String>, u64);
+
 /// Replay the on-disk log to rebuild the in-memory state.
-fn replay_index(
-    index_path: &Path,
-    entries_dir: &Path,
-) -> Result<(HashMap<String, DiskEntry>, Vec<String>, u64), DiskLruError> {
+fn replay_index(index_path: &Path, entries_dir: &Path) -> Result<ReplayedIndex, DiskLruError> {
     let mut entries: HashMap<String, DiskEntry> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut bytes: u64 = 0;
@@ -293,12 +294,10 @@ fn replay_index(
                 }
                 order.retain(|k| k != key);
             }
-            "T" => {
-                // Touch: move to MRU. Only act if the entry exists.
-                if entries.contains_key(key) {
-                    order.retain(|k| k != key);
-                    order.push(key.to_string());
-                }
+            // Touch: move to MRU. Only act if the entry exists.
+            "T" if entries.contains_key(key) => {
+                order.retain(|k| k != key);
+                order.push(key.to_string());
             }
             _ => {
                 // Unknown op — treat as no-op so the cache survives
