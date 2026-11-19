@@ -70,12 +70,6 @@ pub enum EngineError {
     #[error("viewport not yet installed")]
     NoViewport,
 
-    // Intentional: public variant named in `start_playback`'s docs; nothing
-    // constructs it today, and removing it would change the public enum.
-    #[allow(dead_code)]
-    #[error("playback in progress")]
-    PlaybackInProgress,
-
     #[error("no playback session")]
     NoPlayback,
 
@@ -1438,14 +1432,6 @@ pub struct ClipAnchor {
     pub source_in_seconds: f64,
     pub time_base_num: i64,
     pub time_base_den: i64,
-    /// Product of every "opacity" effect's `value` param on the
-    /// active clip (clamped to [0, 1]). 1.0 when no opacity effects
-    /// are attached. Phase 5.2's wiring.
-    // Intentional: public field recorded with each anchor; the value is
-    // applied via `Renderer::set_opacity` when the anchor is built, so
-    // nothing reads it back from here yet.
-    #[allow(dead_code)]
-    pub opacity: f32,
 }
 
 /// Either the single-file [`AudioPlayer`] owner or the multi-source
@@ -1868,15 +1854,6 @@ impl Engine {
         Ok(pts)
     }
 
-    /// Stream info from the last `load_source`. Used by the UI to
-    /// format the time display and scrub bar.
-    // Intentional: public lib API with no caller today (the UI reads
-    // `source_state`, which carries the same info).
-    #[allow(dead_code)]
-    pub fn source_stream_info(&self) -> Option<&StreamInfo> {
-        self.source_stream_info.as_ref()
-    }
-
     /// Snapshot of the Source monitor's state for the UI — stream
     /// info + last-presented PTS + marks. Returns `None` when
     /// nothing has been loaded into Source yet.
@@ -2177,9 +2154,8 @@ impl Engine {
     }
 
     /// Begin streaming playback starting at `from_pts`. The scheduler
-    /// thread takes ownership of the decoder for the duration of playback;
-    /// other commands that need the decoder will return `PlaybackInProgress`
-    /// until `stop_playback` is called.
+    /// thread takes ownership of the decoder for the duration of playback,
+    /// so decoder-dependent commands can't use it until `stop_playback`.
     pub fn start_playback(&mut self, from_pts: i64) -> Result<(), EngineError> {
         tracing::info!(from_pts, "start_playback called");
         self.pause_for_edit();
@@ -3595,7 +3571,6 @@ impl Engine {
             source_in_seconds: anchor_source_in,
             time_base_num: tb_n,
             time_base_den: tb_d,
-            opacity: anchor_opacity,
         });
         self.playing_sequence_active = true;
         // Stash effects for the playback_loop to evaluate per frame.
@@ -3718,7 +3693,6 @@ impl Engine {
             source_in_seconds: anchor_src_in,
             time_base_num: anchor_tb.0,
             time_base_den: anchor_tb.1,
-            opacity: op,
         });
 
         // Resolve B's frame. Same dispatch on title vs decoder.
@@ -3895,7 +3869,6 @@ impl Engine {
             // `PlaybackPrimary::time_base`), so the anchor must match.
             time_base_num: 1,
             time_base_den: 1000,
-            opacity: anchor_opacity,
         });
         self.playing_sequence_active = true;
         self.next_play_effects = effects;
@@ -4053,7 +4026,6 @@ impl Engine {
             source_in_seconds: anchor_source_in,
             time_base_num: 1,
             time_base_den: 1000,
-            opacity,
         });
         let viewport = self
             .viewport
@@ -4919,7 +4891,6 @@ impl Engine {
             source_in_seconds: anchor_source_in,
             time_base_num: tb_n,
             time_base_den: tb_d,
-            opacity: anchor_opacity,
         });
         // Phase 10 — hand the active clip's effect chain + clip-relative
         // time to `decode_and_render_at` so WASM effects show in the
@@ -7009,20 +6980,6 @@ impl Engine {
 
     // ---- GOAT-8: dialogue leveling (BS.1770 loudness analysis) ----------------
 
-    /// The media item referenced by a clip on `track_id` (for off-lock
-    /// loudness analysis).
-    // Intentional: public lib API with no caller today (leveling moved to
-    // `clip_media_and_range` to measure only the trimmed range).
-    #[allow(dead_code)]
-    pub fn clip_media_id(
-        &self,
-        track_id: TrackId,
-        clip_id: vance_timeline::ClipId,
-    ) -> Option<MediaItemId> {
-        self.clip_media_and_range(track_id, clip_id)
-            .map(|(m, _, _)| m)
-    }
-
     /// GOAT-8 — a clip's media id + its active source range in seconds
     /// `(media, source_in_sec, duration_sec)`, so leveling measures only
     /// the clip's used region (not the whole source file).
@@ -7635,9 +7592,6 @@ pub struct AudioMixerOwner {
     /// scheduler stops emitting commands BEFORE the fold thread tears
     /// down its receiver — avoids spurious spawn-then-immediate-Remove).
     scheduler_stop: Arc<AtomicBool>,
-    /// Live counters published by [`vance_audio::AudioMixer`] +
-    /// scheduler. Exposed through [`Self::stats`] for the UI / logs.
-    stats: Arc<vance_audio::MixerStats>,
     /// Phase 7.5 M1: lock-free metering bus published by the fold
     /// thread ~30Hz. UI polls this to render meter bars.
     meter: Arc<arc_swap::ArcSwap<vance_audio::MeterSnapshot>>,
@@ -7675,14 +7629,6 @@ impl AudioMixerOwner {
     /// touches mixer topology lands.
     pub fn publish_sched_clips(&self, clips: Vec<SchedClip>) {
         self.sched_clips.store(Arc::new(clips));
-    }
-
-    /// Snapshot of the live mixer counters.
-    // Intentional: public lib API for the UI / logs (see the `stats` field);
-    // nothing reads the counters yet.
-    #[allow(dead_code)]
-    pub fn stats(&self) -> Arc<vance_audio::MixerStats> {
-        self.stats.clone()
     }
 
     /// Phase 7.5 M1: metering bus handle for the UI poll path.
@@ -8433,7 +8379,6 @@ fn start_audio_mix(
             sched_clips,
             scheduler_handle: Some(scheduler_handle),
             scheduler_stop,
-            stats,
             meter: meter_handle,
         },
         sync,
@@ -9963,18 +9908,6 @@ impl Engine {
     /// Phase 9.2 — public read-only cache stats for the UI.
     pub fn frame_cache_stats(&self) -> Option<vance_cache::CacheStats> {
         self.frame_cache.as_ref().map(|c| c.stats())
-    }
-
-    /// Reset the cache hit/miss counters (occupancy untouched). Lets the
-    /// UI — or a test — measure the hit ratio over a specific window (e.g.
-    /// one scrub gesture) instead of the cache's whole lifetime.
-    // Intentional: public lib API for windowed hit-ratio measurement (see
-    // above); no caller in the app or the tests yet.
-    #[allow(dead_code)]
-    pub fn reset_frame_cache_stats(&self) {
-        if let Some(c) = self.frame_cache.as_ref() {
-            c.reset_hit_stats();
-        }
     }
 
     /// Phase 9.3 — lazily spawn the prefetch worker. Uses the same
