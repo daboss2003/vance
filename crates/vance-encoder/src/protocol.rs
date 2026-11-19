@@ -80,16 +80,20 @@ pub enum EncoderPreset {
     DnxhrSq,
     /// Avid DNxHR LB (low-bandwidth proxy).
     DnxhrLb,
-    /// H.264 — hardware encoder per platform (videotoolbox on macOS,
-    /// nvenc / vaapi on Linux, mediafoundation on Windows). CPU
-    /// fallback (libx264) requires the GPL Encoder Pack.
+    /// H.264 — the encoder is chosen at export time: the first hardware
+    /// encoder that works on this machine (VideoToolbox on macOS; NVENC,
+    /// QSV, VAAPI on Linux; NVENC, QSV, AMF, Media Foundation on Windows),
+    /// else a software fallback (libx264, then libopenh264) if the installed
+    /// `ffmpeg` provides one. Vance runs `ffmpeg` as a separate process and
+    /// doesn't bundle libx264.
     H264 {
         /// CRF-equivalent quality, 0 (best) — 51 (worst). 23 is the
         /// libx264 default; hardware encoders map this to their own
         /// quality knob.
         crf: u8,
     },
-    /// HEVC / H.265 — hardware first, libx265 with the GPL pack.
+    /// HEVC / H.265 — chosen like [`EncoderPreset::H264`]: a working
+    /// hardware encoder first, else libx265 if the installed `ffmpeg` has it.
     Hevc {
         /// CRF-equivalent quality (see [`EncoderPreset::H264::crf`]).
         crf: u8,

@@ -200,6 +200,77 @@ fn every_codec_preset_produces_an_output_file() {
     );
 }
 
+/// H.264 export must succeed on any machine whose ffmpeg has SOME working
+/// H.264 encoder. Unlike the smoke test above it does not tolerate failure:
+/// a hard-coded hardware encoder that isn't usable on this host (VAAPI on a
+/// GPU-less Linux CI runner) must fall back instead of breaking the pipe.
+#[test]
+fn h264_export_succeeds_via_runtime_encoder_selection() {
+    if !ffmpeg_present() {
+        eprintln!("ffmpeg not on PATH — skipping H.264 selection test");
+        return;
+    }
+    let Some(binary) = sidecar_binary() else {
+        eprintln!("vance-encoder binary not built — skipping");
+        return;
+    };
+    let out = std::env::temp_dir().join(format!("vance-h264-select-{}.mp4", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+
+    let (w, h) = (320u32, 240u32);
+    let mut client = EncoderClient::spawn(&binary).expect("spawn");
+    client
+        .open(
+            out.to_string_lossy().to_string(),
+            Some(VideoConfig {
+                width: w,
+                height: h,
+                frame_rate_num: 24,
+                frame_rate_den: 1,
+                pixel_format: VideoPixelFormat::Rgba8,
+                preset: EncoderPreset::H264 { crf: 23 },
+                time_base_num: 1,
+                time_base_den: 24,
+                hdr: None,
+            }),
+            None,
+        )
+        .unwrap_or_else(|e| panic!("open H.264: {e}"));
+    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    for f in 0..10u8 {
+        for (i, p) in pixels.iter_mut().enumerate() {
+            *p = (i as u8).wrapping_add(f.wrapping_mul(9));
+        }
+        client
+            .push_video(f as i64, pixels.clone())
+            .unwrap_or_else(|e| panic!("push H.264 frame {f}: {e}"));
+    }
+    let (frames, _) = client
+        .finish()
+        .unwrap_or_else(|e| panic!("finish H.264: {e}"));
+    assert_eq!(frames, 10);
+    let _ = client.shutdown();
+
+    let len = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    assert!(len > 1_000, "H.264 output too small: {len} bytes");
+    if ffprobe_present() {
+        let probe = Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args([
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "default=nw=1:nk=1",
+            ])
+            .arg(&out)
+            .output()
+            .expect("ffprobe");
+        let codec = String::from_utf8_lossy(&probe.stdout).trim().to_string();
+        assert_eq!(codec, "h264", "expected an H.264 stream, got `{codec}`");
+    }
+    let _ = std::fs::remove_file(&out);
+}
+
 fn preset_slug(p: &EncoderPreset) -> &'static str {
     match p {
         EncoderPreset::ProRes422HQ => "prores422hq",
