@@ -190,10 +190,95 @@ fn free_kib(path: &std::path::Path) -> Option<u64> {
     text.lines().nth(1)?.split_whitespace().nth(3)?.parse().ok()
 }
 
+/// Free space (KiB) available to this user on the volume holding `path`.
+#[cfg(windows)]
+fn free_kib(path: &std::path::Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    // kernel32 is always linked by std on Windows, so this needs no new crate.
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            directory: *const u16,
+            free_bytes_available_to_caller: *mut u64,
+            total_bytes: *mut u64,
+            total_free_bytes: *mut u64,
+        ) -> i32;
+    }
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut available = 0u64;
+    // SAFETY: `wide` is NUL-terminated and outlives the call; the two
+    // optional out-pointers may be null per the Win32 contract.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(available / 1024)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn free_kib(_path: &std::path::Path) -> Option<u64> {
+    None
+}
+
+/// Every descendant of `pid` (children, grandchildren …), deepest last.
+#[cfg(unix)]
+fn descendants(pid: u32) -> Vec<u32> {
+    let mut found = Vec::new();
+    let mut frontier = vec![pid];
+    while let Some(p) = frontier.pop() {
+        let Ok(out) = Command::new("pgrep").args(["-P", &p.to_string()]).output() else {
+            continue;
+        };
+        for child in String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .filter_map(|s| s.parse::<u32>().ok())
+        {
+            found.push(child);
+            frontier.push(child);
+        }
+    }
+    found
+}
+
+/// Stop `child` and everything it started: cargo, rustc, linkers, build
+/// scripts. Stopping only cargo would let in-flight rustc/linker processes
+/// keep writing to the full disk.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // Intentional: signal the process tree explicitly rather than give
+        // cargo its own process group — cargo must stay in ours so Ctrl+C
+        // in the terminal still reaches the whole build.
+        let mut pids = descendants(child.id());
+        pids.push(child.id());
+        let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
+        let _ = Command::new("kill").arg("-TERM").args(&pids).status();
+    }
+    #[cfg(windows)]
+    {
+        let pid = child.id().to_string();
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid, "/T", "/F"])
+            .status();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
 /// Run cargo, but refuse to start — or stop it mid-build — when the disk
 /// is nearly full. A full disk mid-build corrupts the target dir and can
 /// destabilise the whole machine, so failing early is the safer default.
-#[cfg(unix)]
 fn run_disk_guarded(mut cmd: Command) -> Result<(), String> {
     use std::time::Duration;
     let root = workspace_root();
@@ -206,10 +291,15 @@ fn run_disk_guarded(mut cmd: Command) -> Result<(), String> {
             free as f64 / (1024.0 * 1024.0)
         )
     };
-    if let Some(free) = free_kib(&root) {
-        if free < min_kib {
+    match free_kib(&root) {
+        Some(free) if free < min_kib => {
             return Err(format!("refusing to start: {}", too_low(free)));
         }
+        Some(_) => {}
+        None => eprintln!(
+            "xtask: warning: can't read free disk space here; \
+             the disk guard is OFF for this run"
+        ),
     }
     eprintln!("xtask: running {cmd:?}");
     let mut child = cmd
@@ -224,23 +314,10 @@ fn run_disk_guarded(mut cmd: Command) -> Result<(), String> {
             continue;
         };
         if free < min_kib {
-            // Intentional: TERM cargo's direct children (rustc) first, then
-            // cargo itself. Cargo stays in our process group so Ctrl+C still
-            // reaches the whole build; a separate group would break that.
-            let pid = child.id().to_string();
-            let _ = Command::new("pkill").args(["-TERM", "-P", &pid]).status();
-            let _ = Command::new("kill").args(["-TERM", &pid]).status();
-            let _ = child.wait();
+            kill_tree(&mut child);
             return Err(format!("stopped the build: {}", too_low(free)));
         }
     }
-}
-
-#[cfg(not(unix))]
-fn run_disk_guarded(cmd: Command) -> Result<(), String> {
-    // No portable free-space query without a new dependency; the guard
-    // is a dev-machine convenience, so Windows just runs unguarded.
-    run(cmd)
 }
 
 fn exit_ok(status: ExitStatus, cmd: &Command) -> Result<(), String> {
@@ -615,10 +692,48 @@ mod tests {
         assert_eq!(scope_to_packages(&base, &s(&["--", "-p"])), base);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn free_space_is_readable() {
-        let free = free_kib(&workspace_root()).expect("df -Pk should parse");
+        let free = free_kib(&workspace_root()).expect("free space should be readable");
         assert!(free > 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_tree_stops_grandchildren_too() {
+        use std::time::{Duration, Instant};
+        let alive = |pid: u32| {
+            Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        // sh -> sh -> two sleeps. The sleeps are GRANDchildren, like a linker
+        // under rustc under cargo; killing only direct children misses them.
+        let mut child = Command::new("sh")
+            .args(["-c", "sh -c 'sleep 30 & sleep 30 & wait' & wait"])
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut kids = descendants(child.id());
+        while kids.len() < 3 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            kids = descendants(child.id());
+        }
+        assert!(
+            kids.len() >= 3,
+            "shells never forked their sleeps: {kids:?}"
+        );
+
+        kill_tree(&mut child);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while kids.iter().any(|&p| alive(p)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let survivors: Vec<_> = kids.iter().filter(|&&p| alive(p)).collect();
+        assert!(survivors.is_empty(), "descendants survived: {survivors:?}");
     }
 }
