@@ -108,28 +108,54 @@
         <div class="cue">
           <div class="times">
             <input
-              type="number" step="0.01" min="0" value={fmt(c.start_ms)} disabled={busy}
+              type="number"
+              step="0.01"
+              min="0"
+              value={fmt(c.start_ms)}
+              disabled={busy}
               onchange={(e) =>
-                act(() => setCaptionTiming(c.id, parseSec((e.target as HTMLInputElement).value), c.end_ms))}
+                act(() =>
+                  setCaptionTiming(c.id, parseSec((e.target as HTMLInputElement).value), c.end_ms)
+                )}
             />
             <span>→</span>
             <input
-              type="number" step="0.01" min="0" value={fmt(c.end_ms)} disabled={busy}
+              type="number"
+              step="0.01"
+              min="0"
+              value={fmt(c.end_ms)}
+              disabled={busy}
               onchange={(e) =>
-                act(() => setCaptionTiming(c.id, c.start_ms, parseSec((e.target as HTMLInputElement).value)))}
+                act(() =>
+                  setCaptionTiming(c.id, c.start_ms, parseSec((e.target as HTMLInputElement).value))
+                )}
             />
           </div>
           <input
-            class="text" type="text" value={c.text} disabled={busy}
+            class="text"
+            type="text"
+            value={c.text}
+            disabled={busy}
             onchange={(e) => act(() => setCaptionText(c.id, (e.target as HTMLInputElement).value))}
           />
           <div class="cue-actions">
-            <button title="Split at mid-point" disabled={busy}
-              onclick={() => act(() => splitCaption(c.id, Math.round((c.start_ms + c.end_ms) / 2)))}>⊟</button>
-            <button title="Merge with next" disabled={busy}
-              onclick={() => act(() => mergeCaptionWithNext(c.id))}>⊕</button>
-            <button class="rm" title="Remove" disabled={busy}
-              onclick={() => act(() => removeCaption(c.id))}>✕</button>
+            <button
+              title="Split at mid-point"
+              disabled={busy}
+              onclick={() => act(() => splitCaption(c.id, Math.round((c.start_ms + c.end_ms) / 2)))}
+              >⊟</button
+            >
+            <button
+              title="Merge with next"
+              disabled={busy}
+              onclick={() => act(() => mergeCaptionWithNext(c.id))}>⊕</button
+            >
+            <button
+              class="rm"
+              title="Remove"
+              disabled={busy}
+              onclick={() => act(() => removeCaption(c.id))}>✕</button
+            >
           </div>
         </div>
       {/each}
@@ -138,17 +164,21 @@
 
   <div class="io">
     <input type="text" bind:value={filePath} placeholder="captions.srt or .vtt" disabled={busy} />
-    <button disabled={busy} onclick={() => act(() => importCaptions(filePath), 'Imported.')}>Import</button>
-    <button disabled={busy}
-      onclick={() => act(() => exportCaptions(filePath, filePath.toLowerCase().endsWith('.vtt')), 'Exported.')}>Export</button>
+    <button disabled={busy} onclick={() => act(() => importCaptions(filePath), 'Imported.')}
+      >Import</button
+    >
+    <button
+      disabled={busy}
+      onclick={() =>
+        act(() => exportCaptions(filePath, filePath.toLowerCase().endsWith('.vtt')), 'Exported.')}
+      >Export</button
+    >
   </div>
 
   <div class="transcribe">
     <div class="t-head">Auto-transcribe (speech to text)</div>
     {#if !whisperOk}
-      <div class="hint">
-        Needs the speech-to-text add-on. Set it up in Settings → AI add-ons.
-      </div>
+      <div class="hint">Needs the speech-to-text add-on. Set it up in Settings → AI add-ons.</div>
     {/if}
     <div class="t-row">
       <select bind:value={transcribeMediaId} disabled={busy || !whisperOk}>
@@ -166,8 +196,15 @@
       </select>
     </div>
     <div class="t-row">
-      <input type="text" bind:value={language} placeholder="Language (auto-detect)" disabled={busy || !whisperOk} />
-      <button disabled={busy || !whisperOk || !transcribeMediaId} onclick={runTranscribe}>Transcribe</button>
+      <input
+        type="text"
+        bind:value={language}
+        placeholder="Language (auto-detect)"
+        disabled={busy || !whisperOk}
+      />
+      <button disabled={busy || !whisperOk || !transcribeMediaId} onclick={runTranscribe}
+        >Transcribe</button
+      >
     </div>
   </div>
 </div>
@@ -255,21 +292,8 @@
   .t-row input {
     flex: 1;
   }
-  code {
-    background: rgba(255, 255, 255, 0.08);
-    padding: 0 3px;
-    border-radius: 2px;
-  }
   .hint {
     opacity: 0.55;
     font-size: 10px;
-  }
-  .err {
-    color: #ff6b6b;
-    font-size: 11px;
-  }
-  .status {
-    color: var(--ok);
-    font-size: 11px;
   }
 </style>

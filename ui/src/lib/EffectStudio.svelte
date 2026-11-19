@@ -36,8 +36,16 @@
     role="dialog"
     aria-modal="true"
     aria-label="Effect Studio"
+    tabindex="-1"
     onclick={(e) => {
       if (e.target === e.currentTarget) closeStudio();
+    }}
+    onkeydown={(e) => {
+      // Esc closes this dialog only (not the app's global Esc = clear selection).
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        closeStudio();
+      }
     }}
   >
     <div class="card">
@@ -127,11 +135,7 @@
             <pre class="err">{studio.error}</pre>
           {/if}
 
-          <button
-            class="save"
-            disabled={studio.busy || !studio.name || !studio.id}
-            onclick={save}
-          >
+          <button class="save" disabled={studio.busy || !studio.name || !studio.id} onclick={save}>
             Save effect
           </button>
           <div class="hint">

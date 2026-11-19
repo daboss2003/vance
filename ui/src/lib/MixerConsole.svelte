@@ -173,9 +173,15 @@
             <div class="sec-head">
               <span>Effects</span>
               <span class="add-group">
-                <button disabled={busy} title="Add EQ" onclick={() => addInsert(b, 'eq')}>＋EQ</button>
-                <button disabled={busy} title="Add Compressor" onclick={() => addInsert(b, 'comp')}>＋ Compressor</button>
-                <button disabled={busy} title="Add Limiter" onclick={() => addInsert(b, 'limit')}>＋ Limiter</button>
+                <button disabled={busy} title="Add EQ" onclick={() => addInsert(b, 'eq')}
+                  >＋EQ</button
+                >
+                <button disabled={busy} title="Add Compressor" onclick={() => addInsert(b, 'comp')}
+                  >＋ Compressor</button
+                >
+                <button disabled={busy} title="Add Limiter" onclick={() => addInsert(b, 'limit')}
+                  >＋ Limiter</button
+                >
               </span>
             </div>
             {#if b.inserts.length === 0}
@@ -184,7 +190,11 @@
               {#each b.inserts as ins, i (i)}
                 <div class="chip">
                   <span>{insertLabel(ins)}</span>
-                  <button class="x" disabled={busy} onclick={() => act(() => removeBusInsert(b.id, i))}>✕</button>
+                  <button
+                    class="x"
+                    disabled={busy}
+                    onclick={() => act(() => removeBusInsert(b.id, i))}>✕</button
+                  >
                 </div>
               {/each}
             {/if}
@@ -213,16 +223,26 @@
               {#each b.sends as s, i (i)}
                 <div class="chip">
                   <span>→ {sendLabel(s)}</span>
-                  <button class="x" disabled={busy} onclick={() => act(() => removeBusSend(b.id, i))}>✕</button>
+                  <button
+                    class="x"
+                    disabled={busy}
+                    onclick={() => act(() => removeBusSend(b.id, i))}>✕</button
+                  >
                 </div>
               {/each}
             {/if}
           </div>
           <div class="row actions">
-            <button class:on={b.mute} disabled={busy} onclick={() => act(() => setBusMute(b.id, !b.mute))}>
+            <button
+              class:on={b.mute}
+              disabled={busy}
+              onclick={() => act(() => setBusMute(b.id, !b.mute))}
+            >
               {b.mute ? 'Muted' : 'Mute'}
             </button>
-            <button class="rm" disabled={busy} onclick={() => act(() => removeBus(b.id))}>Remove</button>
+            <button class="rm" disabled={busy} onclick={() => act(() => removeBus(b.id))}
+              >Remove</button
+            >
           </div>
           <div class="route">→ {outputLabel(b.output)}</div>
         </div>

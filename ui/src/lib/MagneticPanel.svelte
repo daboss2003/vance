@@ -64,7 +64,11 @@
   </div>
 
   <div class="row">
-    <button onclick={connect} disabled={busy || selCount !== 2} title="Select an anchor clip then a clip to attach">
+    <button
+      onclick={connect}
+      disabled={busy || selCount !== 2}
+      title="Select an anchor clip then a clip to attach"
+    >
       Connect (2)
     </button>
     <button onclick={disconnectSelected} disabled={busy || selCount === 0}>Disconnect</button>

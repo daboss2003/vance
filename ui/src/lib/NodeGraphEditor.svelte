@@ -106,7 +106,11 @@
   function onMove(e: PointerEvent) {
     if (!gesture) return;
     if (gesture.kind === 'pan') {
-      view = { ...view, x: gesture.ox + (e.clientX - gesture.sx), y: gesture.oy + (e.clientY - gesture.sy) };
+      view = {
+        ...view,
+        x: gesture.ox + (e.clientX - gesture.sx),
+        y: gesture.oy + (e.clientY - gesture.sy)
+      };
     } else if (gesture.kind === 'node') {
       const g = screenToGraph(e.clientX, e.clientY);
       moveNode(gesture.id, Math.round(g.x - gesture.dx), Math.round(g.y - gesture.dy));
@@ -155,7 +159,10 @@
   }
   function fitView() {
     if (!graph.nodes.length || !vpEl) return;
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    let minX = Infinity,
+      minY = Infinity,
+      maxX = -Infinity,
+      maxY = -Infinity;
     for (const n of graph.nodes) {
       minX = Math.min(minX, n.x);
       minY = Math.min(minY, n.y);
@@ -164,7 +171,13 @@
     }
     const r = vpEl.getBoundingClientRect();
     const pad = 40;
-    const k = Math.min(1.6, Math.max(0.3, Math.min((r.width - pad * 2) / (maxX - minX), (r.height - pad * 2) / (maxY - minY))));
+    const k = Math.min(
+      1.6,
+      Math.max(
+        0.3,
+        Math.min((r.width - pad * 2) / (maxX - minX), (r.height - pad * 2) / (maxY - minY))
+      )
+    );
     view = {
       k,
       x: (r.width - (maxX - minX) * k) / 2 - minX * k,
@@ -228,7 +241,10 @@
     </div>
   </div>
 
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <!-- Intentional: a pan/zoom canvas is the textbook role="application" case —
+       it must take focus and pointer/keyboard input itself. -->
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
     class="viewport"
     class:wiring
@@ -249,7 +265,21 @@
           {@const fn = nodeById(e.from)}
           {@const tn = nodeById(e.to)}
           {#if fn && tn}
-            <path class="edge" d={bezier(outPos(fn), inPos(tn, e.to_input))} onclick={() => deleteEdge(i)} />
+            <path
+              class="edge"
+              d={bezier(outPos(fn), inPos(tn, e.to_input))}
+              role="button"
+              tabindex="0"
+              aria-label="Delete connection"
+              onclick={() => deleteEdge(i)}
+              onkeydown={(ev) => {
+                if (ev.key === 'Enter' || ev.key === 'Delete' || ev.key === 'Backspace') {
+                  // Stop the canvas handler from also deleting the selected node.
+                  ev.stopPropagation();
+                  deleteEdge(i);
+                }
+              }}
+            />
           {/if}
         {/each}
         {#if gesture?.kind === 'wire'}
@@ -269,6 +299,9 @@
           class:sel={selected === n.id}
           style={`left:${n.x}px; top:${n.y}px; width:${NODE_W}px; --c:${cat(n.kind)}`}
         >
+          <!-- Intentional: pointer-only drag handle (move node). Keyboard
+               move/wire is part of the accessibility pass (hardening milestone). -->
+          <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div class="nhead" onpointerdown={(e) => onHeadDown(e, n.id)}>
             <span class="cdot" style={`background:${cat(n.kind)}`}></span>
             <span class="ntitle">{def?.label ?? n.kind}</span>
@@ -278,19 +311,27 @@
                 title="Delete node"
                 aria-label="Delete node"
                 onpointerdown={(e) => e.stopPropagation()}
-                onclick={() => (deleteNode(n.id), (selected = null))}>✕</button>
+                onclick={() => (deleteNode(n.id), (selected = null))}>✕</button
+              >
             {/if}
           </div>
 
           <!-- input ports -->
           {#each ins as input, ii (input)}
-            <div class="port in" class:target={wiring} style={`top:${inTop(n, ii, ins.length)}px`} aria-hidden="true"></div>
+            <div
+              class="port in"
+              class:target={wiring}
+              style={`top:${inTop(n, ii, ins.length)}px`}
+              aria-hidden="true"
+            ></div>
             {#if ins.length > 1}
               <span class="plabel" style={`top:${inTop(n, ii, ins.length) - 1}px`}>{input}</span>
             {/if}
           {/each}
           <!-- output port -->
           {#if n.kind !== 'output'}
+            <!-- Intentional: pointer-only drag-to-wire handle; see the node header note. -->
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
               class="port out"
               class:armed={graph.pendingFrom === n.id}
@@ -324,8 +365,8 @@
     </div>
 
     <div class="hint">
-      Drag from an output <b style="color:var(--accent,#4c9dff)">●</b> to an input to connect · scroll to
-      zoom · drag empty space to pan · select a node and press <kbd>Delete</kbd>
+      Drag from an output <b style="color:var(--accent,#4c9dff)">●</b> to an input to connect ·
+      scroll to zoom · drag empty space to pan · select a node and press <kbd>Delete</kbd>
     </div>
   </div>
 </div>
@@ -456,7 +497,9 @@
   }
   .node.sel {
     border-color: var(--c);
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--c) 55%, transparent), 0 6px 18px rgba(0, 0, 0, 0.45);
+    box-shadow:
+      0 0 0 2px color-mix(in srgb, var(--c) 55%, transparent),
+      0 6px 18px rgba(0, 0, 0, 0.45);
   }
   .nhead {
     display: flex;
@@ -469,7 +512,10 @@
     cursor: grab;
     border-bottom: 1px solid var(--border, #30353d);
     border-radius: 9px 9px 0 0;
-    background: linear-gradient(color-mix(in srgb, var(--c) 16%, var(--panel-2, #262a31)), var(--panel-2, #262a31));
+    background: linear-gradient(
+      color-mix(in srgb, var(--c) 16%, var(--panel-2, #262a31)),
+      var(--panel-2, #262a31)
+    );
   }
   .nhead:active {
     cursor: grabbing;

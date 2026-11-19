@@ -258,11 +258,9 @@ class ProjectState {
         .map((r, i) => (r.status === 'rejected' ? newlyExtractable[i].id : null))
         .filter((x): x is string => x !== null);
       if (failed.length > 0) {
-        // eslint-disable-next-line no-console
         console.warn(`peaksEnqueue (backfill) failed for ${failed.length} media items:`, failed);
       }
     } catch (e) {
-      // eslint-disable-next-line no-console
       console.warn('peaksBackfillVideoAudio failed:', e);
     }
   }
@@ -279,7 +277,7 @@ class ProjectState {
       return typeof result === 'string' ? result : null;
     } catch (e) {
       const msg = `peaksSetCacheDir(${attemptedLabel}) failed: ${e}`;
-      // eslint-disable-next-line no-console
+
       console.warn(msg);
       this.peaksWarning = msg;
       return null;
@@ -326,7 +324,6 @@ class ProjectState {
       .map((r, i) => (r.status === 'rejected' ? audio[i].id : null))
       .filter((x): x is string => x !== null);
     if (failed.length > 0) {
-      // eslint-disable-next-line no-console
       console.warn(`peaksEnqueue failed for ${failed.length} media items:`, failed);
     }
   }
@@ -395,7 +392,6 @@ class ProjectState {
       .map((r, i) => (r.status === 'rejected' ? audio[i].id : null))
       .filter((x): x is string => x !== null);
     if (failed.length > 0) {
-      // eslint-disable-next-line no-console
       console.warn(`peaksEnqueue failed for ${failed.length} media items:`, failed);
     }
   }
@@ -509,7 +505,6 @@ class ProjectState {
           item.content_hash_prefix_hex,
           Number.isFinite(item.duration_seconds) ? item.duration_seconds : null
         ).catch((e) => {
-          // eslint-disable-next-line no-console
           console.warn('peaksEnqueue failed for', item.id, e);
         });
       }

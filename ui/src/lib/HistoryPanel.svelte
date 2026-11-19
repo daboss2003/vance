@@ -8,12 +8,7 @@
    * to it (switch branch / restore version); name a node as a checkpoint.
    */
 
-  import {
-    editHistory,
-    checkpointHistory,
-    gotoHistory,
-    type HistoryNode
-  } from '$lib/ipc';
+  import { editHistory, checkpointHistory, gotoHistory, type HistoryNode } from '$lib/ipc';
 
   let nodes = $state<HistoryNode[]>([]);
   let busy = $state(false);

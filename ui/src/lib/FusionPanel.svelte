@@ -177,7 +177,13 @@
         return { Background: { color: [0.1, 0.12, 0.16, 1], gradient_to: null } };
       case 'Text':
         return {
-          Text: { text: 'Text', font: 'Arial', size_px: { Const: 96 }, color: white, align: 'Center' }
+          Text: {
+            text: 'Text',
+            font: 'Arial',
+            size_px: { Const: 96 },
+            color: white,
+            align: 'Center'
+          }
         };
       case 'Rectangle':
         return {
@@ -253,14 +259,20 @@
   <div class="create">
     <label>W<input type="number" min="2" bind:value={newW} disabled={busy} /></label>
     <label>H<input type="number" min="2" bind:value={newH} disabled={busy} /></label>
-    <label>sec<input type="number" min="0.1" step="0.1" bind:value={newDur} disabled={busy} /></label>
+    <label
+      >sec<input type="number" min="0.1" step="0.1" bind:value={newDur} disabled={busy} /></label
+    >
     <button onclick={create} disabled={busy}>＋ New Comp</button>
   </div>
 
   {#if fusionItems.length > 0}
     <div class="edit-pick">
       <span>Edit:</span>
-      <select value={editId ?? ''} onchange={(e) => onEditSelect((e.target as HTMLSelectElement).value)} disabled={busy}>
+      <select
+        value={editId ?? ''}
+        onchange={(e) => onEditSelect((e.target as HTMLSelectElement).value)}
+        disabled={busy}
+      >
         <option value="">— select —</option>
         {#each fusionItems as m (m.id)}
           <option value={m.id}>{m.name}</option>
@@ -274,7 +286,11 @@
       <span class="dim">{comp.width}×{comp.height} · {comp.duration_s.toFixed(1)}s</span>
       <label class="out">
         Output
-        <select value={comp.output} onchange={(e) => edit(() => (comp!.output = (e.target as HTMLSelectElement).value))} disabled={busy}>
+        <select
+          value={comp.output}
+          onchange={(e) => edit(() => (comp!.output = (e.target as HTMLSelectElement).value))}
+          disabled={busy}
+        >
           {#each comp.nodes as n (n.id)}
             <option value={n.id}>{n.name}</option>
           {/each}
@@ -298,17 +314,29 @@
         <div class="node" class:isout={comp.output === node.id}>
           <div class="nhead">
             <span class="badge">{v}</span>
-            <input class="nname" value={node.name} disabled={busy}
-              onchange={(e) => edit(() => (node.name = (e.target as HTMLInputElement).value))} />
-            <button class="del" title="Delete node" onclick={() => deleteNode(node.id)} disabled={busy}>✕</button>
+            <input
+              class="nname"
+              value={node.name}
+              disabled={busy}
+              onchange={(e) => edit(() => (node.name = (e.target as HTMLInputElement).value))}
+            />
+            <button
+              class="del"
+              title="Delete node"
+              onclick={() => deleteNode(node.id)}
+              disabled={busy}>✕</button
+            >
           </div>
 
           <!-- Input connections -->
           {#each slotsFor(node) as slot (slot)}
             <label class="row">
               <span class="lbl">{slot}</span>
-              <select value={node.inputs[slot] ?? ''} disabled={busy}
-                onchange={(e) => setConn(node, slot, (e.target as HTMLSelectElement).value)}>
+              <select
+                value={node.inputs[slot] ?? ''}
+                disabled={busy}
+                onchange={(e) => setConn(node, slot, (e.target as HTMLSelectElement).value)}
+              >
                 <option value="">— none —</option>
                 {#each comp.nodes.filter((n) => n.id !== node.id) as n (n.id)}
                   <option value={n.id}>{n.name}</option>
@@ -319,119 +347,367 @@
 
           <!-- Per-kind editable params -->
           {#if v === 'Background'}
-            <label class="row"><span class="lbl">color</span>
-              <input type="color" value={toHex(s.color)} disabled={busy}
-                onchange={(e) => edit(() => (s.color = fromHex((e.target as HTMLInputElement).value, s.color[3])))} />
+            <label class="row"
+              ><span class="lbl">color</span>
+              <input
+                type="color"
+                value={toHex(s.color)}
+                disabled={busy}
+                onchange={(e) =>
+                  edit(() => (s.color = fromHex((e.target as HTMLInputElement).value, s.color[3])))}
+              />
             </label>
-            <label class="row"><span class="lbl">gradient</span>
-              <input type="checkbox" checked={!!s.gradient_to} disabled={busy}
-                onchange={(e) => edit(() => (s.gradient_to = (e.target as HTMLInputElement).checked ? [0, 0, 0, 1] : null))} />
+            <label class="row"
+              ><span class="lbl">gradient</span>
+              <input
+                type="checkbox"
+                checked={!!s.gradient_to}
+                disabled={busy}
+                onchange={(e) =>
+                  edit(
+                    () =>
+                      (s.gradient_to = (e.target as HTMLInputElement).checked ? [0, 0, 0, 1] : null)
+                  )}
+              />
               {#if s.gradient_to}
-                <input type="color" value={toHex(s.gradient_to)} disabled={busy}
-                  onchange={(e) => edit(() => (s.gradient_to = fromHex((e.target as HTMLInputElement).value, 1)))} />
+                <input
+                  type="color"
+                  value={toHex(s.gradient_to)}
+                  disabled={busy}
+                  onchange={(e) =>
+                    edit(() => (s.gradient_to = fromHex((e.target as HTMLInputElement).value, 1)))}
+                />
               {/if}
             </label>
           {:else if v === 'Text'}
-            <label class="row"><span class="lbl">text</span>
-              <input type="text" value={s.text} disabled={busy}
-                onchange={(e) => edit(() => (s.text = (e.target as HTMLInputElement).value))} /></label>
-            <label class="row"><span class="lbl">font</span>
-              <input type="text" value={s.font} disabled={busy}
-                onchange={(e) => edit(() => (s.font = (e.target as HTMLInputElement).value))} /></label>
-            <label class="row"><span class="lbl">size</span>
-              <input type="number" min="1" value={animNum(s.size_px, 96)} disabled={busy || !isConst(s.size_px)}
-                onchange={(e) => edit(() => (s.size_px = { Const: parseFloat((e.target as HTMLInputElement).value) }))} /></label>
-            <label class="row"><span class="lbl">color</span>
-              <input type="color" value={toHex(s.color)} disabled={busy}
-                onchange={(e) => edit(() => (s.color = fromHex((e.target as HTMLInputElement).value, s.color[3])))} /></label>
-            <label class="row"><span class="lbl">align</span>
-              <select value={s.align ?? 'Left'} disabled={busy}
-                onchange={(e) => edit(() => (s.align = (e.target as HTMLSelectElement).value))}>
+            <label class="row"
+              ><span class="lbl">text</span>
+              <input
+                type="text"
+                value={s.text}
+                disabled={busy}
+                onchange={(e) => edit(() => (s.text = (e.target as HTMLInputElement).value))}
+              /></label
+            >
+            <label class="row"
+              ><span class="lbl">font</span>
+              <input
+                type="text"
+                value={s.font}
+                disabled={busy}
+                onchange={(e) => edit(() => (s.font = (e.target as HTMLInputElement).value))}
+              /></label
+            >
+            <label class="row"
+              ><span class="lbl">size</span>
+              <input
+                type="number"
+                min="1"
+                value={animNum(s.size_px, 96)}
+                disabled={busy || !isConst(s.size_px)}
+                onchange={(e) =>
+                  edit(
+                    () => (s.size_px = { Const: parseFloat((e.target as HTMLInputElement).value) })
+                  )}
+              /></label
+            >
+            <label class="row"
+              ><span class="lbl">color</span>
+              <input
+                type="color"
+                value={toHex(s.color)}
+                disabled={busy}
+                onchange={(e) =>
+                  edit(() => (s.color = fromHex((e.target as HTMLInputElement).value, s.color[3])))}
+              /></label
+            >
+            <label class="row"
+              ><span class="lbl">align</span>
+              <select
+                value={s.align ?? 'Left'}
+                disabled={busy}
+                onchange={(e) => edit(() => (s.align = (e.target as HTMLSelectElement).value))}
+              >
                 <option>Left</option><option>Center</option><option>Right</option>
-              </select></label>
+              </select></label
+            >
           {:else if v === 'Rectangle'}
-            <label class="row"><span class="lbl">w × h</span>
-              <input class="sm" type="number" value={animNum(s.width)} disabled={busy}
-                onchange={(e) => edit(() => (s.width = { Const: parseFloat((e.target as HTMLInputElement).value) }))} />
-              <input class="sm" type="number" value={animNum(s.height)} disabled={busy}
-                onchange={(e) => edit(() => (s.height = { Const: parseFloat((e.target as HTMLInputElement).value) }))} /></label>
-            <label class="row"><span class="lbl">radius</span>
-              <input type="number" min="0" value={animNum(s.radius)} disabled={busy}
-                onchange={(e) => edit(() => (s.radius = { Const: parseFloat((e.target as HTMLInputElement).value) }))} /></label>
-            <label class="row"><span class="lbl">color</span>
-              <input type="color" value={toHex(s.color)} disabled={busy}
-                onchange={(e) => edit(() => (s.color = fromHex((e.target as HTMLInputElement).value, s.color[3])))} /></label>
+            <label class="row"
+              ><span class="lbl">w × h</span>
+              <input
+                class="sm"
+                type="number"
+                value={animNum(s.width)}
+                disabled={busy}
+                onchange={(e) =>
+                  edit(
+                    () => (s.width = { Const: parseFloat((e.target as HTMLInputElement).value) })
+                  )}
+              />
+              <input
+                class="sm"
+                type="number"
+                value={animNum(s.height)}
+                disabled={busy}
+                onchange={(e) =>
+                  edit(
+                    () => (s.height = { Const: parseFloat((e.target as HTMLInputElement).value) })
+                  )}
+              /></label
+            >
+            <label class="row"
+              ><span class="lbl">radius</span>
+              <input
+                type="number"
+                min="0"
+                value={animNum(s.radius)}
+                disabled={busy}
+                onchange={(e) =>
+                  edit(
+                    () => (s.radius = { Const: parseFloat((e.target as HTMLInputElement).value) })
+                  )}
+              /></label
+            >
+            <label class="row"
+              ><span class="lbl">color</span>
+              <input
+                type="color"
+                value={toHex(s.color)}
+                disabled={busy}
+                onchange={(e) =>
+                  edit(() => (s.color = fromHex((e.target as HTMLInputElement).value, s.color[3])))}
+              /></label
+            >
           {:else if v === 'MediaIn'}
-            <label class="row"><span class="lbl">name</span>
-              <input type="text" value={s.name} disabled={busy}
-                onchange={(e) => edit(() => (s.name = (e.target as HTMLInputElement).value))} /></label>
-            <label class="row"><span class="lbl">fit</span>
-              <select value={s.fit ?? 'Contain'} disabled={busy}
-                onchange={(e) => edit(() => (s.fit = (e.target as HTMLSelectElement).value))}>
-                <option>None</option><option>Stretch</option><option>Contain</option><option>Cover</option>
-              </select></label>
+            <label class="row"
+              ><span class="lbl">name</span>
+              <input
+                type="text"
+                value={s.name}
+                disabled={busy}
+                onchange={(e) => edit(() => (s.name = (e.target as HTMLInputElement).value))}
+              /></label
+            >
+            <label class="row"
+              ><span class="lbl">fit</span>
+              <select
+                value={s.fit ?? 'Contain'}
+                disabled={busy}
+                onchange={(e) => edit(() => (s.fit = (e.target as HTMLSelectElement).value))}
+              >
+                <option>None</option><option>Stretch</option><option>Contain</option><option
+                  >Cover</option
+                >
+              </select></label
+            >
           {:else if v === 'Transform'}
-            <label class="row"><span class="lbl">pos x,y</span>
-              <input class="sm" type="number" value={animNum(s.position[0])} disabled={busy}
-                onchange={(e) => edit(() => (s.position[0] = { Const: parseFloat((e.target as HTMLInputElement).value) }))} />
-              <input class="sm" type="number" value={animNum(s.position[1])} disabled={busy}
-                onchange={(e) => edit(() => (s.position[1] = { Const: parseFloat((e.target as HTMLInputElement).value) }))} /></label>
-            <label class="row"><span class="lbl">scale</span>
-              <input class="sm" type="number" step="0.01" value={animNum(s.scale[0], 1)} disabled={busy}
-                onchange={(e) => edit(() => (s.scale[0] = { Const: parseFloat((e.target as HTMLInputElement).value) }))} />
-              <input class="sm" type="number" step="0.01" value={animNum(s.scale[1], 1)} disabled={busy}
-                onchange={(e) => edit(() => (s.scale[1] = { Const: parseFloat((e.target as HTMLInputElement).value) }))} /></label>
-            <label class="row"><span class="lbl">rotate</span>
-              <input type="number" step="1" value={animNum(s.rotation_deg)} disabled={busy}
-                onchange={(e) => edit(() => (s.rotation_deg = { Const: parseFloat((e.target as HTMLInputElement).value) }))} /></label>
-            <label class="row"><span class="lbl">opacity</span>
-              <input type="range" min="0" max="1" step="0.01" value={animNum(s.opacity, 1)} disabled={busy}
-                onchange={(e) => edit(() => (s.opacity = { Const: parseFloat((e.target as HTMLInputElement).value) }))} /></label>
+            <label class="row"
+              ><span class="lbl">pos x,y</span>
+              <input
+                class="sm"
+                type="number"
+                value={animNum(s.position[0])}
+                disabled={busy}
+                onchange={(e) =>
+                  edit(
+                    () =>
+                      (s.position[0] = { Const: parseFloat((e.target as HTMLInputElement).value) })
+                  )}
+              />
+              <input
+                class="sm"
+                type="number"
+                value={animNum(s.position[1])}
+                disabled={busy}
+                onchange={(e) =>
+                  edit(
+                    () =>
+                      (s.position[1] = { Const: parseFloat((e.target as HTMLInputElement).value) })
+                  )}
+              /></label
+            >
+            <label class="row"
+              ><span class="lbl">scale</span>
+              <input
+                class="sm"
+                type="number"
+                step="0.01"
+                value={animNum(s.scale[0], 1)}
+                disabled={busy}
+                onchange={(e) =>
+                  edit(
+                    () => (s.scale[0] = { Const: parseFloat((e.target as HTMLInputElement).value) })
+                  )}
+              />
+              <input
+                class="sm"
+                type="number"
+                step="0.01"
+                value={animNum(s.scale[1], 1)}
+                disabled={busy}
+                onchange={(e) =>
+                  edit(
+                    () => (s.scale[1] = { Const: parseFloat((e.target as HTMLInputElement).value) })
+                  )}
+              /></label
+            >
+            <label class="row"
+              ><span class="lbl">rotate</span>
+              <input
+                type="number"
+                step="1"
+                value={animNum(s.rotation_deg)}
+                disabled={busy}
+                onchange={(e) =>
+                  edit(
+                    () =>
+                      (s.rotation_deg = { Const: parseFloat((e.target as HTMLInputElement).value) })
+                  )}
+              /></label
+            >
+            <label class="row"
+              ><span class="lbl">opacity</span>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.01"
+                value={animNum(s.opacity, 1)}
+                disabled={busy}
+                onchange={(e) =>
+                  edit(
+                    () => (s.opacity = { Const: parseFloat((e.target as HTMLInputElement).value) })
+                  )}
+              /></label
+            >
           {:else if v === 'Blur'}
-            <label class="row"><span class="lbl">radius</span>
-              <input type="number" min="0" value={animNum(s.radius, 8)} disabled={busy}
-                onchange={(e) => edit(() => (s.radius = { Const: parseFloat((e.target as HTMLInputElement).value) }))} /></label>
-            <label class="row"><span class="lbl">mode</span>
-              <select value={s.mode ?? 'Gaussian'} disabled={busy}
-                onchange={(e) => edit(() => (s.mode = (e.target as HTMLSelectElement).value))}>
+            <label class="row"
+              ><span class="lbl">radius</span>
+              <input
+                type="number"
+                min="0"
+                value={animNum(s.radius, 8)}
+                disabled={busy}
+                onchange={(e) =>
+                  edit(
+                    () => (s.radius = { Const: parseFloat((e.target as HTMLInputElement).value) })
+                  )}
+              /></label
+            >
+            <label class="row"
+              ><span class="lbl">mode</span>
+              <select
+                value={s.mode ?? 'Gaussian'}
+                disabled={busy}
+                onchange={(e) => edit(() => (s.mode = (e.target as HTMLSelectElement).value))}
+              >
                 <option>Box</option><option>Gaussian</option>
-              </select></label>
+              </select></label
+            >
           {:else if v === 'ColorCorrect'}
-            <label class="row"><span class="lbl">gamma</span>
-              <input type="number" min="0.1" step="0.05" value={animNum(s.gamma, 1)} disabled={busy}
-                onchange={(e) => edit(() => (s.gamma = { Const: parseFloat((e.target as HTMLInputElement).value) }))} /></label>
-            <label class="row"><span class="lbl">saturation</span>
-              <input type="range" min="0" max="3" step="0.05" value={animNum(s.saturation, 1)} disabled={busy}
-                onchange={(e) => edit(() => (s.saturation = { Const: parseFloat((e.target as HTMLInputElement).value) }))} /></label>
+            <label class="row"
+              ><span class="lbl">gamma</span>
+              <input
+                type="number"
+                min="0.1"
+                step="0.05"
+                value={animNum(s.gamma, 1)}
+                disabled={busy}
+                onchange={(e) =>
+                  edit(
+                    () => (s.gamma = { Const: parseFloat((e.target as HTMLInputElement).value) })
+                  )}
+              /></label
+            >
+            <label class="row"
+              ><span class="lbl">saturation</span>
+              <input
+                type="range"
+                min="0"
+                max="3"
+                step="0.05"
+                value={animNum(s.saturation, 1)}
+                disabled={busy}
+                onchange={(e) =>
+                  edit(
+                    () =>
+                      (s.saturation = { Const: parseFloat((e.target as HTMLInputElement).value) })
+                  )}
+              /></label
+            >
           {:else if v === 'Crop'}
-            <label class="row"><span class="lbl">L,T,R,B</span>
+            <label class="row"
+              ><span class="lbl">L,T,R,B</span>
               {#each ['left', 'top', 'right', 'bottom'] as edge (edge)}
-                <input class="sm" type="number" min="0" value={animNum(s[edge])} disabled={busy}
-                  onchange={(e) => edit(() => (s[edge] = { Const: parseFloat((e.target as HTMLInputElement).value) }))} />
-              {/each}</label>
+                <input
+                  class="sm"
+                  type="number"
+                  min="0"
+                  value={animNum(s[edge])}
+                  disabled={busy}
+                  onchange={(e) =>
+                    edit(
+                      () => (s[edge] = { Const: parseFloat((e.target as HTMLInputElement).value) })
+                    )}
+                />
+              {/each}</label
+            >
           {:else if v === 'Merge'}
-            <label class="row"><span class="lbl">mode</span>
-              <select value={s.mode ?? 'Over'} disabled={busy}
-                onchange={(e) => edit(() => (s.mode = (e.target as HTMLSelectElement).value))}>
-                <option>Over</option><option>Add</option><option>Multiply</option><option>Screen</option>
-              </select></label>
-            <label class="row"><span class="lbl">opacity</span>
-              <input type="range" min="0" max="1" step="0.01" value={animNum(s.opacity, 1)} disabled={busy}
-                onchange={(e) => edit(() => (s.opacity = { Const: parseFloat((e.target as HTMLInputElement).value) }))} /></label>
+            <label class="row"
+              ><span class="lbl">mode</span>
+              <select
+                value={s.mode ?? 'Over'}
+                disabled={busy}
+                onchange={(e) => edit(() => (s.mode = (e.target as HTMLSelectElement).value))}
+              >
+                <option>Over</option><option>Add</option><option>Multiply</option><option
+                  >Screen</option
+                >
+              </select></label
+            >
+            <label class="row"
+              ><span class="lbl">opacity</span>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.01"
+                value={animNum(s.opacity, 1)}
+                disabled={busy}
+                onchange={(e) =>
+                  edit(
+                    () => (s.opacity = { Const: parseFloat((e.target as HTMLInputElement).value) })
+                  )}
+              /></label
+            >
           {:else if v === 'Mask'}
-            <label class="row"><span class="lbl">channel</span>
-              <select value={s.channel ?? 'Alpha'} disabled={busy}
-                onchange={(e) => edit(() => (s.channel = (e.target as HTMLSelectElement).value))}>
+            <label class="row"
+              ><span class="lbl">channel</span>
+              <select
+                value={s.channel ?? 'Alpha'}
+                disabled={busy}
+                onchange={(e) => edit(() => (s.channel = (e.target as HTMLSelectElement).value))}
+              >
                 <option>Alpha</option><option>Luminance</option>
-              </select></label>
-            <label class="row"><span class="lbl">invert</span>
-              <input type="checkbox" checked={!!s.invert} disabled={busy}
-                onchange={(e) => edit(() => (s.invert = (e.target as HTMLInputElement).checked))} /></label>
+              </select></label
+            >
+            <label class="row"
+              ><span class="lbl">invert</span>
+              <input
+                type="checkbox"
+                checked={!!s.invert}
+                disabled={busy}
+                onchange={(e) => edit(() => (s.invert = (e.target as HTMLInputElement).checked))}
+              /></label
+            >
           {/if}
         </div>
       {/each}
     </div>
-    <div class="hint">Drag the comp from the Browser onto the timeline. The graph animates as the playhead crosses it.</div>
+    <div class="hint">
+      Drag the comp from the Browser onto the timeline. The graph animates as the playhead crosses
+      it.
+    </div>
   {/if}
 </div>
 

@@ -166,7 +166,9 @@ export async function buy(d: CatalogDetail): Promise<void> {
   catalog.busy = true;
   try {
     await paymentCheckout(d.sku);
-    toast.info('Finish your purchase in the browser — the effect appears in My Effects once it’s paid.');
+    toast.info(
+      'Finish your purchase in the browser — the effect appears in My Effects once it’s paid.'
+    );
   } catch (e) {
     toast.error(String(e));
   } finally {

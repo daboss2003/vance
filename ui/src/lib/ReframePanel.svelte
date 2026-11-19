@@ -6,12 +6,7 @@
    * reframed video. Uses the ZNCC tracker, so the clip must be open in the
    * viewer (play/scrub it once) before running.
    */
-  import {
-    smartReframe,
-    magicMask,
-    magicMaskAvailable,
-    type TrackSummary
-  } from '$lib/ipc';
+  import { smartReframe, magicMask, magicMaskAvailable, type TrackSummary } from '$lib/ipc';
   import { projectState } from '$lib/project.svelte';
   import { selectionState } from '$lib/selection.svelte';
 
@@ -31,9 +26,7 @@
 
   let maskAvail = $state(false);
   let maskMediaId = $state('');
-  let mediaChoices = $derived(
-    projectState.media.filter((m) => m.kind === 'video')
-  );
+  let mediaChoices = $derived(projectState.media.filter((m) => m.kind === 'video'));
   $effect(() => {
     void magicMaskAvailable().then((v) => (maskAvail = v));
   });
@@ -136,7 +129,9 @@
       </select>
       <button disabled={busy || !maskAvail || !maskMediaId} onclick={runMask}>Isolate</button>
     </div>
-    <div class="hint">AI-removes the background; import the matted subject and key it over other tracks.</div>
+    <div class="hint">
+      AI-removes the background; import the matted subject and key it over other tracks.
+    </div>
   </div>
 </div>
 

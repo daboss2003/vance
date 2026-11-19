@@ -6,7 +6,12 @@
    *  - Installed: the current library + Import (drag a .wasm in, or Select a file)
    *    and a Remove action.
    */
-  import { market, closeMarket, importEffectPaths, uninstallEffect } from '$lib/effectsMarket.svelte';
+  import {
+    market,
+    closeMarket,
+    importEffectPaths,
+    uninstallEffect
+  } from '$lib/effectsMarket.svelte';
   import {
     catalog,
     browse,
@@ -29,7 +34,10 @@
   let reviewBody = $state('');
 
   $effect(() => {
-    if (market.open && !folder) void pluginsFolder().then((f) => (folder = f)).catch(() => {});
+    if (market.open && !folder)
+      void pluginsFolder()
+        .then((f) => (folder = f))
+        .catch(() => {});
   });
   // Load the catalog the first time Browse is shown.
   $effect(() => {
@@ -61,8 +69,16 @@
     role="dialog"
     aria-modal="true"
     aria-label="Add-on effects"
+    tabindex="-1"
     onclick={(e) => {
       if (e.target === e.currentTarget) closeMarket();
+    }}
+    onkeydown={(e) => {
+      // Esc closes this dialog only (not the app's global Esc = clear selection).
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        closeMarket();
+      }
     }}
   >
     <div class="card">
@@ -132,7 +148,11 @@
                   >
                 {/each}
               </div>
-              <textarea class="rbody" bind:value={reviewBody} placeholder="Share what you think (optional)"></textarea>
+              <textarea
+                class="rbody"
+                bind:value={reviewBody}
+                placeholder="Share what you think (optional)"
+              ></textarea>
               <button
                 class="primary"
                 disabled={catalog.busy}
@@ -180,11 +200,17 @@
             </select>
           </div>
           <div class="chips">
-            <button class:on={catalog.category === ''} onclick={() => ((catalog.category = ''), browse())}>
+            <button
+              class:on={catalog.category === ''}
+              onclick={() => ((catalog.category = ''), browse())}
+            >
               All
             </button>
             {#each CATEGORIES as c (c)}
-              <button class:on={catalog.category === c} onclick={() => ((catalog.category = c), browse())}>
+              <button
+                class:on={catalog.category === c}
+                onclick={() => ((catalog.category = c), browse())}
+              >
                 {c}
               </button>
             {/each}
@@ -219,7 +245,11 @@
                   </div>
                   <div class="t-foot">
                     <span class="muted small">{ratingLabel(fx.rating, fx.ratings_count)}</span>
-                    <span class="price">{fx.price_cents === 0 ? 'Free' : `$${(fx.price_cents / 100).toFixed(2)}`}</span>
+                    <span class="price"
+                      >{fx.price_cents === 0
+                        ? 'Free'
+                        : `$${(fx.price_cents / 100).toFixed(2)}`}</span
+                    >
                   </div>
                 </button>
               {/each}
@@ -232,7 +262,7 @@
           {/if}
         {/if}
 
-      <!-- ============================ INSTALLED ============================ -->
+        <!-- ============================ INSTALLED ============================ -->
       {:else}
         <button class="create" onclick={openStudio}>✨ Create your own effect (no code)</button>
         <div class="drop" class:hot={market.dragOver}>
@@ -256,7 +286,11 @@
                   <div class="pname">{p.name}</div>
                   <div class="pmeta">{p.kind} · {p.author} · v{p.version}</div>
                 </div>
-                <button class="rm" onclick={() => uninstallEffect(p.id, p.name)} disabled={market.busy}>
+                <button
+                  class="rm"
+                  onclick={() => uninstallEffect(p.id, p.name)}
+                  disabled={market.busy}
+                >
                   Remove
                 </button>
               </li>
@@ -565,7 +599,9 @@
     border-radius: 10px;
     padding: 22px 16px;
     text-align: center;
-    transition: border-color 0.15s, background 0.15s;
+    transition:
+      border-color 0.15s,
+      background 0.15s;
   }
   .drop.hot {
     border-color: var(--accent, #4c9dff);

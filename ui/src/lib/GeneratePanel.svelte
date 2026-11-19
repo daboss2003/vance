@@ -22,8 +22,6 @@
   let seed = $state('');
   let showAdvanced = $state(false);
   let busy = $state(false);
-  let error = $state<string | null>(null);
-  let status = $state<string | null>(null);
 
   // Live generation progress (streamed from the backend on gen://progress).
   let phase = $state('');
@@ -44,7 +42,8 @@
         const p = e.payload;
         if (!p || p.done) return;
         pct = p.pct;
-        phase = p.total > 0 ? `Step ${p.step} / ${p.total}` : p.detail.replace('[vance-imagegen] ', '');
+        phase =
+          p.total > 0 ? `Step ${p.step} / ${p.total}` : p.detail.replace('[vance-imagegen] ', '');
       }
     ).then((u) => (un = u));
     return () => un?.();
@@ -73,10 +72,8 @@
       return;
     }
     busy = true;
-    error = null;
     phase = 'Getting ready…';
     pct = null;
-    status = null;
     try {
       const seedNum = seed.trim() === '' ? null : parseInt(seed, 10);
       const info = await generateImage({
@@ -89,10 +86,8 @@
       });
       await projectState.refresh();
       toast.success(`Created “${info.name}”. It’s in the Browser — drag it onto the timeline.`);
-      status = null;
     } catch (e) {
       toast.error("Couldn't create the image.\n" + String(e));
-      status = null;
     } finally {
       busy = false;
     }
@@ -121,12 +116,36 @@
     </div>
   {/if}
 
-  <textarea placeholder="Describe the image you want…" rows="2" bind:value={prompt} disabled={busy}></textarea>
-  <textarea placeholder="Things to leave out (optional)" rows="1" bind:value={negative} disabled={busy}></textarea>
+  <textarea placeholder="Describe the image you want…" rows="2" bind:value={prompt} disabled={busy}
+  ></textarea>
+  <textarea
+    placeholder="Things to leave out (optional)"
+    rows="1"
+    bind:value={negative}
+    disabled={busy}
+  ></textarea>
 
   <div class="row">
-    <label>Width<input type="number" min="64" max="4096" step="8" bind:value={width} disabled={busy} /></label>
-    <label>Height<input type="number" min="64" max="4096" step="8" bind:value={height} disabled={busy} /></label>
+    <label
+      >Width<input
+        type="number"
+        min="64"
+        max="4096"
+        step="8"
+        bind:value={width}
+        disabled={busy}
+      /></label
+    >
+    <label
+      >Height<input
+        type="number"
+        min="64"
+        max="4096"
+        step="8"
+        bind:value={height}
+        disabled={busy}
+      /></label
+    >
   </div>
 
   <button class="adv-toggle" onclick={() => (showAdvanced = !showAdvanced)}>
@@ -135,9 +154,11 @@
   {#if showAdvanced}
     <div class="row">
       <label title="Higher = more detail, but slower">
-        Detail<input type="number" min="1" max="150" bind:value={steps} disabled={busy} /></label>
+        Detail<input type="number" min="1" max="150" bind:value={steps} disabled={busy} /></label
+      >
       <label class="seed" title="Leave blank for a new image each time">
-        Variation<input type="text" placeholder="random" bind:value={seed} disabled={busy} /></label>
+        Variation<input type="text" placeholder="random" bind:value={seed} disabled={busy} /></label
+      >
     </div>
   {/if}
 
@@ -222,19 +243,6 @@
   .hint {
     opacity: 0.55;
     font-size: 10px;
-  }
-  code {
-    background: #2a2a2a;
-    padding: 0 3px;
-    border-radius: 2px;
-  }
-  .err {
-    color: #ff6b6b;
-    font-size: 11px;
-  }
-  .status {
-    color: var(--ok);
-    font-size: 11px;
   }
   .prog {
     display: flex;

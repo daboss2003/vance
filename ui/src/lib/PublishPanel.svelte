@@ -5,12 +5,7 @@
    * keys), then upload a rendered file. YouTube upload is fully wired;
    * Vimeo/TikTok OAuth connects (their uploaders are the next step).
    */
-  import {
-    publishAuthorized,
-    startOauth,
-    awaitOauth,
-    publishVideo
-  } from '$lib/ipc';
+  import { publishAuthorized, startOauth, awaitOauth, publishVideo } from '$lib/ipc';
 
   const PLATFORMS = ['YouTube', 'Vimeo', 'TikTok'];
   let platform = $state('YouTube');
@@ -78,7 +73,10 @@
         filePath,
         title,
         description,
-        tags: tags.split(',').map((t) => t.trim()).filter(Boolean),
+        tags: tags
+          .split(',')
+          .map((t) => t.trim())
+          .filter(Boolean),
         privacy
       });
       status = `Published: ${url}`;
@@ -111,16 +109,30 @@
         Register an OAuth app in the {platform} developer console and add this redirect URI.
       </div>
       <input type="text" placeholder="Client ID" bind:value={clientId} disabled={busy} />
-      <input type="password" placeholder="Client Secret (if required)" bind:value={clientSecret} disabled={busy} />
+      <input
+        type="password"
+        placeholder="Client Secret (if required)"
+        bind:value={clientSecret}
+        disabled={busy}
+      />
       <input type="text" placeholder="Redirect URI" bind:value={redirectUri} disabled={busy} />
       <button disabled={busy} onclick={connect}>Connect {platform}</button>
       {#if authUrl}
-        <div class="hint">If the browser didn't open: <a href={authUrl} target="_blank" rel="noreferrer">open consent page</a></div>
+        <div class="hint">
+          If the browser didn't open: <a href={authUrl} target="_blank" rel="noreferrer"
+            >open consent page</a
+          >
+        </div>
       {/if}
     </div>
   {:else}
     <div class="upload">
-      <input type="text" placeholder="Rendered file path (.mp4)" bind:value={filePath} disabled={busy} />
+      <input
+        type="text"
+        placeholder="Rendered file path (.mp4)"
+        bind:value={filePath}
+        disabled={busy}
+      />
       <input type="text" placeholder="Title" bind:value={title} disabled={busy} />
       <input type="text" placeholder="Description" bind:value={description} disabled={busy} />
       <input type="text" placeholder="Tags (comma-separated)" bind:value={tags} disabled={busy} />

@@ -59,12 +59,7 @@
     return found ? found.value : info.default;
   }
 
-  function setPluginParam(
-    index: number,
-    effect: AudioEffectSpec,
-    paramId: number,
-    value: number
-  ) {
+  function setPluginParam(index: number, effect: AudioEffectSpec, paramId: number, value: number) {
     if (effect.kind !== 'Plugin') return;
     const params = effect.params.filter((p) => p.param_id !== paramId);
     params.push({ param_id: paramId, value });
@@ -498,29 +493,65 @@
         <div class="flex flex-wrap gap-2 text-[10px] font-mono">
           <label class="flex items-center gap-1">
             <span class="text-vance-muted">thresh</span>
-            <input type="number" step="1" min="-90" max="0" value={effect.spec.threshold_db}
+            <input
+              type="number"
+              step="1"
+              min="-90"
+              max="0"
+              value={effect.spec.threshold_db}
               class="border-vance-border w-14 rounded border bg-vance-panel px-1"
-              oninput={(e) => updateNoiseGate(idx, effect, { threshold_db: parseFloat((e.target as HTMLInputElement).value) })} />
+              oninput={(e) =>
+                updateNoiseGate(idx, effect, {
+                  threshold_db: parseFloat((e.target as HTMLInputElement).value)
+                })}
+            />
             <span class="text-vance-muted">dB</span>
           </label>
           <label class="flex items-center gap-1">
             <span class="text-vance-muted">range</span>
-            <input type="number" step="1" min="-90" max="0" value={effect.spec.range_db}
+            <input
+              type="number"
+              step="1"
+              min="-90"
+              max="0"
+              value={effect.spec.range_db}
               class="border-vance-border w-14 rounded border bg-vance-panel px-1"
-              oninput={(e) => updateNoiseGate(idx, effect, { range_db: parseFloat((e.target as HTMLInputElement).value) })} />
+              oninput={(e) =>
+                updateNoiseGate(idx, effect, {
+                  range_db: parseFloat((e.target as HTMLInputElement).value)
+                })}
+            />
             <span class="text-vance-muted">dB</span>
           </label>
           <label class="flex items-center gap-1">
             <span class="text-vance-muted">atk</span>
-            <input type="number" step="0.5" min="0.1" max="500" value={effect.spec.attack_ms}
+            <input
+              type="number"
+              step="0.5"
+              min="0.1"
+              max="500"
+              value={effect.spec.attack_ms}
               class="border-vance-border w-12 rounded border bg-vance-panel px-1"
-              oninput={(e) => updateNoiseGate(idx, effect, { attack_ms: parseFloat((e.target as HTMLInputElement).value) })} />
+              oninput={(e) =>
+                updateNoiseGate(idx, effect, {
+                  attack_ms: parseFloat((e.target as HTMLInputElement).value)
+                })}
+            />
           </label>
           <label class="flex items-center gap-1">
             <span class="text-vance-muted">rel</span>
-            <input type="number" step="5" min="1" max="5000" value={effect.spec.release_ms}
+            <input
+              type="number"
+              step="5"
+              min="1"
+              max="5000"
+              value={effect.spec.release_ms}
               class="border-vance-border w-14 rounded border bg-vance-panel px-1"
-              oninput={(e) => updateNoiseGate(idx, effect, { release_ms: parseFloat((e.target as HTMLInputElement).value) })} />
+              oninput={(e) =>
+                updateNoiseGate(idx, effect, {
+                  release_ms: parseFloat((e.target as HTMLInputElement).value)
+                })}
+            />
             <span class="text-vance-muted">ms</span>
           </label>
         </div>
@@ -528,24 +559,45 @@
         <div class="flex flex-wrap gap-2 text-[10px] font-mono">
           <label class="flex items-center gap-1">
             <span class="text-vance-muted">mains</span>
-            <select class="border-vance-border rounded border bg-vance-panel px-1"
+            <select
+              class="border-vance-border rounded border bg-vance-panel px-1"
               value={effect.spec.base_hz}
-              onchange={(e) => updateDeHum(idx, effect, { base_hz: parseFloat((e.target as HTMLSelectElement).value) })}>
+              onchange={(e) =>
+                updateDeHum(idx, effect, {
+                  base_hz: parseFloat((e.target as HTMLSelectElement).value)
+                })}
+            >
               <option value={50}>50 Hz</option>
               <option value={60}>60 Hz</option>
             </select>
           </label>
           <label class="flex items-center gap-1">
             <span class="text-vance-muted">harmonics</span>
-            <input type="number" step="1" min="1" max="10" value={effect.spec.harmonics}
+            <input
+              type="number"
+              step="1"
+              min="1"
+              max="10"
+              value={effect.spec.harmonics}
               class="border-vance-border w-12 rounded border bg-vance-panel px-1"
-              oninput={(e) => updateDeHum(idx, effect, { harmonics: parseInt((e.target as HTMLInputElement).value, 10) })} />
+              oninput={(e) =>
+                updateDeHum(idx, effect, {
+                  harmonics: parseInt((e.target as HTMLInputElement).value, 10)
+                })}
+            />
           </label>
           <label class="flex items-center gap-1">
             <span class="text-vance-muted">Q</span>
-            <input type="number" step="1" min="0.5" max="40" value={effect.spec.q}
+            <input
+              type="number"
+              step="1"
+              min="0.5"
+              max="40"
+              value={effect.spec.q}
               class="border-vance-border w-12 rounded border bg-vance-panel px-1"
-              oninput={(e) => updateDeHum(idx, effect, { q: parseFloat((e.target as HTMLInputElement).value) })} />
+              oninput={(e) =>
+                updateDeHum(idx, effect, { q: parseFloat((e.target as HTMLInputElement).value) })}
+            />
           </label>
         </div>
       {:else if effect.kind === 'Plugin'}

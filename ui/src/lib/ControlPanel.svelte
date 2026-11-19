@@ -77,7 +77,9 @@
           await setMasterGainDb(a.SetMasterGainDb);
           await projectState.refresh();
         } else if ('JogFrames' in a) {
-          window.dispatchEvent(new CustomEvent('vance:control', { detail: { JogFrames: a.JogFrames } }));
+          window.dispatchEvent(
+            new CustomEvent('vance:control', { detail: { JogFrames: a.JogFrames } })
+          );
         }
         return;
       }
@@ -131,7 +133,13 @@
 
   <div class="row">
     <span>OSC</span>
-    <input type="number" min="1024" max="65535" bind:value={oscPort} disabled={status.osc_running} />
+    <input
+      type="number"
+      min="1024"
+      max="65535"
+      bind:value={oscPort}
+      disabled={status.osc_running}
+    />
     <button onclick={toggleOsc}>{status.osc_running ? 'Stop' : 'Listen'}</button>
     {#if status.osc_running}<span class="on">● {status.osc_port}</span>{/if}
   </div>
@@ -153,8 +161,8 @@
   {/if}
 
   <div class="hint">
-    OSC: send to <code>/vance/button/0..7</code>, <code>/vance/fader/0</code>, <code>/vance/jog</code>.
-    Buttons: play, stop, start, end, marker, split, undo, redo.
+    OSC: send to <code>/vance/button/0..7</code>, <code>/vance/fader/0</code>,
+    <code>/vance/jog</code>. Buttons: play, stop, start, end, marker, split, undo, redo.
   </div>
 </div>
 

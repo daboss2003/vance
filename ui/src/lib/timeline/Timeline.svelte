@@ -925,15 +925,6 @@
     return null;
   }
 
-  /** Kept as a thin shim for code that just needs the clip itself. */
-  function clipAt(
-    localX: number,
-    localY: number
-  ): { clip: ClipContents; track: TrackContents } | null {
-    const h = hitAt(localX, localY);
-    return h ? { clip: h.clip, track: h.track } : null;
-  }
-
   function formatClipLabel(c: ClipContents, _maxPxWidth: number): string {
     return c.name && c.name.length > 0 ? c.name : c.id.slice(0, 8);
   }

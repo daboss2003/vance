@@ -119,7 +119,11 @@
   {#if mographItems.length > 0}
     <div class="edit-pick">
       <span>Edit:</span>
-      <select value={editId ?? ''} onchange={(e) => onEditSelect((e.target as HTMLSelectElement).value)} disabled={busy}>
+      <select
+        value={editId ?? ''}
+        onchange={(e) => onEditSelect((e.target as HTMLSelectElement).value)}
+        disabled={busy}
+      >
         <option value="">— select —</option>
         {#each mographItems as m (m.id)}
           <option value={m.id}>{m.name}</option>
@@ -156,7 +160,8 @@
               step="0.5"
               value={v.Number}
               disabled={busy}
-              onchange={(e) => commit(ctrl, { Number: parseFloat((e.target as HTMLInputElement).value) })}
+              onchange={(e) =>
+                commit(ctrl, { Number: parseFloat((e.target as HTMLInputElement).value) })}
             />
             <span class="val">{v.Number.toFixed(1)}</span>
           {:else if 'Color' in ctrl.kind && 'Color' in v}
@@ -164,7 +169,8 @@
               type="color"
               value={toHex(v.Color)}
               disabled={busy}
-              onchange={(e) => commit(ctrl, { Color: fromHex((e.target as HTMLInputElement).value, v.Color[3]) })}
+              onchange={(e) =>
+                commit(ctrl, { Color: fromHex((e.target as HTMLInputElement).value, v.Color[3]) })}
             />
           {:else if 'Bool' in ctrl.kind && 'Bool' in v}
             <input
@@ -177,7 +183,8 @@
             <select
               value={v.Choice}
               disabled={busy}
-              onchange={(e) => commit(ctrl, { Choice: parseInt((e.target as HTMLSelectElement).value, 10) })}
+              onchange={(e) =>
+                commit(ctrl, { Choice: parseInt((e.target as HTMLSelectElement).value, 10) })}
             >
               {#each ctrl.kind.Choice.options as opt, i (i)}
                 <option value={i}>{opt}</option>
@@ -186,18 +193,36 @@
           {:else if 'Point' in ctrl.kind && 'Point' in v}
             <span class="point">
               <input
-                type="number" step="0.01" min="0" max="1" value={v.Point[0]} disabled={busy}
-                onchange={(e) => commit(ctrl, { Point: [parseFloat((e.target as HTMLInputElement).value), v.Point[1]] })}
+                type="number"
+                step="0.01"
+                min="0"
+                max="1"
+                value={v.Point[0]}
+                disabled={busy}
+                onchange={(e) =>
+                  commit(ctrl, {
+                    Point: [parseFloat((e.target as HTMLInputElement).value), v.Point[1]]
+                  })}
               />
               <input
-                type="number" step="0.01" min="0" max="1" value={v.Point[1]} disabled={busy}
-                onchange={(e) => commit(ctrl, { Point: [v.Point[0], parseFloat((e.target as HTMLInputElement).value)] })}
+                type="number"
+                step="0.01"
+                min="0"
+                max="1"
+                value={v.Point[1]}
+                disabled={busy}
+                onchange={(e) =>
+                  commit(ctrl, {
+                    Point: [v.Point[0], parseFloat((e.target as HTMLInputElement).value)]
+                  })}
               />
             </span>
           {/if}
         </label>
       {/each}
-      <div class="hint">Drag the item from the Browser onto the timeline. It animates as the playhead crosses it.</div>
+      <div class="hint">
+        Drag the item from the Browser onto the timeline. It animates as the playhead crosses it.
+      </div>
     </div>
   {/if}
 </div>

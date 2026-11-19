@@ -2,7 +2,6 @@
   import { onMount, untrack } from 'svelte';
   import { open } from '@tauri-apps/plugin-dialog';
   import {
-    backendVersion,
     currentTimelineSeconds,
     scrubGrain,
     evalNumber,
@@ -48,7 +47,6 @@
   import FusionPanel from '$lib/FusionPanel.svelte';
   import GeneratePanel from '$lib/GeneratePanel.svelte';
   import ReviewPanel from '$lib/ReviewPanel.svelte';
-  import AiToolsPanel from '$lib/AiToolsPanel.svelte';
   import OnboardingWizard from '$lib/OnboardingWizard.svelte';
   import { getAppSettings, crashLogDir } from '$lib/ipc';
   import { listen } from '@tauri-apps/api/event';
@@ -276,8 +274,26 @@
   // ---- External file drop (from Finder): plugins, media, LUTs ----
   let dropActive = $state(false);
   const MEDIA_EXT = new Set([
-    'mp4', 'mov', 'mkv', 'webm', 'avi', 'm4v', 'mp3', 'wav', 'aac', 'flac', 'm4a', 'ogg',
-    'png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'tiff', 'tif'
+    'mp4',
+    'mov',
+    'mkv',
+    'webm',
+    'avi',
+    'm4v',
+    'mp3',
+    'wav',
+    'aac',
+    'flac',
+    'm4a',
+    'ogg',
+    'png',
+    'jpg',
+    'jpeg',
+    'webp',
+    'gif',
+    'bmp',
+    'tiff',
+    'tif'
   ]);
 
   async function addEffectFromFile(path: string, name: string) {
@@ -361,7 +377,6 @@
   import ScopeCanvas from '$lib/color/ScopeCanvas.svelte';
   import * as GK from '$lib/grade-keys';
 
-  let backend = $state<string>('checking…');
   let info = $state<StreamInfo | null>(null);
   let openError = $state<string | null>(null);
   let renderError = $state<string | null>(null);
@@ -406,14 +421,6 @@
   });
 
   onMount(() => {
-    backendVersion()
-      .then((v) => {
-        backend = v;
-      })
-      .catch((e) => {
-        backend = `error: ${e}`;
-      });
-
     // Populate the load-time gate + renew paid-effect leases at startup, so owned
     // effects work (and auto-install runs) without opening Settings first (§6/§7).
     void reconcileEffects();
@@ -1659,7 +1666,9 @@
   <div
     class="pointer-events-none fixed inset-3 z-[2800] flex items-center justify-center rounded-2xl border-2 border-dashed border-[var(--color-vance-accent)] bg-[color-mix(in_srgb,var(--color-vance-accent)_10%,transparent)]"
   >
-    <div class="bg-vance-panel border-vance-border rounded-lg border px-5 py-3 text-sm font-medium shadow-xl">
+    <div
+      class="bg-vance-panel border-vance-border rounded-lg border px-5 py-3 text-sm font-medium shadow-xl"
+    >
       Drop to add — media, an add-on effect (.wasm), or a color look
     </div>
   </div>
@@ -1678,7 +1687,16 @@
             <stop offset="1" stop-color="#3d7fd6" />
           </linearGradient>
         </defs>
-        <rect x="1" y="1" width="30" height="30" rx="7.5" fill="#22262d" stroke="#333a44" stroke-width="1" />
+        <rect
+          x="1"
+          y="1"
+          width="30"
+          height="30"
+          rx="7.5"
+          fill="#22262d"
+          stroke="#333a44"
+          stroke-width="1"
+        />
         <path
           d="M8.5 9 L16 22.5 L23.5 9"
           fill="none"
@@ -1691,7 +1709,9 @@
       <h1 class="text-sm font-semibold tracking-tight">Vance</h1>
     </div>
     {#if projectState.sequence}
-      <span class="text-vance-muted text-xs truncate max-w-[16rem]">{projectState.sequence.name}</span>
+      <span class="text-vance-muted text-xs truncate max-w-[16rem]"
+        >{projectState.sequence.name}</span
+      >
     {/if}
 
     {#if projectState.info}
@@ -1699,7 +1719,9 @@
         class="ml-3 text-xs text-vance-muted flex min-w-0 items-center gap-1"
         title={projectState.path ?? 'Unsaved project'}
       >
-        <span class="text-vance-fg font-medium truncate max-w-[12rem]">{projectState.info.name}</span>
+        <span class="text-vance-fg font-medium truncate max-w-[12rem]"
+          >{projectState.info.name}</span
+        >
         {#if !projectState.path}
           <span class="text-yellow-400">· unsaved</span>
         {/if}
@@ -2176,6 +2198,22 @@
                   const x = (e.clientX - r.left) / r.width;
                   projectState.seekSource(Math.max(0, Math.min(1, x)) * total);
                 }}
+                onkeydown={(e) => {
+                  // Keyboard seek for the focused source scrubber. Stop the
+                  // arrows reaching the global handler, which steps the
+                  // timeline playhead instead.
+                  if (total <= 0) return;
+                  const to: Record<string, number> = {
+                    ArrowLeft: cur - 1,
+                    ArrowRight: cur + 1,
+                    Home: 0,
+                    End: total
+                  };
+                  if (!(e.key in to)) return;
+                  e.preventDefault();
+                  e.stopPropagation();
+                  projectState.seekSource(Math.max(0, Math.min(total, to[e.key])));
+                }}
               >
                 <!-- Highlight between marks. -->
                 {#if total > 0 && inSec != null && outSec != null}
@@ -2371,7 +2409,9 @@
            stage (Edit / Compositor / Audio / Deliver) via the bottom page bar,
            rather than shown as one flat 14-tab strip. Color has its own layout. -->
       {#if dockPanels.length}
-        <div class="border-vance-border bg-vance-panel flex min-h-0 flex-shrink-0 flex-col border-t">
+        <div
+          class="border-vance-border bg-vance-panel flex min-h-0 flex-shrink-0 flex-col border-t"
+        >
           <div class="flex gap-1 overflow-x-auto px-2 py-1 text-xs">
             {#each dockPanels as p (p.id)}
               <button
@@ -2385,33 +2425,33 @@
             {/each}
           </div>
           <div class="h-56 overflow-auto border-t border-vance-border px-2 py-2">
-          {#if activeDock === 'export'}
-            <ExportPanel />
-          {:else if activeDock === 'history'}
-            <HistoryPanel />
-          {:else if activeDock === 'mixer'}
-            <MixerConsole />
-          {:else if activeDock === 'mograph'}
-            <MographPanel />
-          {:else if activeDock === 'magnetic'}
-            <MagneticPanel />
-          {:else if activeDock === 'captions'}
-            <CaptionsPanel />
-          {:else if activeDock === 'aiaudio'}
-            <AiAudioPanel />
-          {:else if activeDock === 'reframe'}
-            <ReframePanel />
-          {:else if activeDock === 'control'}
-            <ControlPanel />
-          {:else if activeDock === 'publish'}
-            <PublishPanel />
-          {:else if activeDock === 'fusion'}
-            <FusionPanel />
-          {:else if activeDock === 'generate'}
-            <GeneratePanel />
-          {:else if activeDock === 'review'}
-            <ReviewPanel />
-          {/if}
+            {#if activeDock === 'export'}
+              <ExportPanel />
+            {:else if activeDock === 'history'}
+              <HistoryPanel />
+            {:else if activeDock === 'mixer'}
+              <MixerConsole />
+            {:else if activeDock === 'mograph'}
+              <MographPanel />
+            {:else if activeDock === 'magnetic'}
+              <MagneticPanel />
+            {:else if activeDock === 'captions'}
+              <CaptionsPanel />
+            {:else if activeDock === 'aiaudio'}
+              <AiAudioPanel />
+            {:else if activeDock === 'reframe'}
+              <ReframePanel />
+            {:else if activeDock === 'control'}
+              <ControlPanel />
+            {:else if activeDock === 'publish'}
+              <PublishPanel />
+            {:else if activeDock === 'fusion'}
+              <FusionPanel />
+            {:else if activeDock === 'generate'}
+              <GeneratePanel />
+            {:else if activeDock === 'review'}
+              <ReviewPanel />
+            {/if}
           </div>
         </div>
       {/if}
@@ -2911,419 +2951,420 @@
           {:else}
             <!-- Phase 10.6 — WASM effect plugins browser. Applies a
                discovered plugin to this clip as a `wasm:<id>` effect. -->
-          <div class="mt-3">
-            <EffectsBrowser trackId={t.id} clipId={c.id} />
-          </div>
+            <div class="mt-3">
+              <EffectsBrowser trackId={t.id} clipId={c.id} />
+            </div>
 
-          <!-- Transition at this clip's following cut (if any). Lets the
+            <!-- Transition at this clip's following cut (if any). Lets the
                user edit a WASM transition's plugin parameters. -->
-          <TransitionInspector track={t} clip={c} />
+            <TransitionInspector track={t} clip={c} />
 
-          <!-- Phase 7.6 — pan controls. Sliders for the parent track's
+            <!-- Phase 7.6 — pan controls. Sliders for the parent track's
                pan AND the clip's pan, since they compose additively at
                mix time. Audio tracks only (video tracks accept the
                edit but the mixer ignores it; we still show the
                controls so the user sees the value land). -->
-          {#if t.kind === 'audio'}
-            <div class="mt-3">
-              <div class="mb-1 text-[11px] uppercase tracking-wider text-vance-muted">Pan</div>
-              <label class="flex items-center gap-2 font-mono text-xs">
-                <span class="w-12 text-vance-muted">track</span>
-                <input
-                  type="range"
-                  min="-1"
-                  max="1"
-                  step="0.01"
-                  value={t.pan}
-                  oninput={(e) =>
-                    projectState.setTrackPan(
-                      t.id,
-                      parseFloat((e.target as HTMLInputElement).value)
-                    )}
-                  class="flex-1 accent-[var(--color-vance-accent)]"
-                />
-                <span class="w-10 text-right">{t.pan.toFixed(2)}</span>
-              </label>
-              <label class="mt-1 flex items-center gap-2 font-mono text-xs">
-                <span class="w-12 text-vance-muted">clip</span>
-                <input
-                  type="range"
-                  min="-1"
-                  max="1"
-                  step="0.01"
-                  value={c.pan}
-                  oninput={(e) =>
-                    projectState.setClipPan(
-                      t.id,
-                      c.id,
-                      parseFloat((e.target as HTMLInputElement).value)
-                    )}
-                  class="flex-1 accent-[var(--color-vance-accent)]"
-                />
-                <span class="w-10 text-right">{c.pan.toFixed(2)}</span>
-              </label>
-              <div class="mt-0.5 text-[10px] text-vance-muted">
-                composed: {Math.max(-1, Math.min(1, t.pan + c.pan)).toFixed(2)} (clamped)
+            {#if t.kind === 'audio'}
+              <div class="mt-3">
+                <div class="mb-1 text-[11px] uppercase tracking-wider text-vance-muted">Pan</div>
+                <label class="flex items-center gap-2 font-mono text-xs">
+                  <span class="w-12 text-vance-muted">track</span>
+                  <input
+                    type="range"
+                    min="-1"
+                    max="1"
+                    step="0.01"
+                    value={t.pan}
+                    oninput={(e) =>
+                      projectState.setTrackPan(
+                        t.id,
+                        parseFloat((e.target as HTMLInputElement).value)
+                      )}
+                    class="flex-1 accent-[var(--color-vance-accent)]"
+                  />
+                  <span class="w-10 text-right">{t.pan.toFixed(2)}</span>
+                </label>
+                <label class="mt-1 flex items-center gap-2 font-mono text-xs">
+                  <span class="w-12 text-vance-muted">clip</span>
+                  <input
+                    type="range"
+                    min="-1"
+                    max="1"
+                    step="0.01"
+                    value={c.pan}
+                    oninput={(e) =>
+                      projectState.setClipPan(
+                        t.id,
+                        c.id,
+                        parseFloat((e.target as HTMLInputElement).value)
+                      )}
+                    class="flex-1 accent-[var(--color-vance-accent)]"
+                  />
+                  <span class="w-10 text-right">{c.pan.toFixed(2)}</span>
+                </label>
+                <div class="mt-0.5 text-[10px] text-vance-muted">
+                  composed: {Math.max(-1, Math.min(1, t.pan + c.pan)).toFixed(2)} (clamped)
+                </div>
               </div>
-            </div>
 
-            <!-- Phase 7.7 — per-track built-in DSP insert chain
+              <!-- Phase 7.7 — per-track built-in DSP insert chain
                  (parametric EQ + compressor + limiter). Shown for
                  audio tracks since the engine ignores the chain on
                  video tracks. -->
-            <AudioEffectChain trackId={t.id} effects={t.audio_effects} />
-          {/if}
+              <AudioEffectChain trackId={t.id} effects={t.audio_effects} />
+            {/if}
 
-          <!-- Effects: list each attached effect with its kind + a
+            <!-- Effects: list each attached effect with its kind + a
              remove button. 5.2+ adds parameter editing (opacity
              slider, transform widgets, etc.). -->
-          <div class="mt-4">
-            <div
-              class="mb-1 flex items-center justify-between text-[11px] uppercase tracking-wider"
-            >
-              <span class="text-vance-muted">Effects</span>
-              <div class="flex gap-1">
-                <button
-                  class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
-                  onclick={() => projectState.addEffect(t.id, c.id, 'opacity', { value: 1 })}
-                  title="Attach an opacity effect"
-                >
-                  + Opacity
-                </button>
-                <button
-                  class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
-                  onclick={() =>
-                    projectState.addEffect(t.id, c.id, 'transform', {
-                      translate_x: 0,
-                      translate_y: 0,
-                      scale_x: 1,
-                      scale_y: 1,
-                      rotation: 0
-                    })}
-                  title="Attach a transform effect (position/scale/rotate)"
-                >
-                  + Transform
-                </button>
-                <button
-                  class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
-                  onclick={() =>
-                    projectState.addEffect(t.id, c.id, 'crop', {
-                      left: 0,
-                      right: 0,
-                      top: 0,
-                      bottom: 0
-                    })}
-                  title="Attach a crop effect"
-                >
-                  + Crop
-                </button>
-                <button
-                  class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
-                  onclick={() =>
-                    projectState.addEffect(t.id, c.id, 'color', {
-                      brightness: 0,
-                      contrast: 1
-                    })}
-                  title="Attach a brightness/contrast effect"
-                >
-                  + Color
-                </button>
-                <button
-                  class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
-                  onclick={() =>
-                    projectState.addEffect(t.id, c.id, 'chroma_key', {
-                      r: 0,
-                      g: 1,
-                      b: 0,
-                      tolerance: 0.2,
-                      softness: 0.08
-                    })}
-                  title="Attach a chroma key (green-screen) effect"
-                >
-                  + Chroma
-                </button>
-                <button
-                  class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
-                  onclick={() =>
-                    projectState.addEffect(t.id, c.id, 'luma_key', {
-                      threshold: 0.5,
-                      direction: 1,
-                      softness: 0.05
-                    })}
-                  title="Attach a luma key (brightness mask) effect"
-                >
-                  + Luma
-                </button>
-                <button
-                  class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
-                  onclick={() => projectState.addEffect(t.id, c.id, 'lut', { path: '' })}
-                  title="Attach a 3D LUT effect (.cube / .3dl)"
-                >
-                  + LUT
-                </button>
+            <div class="mt-4">
+              <div
+                class="mb-1 flex items-center justify-between text-[11px] uppercase tracking-wider"
+              >
+                <span class="text-vance-muted">Effects</span>
+                <div class="flex gap-1">
+                  <button
+                    class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+                    onclick={() => projectState.addEffect(t.id, c.id, 'opacity', { value: 1 })}
+                    title="Attach an opacity effect"
+                  >
+                    + Opacity
+                  </button>
+                  <button
+                    class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+                    onclick={() =>
+                      projectState.addEffect(t.id, c.id, 'transform', {
+                        translate_x: 0,
+                        translate_y: 0,
+                        scale_x: 1,
+                        scale_y: 1,
+                        rotation: 0
+                      })}
+                    title="Attach a transform effect (position/scale/rotate)"
+                  >
+                    + Transform
+                  </button>
+                  <button
+                    class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+                    onclick={() =>
+                      projectState.addEffect(t.id, c.id, 'crop', {
+                        left: 0,
+                        right: 0,
+                        top: 0,
+                        bottom: 0
+                      })}
+                    title="Attach a crop effect"
+                  >
+                    + Crop
+                  </button>
+                  <button
+                    class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+                    onclick={() =>
+                      projectState.addEffect(t.id, c.id, 'color', {
+                        brightness: 0,
+                        contrast: 1
+                      })}
+                    title="Attach a brightness/contrast effect"
+                  >
+                    + Color
+                  </button>
+                  <button
+                    class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+                    onclick={() =>
+                      projectState.addEffect(t.id, c.id, 'chroma_key', {
+                        r: 0,
+                        g: 1,
+                        b: 0,
+                        tolerance: 0.2,
+                        softness: 0.08
+                      })}
+                    title="Attach a chroma key (green-screen) effect"
+                  >
+                    + Chroma
+                  </button>
+                  <button
+                    class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+                    onclick={() =>
+                      projectState.addEffect(t.id, c.id, 'luma_key', {
+                        threshold: 0.5,
+                        direction: 1,
+                        softness: 0.05
+                      })}
+                    title="Attach a luma key (brightness mask) effect"
+                  >
+                    + Luma
+                  </button>
+                  <button
+                    class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+                    onclick={() => projectState.addEffect(t.id, c.id, 'lut', { path: '' })}
+                    title="Attach a 3D LUT effect (.cube / .3dl)"
+                  >
+                    + LUT
+                  </button>
+                </div>
               </div>
+              {#if c.effects.length === 0}
+                <p class="text-vance-muted text-xs italic">No effects.</p>
+              {:else}
+                <ul class="flex flex-col gap-2 text-xs">
+                  {#each c.effects as e (e.id)}
+                    <li class="rounded border border-vance-border bg-vance-bg px-2 py-1.5">
+                      <div class="flex items-center justify-between">
+                        <span class="font-mono">{e.kind}</span>
+                        <button
+                          class="text-vance-muted hover:text-red-400"
+                          onclick={() => projectState.removeEffect(t.id, c.id, e.id)}
+                          title="Remove effect"
+                        >
+                          ✕
+                        </button>
+                      </div>
+                      {#snippet numericParam(
+                        key: string,
+                        label: string,
+                        min: number,
+                        max: number,
+                        step: number,
+                        defaultVal: number,
+                        precision: number
+                      )}
+                        {@const raw = e.params[key]}
+                        {@const animated = raw !== undefined && isKeyframes(raw)}
+                        {@const kfs: Keyframe[] =
+                      animated && raw !== undefined && isKeyframes(raw) ? raw : []}
+                        {@const cur =
+                          raw !== undefined ? evalNumber(raw, 0, defaultVal) : defaultVal}
+                        <div
+                          class="mt-1 grid grid-cols-[3rem_minmax(0,1fr)_2.25rem_1rem] items-center gap-x-2"
+                        >
+                          <span class="text-vance-muted text-[10px]">{label}</span>
+                          <input
+                            type="range"
+                            {min}
+                            {max}
+                            {step}
+                            value={cur}
+                            class="w-full min-w-0"
+                            onchange={(ev) => {
+                              const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
+                              setOrKeyframe(t, c, e, key, v);
+                            }}
+                          />
+                          <span class="font-mono text-right text-[10px]"
+                            >{cur.toFixed(precision)}</span
+                          >
+                          <button
+                            class="text-[12px] leading-none {animated
+                              ? 'text-[var(--color-vance-accent)]'
+                              : 'text-vance-muted'} hover:brightness-125"
+                            onclick={() => addKeyframeAtPlayhead(t, c, e, key)}
+                            title="Add keyframe at playhead"
+                          >
+                            ◆
+                          </button>
+                        </div>
+                        {#if animated && kfs.length > 0}
+                          <ul class="mt-1 flex flex-col gap-0.5 pl-12 text-[10px] text-vance-muted">
+                            {#each kfs as k (k.time_seconds)}
+                              <li class="flex items-center justify-between gap-2">
+                                <span class="font-mono">{k.time_seconds.toFixed(2)}s</span>
+                                <span class="font-mono flex-1 text-right"
+                                  >{k.value.toFixed(precision)}</span
+                                >
+                                <button
+                                  class="rounded border border-vance-border px-1 font-mono hover:brightness-125"
+                                  onclick={() => cycleKeyframeInterp(t, c, e, key, k.time_seconds)}
+                                  title="Outgoing interpolation: click to cycle Linear → Bezier → Hold"
+                                >
+                                  {interpLabel(k.interp)}
+                                </button>
+                                <button
+                                  class="hover:text-red-400"
+                                  onclick={() => removeKeyframe(t, c, e, key, k.time_seconds)}
+                                  title="Remove keyframe"
+                                >
+                                  ✕
+                                </button>
+                              </li>
+                            {/each}
+                          </ul>
+                        {/if}
+                      {/snippet}
+                      {#if e.kind === 'opacity'}
+                        {@const raw = e.params.value}
+                        {@const animated = raw !== undefined && isKeyframes(raw)}
+                        {@const kfs: Keyframe[] =
+                      animated && raw !== undefined && isKeyframes(raw) ? raw : []}
+                        {@const cur = raw !== undefined ? evalNumber(raw, 0, 1) : 1}
+                        <div
+                          class="mt-1 grid grid-cols-[3rem_minmax(0,1fr)_2.25rem_1rem] items-center gap-x-2"
+                        >
+                          <span class="text-vance-muted text-[10px]">value</span>
+                          <input
+                            type="range"
+                            min="0"
+                            max="1"
+                            step="0.01"
+                            value={cur}
+                            class="w-full min-w-0"
+                            onchange={(ev) => {
+                              const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
+                              setOrKeyframe(t, c, e, 'value', v);
+                            }}
+                          />
+                          <span class="font-mono text-right text-[10px]">{cur.toFixed(2)}</span>
+                          <button
+                            class="text-[12px] leading-none {animated
+                              ? 'text-[var(--color-vance-accent)]'
+                              : 'text-vance-muted'} hover:brightness-125"
+                            onclick={() => addKeyframeAtPlayhead(t, c, e, 'value')}
+                            title="Add keyframe at playhead"
+                          >
+                            ◆
+                          </button>
+                        </div>
+                        {#if animated && kfs.length > 0}
+                          <ul class="mt-1 flex flex-col gap-0.5 pl-12 text-[10px] text-vance-muted">
+                            {#each kfs as k (k.time_seconds)}
+                              <li class="flex items-center justify-between gap-2">
+                                <span class="font-mono">{k.time_seconds.toFixed(2)}s</span>
+                                <span class="font-mono">{k.value.toFixed(2)}</span>
+                                <button
+                                  class="hover:text-red-400"
+                                  onclick={() => removeKeyframe(t, c, e, 'value', k.time_seconds)}
+                                  title="Remove keyframe"
+                                >
+                                  ✕
+                                </button>
+                              </li>
+                            {/each}
+                          </ul>
+                        {/if}
+                      {:else if e.kind === 'transform'}
+                        {@const tx =
+                          typeof e.params.translate_x === 'number' ? e.params.translate_x : 0}
+                        {@const ty =
+                          typeof e.params.translate_y === 'number' ? e.params.translate_y : 0}
+                        {@const sx = typeof e.params.scale_x === 'number' ? e.params.scale_x : 1}
+                        {@const sy = typeof e.params.scale_y === 'number' ? e.params.scale_y : 1}
+                        {@const rot = typeof e.params.rotation === 'number' ? e.params.rotation : 0}
+                        <div
+                          class="mt-1 grid grid-cols-[3rem_minmax(0,1fr)_2.25rem] items-center gap-x-2 gap-y-1"
+                        >
+                          <span class="text-vance-muted text-[10px]">x</span>
+                          <input
+                            type="range"
+                            min="-1"
+                            max="1"
+                            step="0.01"
+                            value={tx}
+                            class="w-full min-w-0"
+                            onchange={(ev) => {
+                              const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
+                              projectState.updateEffectParam(t.id, c.id, e.id, 'translate_x', v);
+                            }}
+                          />
+                          <span class="font-mono text-right text-[10px]">{tx.toFixed(2)}</span>
+
+                          <span class="text-vance-muted text-[10px]">y</span>
+                          <input
+                            type="range"
+                            min="-1"
+                            max="1"
+                            step="0.01"
+                            value={ty}
+                            class="flex-1"
+                            onchange={(ev) => {
+                              const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
+                              projectState.updateEffectParam(t.id, c.id, e.id, 'translate_y', v);
+                            }}
+                          />
+                          <span class="font-mono text-right text-[10px]">{ty.toFixed(2)}</span>
+
+                          <span class="text-vance-muted text-[10px]">scale x</span>
+                          <input
+                            type="range"
+                            min="0.1"
+                            max="3"
+                            step="0.01"
+                            value={sx}
+                            class="w-full min-w-0"
+                            onchange={(ev) => {
+                              const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
+                              projectState.updateEffectParam(t.id, c.id, e.id, 'scale_x', v);
+                            }}
+                          />
+                          <span class="font-mono text-right text-[10px]">{sx.toFixed(2)}</span>
+
+                          <span class="text-vance-muted text-[10px]">scale y</span>
+                          <input
+                            type="range"
+                            min="0.1"
+                            max="3"
+                            step="0.01"
+                            value={sy}
+                            class="flex-1"
+                            onchange={(ev) => {
+                              const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
+                              projectState.updateEffectParam(t.id, c.id, e.id, 'scale_y', v);
+                            }}
+                          />
+                          <span class="font-mono text-right text-[10px]">{sy.toFixed(2)}</span>
+
+                          <span class="text-vance-muted text-[10px]">rot°</span>
+                          <input
+                            type="range"
+                            min="-180"
+                            max="180"
+                            step="1"
+                            value={rot}
+                            class="w-full min-w-0"
+                            onchange={(ev) => {
+                              const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
+                              projectState.updateEffectParam(t.id, c.id, e.id, 'rotation', v);
+                            }}
+                          />
+                          <span class="font-mono text-right text-[10px]">{rot.toFixed(0)}°</span>
+                        </div>
+                      {:else if e.kind === 'crop'}
+                        {@render numericParam('left', 'left', 0, 0.95, 0.01, 0, 2)}
+                        {@render numericParam('right', 'right', 0, 0.95, 0.01, 0, 2)}
+                        {@render numericParam('top', 'top', 0, 0.95, 0.01, 0, 2)}
+                        {@render numericParam('bottom', 'bot', 0, 0.95, 0.01, 0, 2)}
+                      {:else if e.kind === 'color'}
+                        {@render numericParam('brightness', 'bright', -1, 1, 0.01, 0, 2)}
+                        {@render numericParam('contrast', 'contr', 0, 3, 0.01, 1, 2)}
+                      {:else if e.kind === 'chroma_key'}
+                        {@render numericParam('r', 'R', 0, 1, 0.01, 0, 2)}
+                        {@render numericParam('g', 'G', 0, 1, 0.01, 1, 2)}
+                        {@render numericParam('b', 'B', 0, 1, 0.01, 0, 2)}
+                        {@render numericParam('tolerance', 'tol', 0, 1, 0.01, 0.2, 2)}
+                        {@render numericParam('softness', 'soft', 0, 0.5, 0.01, 0.08, 2)}
+                      {:else if e.kind === 'luma_key'}
+                        {@render numericParam('threshold', 'thr', 0, 1, 0.01, 0.5, 2)}
+                        {@render numericParam('direction', 'dir', -1, 1, 1, 1, 0)}
+                        {@render numericParam('softness', 'soft', 0, 0.5, 0.01, 0.05, 2)}
+                      {:else if e.kind === 'lut'}
+                        {@const rawPath = e.params.path}
+                        {@const lutPath: string = typeof rawPath === 'string' ? rawPath : ''}
+                        <div class="mt-1 flex items-center gap-2 text-[10px]">
+                          <button
+                            class="rounded bg-vance-bg border-vance-border border px-2 py-0.5 hover:brightness-125"
+                            onclick={() => pickLutFile(t, c, e)}
+                            title="Pick a .cube or .3dl LUT file"
+                          >
+                            Pick file…
+                          </button>
+                          <span class="text-vance-muted truncate font-mono" title={lutPath}>
+                            {lutPath || '(none selected)'}
+                          </span>
+                        </div>
+                      {/if}
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
             </div>
-            {#if c.effects.length === 0}
-              <p class="text-vance-muted text-xs italic">No effects.</p>
-            {:else}
-              <ul class="flex flex-col gap-2 text-xs">
-                {#each c.effects as e (e.id)}
-                  <li class="rounded border border-vance-border bg-vance-bg px-2 py-1.5">
-                    <div class="flex items-center justify-between">
-                      <span class="font-mono">{e.kind}</span>
-                      <button
-                        class="text-vance-muted hover:text-red-400"
-                        onclick={() => projectState.removeEffect(t.id, c.id, e.id)}
-                        title="Remove effect"
-                      >
-                        ✕
-                      </button>
-                    </div>
-                    {#snippet numericParam(
-                      key: string,
-                      label: string,
-                      min: number,
-                      max: number,
-                      step: number,
-                      defaultVal: number,
-                      precision: number
-                    )}
-                      {@const raw = e.params[key]}
-                      {@const animated = raw !== undefined && isKeyframes(raw)}
-                      {@const kfs: Keyframe[] =
-                      animated && raw !== undefined && isKeyframes(raw) ? raw : []}
-                      {@const cur = raw !== undefined ? evalNumber(raw, 0, defaultVal) : defaultVal}
-                      <div
-                        class="mt-1 grid grid-cols-[3rem_minmax(0,1fr)_2.25rem_1rem] items-center gap-x-2"
-                      >
-                        <span class="text-vance-muted text-[10px]">{label}</span>
-                        <input
-                          type="range"
-                          {min}
-                          {max}
-                          {step}
-                          value={cur}
-                          class="w-full min-w-0"
-                          onchange={(ev) => {
-                            const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
-                            setOrKeyframe(t, c, e, key, v);
-                          }}
-                        />
-                        <span class="font-mono text-right text-[10px]"
-                          >{cur.toFixed(precision)}</span
-                        >
-                        <button
-                          class="text-[12px] leading-none {animated
-                            ? 'text-[var(--color-vance-accent)]'
-                            : 'text-vance-muted'} hover:brightness-125"
-                          onclick={() => addKeyframeAtPlayhead(t, c, e, key)}
-                          title="Add keyframe at playhead"
-                        >
-                          ◆
-                        </button>
-                      </div>
-                      {#if animated && kfs.length > 0}
-                        <ul class="mt-1 flex flex-col gap-0.5 pl-12 text-[10px] text-vance-muted">
-                          {#each kfs as k (k.time_seconds)}
-                            <li class="flex items-center justify-between gap-2">
-                              <span class="font-mono">{k.time_seconds.toFixed(2)}s</span>
-                              <span class="font-mono flex-1 text-right"
-                                >{k.value.toFixed(precision)}</span
-                              >
-                              <button
-                                class="rounded border border-vance-border px-1 font-mono hover:brightness-125"
-                                onclick={() => cycleKeyframeInterp(t, c, e, key, k.time_seconds)}
-                                title="Outgoing interpolation: click to cycle Linear → Bezier → Hold"
-                              >
-                                {interpLabel(k.interp)}
-                              </button>
-                              <button
-                                class="hover:text-red-400"
-                                onclick={() => removeKeyframe(t, c, e, key, k.time_seconds)}
-                                title="Remove keyframe"
-                              >
-                                ✕
-                              </button>
-                            </li>
-                          {/each}
-                        </ul>
-                      {/if}
-                    {/snippet}
-                    {#if e.kind === 'opacity'}
-                      {@const raw = e.params.value}
-                      {@const animated = raw !== undefined && isKeyframes(raw)}
-                      {@const kfs: Keyframe[] =
-                      animated && raw !== undefined && isKeyframes(raw) ? raw : []}
-                      {@const cur = raw !== undefined ? evalNumber(raw, 0, 1) : 1}
-                      <div
-                        class="mt-1 grid grid-cols-[3rem_minmax(0,1fr)_2.25rem_1rem] items-center gap-x-2"
-                      >
-                        <span class="text-vance-muted text-[10px]">value</span>
-                        <input
-                          type="range"
-                          min="0"
-                          max="1"
-                          step="0.01"
-                          value={cur}
-                          class="w-full min-w-0"
-                          onchange={(ev) => {
-                            const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
-                            setOrKeyframe(t, c, e, 'value', v);
-                          }}
-                        />
-                        <span class="font-mono text-right text-[10px]">{cur.toFixed(2)}</span>
-                        <button
-                          class="text-[12px] leading-none {animated
-                            ? 'text-[var(--color-vance-accent)]'
-                            : 'text-vance-muted'} hover:brightness-125"
-                          onclick={() => addKeyframeAtPlayhead(t, c, e, 'value')}
-                          title="Add keyframe at playhead"
-                        >
-                          ◆
-                        </button>
-                      </div>
-                      {#if animated && kfs.length > 0}
-                        <ul class="mt-1 flex flex-col gap-0.5 pl-12 text-[10px] text-vance-muted">
-                          {#each kfs as k (k.time_seconds)}
-                            <li class="flex items-center justify-between gap-2">
-                              <span class="font-mono">{k.time_seconds.toFixed(2)}s</span>
-                              <span class="font-mono">{k.value.toFixed(2)}</span>
-                              <button
-                                class="hover:text-red-400"
-                                onclick={() => removeKeyframe(t, c, e, 'value', k.time_seconds)}
-                                title="Remove keyframe"
-                              >
-                                ✕
-                              </button>
-                            </li>
-                          {/each}
-                        </ul>
-                      {/if}
-                    {:else if e.kind === 'transform'}
-                      {@const tx =
-                        typeof e.params.translate_x === 'number' ? e.params.translate_x : 0}
-                      {@const ty =
-                        typeof e.params.translate_y === 'number' ? e.params.translate_y : 0}
-                      {@const sx = typeof e.params.scale_x === 'number' ? e.params.scale_x : 1}
-                      {@const sy = typeof e.params.scale_y === 'number' ? e.params.scale_y : 1}
-                      {@const rot = typeof e.params.rotation === 'number' ? e.params.rotation : 0}
-                      <div
-                        class="mt-1 grid grid-cols-[3rem_minmax(0,1fr)_2.25rem] items-center gap-x-2 gap-y-1"
-                      >
-                        <span class="text-vance-muted text-[10px]">x</span>
-                        <input
-                          type="range"
-                          min="-1"
-                          max="1"
-                          step="0.01"
-                          value={tx}
-                          class="w-full min-w-0"
-                          onchange={(ev) => {
-                            const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
-                            projectState.updateEffectParam(t.id, c.id, e.id, 'translate_x', v);
-                          }}
-                        />
-                        <span class="font-mono text-right text-[10px]">{tx.toFixed(2)}</span>
-
-                        <span class="text-vance-muted text-[10px]">y</span>
-                        <input
-                          type="range"
-                          min="-1"
-                          max="1"
-                          step="0.01"
-                          value={ty}
-                          class="flex-1"
-                          onchange={(ev) => {
-                            const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
-                            projectState.updateEffectParam(t.id, c.id, e.id, 'translate_y', v);
-                          }}
-                        />
-                        <span class="font-mono text-right text-[10px]">{ty.toFixed(2)}</span>
-
-                        <span class="text-vance-muted text-[10px]">scale x</span>
-                        <input
-                          type="range"
-                          min="0.1"
-                          max="3"
-                          step="0.01"
-                          value={sx}
-                          class="w-full min-w-0"
-                          onchange={(ev) => {
-                            const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
-                            projectState.updateEffectParam(t.id, c.id, e.id, 'scale_x', v);
-                          }}
-                        />
-                        <span class="font-mono text-right text-[10px]">{sx.toFixed(2)}</span>
-
-                        <span class="text-vance-muted text-[10px]">scale y</span>
-                        <input
-                          type="range"
-                          min="0.1"
-                          max="3"
-                          step="0.01"
-                          value={sy}
-                          class="flex-1"
-                          onchange={(ev) => {
-                            const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
-                            projectState.updateEffectParam(t.id, c.id, e.id, 'scale_y', v);
-                          }}
-                        />
-                        <span class="font-mono text-right text-[10px]">{sy.toFixed(2)}</span>
-
-                        <span class="text-vance-muted text-[10px]">rot°</span>
-                        <input
-                          type="range"
-                          min="-180"
-                          max="180"
-                          step="1"
-                          value={rot}
-                          class="w-full min-w-0"
-                          onchange={(ev) => {
-                            const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
-                            projectState.updateEffectParam(t.id, c.id, e.id, 'rotation', v);
-                          }}
-                        />
-                        <span class="font-mono text-right text-[10px]">{rot.toFixed(0)}°</span>
-                      </div>
-                    {:else if e.kind === 'crop'}
-                      {@render numericParam('left', 'left', 0, 0.95, 0.01, 0, 2)}
-                      {@render numericParam('right', 'right', 0, 0.95, 0.01, 0, 2)}
-                      {@render numericParam('top', 'top', 0, 0.95, 0.01, 0, 2)}
-                      {@render numericParam('bottom', 'bot', 0, 0.95, 0.01, 0, 2)}
-                    {:else if e.kind === 'color'}
-                      {@render numericParam('brightness', 'bright', -1, 1, 0.01, 0, 2)}
-                      {@render numericParam('contrast', 'contr', 0, 3, 0.01, 1, 2)}
-                    {:else if e.kind === 'chroma_key'}
-                      {@render numericParam('r', 'R', 0, 1, 0.01, 0, 2)}
-                      {@render numericParam('g', 'G', 0, 1, 0.01, 1, 2)}
-                      {@render numericParam('b', 'B', 0, 1, 0.01, 0, 2)}
-                      {@render numericParam('tolerance', 'tol', 0, 1, 0.01, 0.2, 2)}
-                      {@render numericParam('softness', 'soft', 0, 0.5, 0.01, 0.08, 2)}
-                    {:else if e.kind === 'luma_key'}
-                      {@render numericParam('threshold', 'thr', 0, 1, 0.01, 0.5, 2)}
-                      {@render numericParam('direction', 'dir', -1, 1, 1, 1, 0)}
-                      {@render numericParam('softness', 'soft', 0, 0.5, 0.01, 0.05, 2)}
-                    {:else if e.kind === 'lut'}
-                      {@const rawPath = e.params.path}
-                      {@const lutPath: string = typeof rawPath === 'string' ? rawPath : ''}
-                      <div class="mt-1 flex items-center gap-2 text-[10px]">
-                        <button
-                          class="rounded bg-vance-bg border-vance-border border px-2 py-0.5 hover:brightness-125"
-                          onclick={() => pickLutFile(t, c, e)}
-                          title="Pick a .cube or .3dl LUT file"
-                        >
-                          Pick file…
-                        </button>
-                        <span class="text-vance-muted truncate font-mono" title={lutPath}>
-                          {lutPath || '(none selected)'}
-                        </span>
-                      </div>
-                    {/if}
-                  </li>
-                {/each}
-              </ul>
-            {/if}
-          </div>
           {/if}
         {:else if selectionState.count > 1}
           <p class="text-vance-muted text-xs">

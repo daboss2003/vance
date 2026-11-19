@@ -10,8 +10,17 @@
     role="dialog"
     aria-modal="true"
     aria-label={d.title}
+    tabindex="-1"
     onclick={(e) => {
       if (e.target === e.currentTarget) closeDialog(d.id, null);
+    }}
+    onkeydown={(e) => {
+      // Esc closes the dialog only — stop it reaching the app's global
+      // Esc handler, which would also clear the timeline selection.
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        closeDialog(d.id, null);
+      }
     }}
   >
     <div class="card">
@@ -24,10 +33,7 @@
       {/if}
       <div class="actions">
         {#each d.actions as a}
-          <button
-            class="btn {a.kind ?? 'default'}"
-            onclick={() => closeDialog(d.id, a.value)}
-          >
+          <button class="btn {a.kind ?? 'default'}" onclick={() => closeDialog(d.id, a.value)}>
             {a.label}
           </button>
         {/each}

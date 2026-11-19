@@ -27,7 +27,6 @@
 
   let rendering = $state(false);
   let lastOutcome = $state<RenderOutcome | null>(null);
-  let error = $state<string | null>(null);
 
   /** Pretty label for each preset key. */
   const PRESETS: { value: EncoderPresetKey; label: string }[] = [
@@ -45,7 +44,6 @@
   const needsCrf = $derived(preset === 'H264' || preset === 'Hevc' || preset === 'Av1');
 
   async function doRender() {
-    error = null;
     rendering = true;
     lastOutcome = null;
     try {
@@ -61,7 +59,7 @@
       });
       toast.success('Export finished — saved to ' + lastOutcome.output_path);
     } catch (e) {
-      toast.error("Export failed.\n" + String(e));
+      toast.error('Export failed.\n' + String(e));
     } finally {
       rendering = false;
     }
@@ -94,7 +92,10 @@
   </label>
 
   {#if needsCrf}
-    <label class="mb-1 flex items-center gap-1" title="Lower number = higher quality (and larger file)">
+    <label
+      class="mb-1 flex items-center gap-1"
+      title="Lower number = higher quality (and larger file)"
+    >
       <span class="text-vance-muted w-12">Quality</span>
       <input
         type="number"
@@ -107,7 +108,10 @@
     </label>
   {/if}
 
-  <label class="mb-1 flex items-center gap-1" title="Export in HDR — brighter highlights and richer color (HEVC 10-bit).">
+  <label
+    class="mb-1 flex items-center gap-1"
+    title="Export in HDR — brighter highlights and richer color (HEVC 10-bit)."
+  >
     <span class="text-vance-muted w-12">HDR</span>
     <input type="checkbox" bind:checked={hdr} />
   </label>

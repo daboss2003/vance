@@ -88,7 +88,8 @@
    *  incomplete setup keeps bringing the wizard back at the components step. */
   async function finish() {
     if (!coreReady) {
-      error = 'A required component is still missing. Install it and press “Re-check”, then finish.';
+      error =
+        'A required component is still missing. Install it and press “Re-check”, then finish.';
       step = CAPS_STEP;
       await persistStep(step);
       return;
@@ -96,7 +97,11 @@
     busy = true;
     error = null;
     try {
-      await setAppSettings({ ...settings, first_run_complete: true, onboarding_step: steps.length - 1 });
+      await setAppSettings({
+        ...settings,
+        first_run_complete: true,
+        onboarding_step: steps.length - 1
+      });
       onDone();
     } catch (e) {
       error = String(e);
@@ -133,7 +138,10 @@
 
     {#if step === 0}
       <h1>Welcome to Vance</h1>
-      <p class="lead">A fast, cross-platform video editor. This quick setup takes about a minute — or skip it; the editor works right away.</p>
+      <p class="lead">
+        A fast, cross-platform video editor. This quick setup takes about a minute — or skip it; the
+        editor works right away.
+      </p>
       <ul class="feat">
         <li>Edit, grade, mix, and caption on a magnetic or track timeline.</li>
         <li>Node-graph compositing (Fusion), motion-graphics titles, and AI-assisted tools.</li>
@@ -143,9 +151,12 @@
       <h1>What Vance found</h1>
       <p class="lead">
         {#if coreReady}
-          Core editing and export are ready. Add any optional AI tools below — Vance installs them for you, right here.
+          Core editing and export are ready. Add any optional AI tools below — Vance installs them
+          for you, right here.
         {:else}
-          A required component is missing — install it (see the hint below), then press <strong>Re-check</strong>. Setup can’t finish until it’s present.
+          A required component is missing — install it (see the hint below), then press <strong
+            >Re-check</strong
+          >. Setup can’t finish until it’s present.
         {/if}
       </p>
       <div class="caps">
@@ -165,16 +176,26 @@
       <button class="ghost recheck" onclick={recheck} disabled={busy}>↻ Re-check</button>
 
       <h2 class="aihdr">Optional AI tools</h2>
-      <p class="lead sub">Captions, voice isolation, subject mask, and generative images. Click <strong>Install</strong> on the ones you want — they download in the background while you keep setting up. All optional; add or remove them any time later.</p>
+      <p class="lead sub">
+        Captions, voice isolation, subject mask, and generative images. Click <strong
+          >Install</strong
+        > on the ones you want — they download in the background while you keep setting up. All optional;
+        add or remove them any time later.
+      </p>
       <AiToolsPanel embedded />
     {:else if step === 2}
       <h1>Privacy</h1>
-      <p class="lead">Both are off by default and you can change them any time. Vance never collects personal data.</p>
+      <p class="lead">
+        Both are off by default and you can change them any time. Vance never collects personal
+        data.
+      </p>
       <label class="opt">
         <input type="checkbox" bind:checked={settings.crash_reports_opt_in} disabled={busy} />
         <span>
           <strong>Send crash reports</strong>
-          <em>Crash logs are always saved locally; this only enables sharing them to help fix bugs.</em>
+          <em
+            >Crash logs are always saved locally; this only enables sharing them to help fix bugs.</em
+          >
         </span>
       </label>
       <label class="opt">
@@ -188,19 +209,27 @@
       <h1>You’re set</h1>
       <p class="lead">
         Open a file or create media from the panels below. The
-        <strong>AI setup</strong> (choose a provider, paste a key) lives in Settings when you want it — it’s never required.
+        <strong>AI setup</strong> (choose a provider, paste a key) lives in Settings when you want it
+        — it’s never required.
       </p>
       <p class="lead">Have fun. 🎬</p>
     {/if}
 
     <div class="actions">
-      <button class="ghost" onclick={finishLater} disabled={busy} title="Closes setup for now; it returns next launch where you left off">Finish later</button>
+      <button
+        class="ghost"
+        onclick={finishLater}
+        disabled={busy}
+        title="Closes setup for now; it returns next launch where you left off">Finish later</button
+      >
       <span class="spacer"></span>
       {#if step > 0}<button class="ghost" onclick={back} disabled={busy}>Back</button>{/if}
       {#if step < steps.length - 1}
         <button onclick={next} disabled={busy}>Next</button>
       {:else}
-        <button onclick={finish} disabled={busy}>{coreReady ? 'Get started' : 'Finish setup'}</button>
+        <button onclick={finish} disabled={busy}
+          >{coreReady ? 'Get started' : 'Finish setup'}</button
+        >
       {/if}
     </div>
   </div>

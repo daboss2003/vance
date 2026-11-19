@@ -105,8 +105,16 @@
     role="dialog"
     aria-modal="true"
     aria-label="Settings"
+    tabindex="-1"
     onclick={(e) => {
       if (e.target === e.currentTarget) closeSettings();
+    }}
+    onkeydown={(e) => {
+      // Esc closes this dialog only (not the app's global Esc = clear selection).
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        closeSettings();
+      }
     }}
   >
     <div class="card">
@@ -128,7 +136,10 @@
         <button class:active={account.tab === 'devices'} onclick={() => (account.tab = 'devices')}>
           Devices
         </button>
-        <button class:active={account.tab === 'advanced'} onclick={() => (account.tab = 'advanced')}>
+        <button
+          class:active={account.tab === 'advanced'}
+          onclick={() => (account.tab = 'advanced')}
+        >
           Advanced
         </button>
       </div>
@@ -193,7 +204,7 @@
           </button>
         {/if}
 
-      <!-- MY EFFECTS -->
+        <!-- MY EFFECTS -->
       {:else if account.tab === 'effects'}
         {#if !account.signedIn}
           <div class="muted">Sign in to see the effects you own.</div>
@@ -241,14 +252,14 @@
           {/if}
         {/if}
 
-      <!-- SELLING -->
+        <!-- SELLING -->
       {:else if account.tab === 'selling'}
         {#if !account.signedIn}
           <div class="muted">Sign in to sell your effects.</div>
         {:else}
           <p class="muted small">
-            Sell effects you make. Buyers pay you directly through Stripe; Vance
-            takes a 20% fee and never holds your money.
+            Sell effects you make. Buyers pay you directly through Stripe; Vance takes a 20% fee and
+            never holds your money.
           </p>
           {#if !account.sellingLoaded}
             <div class="muted">Checking…</div>
@@ -275,11 +286,13 @@
               </div>
             {:else}
               <button class="primary" disabled={account.busy} onclick={connectPayouts}>
-                {account.sellerConnected ? 'Finish connecting payouts' : 'Connect payouts with Stripe'}
+                {account.sellerConnected
+                  ? 'Finish connecting payouts'
+                  : 'Connect payouts with Stripe'}
               </button>
               <p class="muted small" style="margin-top:10px">
-                Opens Stripe in your browser to set up how you get paid. Requires the
-                marketplace server to have Stripe configured.
+                Opens Stripe in your browser to set up how you get paid. Requires the marketplace
+                server to have Stripe configured.
               </p>
             {/if}
 
@@ -292,7 +305,8 @@
                       <div class="dname">{l.display_name}</div>
                       <div class="muted small">
                         {l.price_cents === 0 ? 'Free' : `$${(l.price_cents / 100).toFixed(2)}`} ·
-                        {l.downloads} installs{#if l.reports > 0} ·
+                        {l.downloads} installs{#if l.reports > 0}
+                          ·
                           <span style="color:#f2c14e">{l.reports} reports</span>{/if}
                       </div>
                     </div>
@@ -303,7 +317,7 @@
           {/if}
         {/if}
 
-      <!-- DEVICES -->
+        <!-- DEVICES -->
       {:else if account.tab === 'devices'}
         {#if !account.signedIn}
           <div class="muted">Sign in to manage your devices.</div>
@@ -342,12 +356,18 @@
                       >
                         Sign out
                       </button>
-                      <button class="ghost tiny" onclick={() => ((confirmingId = null), (devicePassword = ''))}>
+                      <button
+                        class="ghost tiny"
+                        onclick={() => ((confirmingId = null), (devicePassword = ''))}
+                      >
                         Cancel
                       </button>
                     </div>
                   {:else}
-                    <button class="ghost" onclick={() => ((confirmingId = d.id), (devicePassword = ''))}>
+                    <button
+                      class="ghost"
+                      onclick={() => ((confirmingId = d.id), (devicePassword = ''))}
+                    >
                       Sign out
                     </button>
                   {/if}
@@ -357,14 +377,19 @@
           </ul>
         {/if}
 
-      <!-- ADVANCED -->
+        <!-- ADVANCED -->
       {:else}
         <div class="sec-title">Accounts server</div>
         <p class="muted small">
           Where Vance signs in and syncs your account. Leave the default unless you're pointing at
           your own deployment.
         </p>
-        <input class="in" type="text" bind:value={baseUrlDraft} placeholder="http://127.0.0.1:8787" />
+        <input
+          class="in"
+          type="text"
+          bind:value={baseUrlDraft}
+          placeholder="http://127.0.0.1:8787"
+        />
         <button
           class="primary"
           disabled={!baseUrlDraft || baseUrlDraft === account.baseUrl}

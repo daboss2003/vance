@@ -436,14 +436,10 @@ export function defaultDeHum(): AudioEffectSpec {
 export const analyzeLoudness = (mediaId: string): Promise<number | null> =>
   invoke('analyze_loudness', { mediaId });
 /** Auto-level a clip to `targetLufs`; returns the applied gain (dB). */
-export const levelClip = (
-  trackId: string,
-  clipId: string,
-  targetLufs: number
-): Promise<number> => invoke('level_clip', { trackId, clipId, targetLufs });
+export const levelClip = (trackId: string, clipId: string, targetLufs: number): Promise<number> =>
+  invoke('level_clip', { trackId, clipId, targetLufs });
 /** Whether a voice-isolation CLI (Demucs) is installed. */
-export const voiceIsolationAvailable = (): Promise<boolean> =>
-  invoke('voice_isolation_available');
+export const voiceIsolationAvailable = (): Promise<boolean> => invoke('voice_isolation_available');
 /** Isolate vocals from a media item; returns the imported stem's info. */
 export const isolateVoice = (mediaId: string): Promise<MediaItemInfo> =>
   invoke('isolate_voice', { mediaId });
@@ -752,8 +748,7 @@ export const aiPythonAvailable = (): Promise<boolean> => invoke('ai_python_avail
 
 /** Install an optional AI tool by id into Vance's managed tools dir. Slow
  *  (venv build / large downloads); resolves to the installed executable path. */
-export const installAiTool = (id: string): Promise<string> =>
-  invoke('install_ai_tool', { id });
+export const installAiTool = (id: string): Promise<string> => invoke('install_ai_tool', { id });
 
 /** Override (or clear, by passing `null`) the input color space tag
  *  for a media library item. Phase 6.2. */
@@ -1049,8 +1044,7 @@ export const captions = (): Promise<Cue[]> => invoke('captions');
 /** Add a cue; returns its id. */
 export const addCaption = (startMs: number, endMs: number, text: string): Promise<string> =>
   invoke('add_caption', { startMs, endMs, text });
-export const removeCaption = (cueId: string): Promise<void> =>
-  invoke('remove_caption', { cueId });
+export const removeCaption = (cueId: string): Promise<void> => invoke('remove_caption', { cueId });
 export const setCaptionText = (cueId: string, text: string): Promise<void> =>
   invoke('set_caption_text', { cueId, text });
 export const setCaptionTiming = (cueId: string, startMs: number, endMs: number): Promise<void> =>
@@ -1105,8 +1099,7 @@ export const replyReviewComment = (
   text: string
 ): Promise<void> => invoke('reply_review_comment', { commentId, author, text });
 /** Whether a local Whisper CLI is installed. */
-export const transcriptionAvailable = (): Promise<boolean> =>
-  invoke('transcription_available');
+export const transcriptionAvailable = (): Promise<boolean> => invoke('transcription_available');
 /** Auto-transcribe a media item (slow). Returns the cue count. */
 export const transcribeMedia = (
   mediaId: string,
@@ -1406,10 +1399,8 @@ export type PluginParamInfo = {
 
 /** Enumerate a plugin's parameters (spawns a one-shot sidecar probe).
  *  Returns an empty list when the plugin can't be loaded. */
-export const listPluginParams = (
-  format: string,
-  id: string
-): Promise<PluginParamInfo[]> => invoke('list_plugin_params', { format, id });
+export const listPluginParams = (format: string, id: string): Promise<PluginParamInfo[]> =>
+  invoke('list_plugin_params', { format, id });
 
 // ---- Phase 10 — WASM effect plugins ---------------------------------------
 
@@ -1449,8 +1440,7 @@ export const addWasmPlugin = (source: string): Promise<WasmPlugin> =>
   invoke('add_wasm_plugin', { source });
 
 /** Uninstall an add-on effect by id (deletes it from the managed folder). */
-export const removeWasmPlugin = (id: string): Promise<void> =>
-  invoke('remove_wasm_plugin', { id });
+export const removeWasmPlugin = (id: string): Promise<void> => invoke('remove_wasm_plugin', { id });
 
 /** Path to Vance's managed add-ons folder (for a "show folder" affordance). */
 export const pluginsFolder = (): Promise<string> => invoke('plugins_folder');
@@ -1592,8 +1582,7 @@ export const startMidiControl = (portIndex: number): Promise<void> =>
   invoke('start_midi_control', { portIndex });
 export const stopMidiControl = (): Promise<void> => invoke('stop_midi_control');
 /** Drain queued control-surface actions (poll on a timer while enabled). */
-export const pollControlActions = (): Promise<ControlAction[]> =>
-  invoke('poll_control_actions');
+export const pollControlActions = (): Promise<ControlAction[]> => invoke('poll_control_actions');
 
 // ---- GOAT-11: direct publish (YouTube / Vimeo / TikTok) ---------------------
 
@@ -1641,8 +1630,7 @@ export const editHistory = (): Promise<HistoryNode[]> => invoke('edit_history');
 export const checkpointHistory = (name: string): Promise<void> =>
   invoke('checkpoint_history', { name });
 /** Jump to a history node by id (switch branch / restore version). */
-export const gotoHistory = (nodeId: number): Promise<boolean> =>
-  invoke('goto_history', { nodeId });
+export const gotoHistory = (nodeId: number): Promise<boolean> => invoke('goto_history', { nodeId });
 
 // ---- Avid-grade bins: custom columns + smart bins (GOAT-3) ----------------
 
@@ -1703,8 +1691,7 @@ export const addSmartBin = (name: string, query: MediaQuery): Promise<string> =>
   invoke('add_smart_bin', { name, query });
 
 /** Remove a smart bin by id. */
-export const removeSmartBin = (id: string): Promise<boolean> =>
-  invoke('remove_smart_bin', { id });
+export const removeSmartBin = (id: string): Promise<boolean> => invoke('remove_smart_bin', { id });
 
 /** All smart bins (browser sidebar). */
 export const smartBins = (): Promise<SmartBin[]> => invoke('smart_bins');

@@ -101,7 +101,9 @@
           <option value={m.id}>{m.name}</option>
         {/each}
       </select>
-      <button disabled={busy || !isolateAvail || !isolateMediaId} onclick={runIsolate}>Isolate</button>
+      <button disabled={busy || !isolateAvail || !isolateMediaId} onclick={runIsolate}
+        >Isolate</button
+      >
     </div>
     <div class="hint">Separates the voice from background audio and adds it as a new track.</div>
   </div>
@@ -143,21 +145,8 @@
   .row select {
     flex: 1;
   }
-  code {
-    background: rgba(255, 255, 255, 0.08);
-    padding: 0 3px;
-    border-radius: 2px;
-  }
   .hint {
     opacity: 0.5;
     font-size: 10px;
-  }
-  .err {
-    color: #ff6b6b;
-    font-size: 11px;
-  }
-  .status {
-    color: var(--ok);
-    font-size: 11px;
   }
 </style>

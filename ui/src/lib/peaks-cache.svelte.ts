@@ -236,7 +236,7 @@ class PeaksCache {
         // direct calls, just without auto-invalidation on 'done'.
         this.listenerInstalled = false;
         this.unlistenFn = null;
-        // eslint-disable-next-line no-console
+
         console.warn('peaks://progress listen failed:', err);
       } finally {
         this.listenerInstallPromise = null;
@@ -346,7 +346,7 @@ class PeaksCache {
         return m;
       } catch (err) {
         this.metaCooldownUntil.set(mediaId, Date.now() + FAILURE_COOLDOWN_MS);
-        // eslint-disable-next-line no-console
+
         console.warn('peaks_meta failed:', err);
         return null;
       }
@@ -460,7 +460,7 @@ class PeaksCache {
       // burn CPU re-requesting the same broken combination every
       // frame, but don't bump version (no new data for consumers).
       this.markFailure(key);
-      // eslint-disable-next-line no-console
+
       console.warn('peaks_for_clip failed:', err);
       return null;
     }

@@ -107,11 +107,7 @@
 
   <div class="compose">
     <input class="author" type="text" placeholder="Name" bind:value={author} disabled={busy} />
-    <textarea
-      placeholder="Comment at the playhead…"
-      rows="2"
-      bind:value={draft}
-      disabled={busy}
+    <textarea placeholder="Comment at the playhead…" rows="2" bind:value={draft} disabled={busy}
     ></textarea>
     <button onclick={add} disabled={busy || !draft.trim()}>＋ Comment</button>
   </div>
@@ -127,7 +123,9 @@
     {#each visible as c (c.id)}
       <div class="comment" class:resolved={c.resolved}>
         <div class="crow">
-          <button class="ts" title="Jump to this time" onclick={() => jump(c)}>{fmtTime(c.timeline_ms)}</button>
+          <button class="ts" title="Jump to this time" onclick={() => jump(c)}
+            >{fmtTime(c.timeline_ms)}</button
+          >
           <span class="who">{c.author}</span>
           <span class="when">{fmtWhen(c.created_unix)}</span>
           <span class="spacer"></span>
@@ -160,7 +158,9 @@
       </div>
     {/each}
   </div>
-  <div class="hint">Comments travel in the .vance project — share the file to share the review.</div>
+  <div class="hint">
+    Comments travel in the .vance project — share the file to share the review.
+  </div>
 </div>
 
 <style>

@@ -13,12 +13,7 @@
    * Used both in first-run onboarding and as an anytime Settings panel, so a
    * user who declines at setup can add them later.
    */
-  import {
-    aiToolStatus,
-    aiPythonAvailable,
-    installAiTool,
-    type AiToolStatus
-  } from '$lib/ipc';
+  import { aiToolStatus, installAiTool, type AiToolStatus } from '$lib/ipc';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
   let {
@@ -29,7 +24,6 @@
   }: { embedded?: boolean; onChange?: () => void } = $props();
 
   let tools = $state<AiToolStatus[]>([]);
-  let pythonOk = $state(true);
   let installing = $state<string | null>(null);
   let queue = $state<string[]>([]);
   let errors = $state<Record<string, string>>({});
@@ -92,7 +86,7 @@
 
   async function refresh() {
     try {
-      [tools, pythonOk] = await Promise.all([aiToolStatus(), aiPythonAvailable()]);
+      tools = await aiToolStatus();
     } catch (e) {
       errors = { ...errors, _load: String(e) };
     } finally {
@@ -153,8 +147,8 @@
   {#if !embedded}<div class="head">AI tools</div>{/if}
 
   <p class="lead">
-    Optional AI features. Add the ones you want — Vance keeps them in its own
-    folder, so nothing else on your computer changes.
+    Optional AI features. Add the ones you want — Vance keeps them in its own folder, so nothing
+    else on your computer changes.
   </p>
 
   {#if errors._load}<div class="err">{errors._load}</div>{/if}
@@ -193,8 +187,8 @@
   </div>
 
   <div class="hint foot">
-    Add as many as you want — they download one at a time in the background (a few
-    minutes each; the downloads are large). You can keep working meanwhile.
+    Add as many as you want — they download one at a time in the background (a few minutes each; the
+    downloads are large). You can keep working meanwhile.
   </div>
 </div>
 
@@ -214,8 +208,8 @@
         {#if queue.length > 0}<span> · {queue.length} more queued</span>{/if}
       </div>
       <div class="prog-note">
-        Large downloads — this can take several minutes. You can leave this open, or
-        close setup and it keeps going in the background.
+        Large downloads — this can take several minutes. You can leave this open, or close setup and
+        it keeps going in the background.
       </div>
     </div>
   </div>
@@ -242,9 +236,6 @@
     margin: 0;
     opacity: 0.8;
     line-height: 1.45;
-  }
-  .warn {
-    color: #e0a458;
   }
   .rows {
     display: flex;
@@ -276,13 +267,6 @@
   }
   .name {
     font-weight: 600;
-  }
-  .method {
-    font-size: 10px;
-    opacity: 0.5;
-    margin-left: 6px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
   }
   .sub {
     opacity: 0.7;

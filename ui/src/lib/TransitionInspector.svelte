@@ -24,7 +24,10 @@
 
   let plugins = $state<WasmPlugin[] | null>(null);
   $effect(() => {
-    if (plugins === null) void listWasmPlugins().then((p) => (plugins = p)).catch(() => (plugins = []));
+    if (plugins === null)
+      void listWasmPlugins()
+        .then((p) => (plugins = p))
+        .catch(() => (plugins = []));
   });
 
   // The transition (if any) at the cut immediately after this clip.
@@ -70,7 +73,9 @@
     <div class="mb-1 flex items-center justify-between text-[11px] uppercase tracking-wider">
       <span class="text-vance-muted">Transition</span>
       <span class="text-vance-fg font-mono text-[10px]">
-        {transition.kind === 'dissolve' ? 'Dissolve' : (transition.kind.slice(5) ?? transition.kind)}
+        {transition.kind === 'dissolve'
+          ? 'Dissolve'
+          : (transition.kind.slice(5) ?? transition.kind)}
         · {transition.duration_seconds.toFixed(2)}s
       </span>
     </div>
@@ -95,7 +100,8 @@
               step={(param.max - param.min) / 1000 || 0.001}
               value={currentValue(param.key, param.default)}
               class="flex-1"
-              onchange={(e) => setParam(param.key, parseFloat((e.target as HTMLInputElement).value))}
+              onchange={(e) =>
+                setParam(param.key, parseFloat((e.target as HTMLInputElement).value))}
             />
             <span class="text-vance-fg w-12 text-right">
               {currentValue(param.key, param.default).toFixed(3)}
