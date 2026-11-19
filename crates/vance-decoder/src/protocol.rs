@@ -201,12 +201,12 @@ pub enum PixelFormat {
 impl PixelFormat {
     /// Number of bytes for a frame of this format at `width` × `height`.
     pub fn frame_size(self, width: u32, height: u32) -> usize {
-        match self {
-            // 12 bpp, 1 byte/sample.
-            PixelFormat::Yuv420P | PixelFormat::Nv12 => width as usize * height as usize * 3 / 2,
-            // 4:2:0 with 2 bytes/sample → 24 bpp.
-            PixelFormat::Yuv420P10Le => width as usize * height as usize * 3,
-        }
+        // 4:2:0: a full-size luma plane plus two chroma planes (planar) or one
+        // interleaved UV plane (NV12) of ceil(w/2) x ceil(h/2) samples each,
+        // so odd sizes round chroma UP (w*h*3/2 would come out short).
+        let luma = width as usize * height as usize;
+        let chroma = width.div_ceil(2) as usize * height.div_ceil(2) as usize;
+        (luma + 2 * chroma) * self.bytes_per_sample()
     }
 
     /// Bytes per sample on the wire (1 for 8-bit, 2 for 10/16-bit).
@@ -280,6 +280,20 @@ mod tests {
         assert_eq!(PixelFormat::Yuv420P.bytes_per_sample(), 1);
         // 4K 10-bit ≈ 23.7 MiB — exceeds the old 16 MiB IPC cap (raised).
         assert_eq!(PixelFormat::Yuv420P10Le.frame_size(3840, 2160), 24_883_200);
+    }
+
+    #[test]
+    fn pixel_format_size_odd_dimensions() {
+        // Chroma is ceil(w/2) x ceil(h/2): 161x91 → Y 14_651 + 2 × (81 × 46).
+        assert_eq!(
+            PixelFormat::Yuv420P.frame_size(161, 91),
+            14_651 + 2 * 81 * 46
+        );
+        assert_eq!(PixelFormat::Nv12.frame_size(161, 91), 14_651 + 2 * 81 * 46);
+        assert_eq!(
+            PixelFormat::Yuv420P10Le.frame_size(161, 91),
+            2 * (14_651 + 2 * 81 * 46)
+        );
     }
 
     #[test]

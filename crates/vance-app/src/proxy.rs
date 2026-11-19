@@ -350,6 +350,8 @@ fn yuv_or_nv12_to_rgba(
 ) -> Vec<u8> {
     let w = frame.width as usize;
     let h = frame.height as usize;
+    // 4:2:0 chroma has ceil(h/2) rows: an odd height's last row still has one.
+    let ch = h.div_ceil(2);
     let mut out = vec![0u8; pixel_count_rgba];
     match frame.pixel_format {
         PixelFormat::Yuv420P => {
@@ -358,9 +360,9 @@ fn yuv_or_nv12_to_rgba(
             let stride_v = frame.strides[2] as usize;
             let y_plane = &frame.bytes[..stride_y * h];
             let u_off = stride_y * h;
-            let u_plane = &frame.bytes[u_off..u_off + stride_u * (h / 2)];
-            let v_off = u_off + stride_u * (h / 2);
-            let v_plane = &frame.bytes[v_off..v_off + stride_v * (h / 2)];
+            let u_plane = &frame.bytes[u_off..u_off + stride_u * ch];
+            let v_off = u_off + stride_u * ch;
+            let v_plane = &frame.bytes[v_off..v_off + stride_v * ch];
             for y in 0..h {
                 for x in 0..w {
                     let y_b = y_plane[y * stride_y + x] as f32;
@@ -382,10 +384,10 @@ fn yuv_or_nv12_to_rgba(
             let su = frame.strides[1] as usize;
             let sv = frame.strides[2] as usize;
             let y_bytes = sy * 2 * h;
-            let u_bytes = su * 2 * (h / 2);
+            let u_bytes = su * 2 * ch;
             let y_plane = &frame.bytes[..y_bytes];
             let u_plane = &frame.bytes[y_bytes..y_bytes + u_bytes];
-            let v_plane = &frame.bytes[y_bytes + u_bytes..y_bytes + u_bytes + sv * 2 * (h / 2)];
+            let v_plane = &frame.bytes[y_bytes + u_bytes..y_bytes + u_bytes + sv * 2 * ch];
             let s16 = |plane: &[u8], idx: usize| -> f32 {
                 let b = idx * 2;
                 (u16::from_le_bytes([plane[b], plane[b + 1]]) >> 2) as f32
@@ -409,7 +411,7 @@ fn yuv_or_nv12_to_rgba(
             let stride_uv = frame.strides[1] as usize;
             let y_plane = &frame.bytes[..stride_y * h];
             let uv_off = stride_y * h;
-            let uv_plane = &frame.bytes[uv_off..uv_off + stride_uv * (h / 2)];
+            let uv_plane = &frame.bytes[uv_off..uv_off + stride_uv * ch];
             for y in 0..h {
                 for x in 0..w {
                     let y_b = y_plane[y * stride_y + x] as f32;
@@ -520,6 +522,55 @@ mod tests {
             assert_eq!(chunk[1], 128);
             assert_eq!(chunk[2], 128);
             assert_eq!(chunk[3], 255);
+        }
+    }
+
+    #[test]
+    fn odd_dimension_frames_convert_in_every_format() {
+        // 4:2:0 chroma is ceil(w/2) x ceil(h/2): the last (odd) row and column
+        // must read the final chroma sample, not run past the plane.
+        let (w, h) = (5u32, 3u32);
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let grey = |n: u32, bytes_per_sample: usize| -> Vec<u8> {
+            if bytes_per_sample == 2 {
+                std::iter::repeat_n((128u16 << 2).to_le_bytes(), n as usize)
+                    .flatten()
+                    .collect()
+            } else {
+                vec![128u8; n as usize]
+            }
+        };
+        let frames = [
+            (
+                PixelFormat::Yuv420P,
+                vec![w, cw, cw],
+                grey(w * h + 2 * cw * ch, 1),
+            ),
+            (
+                PixelFormat::Nv12,
+                vec![w, cw * 2],
+                grey(w * h + 2 * cw * ch, 1),
+            ),
+            (
+                PixelFormat::Yuv420P10Le,
+                vec![w, cw, cw],
+                grey(w * h + 2 * cw * ch, 2),
+            ),
+        ];
+        for (pixel_format, strides, bytes) in frames {
+            let frame = vance_decoder::protocol::FrameData {
+                pts: 0,
+                width: w,
+                height: h,
+                pixel_format,
+                strides,
+                bytes,
+            };
+            let out = yuv_or_nv12_to_rgba(&frame, (w * h * 4) as usize);
+            assert!(
+                out.chunks_exact(4).all(|px| px == [128, 128, 128, 255]),
+                "{pixel_format:?}: odd frame converted wrong: {out:?}"
+            );
         }
     }
 }

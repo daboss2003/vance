@@ -410,6 +410,36 @@ fn renders_solid_red_yuv420p() {
 }
 
 #[test]
+fn odd_dimension_frames_upload_and_render() {
+    // 4:2:0 chroma planes are ceil(w/2) x ceil(h/2), so an odd-sized frame
+    // carries more bytes than w*h*3/2. Every format must accept a correctly
+    // built odd frame instead of rejecting it as malformed.
+    let (w, h) = (161u32, 91u32);
+    let expected = yuv709_limited_to_srgb_byte(63, 102, 240);
+    let mut ten_bit = solid_yuv420p(w, h, 0, 0, 0);
+    ten_bit.pixel_format = PixelFormat::Yuv420P10Le;
+    ten_bit.bytes = [
+        (w * h, 63u16 << 2),
+        (w.div_ceil(2) * h.div_ceil(2), 102 << 2),
+    ]
+    .into_iter()
+    .chain([(w.div_ceil(2) * h.div_ceil(2), 240 << 2)])
+    .flat_map(|(n, code)| std::iter::repeat_n(code.to_le_bytes(), n as usize).flatten())
+    .collect();
+    for (label, frame) in [
+        ("yuv420p", solid_yuv420p(w, h, 63, 102, 240)),
+        ("nv12", solid_nv12(w, h, 63, 102, 240)),
+        ("yuv420p10le", ten_bit),
+    ] {
+        let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
+        r.upload_frame(&frame)
+            .unwrap_or_else(|e| panic!("{label} {w}x{h} upload: {e:?}"));
+        let buf = r.render_to_rgba_buffer(w, h).expect("render");
+        assert_rgb_close(center(&buf, w, h), expected, 3, label);
+    }
+}
+
+#[test]
 fn nv12_matches_yuv420p() {
     // Same color, two formats — should produce the same RGB to within tolerance.
     let (y, u, v) = (140u8, 90u8, 200u8);
