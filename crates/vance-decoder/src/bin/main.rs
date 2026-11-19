@@ -56,6 +56,67 @@ struct OpenContext {
     /// Reusable destination frame for `av_hwframe_transfer_data`.
     /// `None` when not using HW decode.
     sw_dest_frame: Option<ffmpeg::frame::Video>,
+    /// Built on the first decoded frame whose format isn't `info.pixel_format`.
+    converter: Option<FrameConverter>,
+}
+
+/// Cached swscale pass from a decoded frame's non-wire pixel format (4:2:2,
+/// 4:4:4, RGB, 12-bit, ...) to the wire format chosen at open. Rebuilt only
+/// when the source format or size changes.
+struct FrameConverter {
+    sws: ffmpeg::software::scaling::Context,
+    /// (format, width, height) of the source frames `sws` was built for.
+    src: (ffmpeg::format::Pixel, u32, u32),
+    /// Reused destination frame, allocated once in the wire format.
+    out: ffmpeg::frame::Video,
+}
+
+// SAFETY: the SwsContext is owned exclusively by this converter, which lives
+// in an `OpenContext` and is only used by the one thread that currently owns
+// that context (the main thread, or the decode thread during a stream).
+unsafe impl Send for FrameConverter {}
+
+impl FrameConverter {
+    fn new(src: (ffmpeg::format::Pixel, u32, u32), target: PixelFormat) -> Result<Self, String> {
+        use ffmpeg::software::scaling::{Context, Flags};
+        let (format, width, height) = src;
+        let dst = wire_to_ffmpeg(target);
+        // FULL_CHR_H_INP: without it, swscale's RGB input path pairs pixels
+        // for chroma and, on odd widths, averages the last column with one
+        // pixel past the edge (a tinted right-hand column). It has no effect
+        // on YUV input.
+        let flags = Flags::BILINEAR | Flags::FULL_CHR_H_INP;
+        let mut sws = Context::get(format, width, height, dst, width, height, flags)
+            .map_err(|e| format!("swscale {format:?} -> {dst:?}: {e}"))?;
+        // Intentional: the same table and the same range flag on both sides,
+        // whatever the source's tags say. Between YUV formats swscale then
+        // changes only chroma subsampling and bit depth: the source's matrix
+        // and range (incl. full-range yuvj*) pass through untouched, exactly
+        // as they do for the natively carried formats. For RGB sources (PNG,
+        // ...) the destination side makes it a standard Rec.709 limited-range
+        // conversion, which is what the renderer assumes for YUV input. The
+        // return value is ignored: swscale returns -1 for a YUV->YUV context
+        // even after it has applied the settings.
+        unsafe {
+            let bt709 = ffmpeg::sys::sws_getCoefficients(ffmpeg::sys::SWS_CS_ITU709);
+            ffmpeg::sys::sws_setColorspaceDetails(
+                sws.as_mut_ptr(),
+                bt709,
+                0,
+                bt709,
+                0,
+                0,
+                1 << 16,
+                1 << 16,
+            );
+        }
+        eprintln!("[decoder] converting {format:?} {width}x{height} -> {dst:?} (swscale)");
+        Ok(Self {
+            sws,
+            src,
+            out: ffmpeg::frame::Video::new(dst, width, height),
+        })
+    }
 }
 
 /// Decode-thread bookkeeping held by the main thread for the lifetime of a
@@ -161,7 +222,7 @@ impl State {
         // Detect the source bit depth from the stream's declared pixel
         // format BEFORE choosing a decode path. A >8-bit source forces
         // software decode (the HW/NV12 path can't carry 10-bit correctly).
-        let src_pix_fmt: i32 = unsafe { (*stream.parameters().as_ptr()).format };
+        let src_pix_fmt = ffmpeg::format::Pixel::from(unsafe { (*codec_ctx.as_ptr()).pix_fmt });
         let high_bit_source = is_high_bit_source(src_pix_fmt);
         // HDR transfer hint from the stream's color VUI (for auto-tagging the
         // clip's input color space on import).
@@ -193,12 +254,12 @@ impl State {
 
         // If HW decode is in play, decoded frames are AV_PIX_FMT_VIDEOTOOLBOX
         // and we transfer them to NV12. Report NV12 in StreamInfo so the
-        // renderer picks the right path. Otherwise, report whatever the
-        // SW decoder outputs.
+        // renderer picks the right path. Otherwise, report the SW decoder's
+        // format if the wire carries it, else the format it's converted to.
         let pixel_format = if using_hw {
             PixelFormat::Nv12
         } else {
-            map_pixel_format(decoder.format()).map_err(OpenError::UnsupportedPixelFormat)?
+            software_wire_format(decoder.format()).map_err(OpenError::UnsupportedPixelFormat)?
         };
         let sw_dest_frame = if using_hw {
             Some(ffmpeg::frame::Video::empty())
@@ -237,6 +298,7 @@ impl State {
             info: info.clone(),
             _hw_device: hw_device,
             sw_dest_frame,
+            converter: None,
         });
         Ok(info)
     }
@@ -367,6 +429,7 @@ fn decode_one_at_or_after(ctx: &mut OpenContext, target_pts: i64) -> Result<Fram
                     return materialize_frame(
                         &decoded,
                         ctx.sw_dest_frame.as_mut(),
+                        &mut ctx.converter,
                         ctx.info.pixel_format,
                     );
                 }
@@ -383,6 +446,7 @@ fn decode_one_at_or_after(ctx: &mut OpenContext, target_pts: i64) -> Result<Fram
                     return materialize_frame(
                         &decoded,
                         ctx.sw_dest_frame.as_mut(),
+                        &mut ctx.converter,
                         ctx.info.pixel_format,
                     );
                 }
@@ -393,18 +457,20 @@ fn decode_one_at_or_after(ctx: &mut OpenContext, target_pts: i64) -> Result<Fram
 }
 
 /// Convert a decoded `Video` frame into wire `FrameData`, transferring
-/// hardware surfaces to NV12 system memory if needed.
+/// hardware surfaces to system memory and converting any frame whose format
+/// isn't `pixel_format` (the wire format chosen at open) via `converter`.
 ///
-/// Takes split borrows (sw_dest_frame, pixel_format) instead of `&mut ctx`
-/// so callers can hold a mutable borrow on `ctx.input` (the packets
-/// iterator) at the same time.
+/// Takes split borrows (sw_dest_frame, converter, pixel_format) instead of
+/// `&mut ctx` so callers can hold a mutable borrow on `ctx.input` (the
+/// packets iterator) at the same time.
 fn materialize_frame(
     decoded: &ffmpeg::frame::Video,
     sw_dest_frame: Option<&mut ffmpeg::frame::Video>,
+    converter: &mut Option<FrameConverter>,
     pixel_format: PixelFormat,
 ) -> Result<FrameData, String> {
     let format_i32 = unsafe { (*decoded.as_ptr()).format };
-    if hwaccel::is_hardware_pixel_format(format_i32) {
+    let sw_frame: &ffmpeg::frame::Video = if hwaccel::is_hardware_pixel_format(format_i32) {
         let dest = sw_dest_frame.ok_or("got HW frame but no sw_dest_frame allocated")?;
         unsafe {
             hwaccel::transfer_to_sw(
@@ -414,10 +480,35 @@ fn materialize_frame(
             let pts = (*decoded.as_ptr()).pts;
             (*dest.as_mut_ptr()).pts = pts;
         }
-        frame_to_payload(dest, pixel_format)
+        dest
     } else {
-        frame_to_payload(decoded, pixel_format)
+        decoded
+    };
+    if map_pixel_format(sw_frame.format()).ok() == Some(pixel_format) {
+        frame_to_payload(sw_frame, pixel_format)
+    } else {
+        let converted = convert_frame(converter, sw_frame, pixel_format)?;
+        frame_to_payload(converted, pixel_format)
     }
+}
+
+/// Run `frame` through the cached converter (building or rebuilding it if
+/// the source format/size differs) and return the converted frame.
+fn convert_frame<'c>(
+    slot: &'c mut Option<FrameConverter>,
+    frame: &ffmpeg::frame::Video,
+    target: PixelFormat,
+) -> Result<&'c ffmpeg::frame::Video, String> {
+    let src = (frame.format(), frame.width(), frame.height());
+    let conv = match slot.take() {
+        Some(c) if c.src == src => slot.insert(c),
+        _ => slot.insert(FrameConverter::new(src, target)?),
+    };
+    conv.sws
+        .run(frame, &mut conv.out)
+        .map_err(|e| format!("swscale: {e}"))?;
+    conv.out.set_pts(frame.pts());
+    Ok(&conv.out)
 }
 
 /// Background decode loop. Reads packets, sends decoded frames to `tx`.
@@ -470,6 +561,7 @@ fn decode_stream_loop(
                 let payload = match materialize_frame(
                     &decoded,
                     ctx.sw_dest_frame.as_mut(),
+                    &mut ctx.converter,
                     ctx.info.pixel_format,
                 ) {
                     Ok(p) => p,
@@ -503,8 +595,12 @@ fn decode_stream_loop(
                 if pts < from_pts {
                     continue;
                 }
-                match materialize_frame(&decoded, ctx.sw_dest_frame.as_mut(), ctx.info.pixel_format)
-                {
+                match materialize_frame(
+                    &decoded,
+                    ctx.sw_dest_frame.as_mut(),
+                    &mut ctx.converter,
+                    ctx.info.pixel_format,
+                ) {
                     Ok(p) => {
                         if tx.send(Some(DecodedItem::Frame(p))).is_err() {
                             break 'outer;
@@ -536,6 +632,8 @@ fn ffmpeg_version_string() -> String {
     }
 }
 
+/// The wire format for a decoded format the wire carries as-is (no
+/// conversion pass). Every other format goes through `FrameConverter`.
 fn map_pixel_format(pf: ffmpeg::format::Pixel) -> Result<PixelFormat, String> {
     use ffmpeg::format::Pixel as P;
     match pf {
@@ -544,6 +642,33 @@ fn map_pixel_format(pf: ffmpeg::format::Pixel) -> Result<PixelFormat, String> {
         // 10-bit 4:2:0 (HEVC Main10 / HDR PQ-HLG) → carried 10-bit.
         P::YUV420P10LE => Ok(PixelFormat::Yuv420P10Le),
         other => Err(format!("{other:?}")),
+    }
+}
+
+/// The wire format a software decoder outputting `decoded` delivers: the
+/// format itself when the wire carries it natively, else the 4:2:0 format
+/// it's converted to (10-bit for a >8-bit source so ProRes / DNxHR / 4:2:2
+/// HEVC stay 10-bit, else 8-bit). Fails only for formats swscale can't read.
+fn software_wire_format(decoded: ffmpeg::format::Pixel) -> Result<PixelFormat, String> {
+    if let Ok(native) = map_pixel_format(decoded) {
+        return Ok(native);
+    }
+    if !ffmpeg::software::scaling::support::input(decoded) {
+        return Err(format!("{decoded:?}"));
+    }
+    Ok(if is_high_bit_source(decoded) {
+        PixelFormat::Yuv420P10Le
+    } else {
+        PixelFormat::Yuv420P
+    })
+}
+
+fn wire_to_ffmpeg(pf: PixelFormat) -> ffmpeg::format::Pixel {
+    use ffmpeg::format::Pixel as P;
+    match pf {
+        PixelFormat::Yuv420P => P::YUV420P,
+        PixelFormat::Nv12 => P::NV12,
+        PixelFormat::Yuv420P10Le => P::YUV420P10LE,
     }
 }
 
@@ -560,16 +685,17 @@ fn color_transfer_hint(trc: i32) -> vance_decoder::protocol::ColorTransferHint {
     }
 }
 
-/// Whether a source pixel format is >8-bit. We force SOFTWARE decode for
-/// these: VideoToolbox returns a P010 surface for a Main10 source but the HW
-/// path unconditionally reports/handles NV12, which would corrupt the frame.
-/// Software decode yields planar `yuv420p10le` we carry losslessly.
-fn is_high_bit_source(src_pix_fmt: i32) -> bool {
-    use ffmpeg::sys::AVPixelFormat::*;
-    src_pix_fmt == AV_PIX_FMT_YUV420P10LE as i32
-        || src_pix_fmt == AV_PIX_FMT_YUV420P10BE as i32
-        || src_pix_fmt == AV_PIX_FMT_P010LE as i32
-        || src_pix_fmt == AV_PIX_FMT_YUV420P12LE as i32
+/// Whether a source pixel format has more than 8 bits per component (10-bit
+/// HEVC, 10-bit 4:2:2 ProRes / DNxHR, 12-bit 4:4:4, P010, 16-bit RGB, ...).
+/// We force SOFTWARE decode for these: VideoToolbox returns a >8-bit surface
+/// but the HW path unconditionally reports/handles NV12, which would corrupt
+/// the frame or drop it to 8 bits. Software decode keeps the depth, carried
+/// as `yuv420p10le` (natively or via `FrameConverter`).
+fn is_high_bit_source(pf: ffmpeg::format::Pixel) -> bool {
+    // SAFETY: `descriptor()` only returns non-null pointers into libavutil's
+    // static descriptor table.
+    pf.descriptor()
+        .is_some_and(|d| unsafe { (*d.as_ptr()).comp[0].depth } > 8)
 }
 
 fn frame_to_payload(
@@ -605,9 +731,13 @@ fn frame_to_payload(
         } else {
             height.div_ceil(2)
         };
-        // Width in SAMPLES for this plane.
-        let plane_width = if plane == 0 || expected_pf == PixelFormat::Nv12 && plane == 1 {
+        // Width in SAMPLES for this plane. NV12's UV plane interleaves one U
+        // and one V per chroma column, so it's 2 * ceil(w/2) — one more than
+        // `width` when the width is odd.
+        let plane_width = if plane == 0 {
             width
+        } else if expected_pf == PixelFormat::Nv12 {
+            width.div_ceil(2) * 2
         } else {
             width.div_ceil(2)
         };
@@ -631,4 +761,39 @@ fn frame_to_payload(
         strides,
         bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ffmpeg::format::Pixel as P;
+
+    #[test]
+    fn high_bit_detection_uses_component_depth() {
+        for pf in [P::YUV422P10LE, P::YUV444P12LE, P::P010LE, P::YUV420P10LE] {
+            assert!(is_high_bit_source(pf), "{pf:?} should be high-bit");
+        }
+        for pf in [P::YUV420P, P::NV12, P::YUV444P, P::RGB24, P::None] {
+            assert!(!is_high_bit_source(pf), "{pf:?} should be 8-bit");
+        }
+    }
+
+    #[test]
+    fn software_wire_format_keeps_native_and_converts_the_rest() {
+        let cases = [
+            (P::YUV420P, PixelFormat::Yuv420P),
+            (P::YUVJ420P, PixelFormat::Yuv420P),
+            (P::NV12, PixelFormat::Nv12),
+            (P::YUV420P10LE, PixelFormat::Yuv420P10Le),
+            (P::YUV422P10LE, PixelFormat::Yuv420P10Le),
+            (P::YUV444P12LE, PixelFormat::Yuv420P10Le),
+            (P::YUV444P, PixelFormat::Yuv420P),
+            (P::YUVJ422P, PixelFormat::Yuv420P),
+            (P::RGB24, PixelFormat::Yuv420P),
+        ];
+        for (src, wire) in cases {
+            assert_eq!(software_wire_format(src), Ok(wire), "{src:?}");
+        }
+        assert!(software_wire_format(P::None).is_err());
+    }
 }
