@@ -1,23 +1,20 @@
 [alias]
 xtask = "run --quiet --package xtask --"
 
-# FFmpeg discovery on macOS (Homebrew, Apple Silicon).
-#
-# `ffmpeg-the-third` 3.x supports FFmpeg up to 7.1, but `brew install ffmpeg`
-# now ships 8.x (which removed `avfft.h` and breaks the bindings). We install
-# the side-by-side `ffmpeg@7` formula and point pkg-config at it here.
-#
-# Linux + Windows use system / vcpkg paths; covered in CI matrix later.
 [env]
 # FFmpeg discovery on macOS (Homebrew).
 #
 # `ffmpeg-the-third` 3.x supports FFmpeg up to 7.1; brew's default `ffmpeg`
-# now ships 8.x (which removed `avfft.h` and breaks the bindings). We use
-# the side-by-side `brew install ffmpeg@7` formula. `FFMPEG_DIR` overrides
-# pkg-config detection in the sys crate's build script.
+# now ships 8.x (which removed `avfft.h` and breaks the bindings). We use the
+# side-by-side, keg-only `brew install ffmpeg@7` formula and point pkg-config
+# at it. PKG_CONFIG_PATH is searched BEFORE pkg-config's default dirs, so
+# ffmpeg@7 wins over brew's 8.x. Both the Apple Silicon (/opt/homebrew) and
+# Intel (/usr/local) prefixes are listed; a missing one is simply skipped.
 #
-# Apple Silicon path is /opt/homebrew/opt; Intel Mac is /usr/local/opt.
-# Cargo's [env] is global, not per-target, so we set both via the env
-# resolution order — whichever directory exists wins.
-FFMPEG_DIR = { value = "/opt/homebrew/opt/ffmpeg@7", force = true }
+# Intentional: no FFMPEG_DIR here. Cargo's [env] applies on EVERY platform, so
+# a forced macOS FFMPEG_DIR broke the build on Linux and Windows (the sys
+# crate read headers from a nonexistent dir: "found avcodec version (0, 0)").
+# Linux finds FFmpeg via the system pkg-config dirs; Windows sets FFMPEG_DIR in
+# its own environment. On those platforms the macOS entries below don't exist
+# and are ignored.
 PKG_CONFIG_PATH = { value = "/opt/homebrew/opt/ffmpeg@7/lib/pkgconfig:/usr/local/opt/ffmpeg@7/lib/pkgconfig", force = true }

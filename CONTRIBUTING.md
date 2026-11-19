@@ -23,7 +23,14 @@ brew install lilv                        # ONLY for `--features lv2` (LV2 plugin
 host with `--features lv2`. The default build doesn't link them, so you can
 skip `brew install lilv` unless you're working on LV2 hosting.
 
-Why `ffmpeg@7`: `ffmpeg-the-third` 3.x (our binding crate) supports FFmpeg up to 7.1. Brew's default `ffmpeg` formula now ships 8.x, which removed headers our bindings need. `.cargo/config.toml` points the build at the side-by-side `ffmpeg@7` install via `FFMPEG_DIR`, so the build "just works" once `ffmpeg@7` is present — no shell setup required.
+Then point the FFmpeg bindings at `ffmpeg@7` once, in your **machine-level** Cargo config (`~/.cargo/config.toml`, not the repo's). The setting applies to plain `cargo`, `cargo xtask` and rust-analyzer alike:
+
+```toml
+[env]
+FFMPEG_DIR = "/opt/homebrew/opt/ffmpeg@7"   # Intel Macs: /usr/local/opt/ffmpeg@7  (= `brew --prefix ffmpeg@7`)
+```
+
+Why: `ffmpeg-the-third` 3.x (our binding crate) supports FFmpeg up to 7.1. Brew's default `ffmpeg` formula ships 8.x, which removed headers the bindings need. On macOS the binding crate's build script puts `/opt/homebrew/lib/pkgconfig` (brew's 8.x) ahead of the repo's `PKG_CONFIG_PATH`, so without `FFMPEG_DIR` it finds 8.x and fails with `fatal error: '/usr/include/libavcodec/avfft.h' file not found`. The repo can't set `FFMPEG_DIR` itself: Cargo's `[env]` applies on every platform, and a macOS path breaks the Linux and Windows builds. If only `ffmpeg@7` is installed (no 8.x), you can skip this step.
 
 ### Windows
 
@@ -39,6 +46,7 @@ sudo apt install build-essential pkg-config libssl-dev curl wget file \
   libgtk-3-dev libwebkit2gtk-4.1-dev librsvg2-dev \
   libayatana-appindicator3-dev libxdo-dev \
   libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavfilter-dev \
+  libswresample-dev libavdevice-dev libasound2-dev ffmpeg \
   libopencolorio-dev
 
 # ONLY for `--features lv2` (LV2 plugin hosting); skip for the default build:
