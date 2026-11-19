@@ -10,12 +10,13 @@
 //! stdin pipes (the CLI only takes one stdin) at the cost of one extra
 //! mux pass per export.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
+use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use vance_encoder::protocol::{
     AudioCodec, AudioConfig, EncoderError, EncoderPreset, EncoderRequest, EncoderResponse,
@@ -291,9 +292,10 @@ fn video_ffmpeg_args(
 /// The encoder for `cfg`. HDR10 overrides the preset with a software HEVC
 /// Main10 path so the mastering metadata + PQ signaling are emitted reliably
 /// (hardware encoders don't accept x265-params); otherwise the preset decides.
+/// `select` picks an H.264 / HEVC encoder that works at `cfg`'s frame format.
 fn video_encoder_choice(
     cfg: &VideoConfig,
-    select: impl FnOnce(VideoCodec) -> Result<Candidate, String>,
+    select: impl FnOnce(VideoCodec, FrameFormat) -> Result<Candidate, String>,
 ) -> Result<VideoEncoderChoice, String> {
     match &cfg.hdr {
         Some(hdr) => Ok(VideoEncoderChoice {
@@ -301,7 +303,7 @@ fn video_encoder_choice(
             pre_input: Vec::new(),
             codec_args: hdr_encode_args(hdr, &cfg.preset),
         }),
-        None => preset_encoder_choice(&cfg.preset, select),
+        None => preset_encoder_choice(&cfg.preset, |codec| select(codec, FrameFormat::of(cfg))),
     }
 }
 
@@ -395,7 +397,7 @@ struct VideoEncoderChoice {
 }
 
 /// Codecs whose encoder is picked at runtime from a candidate list.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum VideoCodec {
     H264,
     Hevc,
@@ -414,6 +416,38 @@ impl VideoCodec {
             VideoCodec::H264 => "libx264",
             VideoCodec::Hevc => "libx265",
         }
+    }
+}
+
+/// The frame size and rate an export encodes at. Hardware encoders have size
+/// limits (an M1's h264_videotoolbox refuses frames wider than 4096), so a
+/// candidate is probed, and its pick cached, at the export's own format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FrameFormat {
+    width: u32,
+    height: u32,
+    frame_rate_num: u32,
+    frame_rate_den: u32,
+}
+
+impl FrameFormat {
+    fn of(cfg: &VideoConfig) -> Self {
+        FrameFormat {
+            width: cfg.width,
+            height: cfg.height,
+            frame_rate_num: cfg.frame_rate_num,
+            frame_rate_den: cfg.frame_rate_den,
+        }
+    }
+}
+
+impl fmt::Display for FrameFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}x{} at {}/{} fps",
+            self.width, self.height, self.frame_rate_num, self.frame_rate_den
+        )
     }
 }
 
@@ -554,27 +588,29 @@ fn openh264_bitrate_kbps(crf: u8) -> u32 {
 }
 
 /// The first candidate that this ffmpeg lists (`available`) AND that passes
-/// `probe` (a real test encode): an encoder can be compiled into ffmpeg yet
-/// unusable on this machine (no GPU, driver or device node).
+/// `probe` (a real test encode at `format`): an encoder can be compiled into
+/// ffmpeg yet unusable on this machine (no GPU, driver or device node) or at
+/// this frame size.
 fn select_encoder(
     codec: VideoCodec,
+    format: FrameFormat,
     candidates: &[Candidate],
     available: &HashSet<String>,
-    mut probe: impl FnMut(&Candidate) -> bool,
+    mut probe: impl FnMut(&Candidate, FrameFormat) -> bool,
 ) -> Result<Candidate, String> {
     let mut tried = Vec::with_capacity(candidates.len());
     for c in candidates {
         if !available.contains(c.name) {
             tried.push(format!("{} (not in this ffmpeg build)", c.name));
-        } else if probe(c) {
+        } else if probe(c, format) {
             return Ok(*c);
         } else {
             tried.push(format!("{} (test encode failed)", c.name));
         }
     }
     Err(format!(
-        "No working {} encoder found (tried: {}). Install an ffmpeg build with {} or a \
-         supported hardware encoder.",
+        "No working {} encoder found for {format} (tried: {}). Install an ffmpeg build with \
+         {} or a supported hardware encoder.",
         codec.label(),
         tried.join(", "),
         codec.software_encoder()
@@ -584,30 +620,55 @@ fn select_encoder(
 /// CRF the probe encodes at. Any in-range value works: the probe checks that
 /// the encoder opens and encodes a frame, not its quality.
 const PROBE_CRF: u8 = 23;
-/// A wedged hardware driver must not hang the export's Open forever.
+/// A wedged hardware driver must not hang the export's Open forever. This is
+/// the limit for frames up to 4K UHD; see [`probe_timeout`].
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// The encoder this sidecar uses for `codec`, chosen at most once per
-/// process (listing + probe encodes cost real time) and logged once.
-fn selected_encoder(codec: VideoCodec) -> Result<Candidate, String> {
-    static H264: OnceLock<Result<Candidate, String>> = OnceLock::new();
-    static HEVC: OnceLock<Result<Candidate, String>> = OnceLock::new();
-    let cell = match codec {
-        VideoCodec::H264 => &H264,
-        VideoCodec::Hevc => &HEVC,
-    };
-    cell.get_or_init(|| {
+/// Encoder picks per (codec, frame format). A pick is reused only for the
+/// format it was probed at: hardware that handles 1080p can refuse 8K.
+struct SelectionCache(Mutex<BTreeMap<(VideoCodec, FrameFormat), Result<Candidate, String>>>);
+
+impl SelectionCache {
+    const fn new() -> Self {
+        SelectionCache(Mutex::new(BTreeMap::new()))
+    }
+
+    /// The cached pick for `codec` at `format`, running `select` on a miss.
+    /// Failures are cached too: probing again would fail the same way.
+    fn get_or_select(
+        &self,
+        codec: VideoCodec,
+        format: FrameFormat,
+        select: impl FnOnce() -> Result<Candidate, String>,
+    ) -> Result<Candidate, String> {
+        // Intentional: the lock is held across `select` (seconds of probe
+        // encodes). The sidecar handles one request at a time, and a second
+        // caller for the same format should wait for the pick, not re-probe.
+        let mut picks = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        picks.entry((codec, format)).or_insert_with(select).clone()
+    }
+}
+
+/// The encoder this sidecar uses for `codec` at `format`, chosen at most once
+/// per process and format (listing + probe encodes cost real time) and logged
+/// once.
+fn selected_encoder(codec: VideoCodec, format: FrameFormat) -> Result<Candidate, String> {
+    static PICKS: SelectionCache = SelectionCache::new();
+    PICKS.get_or_select(codec, format, || {
         let picked = list_ffmpeg_encoders().and_then(|available| {
             let candidates = candidates_for(std::env::consts::OS, codec);
-            select_encoder(codec, &candidates, &available, probe_encoder)
+            select_encoder(codec, format, &candidates, &available, probe_encoder)
         });
         match &picked {
-            Ok(c) => eprintln!("[encoder] {} encoder: {}", codec.label(), c.name),
+            Ok(c) => eprintln!(
+                "[encoder] {} encoder for {format}: {}",
+                codec.label(),
+                c.name
+            ),
             Err(e) => eprintln!("[encoder] {e}"),
         }
         picked
     })
-    .clone()
 }
 
 /// Encoder names compiled into the `ffmpeg` on PATH.
@@ -635,35 +696,48 @@ fn parse_encoder_list(listing: &str) -> HashSet<String> {
         .collect()
 }
 
-fn probe_encoder(candidate: &Candidate) -> bool {
-    match run_probe(&probe_args(&candidate.choice(PROBE_CRF))) {
+fn probe_encoder(candidate: &Candidate, format: FrameFormat) -> bool {
+    let args = probe_args(&candidate.choice(PROBE_CRF), format);
+    match run_probe(&args, probe_timeout(format)) {
         Ok(()) => true,
         Err(reason) => {
-            eprintln!("[encoder] {} unusable: {reason}", candidate.name);
+            eprintln!(
+                "[encoder] {} unusable at {format}: {reason}",
+                candidate.name
+            );
             false
         }
     }
 }
 
-/// A one-frame test encode with exactly the args a real export would use.
-fn probe_args(choice: &VideoEncoderChoice) -> Vec<String> {
+/// A one-frame test encode with exactly the codec args, frame size and rate a
+/// real export would use.
+fn probe_args(choice: &VideoEncoderChoice, format: FrameFormat) -> Vec<String> {
     let s = |a: &[&str]| a.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let source = format!(
+        "color=c=black:s={}x{}:r={}/{}",
+        format.width, format.height, format.frame_rate_num, format.frame_rate_den
+    );
     let mut args = s(&["-hide_banner", "-nostdin", "-loglevel", "error"]);
     args.extend(choice.pre_input.iter().cloned());
-    args.extend(s(&[
-        "-f",
-        "lavfi",
-        "-i",
-        "color=c=black:s=256x256:r=30",
-        "-frames:v",
-        "1",
-    ]));
+    args.extend(s(&["-f", "lavfi", "-i", &source, "-frames:v", "1"]));
     args.extend(choice.codec_args.iter().cloned());
     args.extend(s(&["-f", "null", "-"]));
     args
 }
 
-fn run_probe(args: &[String]) -> Result<(), String> {
+/// [`PROBE_TIMEOUT`] scaled by frame area above 4K UHD. A software probe's
+/// time grows with the frame (on an M1, one libx265 frame takes ~1.7 s at 8K
+/// and ~7 s at 16K), so a fixed limit would fail a slower CPU's legitimate
+/// probe and refuse a big export for being big.
+fn probe_timeout(format: FrameFormat) -> Duration {
+    const UHD_AREA: u128 = 3840 * 2160;
+    let area = u128::from(format.width) * u128::from(format.height);
+    let ms = PROBE_TIMEOUT.as_millis() * area / UHD_AREA;
+    Duration::from_millis(u64::try_from(ms).unwrap_or(u64::MAX)).max(PROBE_TIMEOUT)
+}
+
+fn run_probe(args: &[String], timeout: Duration) -> Result<(), String> {
     // stdin / stdout carry this sidecar's IPC frames; the probe must not touch them.
     let mut child = Command::new("ffmpeg")
         .args(args)
@@ -682,7 +756,7 @@ fn run_probe(args: &[String]) -> Result<(), String> {
         }
         text
     });
-    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
@@ -692,7 +766,7 @@ fn run_probe(args: &[String]) -> Result<(), String> {
                 let _ = child.wait();
                 break Err(format!(
                     "test encode timed out after {}s",
-                    PROBE_TIMEOUT.as_secs()
+                    timeout.as_secs()
                 ));
             }
             Err(e) => {
@@ -893,6 +967,16 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
+    /// `width`×`height` at 30 fps.
+    fn at(width: u32, height: u32) -> FrameFormat {
+        FrameFormat {
+            width,
+            height,
+            frame_rate_num: 30,
+            frame_rate_den: 1,
+        }
+    }
+
     fn config(preset: EncoderPreset) -> VideoConfig {
         VideoConfig {
             width: 320,
@@ -926,7 +1010,7 @@ mod tests {
         let candidates = candidates_for("linux", H264);
         let available = listed(&["h264_vaapi", "libx264", "libopenh264"]);
         let mut probed = Vec::new();
-        let picked = select_encoder(H264, &candidates, &available, |c| {
+        let picked = select_encoder(H264, at(1920, 1080), &candidates, &available, |c, _| {
             probed.push(c.name);
             c.name != "h264_vaapi"
         })
@@ -941,16 +1025,173 @@ mod tests {
         let candidates = candidates_for("linux", H264);
         // NVENC isn't in this build, so the first listed hardware encoder wins.
         let available = listed(&["h264_vaapi", "h264_qsv", "libx264"]);
-        let picked = select_encoder(H264, &candidates, &available, |_| true).unwrap();
+        let picked =
+            select_encoder(H264, at(1920, 1080), &candidates, &available, |_, _| true).unwrap();
         assert_eq!(picked.name, "h264_qsv");
+    }
+
+    #[test]
+    fn probe_runs_at_the_export_size_so_8k_falls_back_while_1080p_keeps_hardware() {
+        let candidates = candidates_for("macos", H264);
+        let available = listed(&["h264_videotoolbox", "libx264", "libopenh264"]);
+        let (hd, uhd8k) = (at(1920, 1080), at(7680, 4320));
+        let mut probed = Vec::new();
+        let mut pick = |format| {
+            select_encoder(H264, format, &candidates, &available, |c, seen| {
+                probed.push((c.name, seen));
+                // Like an M1's h264_videotoolbox: nothing wider than 4096.
+                c.family != EncoderFamily::VideoToolbox || seen.width <= 4096
+            })
+            .map(|c| c.name)
+        };
+        assert_eq!(pick(hd), Ok("h264_videotoolbox"));
+        assert_eq!(pick(uhd8k), Ok("libx264"));
+        assert_eq!(
+            probed,
+            [
+                ("h264_videotoolbox", hd),
+                ("h264_videotoolbox", uhd8k),
+                ("libx264", uhd8k)
+            ]
+        );
+    }
+
+    #[test]
+    fn video_encoder_choice_selects_at_the_configs_size_and_rate() {
+        let mut cfg = config(EncoderPreset::Hevc { crf: 28 });
+        (cfg.width, cfg.height) = (7680, 4320);
+        (cfg.frame_rate_num, cfg.frame_rate_den) = (30_000, 1001);
+        let choice = video_encoder_choice(&cfg, |codec, format| {
+            assert_eq!(codec, Hevc);
+            assert_eq!(
+                format,
+                FrameFormat {
+                    width: 7680,
+                    height: 4320,
+                    frame_rate_num: 30_000,
+                    frame_rate_den: 1001
+                }
+            );
+            Ok(candidate("macos", Hevc, "libx265"))
+        })
+        .unwrap();
+        assert_eq!(choice.name, "libx265");
+    }
+
+    #[test]
+    fn selection_cache_never_reuses_a_pick_made_for_another_format() {
+        let cache = SelectionCache::new();
+        let vt = candidate("macos", H264, "h264_videotoolbox");
+        let x264 = candidate("macos", H264, "libx264");
+        let hd = at(1920, 1080);
+        let cached = || -> Result<Candidate, String> { panic!("re-selected a cached format") };
+
+        assert_eq!(cache.get_or_select(H264, hd, || Ok(vt)), Ok(vt));
+        assert_eq!(cache.get_or_select(H264, hd, cached), Ok(vt));
+        // Each of these differs from `hd` in one field, so each gets its own
+        // selection instead of the 1080p pick.
+        for other in [
+            at(7680, 4320),
+            at(1920, 4320),
+            at(7680, 1080),
+            FrameFormat {
+                frame_rate_num: 240,
+                ..hd
+            },
+            FrameFormat {
+                frame_rate_num: 30_000,
+                frame_rate_den: 1001,
+                ..hd
+            },
+        ] {
+            assert_eq!(cache.get_or_select(H264, other, || Ok(x264)), Ok(x264));
+            assert_eq!(cache.get_or_select(H264, other, cached), Ok(x264));
+        }
+        assert_eq!(cache.get_or_select(H264, hd, cached), Ok(vt));
+
+        // The codec is part of the key, and a failed selection is cached too.
+        let none = Err("No working HEVC encoder found".to_string());
+        assert_eq!(cache.get_or_select(Hevc, hd, || none.clone()), none);
+        assert_eq!(cache.get_or_select(Hevc, hd, cached), none);
+        assert_eq!(cache.get_or_select(H264, hd, cached), Ok(vt));
+    }
+
+    #[test]
+    fn probe_encodes_one_frame_at_the_export_size_and_rate() {
+        let choice = candidate("macos", H264, "h264_videotoolbox").choice(PROBE_CRF);
+        let format = FrameFormat {
+            width: 7680,
+            height: 4320,
+            frame_rate_num: 30_000,
+            frame_rate_den: 1001,
+        };
+        assert_eq!(
+            probe_args(&choice, format),
+            [
+                "-hide_banner",
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=7680x4320:r=30000/1001",
+                "-frames:v",
+                "1",
+                "-c:v",
+                "h264_videotoolbox",
+                "-q:v",
+                "54",
+                "-pix_fmt",
+                "yuv420p",
+                "-f",
+                "null",
+                "-",
+            ]
+        );
+
+        // The probe's size and rate are the export command line's `-s` / `-framerate`.
+        let cfg = config(EncoderPreset::H264 { crf: 23 });
+        let export = argv(&cfg, &choice);
+        let value_of = |flag: &str| &export[export.iter().position(|a| a == flag).unwrap() + 1];
+        let source = format!(
+            "color=c=black:s={}:r={}",
+            value_of("-s"),
+            value_of("-framerate")
+        );
+        assert_eq!(source, "color=c=black:s=320x240:r=24/1");
+        assert!(probe_args(&choice, FrameFormat::of(&cfg)).contains(&source));
+    }
+
+    #[test]
+    fn probe_timeout_grows_with_frame_area() {
+        let secs = |w, h| probe_timeout(at(w, h)).as_secs();
+        assert_eq!(secs(256, 256), 15);
+        assert_eq!(secs(1920, 1080), 15);
+        assert_eq!(secs(3840, 2160), 15);
+        assert_eq!(secs(4096, 2160), 16);
+        assert_eq!(secs(7680, 4320), 60);
+        assert_eq!(secs(8192, 4320), 64);
+        assert_eq!(secs(15_360, 8640), 240);
+        assert_eq!(secs(0, 0), 15);
+        assert!(secs(u32::MAX, u32::MAX) >= 240);
     }
 
     #[test]
     fn no_working_encoder_is_a_clear_error_naming_what_was_tried() {
         let candidates = candidates_for("linux", H264);
-        let err =
-            select_encoder(H264, &candidates, &listed(&["h264_vaapi"]), |_| false).unwrap_err();
-        assert!(err.starts_with("No working H.264 encoder found"), "{err}");
+        let err = select_encoder(
+            H264,
+            at(7680, 4320),
+            &candidates,
+            &listed(&["h264_vaapi"]),
+            |_, _| false,
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("No working H.264 encoder found for 7680x4320 at 30/1 fps (tried: "),
+            "{err}"
+        );
         assert!(err.contains("h264_vaapi (test encode failed)"), "{err}");
         for name in ["h264_nvenc", "h264_qsv", "libx264", "libopenh264"] {
             assert!(
@@ -963,9 +1204,18 @@ mod tests {
             "{err}"
         );
 
-        let err = select_encoder(Hevc, &candidates_for("linux", Hevc), &listed(&[]), |_| true)
-            .unwrap_err();
-        assert!(err.starts_with("No working HEVC encoder found"), "{err}");
+        let err = select_encoder(
+            Hevc,
+            at(1920, 1080),
+            &candidates_for("linux", Hevc),
+            &listed(&[]),
+            |_, _| true,
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("No working HEVC encoder found for 1920x1080 at 30/1 fps"),
+            "{err}"
+        );
         assert!(
             err.contains("Install an ffmpeg build with libx265"),
             "{err}"
@@ -974,7 +1224,7 @@ mod tests {
 
     #[test]
     fn selection_error_surfaces_through_the_video_encoder_path() {
-        let err = video_encoder_choice(&config(EncoderPreset::Hevc { crf: 28 }), |codec| {
+        let err = video_encoder_choice(&config(EncoderPreset::Hevc { crf: 28 }), |codec, _| {
             assert_eq!(codec, Hevc);
             Err("No working HEVC encoder found (tried: libx265)".to_string())
         })
@@ -986,8 +1236,11 @@ mod tests {
     fn vaapi_opens_its_device_before_the_input_and_uploads_frames() {
         let cfg = config(EncoderPreset::H264 { crf: 23 });
         let vaapi = candidate("linux", H264, "h264_vaapi");
-        let choice = video_encoder_choice(&cfg, |_| Ok(vaapi)).unwrap();
-        for args in [argv(&cfg, &choice), probe_args(&choice)] {
+        let choice = video_encoder_choice(&cfg, |_, _| Ok(vaapi)).unwrap();
+        for args in [
+            argv(&cfg, &choice),
+            probe_args(&choice, FrameFormat::of(&cfg)),
+        ] {
             let pos = |a: &str| {
                 args.iter()
                     .position(|x| x == a)
@@ -1031,7 +1284,8 @@ mod tests {
         }
         // And the whole command line keeps its previous layout.
         let cfg = config(EncoderPreset::H264 { crf: 23 });
-        let choice = video_encoder_choice(&cfg, |_| Ok(candidates_for("macos", H264)[0])).unwrap();
+        let choice =
+            video_encoder_choice(&cfg, |_, _| Ok(candidates_for("macos", H264)[0])).unwrap();
         assert_eq!(
             argv(&cfg, &choice),
             [
@@ -1280,7 +1534,7 @@ mod tests {
             ),
         ];
         for (preset, expected) in cases {
-            let choice = video_encoder_choice(&config(preset.clone()), |_| {
+            let choice = video_encoder_choice(&config(preset.clone()), |_, _| {
                 panic!("{preset:?} must not run encoder selection")
             })
             .unwrap();
@@ -1298,7 +1552,7 @@ mod tests {
             let mut cfg = config(preset);
             cfg.hdr = Some(HdrMetadata::hdr10(1000.0, 0.0001, 1000, 400));
             let choice =
-                video_encoder_choice(&cfg, |_| panic!("HDR must not run encoder selection"))
+                video_encoder_choice(&cfg, |_, _| panic!("HDR must not run encoder selection"))
                     .unwrap();
             assert!(choice.pre_input.is_empty());
             assert_eq!(
@@ -1325,41 +1579,77 @@ mod tests {
         );
     }
 
+    fn ffmpeg_on_path() -> bool {
+        Command::new("ffmpeg").arg("-version").output().is_ok()
+    }
+
+    /// Opens `cfg` the way Open does (encoder selection included), pushes
+    /// `frames` frames and returns the encoder used + the output size in bytes.
+    fn real_encode(cfg: &VideoConfig, frames: u8) -> (&'static str, u64) {
+        let out = std::env::temp_dir().join(format!(
+            "vance-enc-select-{}-{}x{}.mp4",
+            std::process::id(),
+            cfg.width,
+            cfg.height
+        ));
+        let _ = std::fs::remove_file(&out);
+        let mut pipe = spawn_video_ffmpeg(cfg, &out).expect("spawn ffmpeg");
+        let pixels = cfg.width as usize * cfg.height as usize;
+        let mut frame = vec![0u8; pixels * cfg.pixel_format.bytes_per_pixel()];
+        let mut written = Ok(());
+        for f in 0..frames {
+            // Bands of flat color: some content, and cheap to fill at 8K.
+            for (i, band) in frame.chunks_mut(4096).enumerate() {
+                band.fill((i as u8) ^ f.wrapping_mul(37));
+            }
+            written = pipe.stdin.write_all(&frame);
+            if written.is_err() {
+                break;
+            }
+        }
+        drop(pipe.stdin);
+        let status = pipe.child.wait().expect("wait ffmpeg");
+        let len = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        let _ = std::fs::remove_file(&out);
+        assert!(
+            written.is_ok() && status.success(),
+            "{} encode at {} failed: write {written:?}, exit {status}",
+            pipe.encoder,
+            FrameFormat::of(cfg)
+        );
+        assert!(len > 1_000, "{} wrote only {len} bytes", pipe.encoder);
+        (pipe.encoder, len)
+    }
+
     /// Real ffmpeg on this machine: selection must find a working H.264
     /// encoder, and a short encode through the export's own argv must succeed.
     #[test]
     fn real_ffmpeg_selects_a_working_h264_encoder_and_encodes() {
-        if Command::new("ffmpeg").arg("-version").output().is_err() {
+        if !ffmpeg_on_path() {
             eprintln!("ffmpeg not on PATH — skipping real encoder selection test");
             return;
         }
-        let picked = selected_encoder(H264).expect("a working H.264 encoder");
+        let cfg = config(EncoderPreset::H264 { crf: 23 });
+        let format = FrameFormat::of(&cfg);
+        let picked = selected_encoder(H264, format).expect("a working H.264 encoder");
         assert!(candidates_for(std::env::consts::OS, H264).contains(&picked));
         // Cached for the process: a second call returns the same pick.
-        assert_eq!(selected_encoder(H264), Ok(picked));
+        assert_eq!(selected_encoder(H264, format), Ok(picked));
+        assert_eq!(real_encode(&cfg, 8).0, picked.name);
+    }
 
-        let out = std::env::temp_dir().join(format!("vance-enc-select-{}.mp4", std::process::id()));
-        let _ = std::fs::remove_file(&out);
-        let cfg = config(EncoderPreset::H264 { crf: 23 });
-        let mut pipe = spawn_video_ffmpeg(&cfg, &out).expect("spawn ffmpeg");
-        assert_eq!(pipe.encoder, picked.name);
-        let mut frame = vec![0u8; 320 * 240 * 4];
-        for f in 0..8u8 {
-            frame
-                .iter_mut()
-                .enumerate()
-                .for_each(|(i, p)| *p = (i as u8) ^ f);
-            pipe.stdin.write_all(&frame).expect("write frame");
+    /// Real ffmpeg at 8K, which many hardware H.264 encoders refuse (an M1's
+    /// h264_videotoolbox passes a small probe, then can't open at 8K): the
+    /// export must get an encoder that works at its own size.
+    #[test]
+    fn real_ffmpeg_8k_h264_export_gets_an_encoder_that_handles_8k() {
+        if !ffmpeg_on_path() {
+            eprintln!("ffmpeg not on PATH — skipping real 8K encoder selection test");
+            return;
         }
-        drop(pipe.stdin);
-        let status = pipe.child.wait().expect("wait ffmpeg");
-        assert!(
-            status.success(),
-            "{} encode exited with {status}",
-            picked.name
-        );
-        let len = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
-        let _ = std::fs::remove_file(&out);
-        assert!(len > 1_000, "{} wrote only {len} bytes", picked.name);
+        let mut cfg = config(EncoderPreset::H264 { crf: 23 });
+        (cfg.width, cfg.height) = (7680, 4320);
+        let (encoder, len) = real_encode(&cfg, 2);
+        eprintln!("8K H.264 export used {encoder} ({len} bytes)");
     }
 }
