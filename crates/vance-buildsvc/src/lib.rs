@@ -64,7 +64,10 @@ pub fn review(bytes: &[u8], kind: Kind, max_bytes: usize) -> Verdict {
                 }
                 if let Some(gpu) = &m.gpu {
                     if !gpu.textures.is_empty() {
-                        notes.push(format!("requests {} texture binding(s)", gpu.textures.len()));
+                        notes.push(format!(
+                            "requests {} texture binding(s)",
+                            gpu.textures.len()
+                        ));
                     }
                 }
             }
@@ -138,7 +141,8 @@ mod tests {
         assert_eq!(v.id.as_deref(), Some("com.you.fx"));
 
         // Won't compile → rejected.
-        let bad = shader_pkg("fn effect(c: vec4<f32>, uv: vec2<f32>) -> vec4<f32> { return nope(c); }");
+        let bad =
+            shader_pkg("fn effect(c: vec4<f32>, uv: vec2<f32>) -> vec4<f32> { return nope(c); }");
         assert!(!review(&bad, Kind::Shader, DEFAULT_MAX_BYTES).pass);
 
         // Over budget → rejected.

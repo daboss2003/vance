@@ -215,7 +215,10 @@ fn discover_bundles(bundles: &[PathBuf]) -> Vec<PluginDescriptor> {
             // Can't re-invoke ourselves; fall back to in-process
             // enumeration (less crash-safe, but better than nothing).
             tracing::warn!(?e, "current_exe failed — CLAP probes run in-process");
-            bundles.iter().flat_map(|b| enumerate_bundle_inproc(b)).collect()
+            bundles
+                .iter()
+                .flat_map(|b| enumerate_bundle_inproc(b))
+                .collect()
         }
     }
 }
@@ -236,7 +239,10 @@ pub fn discover_bundles_with_exe(exe: &Path, bundles: &[PathBuf]) -> Vec<PluginD
 fn discover_bundles(bundles: &[PathBuf]) -> Vec<PluginDescriptor> {
     // No host compiled in → nothing dangerous to load; enumerate
     // directly (each is just a path→non-runnable descriptor).
-    bundles.iter().flat_map(|b| enumerate_bundle_inproc(b)).collect()
+    bundles
+        .iter()
+        .flat_map(|b| enumerate_bundle_inproc(b))
+        .collect()
 }
 
 /// Load one bundle in a child process and collect its descriptors. Any
@@ -467,7 +473,10 @@ mod tests {
             .iter()
             .filter(|p| p.file_name().map(|n| n == "Vendor.clap").unwrap_or(false))
             .count();
-        assert_eq!(clap_count, 1, "symlinked bundle should be found exactly once: {found:?}");
+        assert_eq!(
+            clap_count, 1,
+            "symlinked bundle should be found exactly once: {found:?}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -19,8 +19,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use vance_publish::{
-    authorize_url, pkce_from_bytes, token_exchange_form, youtube_resumable_init, OAuthConfig,
-    Pkce, Platform, TokenResponse, UploadMeta,
+    authorize_url, pkce_from_bytes, token_exchange_form, youtube_resumable_init, OAuthConfig, Pkce,
+    Platform, TokenResponse, UploadMeta,
 };
 
 /// How long we wait for the browser callback. The redirect listener and the
@@ -117,8 +117,9 @@ impl PublishHub {
         let pkce = pkce_from_bytes(&rnd);
         let state = uuid::Uuid::new_v4().to_string();
 
-        let port = redirect_port(&redirect_uri)
-            .ok_or_else(|| PublishError::State("redirect_uri must be http://127.0.0.1:PORT/...".into()))?;
+        let port = redirect_port(&redirect_uri).ok_or_else(|| {
+            PublishError::State("redirect_uri must be http://127.0.0.1:PORT/...".into())
+        })?;
         let (slot, stop, handle) = spawn_redirect_listener(port)?;
 
         let url = authorize_url(platform, &cfg, &pkce.challenge, &state);
@@ -194,12 +195,16 @@ pub fn await_and_exchange(
             break pair;
         }
         if Instant::now() >= deadline {
-            return Err(PublishError::State("timed out waiting for authorization".into()));
+            return Err(PublishError::State(
+                "timed out waiting for authorization".into(),
+            ));
         }
         std::thread::sleep(Duration::from_millis(150));
     };
     if got_state != expected_state {
-        return Err(PublishError::State("OAuth state mismatch (possible CSRF)".into()));
+        return Err(PublishError::State(
+            "OAuth state mismatch (possible CSRF)".into(),
+        ));
     }
     let form = token_exchange_form(platform, cfg, &code, verifier);
     let client = http_client()?;
@@ -212,11 +217,16 @@ pub fn await_and_exchange(
     if !resp.status().is_success() {
         let s = resp.status();
         let body = resp.text().unwrap_or_default();
-        return Err(PublishError::Api(format!("token exchange {s}: {}", truncate(&body))));
+        return Err(PublishError::Api(format!(
+            "token exchange {s}: {}",
+            truncate(&body)
+        )));
     }
     let token: TokenResponse = resp.json().map_err(|e| PublishError::Http(e.to_string()))?;
     if token.access_token.is_empty() {
-        return Err(PublishError::Api("token response had no access_token".into()));
+        return Err(PublishError::Api(
+            "token response had no access_token".into(),
+        ));
     }
     Ok(token.access_token)
 }
@@ -256,7 +266,10 @@ pub fn upload_youtube(
     if !init_resp.status().is_success() {
         let s = init_resp.status();
         let body = init_resp.text().unwrap_or_default();
-        return Err(PublishError::Api(format!("youtube init {s}: {}", truncate(&body))));
+        return Err(PublishError::Api(format!(
+            "youtube init {s}: {}",
+            truncate(&body)
+        )));
     }
     let session = init_resp
         .headers()
@@ -558,7 +571,9 @@ fn open_browser(url: &str) {
     let _ = if cfg!(target_os = "macos") {
         std::process::Command::new("open").arg(url).spawn()
     } else if cfg!(target_os = "windows") {
-        std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn()
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()
     } else {
         std::process::Command::new("xdg-open").arg(url).spawn()
     };
@@ -610,7 +625,8 @@ mod tests {
         c.write_all(b"GET /callback?code=abc123").unwrap();
         c.flush().unwrap();
         std::thread::sleep(Duration::from_millis(40));
-        c.write_all(b"&state=xyz HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        c.write_all(b"&state=xyz HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
         c.flush().unwrap();
         // Drain the server's response so it doesn't block on write.
         let mut resp = Vec::new();

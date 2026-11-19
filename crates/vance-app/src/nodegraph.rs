@@ -24,48 +24,111 @@ struct NodeKind {
 }
 
 const KINDS: &[NodeKind] = &[
-    NodeKind { key: "input", label: "Source", inputs: &[], params: &[] },
-    NodeKind { key: "output", label: "Output", inputs: &["in"], params: &[] },
+    NodeKind {
+        key: "input",
+        label: "Source",
+        inputs: &[],
+        params: &[],
+    },
+    NodeKind {
+        key: "output",
+        label: "Output",
+        inputs: &["in"],
+        params: &[],
+    },
     NodeKind {
         key: "brightness",
         label: "Brightness",
         inputs: &["in"],
-        params: &[Param { key: "amount", label: "Amount", min: 0.0, max: 2.0, default: 1.0 }],
+        params: &[Param {
+            key: "amount",
+            label: "Amount",
+            min: 0.0,
+            max: 2.0,
+            default: 1.0,
+        }],
     },
     NodeKind {
         key: "contrast",
         label: "Contrast",
         inputs: &["in"],
-        params: &[Param { key: "amount", label: "Amount", min: 0.0, max: 2.0, default: 1.0 }],
+        params: &[Param {
+            key: "amount",
+            label: "Amount",
+            min: 0.0,
+            max: 2.0,
+            default: 1.0,
+        }],
     },
     NodeKind {
         key: "saturation",
         label: "Saturation",
         inputs: &["in"],
-        params: &[Param { key: "amount", label: "Amount", min: 0.0, max: 2.0, default: 1.0 }],
+        params: &[Param {
+            key: "amount",
+            label: "Amount",
+            min: 0.0,
+            max: 2.0,
+            default: 1.0,
+        }],
     },
     NodeKind {
         key: "gamma",
         label: "Gamma",
         inputs: &["in"],
-        params: &[Param { key: "gamma", label: "Gamma", min: 0.1, max: 3.0, default: 1.0 }],
+        params: &[Param {
+            key: "gamma",
+            label: "Gamma",
+            min: 0.1,
+            max: 3.0,
+            default: 1.0,
+        }],
     },
-    NodeKind { key: "invert", label: "Invert", inputs: &["in"], params: &[] },
+    NodeKind {
+        key: "invert",
+        label: "Invert",
+        inputs: &["in"],
+        params: &[],
+    },
     NodeKind {
         key: "tint",
         label: "Tint",
         inputs: &["in"],
         params: &[
-            Param { key: "r", label: "Red", min: 0.0, max: 1.0, default: 1.0 },
-            Param { key: "g", label: "Green", min: 0.0, max: 1.0, default: 0.8 },
-            Param { key: "b", label: "Blue", min: 0.0, max: 1.0, default: 0.6 },
+            Param {
+                key: "r",
+                label: "Red",
+                min: 0.0,
+                max: 1.0,
+                default: 1.0,
+            },
+            Param {
+                key: "g",
+                label: "Green",
+                min: 0.0,
+                max: 1.0,
+                default: 0.8,
+            },
+            Param {
+                key: "b",
+                label: "Blue",
+                min: 0.0,
+                max: 1.0,
+                default: 0.6,
+            },
         ],
     },
     NodeKind {
         key: "mix",
         label: "Blend",
         inputs: &["a", "b"],
-        params: &[Param { key: "t", label: "Blend", min: 0.0, max: 1.0, default: 0.5 }],
+        params: &[Param {
+            key: "t",
+            label: "Blend",
+            min: 0.0,
+            max: 1.0,
+            default: 0.5,
+        }],
     },
 ];
 
@@ -152,7 +215,9 @@ fn visit<'a>(
         _ => {}
     }
     state.insert(id, 1);
-    let node = by_id.get(id).ok_or("a connection points at a missing node")?;
+    let node = by_id
+        .get(id)
+        .ok_or("a connection points at a missing node")?;
     let kind = kind_of(&node.kind)?;
     for inp in kind.inputs {
         let src = inbound
@@ -167,8 +232,7 @@ fn visit<'a>(
 
 /// Compile a graph → `(wgsl_effect_body, params)`.
 pub fn compile(graph: &Graph) -> Result<(String, Vec<OutParam>), String> {
-    let by_id: HashMap<&str, &GraphNode> =
-        graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let by_id: HashMap<&str, &GraphNode> = graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     let outputs: Vec<&GraphNode> = graph.nodes.iter().filter(|n| n.kind == "output").collect();
     if outputs.len() != 1 {
         return Err("add exactly one Output node".into());
@@ -290,7 +354,11 @@ mod tests {
     fn compiles_a_chain_to_valid_wgsl() {
         // Source → Brightness → Output.
         let g = Graph {
-            nodes: vec![node("s", "input"), node("b", "brightness"), node("o", "output")],
+            nodes: vec![
+                node("s", "input"),
+                node("b", "brightness"),
+                node("o", "output"),
+            ],
             edges: vec![edge("s", "b", "in"), edge("b", "o", "in")],
         };
         let (body, params) = compile(&g).unwrap();
@@ -303,13 +371,24 @@ mod tests {
 
     #[test]
     fn errors_without_output_and_on_cycles() {
-        let g = Graph { nodes: vec![node("s", "input")], edges: vec![] };
+        let g = Graph {
+            nodes: vec![node("s", "input")],
+            edges: vec![],
+        };
         assert!(compile(&g).is_err());
 
         // A 2-node cycle b→c→b feeding output.
         let g = Graph {
-            nodes: vec![node("b", "brightness"), node("c", "contrast"), node("o", "output")],
-            edges: vec![edge("b", "c", "in"), edge("c", "b", "in"), edge("c", "o", "in")],
+            nodes: vec![
+                node("b", "brightness"),
+                node("c", "contrast"),
+                node("o", "output"),
+            ],
+            edges: vec![
+                edge("b", "c", "in"),
+                edge("c", "b", "in"),
+                edge("c", "o", "in"),
+            ],
         };
         assert!(compile(&g).unwrap_err().contains("loop"));
     }

@@ -142,8 +142,13 @@ mod tests {
         let caps = detect();
         // The fixed set is always reported (present or not), each with an id,
         // a name, and a non-empty hint.
-        for id in ["ffmpeg", "decoder", "encoder", "audio", "whisper", "demucs", "matte", "imagegen"] {
-            let c = caps.iter().find(|c| c.id == id).unwrap_or_else(|| panic!("missing {id}"));
+        for id in [
+            "ffmpeg", "decoder", "encoder", "audio", "whisper", "demucs", "matte", "imagegen",
+        ] {
+            let c = caps
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("missing {id}"));
             assert!(!c.name.is_empty());
             assert!(!c.hint.is_empty());
         }

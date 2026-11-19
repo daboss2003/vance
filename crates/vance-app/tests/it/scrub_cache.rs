@@ -17,7 +17,11 @@ use vance_decoder::DecoderClient;
 fn decoder_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/debug")
-        .join(if cfg!(windows) { "vance-decoder.exe" } else { "vance-decoder" })
+        .join(if cfg!(windows) {
+            "vance-decoder.exe"
+        } else {
+            "vance-decoder"
+        })
 }
 
 fn fixture_path() -> PathBuf {
@@ -56,8 +60,12 @@ fn scrub_jog_hit_ratio_exceeds_80pct() {
     assert!(dur > 0, "fixture reports no duration");
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let cache =
-        FrameCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024, 256 * 1024 * 1024).unwrap();
+    let cache = FrameCache::new(
+        dir.path().to_path_buf(),
+        64 * 1024 * 1024,
+        256 * 1024 * 1024,
+    )
+    .unwrap();
 
     // 5 distinct scrub targets across the first third of the clip. The
     // cache keys on the REQUESTED pts, so revisiting a target hits — which
@@ -100,7 +108,11 @@ fn scrub_jog_hit_ratio_exceeds_80pct() {
     // miss — a key mismatch, a regression in the cache-fronted path, or an
     // eviction that shouldn't have happened.
     let expected = (passes * window.len()) as u64;
-    assert_eq!(s.misses, 0, "warm jog should never miss (got {} misses)", s.misses);
+    assert_eq!(
+        s.misses, 0,
+        "warm jog should never miss (got {} misses)",
+        s.misses
+    );
     assert_eq!(
         s.ring_hits + s.disk_hits,
         expected,

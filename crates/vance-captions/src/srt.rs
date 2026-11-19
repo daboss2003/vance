@@ -138,7 +138,8 @@ mod tests {
     #[test]
     fn next_index_without_blank_line_still_detected() {
         // A real index line after body text is still treated as the next cue.
-        let src = "1\n00:00:01,000 --> 00:00:04,000\nHello\n2\n00:00:05,000 --> 00:00:08,000\nWorld\n";
+        let src =
+            "1\n00:00:01,000 --> 00:00:04,000\nHello\n2\n00:00:05,000 --> 00:00:08,000\nWorld\n";
         let cues = from_srt(src).unwrap();
         assert_eq!(cues.len(), 2);
         assert_eq!(cues[0].text, "Hello");
@@ -151,6 +152,9 @@ mod tests {
         let out = to_srt(&cues);
         let back = from_srt(&out).unwrap();
         assert_eq!(back.len(), 1);
-        assert_eq!(back[0].text, "line1\nline2", "interior blank collapsed, no loss");
+        assert_eq!(
+            back[0].text, "line1\nline2",
+            "interior blank collapsed, no loss"
+        );
     }
 }

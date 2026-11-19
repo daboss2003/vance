@@ -44,13 +44,14 @@ fn loads_and_processes_real_lv2_plugin() {
     }
 
     let block = 64usize;
-    let mut plugin = vance_audio::lv2_host::instantiate("urn:vance:test:gain", &[], 48_000.0, block)
-        .unwrap_or_else(|| {
-            panic!(
-                "LV2 host failed to instantiate the staged plugin (LV2_PATH={:?})",
-                bundle.root()
-            )
-        });
+    let mut plugin =
+        vance_audio::lv2_host::instantiate("urn:vance:test:gain", &[], 48_000.0, block)
+            .unwrap_or_else(|| {
+                panic!(
+                    "LV2 host failed to instantiate the staged plugin (LV2_PATH={:?})",
+                    bundle.root()
+                )
+            });
 
     // The fixture is a 0.5x mono gain. The host sums L+R*0.5 → mono in,
     // duplicates mono out → L/R. Feed 1.0 on both channels: mono in =

@@ -63,8 +63,7 @@ pub fn scene_at(seq: &Sequence, timeline_t: RationalTime) -> SceneAt {
             }
             let into_clip = RationalTime(c.timeline_in.0).0; // borrow guard
             let _ = into_clip; // silence unused-binding lint in case of future edits
-            let source_pts =
-                RationalTime(c.source_in.0 + (timeline_t.0 - c.timeline_in.0));
+            let source_pts = RationalTime(c.source_in.0 + (timeline_t.0 - c.timeline_in.0));
             return SceneAt::Clip(ActiveClip {
                 clip_id: c.id,
                 media: c.media,
@@ -145,14 +144,10 @@ pub fn transition_at(seq: &Sequence, timeline_t: RationalTime) -> Option<ActiveT
             let mix = transition_mix(tr, timeline_t);
             // A's source_pts is wherever we'd be if A still played at
             // `timeline_t` (it may have ended; we virtually extend).
-            let from_src = RationalTime(
-                from.source_in.0 + (timeline_t.0 - from.timeline_in.0),
-            );
+            let from_src = RationalTime(from.source_in.0 + (timeline_t.0 - from.timeline_in.0));
             // B's source_pts: similarly, virtually start B early so
             // it covers the pre-cut portion of the window.
-            let to_src = RationalTime(
-                to.source_in.0 + (timeline_t.0 - to.timeline_in.0),
-            );
+            let to_src = RationalTime(to.source_in.0 + (timeline_t.0 - to.timeline_in.0));
             return Some(ActiveTransition {
                 transition_id: tr.id,
                 kind: tr.kind.clone(),
@@ -216,7 +211,10 @@ mod tests {
     fn empty_outside_clip_range() {
         let (seq, _media, _cid) = seq_with_clip(0, 5); // [0,5)
         assert_eq!(scene_at(&seq, t(5)), SceneAt::Empty);
-        assert_eq!(scene_at(&seq, RationalTime::new(-1, 1).unwrap()), SceneAt::Empty);
+        assert_eq!(
+            scene_at(&seq, RationalTime::new(-1, 1).unwrap()),
+            SceneAt::Empty
+        );
     }
 
     #[test]

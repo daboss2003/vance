@@ -93,8 +93,12 @@ fn audio_codecs_export_to_recognisable_files() {
             samples.push(s);
             samples.push(s);
         }
-        client.push_audio(0, samples).unwrap_or_else(|e| panic!("push: {e}"));
-        client.finish().unwrap_or_else(|e| panic!("finish {codec:?}: {e}"));
+        client
+            .push_audio(0, samples)
+            .unwrap_or_else(|e| panic!("push: {e}"));
+        client
+            .finish()
+            .unwrap_or_else(|e| panic!("finish {codec:?}: {e}"));
         let _ = client.shutdown();
 
         let probe = Command::new("ffprobe")
@@ -168,7 +172,10 @@ fn every_codec_preset_produces_an_output_file() {
             time_base_den: 24,
             hdr: None,
         };
-        if client.open(out.to_string_lossy().to_string(), Some(cfg), None).is_err() {
+        if client
+            .open(out.to_string_lossy().to_string(), Some(cfg), None)
+            .is_err()
+        {
             // ffmpeg refused (codec missing). Skip — not a sidecar bug.
             continue;
         }
@@ -310,10 +317,7 @@ fn prores_422_hq_one_second_round_trip() {
         return;
     };
 
-    let temp = std::env::temp_dir().join(format!(
-        "vance-prores-test-{}.mov",
-        std::process::id()
-    ));
+    let temp = std::env::temp_dir().join(format!("vance-prores-test-{}.mov", std::process::id()));
     let _ = std::fs::remove_file(&temp);
 
     let mut client = EncoderClient::spawn(&binary).expect("sidecar spawn");
@@ -363,7 +367,9 @@ fn prores_422_hq_one_second_round_trip() {
                 pixels[i + 3] = 255;
             }
         }
-        client.push_video(f as i64, pixels.clone()).expect("push_video");
+        client
+            .push_video(f as i64, pixels.clone())
+            .expect("push_video");
     }
     // 1 second of stereo silence (48_000 frames * 2 channels).
     let samples = vec![0f32; (sample_rate * 2) as usize];

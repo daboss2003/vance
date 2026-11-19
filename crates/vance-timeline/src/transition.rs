@@ -82,7 +82,11 @@ impl Transition {
 
     /// New WASM-plugin transition at `position` of length `duration`,
     /// driven by the plugin with manifest id `plugin_id`.
-    pub fn wasm(plugin_id: impl Into<String>, position: RationalTime, duration: RationalTime) -> Self {
+    pub fn wasm(
+        plugin_id: impl Into<String>,
+        position: RationalTime,
+        duration: RationalTime,
+    ) -> Self {
         Self {
             id: TransitionId::new(),
             kind: TransitionKind::Wasm(plugin_id.into()),

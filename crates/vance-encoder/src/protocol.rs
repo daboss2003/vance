@@ -540,10 +540,14 @@ mod tests {
         assert_eq!(
             sig.ffmpeg_args(),
             vec![
-                "-color_primaries", "bt2020",
-                "-color_trc", "smpte2084",
-                "-colorspace", "bt2020nc",
-                "-color_range", "tv",
+                "-color_primaries",
+                "bt2020",
+                "-color_trc",
+                "smpte2084",
+                "-colorspace",
+                "bt2020nc",
+                "-color_range",
+                "tv",
             ]
         );
     }

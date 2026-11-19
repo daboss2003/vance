@@ -252,7 +252,11 @@ mod tests {
                 let mut binds: Vec<&str> = Vec::new();
                 collect_binds(&layer.content, &mut binds);
                 for b in binds {
-                    assert!(ids.contains(b), "{}: bind '{b}' has no control", tpl.meta.name);
+                    assert!(
+                        ids.contains(b),
+                        "{}: bind '{b}' has no control",
+                        tpl.meta.name
+                    );
                 }
             }
         }
@@ -306,7 +310,9 @@ mod tests {
             controls: vec![Control {
                 id: "p".into(),
                 label: "P".into(),
-                kind: ControlKind::Point { default: [0.1, 0.1] },
+                kind: ControlKind::Point {
+                    default: [0.1, 0.1],
+                },
             }],
             layers: vec![Layer {
                 id: "box".into(),

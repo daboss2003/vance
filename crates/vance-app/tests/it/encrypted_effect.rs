@@ -35,7 +35,8 @@ fn encrypted_effect_discovers_decrypts_and_loads() {
         .unwrap();
     let mut body = nonce.to_vec();
     body.extend_from_slice(&ct);
-    let plaintext_sha = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(&wasm));
+    let plaintext_sha =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(&wasm));
 
     // Package as a `.vef` (plaintext manifest header + encrypted body) on disk.
     let dir = tempfile::tempdir().unwrap();
@@ -56,7 +57,10 @@ fn encrypted_effect_discovers_decrypts_and_loads() {
 
     // With the key, the gate recovers the exact plaintext, which loads as wasm.
     let gate = EntitlementGate::default();
-    gate.set_keys(std::collections::HashMap::from([(id.clone(), (cek, plaintext_sha))]));
+    gate.set_keys(std::collections::HashMap::from([(
+        id.clone(),
+        (cek, plaintext_sha),
+    )]));
     let recovered = gate.decrypt(&id, &parsed.body).expect("gate decrypts");
     assert_eq!(recovered, wasm, "recovered the exact effect");
     assert_eq!(
@@ -67,7 +71,9 @@ fn encrypted_effect_discovers_decrypts_and_loads() {
 
     // Without a key, the paid boundary holds: no plaintext ever materialises.
     assert!(
-        EntitlementGate::default().decrypt(&id, &parsed.body).is_none(),
+        EntitlementGate::default()
+            .decrypt(&id, &parsed.body)
+            .is_none(),
         "blocked without a valid key"
     );
 }

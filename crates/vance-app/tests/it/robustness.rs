@@ -35,7 +35,10 @@ fn import_missing_file_errs_not_panics() {
     let mut e = Engine::default();
     e.new_project("x".into()).unwrap();
     let r = e.import_media_file("/definitely/not/here/nope.mp4");
-    assert!(r.is_err(), "importing a missing file must return Err, not a frame");
+    assert!(
+        r.is_err(),
+        "importing a missing file must return Err, not a frame"
+    );
 }
 
 #[test]
@@ -63,7 +66,10 @@ fn load_corrupt_bundle_errs_not_panics() {
     let mut e = Engine::default();
     let r = e.load_project(&bad.to_string_lossy());
     let _ = std::fs::remove_file(&bad);
-    assert!(r.is_err(), "loading a corrupt bundle must return Err, not panic");
+    assert!(
+        r.is_err(),
+        "loading a corrupt bundle must return Err, not panic"
+    );
 }
 
 #[test]
@@ -84,7 +90,9 @@ fn export_to_unwritable_path_errs_not_panics() {
     e.new_project("x".into()).unwrap();
     // A synthetic clip so no decode is needed; export to a path whose parent
     // directory does not exist — the encoder/ffmpeg must fail cleanly.
-    let fusion = e.create_fusion_media(Some("c".into()), 160, 120, 1.0).unwrap();
+    let fusion = e
+        .create_fusion_media(Some("c".into()), 160, 120, 1.0)
+        .unwrap();
     let media_id = vance_timeline::MediaItemId::from_uuid(fusion.id.parse().unwrap());
     let track = {
         let c = e.current_sequence_contents().unwrap();
@@ -102,7 +110,10 @@ fn export_to_unwritable_path_errs_not_panics() {
         end_seconds: Some(0.2),
         hdr: false,
     });
-    assert!(r.is_err(), "export to an unwritable path must return Err, not panic");
+    assert!(
+        r.is_err(),
+        "export to an unwritable path must return Err, not panic"
+    );
 }
 
 #[test]
@@ -112,7 +123,10 @@ fn empty_range_export_errs() {
     e.new_project("x".into()).unwrap();
     // end <= start → the range guard should reject it.
     let r = e.render_sequence(RenderOptions {
-        output_path: std::env::temp_dir().join("vance-empty.mov").to_string_lossy().into(),
+        output_path: std::env::temp_dir()
+            .join("vance-empty.mov")
+            .to_string_lossy()
+            .into(),
         preset: EncoderPreset::ProRes422HQ,
         width: Some(160),
         height: Some(120),

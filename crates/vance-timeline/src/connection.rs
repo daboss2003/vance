@@ -78,7 +78,11 @@ mod tests {
         let mut expect = vec![a, b, c];
         expect.sort();
         assert_eq!(sub, expect, "a's subtree is {{a,b,c}}");
-        assert_eq!(connected_subtree(&conns, c), vec![c], "leaf subtree is itself");
+        assert_eq!(
+            connected_subtree(&conns, c),
+            vec![c],
+            "leaf subtree is itself"
+        );
     }
 
     #[test]

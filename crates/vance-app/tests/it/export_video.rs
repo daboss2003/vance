@@ -102,20 +102,27 @@ fn native_opacity_darkens_export() {
     // Baseline: no effect.
     let mut e1 = Engine::default();
     e1.new_project("vid".into()).expect("proj");
-    let Some(_) = import_clip(&mut e1) else { return };
+    let Some(_) = import_clip(&mut e1) else {
+        return;
+    };
     let (_, base_luma) = export_frame(&mut e1, 0.5).expect("base");
 
     // opacity = 0 → fully transparent → black frame.
     let mut e2 = Engine::default();
     e2.new_project("vid".into()).expect("proj");
-    let Some((track, clip)) = import_clip(&mut e2) else { return };
+    let Some((track, clip)) = import_clip(&mut e2) else {
+        return;
+    };
     let mut params: BTreeMap<String, EffectValue> = BTreeMap::new();
     params.insert("value".into(), EffectValue::Number(0.0));
     e2.add_effect_to_clip(track, clip, "opacity".into(), params)
         .expect("add opacity");
     let (_, dark_luma) = export_frame(&mut e2, 0.5).expect("dark");
 
-    assert!(base_luma > 5.0, "baseline frame should have real luma, got {base_luma}");
+    assert!(
+        base_luma > 5.0,
+        "baseline frame should have real luma, got {base_luma}"
+    );
     assert!(
         dark_luma < base_luma * 0.2,
         "opacity=0 must darken the export: base={base_luma}, dark={dark_luma}"
@@ -197,7 +204,10 @@ fn wasm_transition_blends_into_export() {
         eprintln!("tools/fixture missing — skipping");
         return;
     }
-    if !dissolve_wasm_dir().join("vance_plugin_dissolve.wasm").exists() {
+    if !dissolve_wasm_dir()
+        .join("vance_plugin_dissolve.wasm")
+        .exists()
+    {
         eprintln!("dissolve.wasm not built — skipping wasm transition export test");
         return;
     }
@@ -219,7 +229,10 @@ fn wasm_transition_blends_into_export() {
         let c1_id = vance_timeline::ClipId::from_uuid(c1.parse().ok()?);
         e.insert_clip_at(track, media_id, 5.0).ok()?;
         // Register the WASM transition plugin.
-        assert!(e.add_plugin_dir(dissolve_wasm_dir()) >= 1, "dissolve plugin not discovered");
+        assert!(
+            e.add_plugin_dir(dissolve_wasm_dir()) >= 1,
+            "dissolve plugin not discovered"
+        );
         if let Some(kind) = transition {
             e.add_transition_at_cut(track, c1_id, kind, 1.0).ok()?;
         }
@@ -227,8 +240,10 @@ fn wasm_transition_blends_into_export() {
     };
 
     let hard_cut = build(None).expect("hard-cut export");
-    let wasm = build(Some(TransitionKind::Wasm("com.vance.sample.dissolve".into())))
-        .expect("wasm transition export");
+    let wasm = build(Some(TransitionKind::Wasm(
+        "com.vance.sample.dissolve".into(),
+    )))
+    .expect("wasm transition export");
     let dissolve = build(Some(TransitionKind::Dissolve)).expect("dissolve export");
 
     assert_eq!(wasm.len(), hard_cut.len());
@@ -253,7 +268,10 @@ fn wasm_transition_param_override_reaches_plugin() {
         eprintln!("tools/fixture missing — skipping");
         return;
     }
-    if !dissolve_wasm_dir().join("vance_plugin_dissolve.wasm").exists() {
+    if !dissolve_wasm_dir()
+        .join("vance_plugin_dissolve.wasm")
+        .exists()
+    {
         eprintln!("dissolve.wasm not built — skipping");
         return;
     }

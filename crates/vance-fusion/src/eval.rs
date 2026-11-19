@@ -66,8 +66,16 @@ mod tests {
     fn const_keys_expr_resolve() {
         assert_eq!(Anim::Const(3.0).resolve(1.0, ctx()), 3.0);
         let lane = Anim::Keys(vec![
-            Key { t: 0.0, v: 0.0, interp: Interp::Linear },
-            Key { t: 1.0, v: 10.0, interp: Interp::Linear },
+            Key {
+                t: 0.0,
+                v: 0.0,
+                interp: Interp::Linear,
+            },
+            Key {
+                t: 1.0,
+                v: 10.0,
+                interp: Interp::Linear,
+            },
         ]);
         assert!((lane.resolve(0.5, ctx()) - 5.0).abs() < 1e-9);
         let e = Anim::Expr("time / duration".into());

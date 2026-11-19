@@ -64,10 +64,7 @@ impl PrefetchWorker {
     /// Spawn a worker that decodes ahead of the playhead into
     /// `cache`. The worker spawns its own decoder sidecar lazily on
     /// the first request.
-    pub fn spawn(
-        cache: Arc<FrameCache>,
-        decoder_binary: PathBuf,
-    ) -> Self {
+    pub fn spawn(cache: Arc<FrameCache>, decoder_binary: PathBuf) -> Self {
         let target_pts = Arc::new(AtomicI64::new(NO_TARGET));
         let generation = Arc::new(AtomicI64::new(0));
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -131,8 +128,7 @@ impl Drop for PrefetchWorker {
 thread_local! {
     static REQUEST_SLOT: std::cell::Cell<()> = const { std::cell::Cell::new(()) };
 }
-static PREFETCH_SLOT: parking_lot::Mutex<Option<PrefetchRequest>> =
-    parking_lot::Mutex::new(None);
+static PREFETCH_SLOT: parking_lot::Mutex<Option<PrefetchRequest>> = parking_lot::Mutex::new(None);
 
 fn worker_loop(
     target_pts: Arc<AtomicI64>,
@@ -200,8 +196,7 @@ fn worker_loop(
                 break;
             }
             pts += req.step_pts;
-            let key =
-                vance_cache::CacheKey::for_source_frame(req.source_uri.clone(), pts, 0);
+            let key = vance_cache::CacheKey::for_source_frame(req.source_uri.clone(), pts, 0);
             // Skip frames the cache already has. Presence-only check so
             // the worker doesn't (a) copy bytes it won't use or (b) pollute
             // the user-facing scrub hit-ratio counters from this thread.

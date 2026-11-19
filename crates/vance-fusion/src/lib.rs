@@ -116,14 +116,16 @@ impl Compositor {
         // Evaluation order (reachable-from-output, post-order) + per-node
         // consumer counts. `None` for a missing output or an over-large graph.
         let Some((order, mut remaining)) = topo_order(comp) else {
-            tracing::warn!(nodes = comp.nodes.len(), "fusion: graph exceeds node cap — rendering transparent");
+            tracing::warn!(
+                nodes = comp.nodes.len(),
+                "fusion: graph exceeds node cap — rendering transparent"
+            );
             return RgbaImage::new(w, h);
         };
         // Every node output is a full canvas; bound the simultaneously-live
         // set by bytes. Dims match RgbaImage::new's clamp so the estimate is
         // exact.
-        let canvas_bytes =
-            (w.clamp(1, MAX_DIM) as u64) * (h.clamp(1, MAX_DIM) as u64) * 4;
+        let canvas_bytes = (w.clamp(1, MAX_DIM) as u64) * (h.clamp(1, MAX_DIM) as u64) * 4;
 
         let mut ready: HashMap<String, RgbaImage> = HashMap::new();
         for id in &order {
@@ -538,7 +540,10 @@ mod tests {
         nodes.push(Node::new(
             "src",
             "BG",
-            NodeKind::Background(BgSpec { color: [0.2, 0.4, 0.6, 1.0], gradient_to: None }),
+            NodeKind::Background(BgSpec {
+                color: [0.2, 0.4, 0.6, 1.0],
+                gradient_to: None,
+            }),
         ));
         // chain[i] -> chain[i+1] -> ... -> src, output = chain[0].
         for i in 0..n {
@@ -573,7 +578,9 @@ mod tests {
                 (img.width, img.pixels[3])
             })
             .unwrap();
-        let (w, _a) = handle.join().expect("deep chain must not overflow the stack");
+        let (w, _a) = handle
+            .join()
+            .expect("deep chain must not overflow the stack");
         assert_eq!(w, 16);
     }
 
@@ -583,10 +590,14 @@ mod tests {
         // of the requested size WITHOUT touching the graph (no giant per-op
         // scratch). The output node here would panic if evaluated (bad slot),
         // proving the early return skips evaluation. 8192*8200 > 8192².
-        let boom = Node::new("out", "Blur", NodeKind::Blur(BlurSpec {
-            radius: Anim::Const(1.0),
-            mode: BlurMode::Box,
-        }))
+        let boom = Node::new(
+            "out",
+            "Blur",
+            NodeKind::Blur(BlurSpec {
+                radius: Anim::Const(1.0),
+                mode: BlurMode::Box,
+            }),
+        )
         .with_input("input", "out"); // self-cycle; must not be evaluated
         let comp = Comp {
             width: 8192,
@@ -600,7 +611,10 @@ mod tests {
         let img = Compositor::new().render(&comp, 0.0, &no_inputs());
         assert_eq!(img.width, 8192);
         assert_eq!(img.height, 8200);
-        assert!(img.pixels.iter().all(|&x| x == 0), "over-cap canvas → transparent");
+        assert!(
+            img.pixels.iter().all(|&x| x == 0),
+            "over-cap canvas → transparent"
+        );
     }
 
     #[test]
@@ -612,13 +626,24 @@ mod tests {
         nodes.push(Node::new(
             "src",
             "BG",
-            NodeKind::Background(BgSpec { color: [1.0, 1.0, 1.0, 1.0], gradient_to: None }),
+            NodeKind::Background(BgSpec {
+                color: [1.0, 1.0, 1.0, 1.0],
+                gradient_to: None,
+            }),
         ));
         for i in 0..n {
-            let src = if i + 1 < n { format!("t{}", i + 1) } else { "src".to_string() };
+            let src = if i + 1 < n {
+                format!("t{}", i + 1)
+            } else {
+                "src".to_string()
+            };
             nodes.push(
-                Node::new(format!("t{i}"), "T", NodeKind::Transform(TransformSpec::identity(2, 2)))
-                    .with_input("input", &src),
+                Node::new(
+                    format!("t{i}"),
+                    "T",
+                    NodeKind::Transform(TransformSpec::identity(2, 2)),
+                )
+                .with_input("input", &src),
             );
         }
         let comp = Comp {
@@ -632,7 +657,10 @@ mod tests {
         };
         let img = Compositor::new().render(&comp, 0.0, &no_inputs());
         assert_eq!(img.width, 2);
-        assert!(img.pixels.iter().all(|&x| x == 0), "node cap exceeded → transparent");
+        assert!(
+            img.pixels.iter().all(|&x| x == 0),
+            "node cap exceeded → transparent"
+        );
     }
 
     #[test]
@@ -654,7 +682,10 @@ mod tests {
             output: "m".into(),
         };
         let mut inputs = HashMap::new();
-        inputs.insert("source".to_string(), RgbaImage::filled(10, 10, [1.0, 0.0, 0.0, 1.0]));
+        inputs.insert(
+            "source".to_string(),
+            RgbaImage::filled(10, 10, [1.0, 0.0, 0.0, 1.0]),
+        );
         let img = Compositor::new().render(&comp, 0.0, &inputs);
         // Stretched red fills the canvas — center is opaque red.
         let c = ((50 * 100 + 50) * 4) as usize;

@@ -96,6 +96,8 @@ mod tests {
     fn hex_is_16_chars_lowercase() {
         let h = Fnv1a64::new().finish_hex();
         assert_eq!(h.len(), 16);
-        assert!(h.chars().all(|c| c.is_ascii_hexdigit() && (c.is_ascii_digit() || c.is_lowercase())));
+        assert!(h
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && (c.is_ascii_digit() || c.is_lowercase())));
     }
 }

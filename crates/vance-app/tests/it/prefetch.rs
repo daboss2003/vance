@@ -15,7 +15,11 @@ use vance_decoder::DecoderClient;
 fn decoder_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/debug")
-        .join(if cfg!(windows) { "vance-decoder.exe" } else { "vance-decoder" })
+        .join(if cfg!(windows) {
+            "vance-decoder.exe"
+        } else {
+            "vance-decoder"
+        })
 }
 
 fn fixture_path() -> PathBuf {
@@ -56,7 +60,12 @@ fn prefetch_warms_frames_ahead_of_anchor() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let cache = Arc::new(
-        FrameCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024, 256 * 1024 * 1024).unwrap(),
+        FrameCache::new(
+            dir.path().to_path_buf(),
+            64 * 1024 * 1024,
+            256 * 1024 * 1024,
+        )
+        .unwrap(),
     );
 
     let step_pts = (dur / 30).max(1);
@@ -88,7 +97,10 @@ fn prefetch_warms_frames_ahead_of_anchor() {
     }
     worker.shutdown();
 
-    eprintln!("[prefetch] warmed {warmed}/{} frames ahead of anchor", expected.len());
+    eprintln!(
+        "[prefetch] warmed {warmed}/{} frames ahead of anchor",
+        expected.len()
+    );
     assert!(
         warmed >= horizon as usize - 1,
         "prefetch warmed only {warmed}/{} frames — worker did not walk the horizon",

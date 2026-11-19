@@ -19,7 +19,9 @@ use vance_encoder::protocol::{
 };
 
 fn main() -> vance_ipc::Result<()> {
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
     tracing::info!("encoder sidecar starting");
 
     let mut state: State = State::default();
@@ -295,9 +297,9 @@ fn hdr_encode_args(hdr: &HdrMetadata, preset: &EncoderPreset) -> Vec<String> {
 /// Extract a CRF from a quality-based preset (H.264 / HEVC / AV1), else None.
 fn preset_crf(preset: &EncoderPreset) -> Option<u8> {
     match preset {
-        EncoderPreset::H264 { crf }
-        | EncoderPreset::Hevc { crf }
-        | EncoderPreset::Av1 { crf } => Some(*crf),
+        EncoderPreset::H264 { crf } | EncoderPreset::Hevc { crf } | EncoderPreset::Av1 { crf } => {
+            Some(*crf)
+        }
         _ => None,
     }
 }
@@ -467,7 +469,9 @@ fn write_wav_header_placeholder(a: &mut AudioPipe) -> Result<(), String> {
     hdr.extend_from_slice(&24u16.to_le_bytes()); // bits per sample
     hdr.extend_from_slice(b"data");
     hdr.extend_from_slice(&0u32.to_le_bytes());
-    a.file.write_all(&hdr).map_err(|e| format!("wav header: {e}"))
+    a.file
+        .write_all(&hdr)
+        .map_err(|e| format!("wav header: {e}"))
 }
 
 fn finalize_wav_header(a: &AudioPipe) -> Result<(), String> {
@@ -478,10 +482,14 @@ fn finalize_wav_header(a: &AudioPipe) -> Result<(), String> {
         .open(&a.out_path)
         .map_err(|e| format!("open wav for patch: {e}"))?;
     let riff_size = 36 + data_size;
-    file.seek(SeekFrom::Start(4)).map_err(|e| format!("seek riff: {e}"))?;
-    file.write_all(&riff_size.to_le_bytes()).map_err(|e| format!("patch riff: {e}"))?;
-    file.seek(SeekFrom::Start(40)).map_err(|e| format!("seek data: {e}"))?;
-    file.write_all(&data_size.to_le_bytes()).map_err(|e| format!("patch data: {e}"))?;
+    file.seek(SeekFrom::Start(4))
+        .map_err(|e| format!("seek riff: {e}"))?;
+    file.write_all(&riff_size.to_le_bytes())
+        .map_err(|e| format!("patch riff: {e}"))?;
+    file.seek(SeekFrom::Start(40))
+        .map_err(|e| format!("seek data: {e}"))?;
+    file.write_all(&data_size.to_le_bytes())
+        .map_err(|e| format!("patch data: {e}"))?;
     Ok(())
 }
 
@@ -498,7 +506,12 @@ fn audio_codec_args(codec: AudioCodec) -> Vec<String> {
             "-vbr".into(),
             "4".into(),
         ],
-        AudioCodec::Flac => vec!["-c:a".into(), "flac".into(), "-compression_level".into(), "5".into()],
+        AudioCodec::Flac => vec![
+            "-c:a".into(),
+            "flac".into(),
+            "-compression_level".into(),
+            "5".into(),
+        ],
     }
 }
 
@@ -550,7 +563,9 @@ fn run_audio_only_export(
         cmd.arg(a);
     }
     cmd.arg(final_path);
-    let status = cmd.status().map_err(|e| format!("audio export spawn: {e}"))?;
+    let status = cmd
+        .status()
+        .map_err(|e| format!("audio export spawn: {e}"))?;
     if !status.success() {
         return Err(format!("ffmpeg audio export exited with {status:?}"));
     }

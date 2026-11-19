@@ -261,8 +261,14 @@ mod tests {
         // .vance bundle uses, or a project with a title becomes unopenable
         // (the EffectValue-class data-loss bug we already fixed once).
         let mut inst = vance_mograph::MographInstance::new(vance_mograph::builtins::lower_third());
-        inst.set("title", vance_mograph::ControlValue::Text("Ada Lovelace".into()));
-        inst.set("accent", vance_mograph::ControlValue::Color([0.1, 0.4, 0.9, 1.0]));
+        inst.set(
+            "title",
+            vance_mograph::ControlValue::Text("Ada Lovelace".into()),
+        );
+        inst.set(
+            "accent",
+            vance_mograph::ControlValue::Color([0.1, 0.4, 0.9, 1.0]),
+        );
         let item = MediaItem::new_mograph("Lower Third", RationalTime::new(6, 1).unwrap(), inst);
         assert_eq!(item.kind, MediaKind::MoGraph);
 

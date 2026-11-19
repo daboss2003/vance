@@ -46,11 +46,17 @@ impl FontDb {
         display.sort();
         display.dedup();
         // Prefer a sane default if present, else the first family found.
-        let default_key = ["arial", "helvetica", "helvetica neue", "dejavu sans", "liberation sans"]
-            .iter()
-            .map(|s| s.to_string())
-            .find(|k| by_name.contains_key(k))
-            .or_else(|| by_name.keys().next().cloned());
+        let default_key = [
+            "arial",
+            "helvetica",
+            "helvetica neue",
+            "dejavu sans",
+            "liberation sans",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .find(|k| by_name.contains_key(k))
+        .or_else(|| by_name.keys().next().cloned());
         FontDb {
             by_name,
             display,
@@ -113,7 +119,10 @@ fn font_dirs() -> Vec<PathBuf> {
         }
     } else if cfg!(target_os = "windows") {
         let win = std::env::var_os("WINDIR").map(PathBuf::from);
-        dirs.push(win.unwrap_or_else(|| PathBuf::from(r"C:\Windows")).join("Fonts"));
+        dirs.push(
+            win.unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+                .join("Fonts"),
+        );
     } else {
         dirs.push(PathBuf::from("/usr/share/fonts"));
         dirs.push(PathBuf::from("/usr/local/share/fonts"));

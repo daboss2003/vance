@@ -169,7 +169,11 @@ pub fn instantiate(
                      (rebuild with the matching feature, e.g. --features vance-app/clap)"
                 );
             } else {
-                tracing::warn!(format = other, id, "unknown audio plugin format — bypassing slot");
+                tracing::warn!(
+                    format = other,
+                    id,
+                    "unknown audio plugin format — bypassing slot"
+                );
             }
             return None;
         }

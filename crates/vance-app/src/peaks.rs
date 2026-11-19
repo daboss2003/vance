@@ -49,8 +49,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use vance_audio::{AudioClient, AudioClientError};
 use vance_peaks::{
-    write_atomic, FinishedPeaks, HashPrefix, LEVEL_COUNT_MAX, PeakBuilder, PeakError, PeakFile,
-    PeakHeader, FORMAT_VERSION, LANE_COUNT,
+    write_atomic, FinishedPeaks, HashPrefix, PeakBuilder, PeakError, PeakFile, PeakHeader,
+    FORMAT_VERSION, LANE_COUNT, LEVEL_COUNT_MAX,
 };
 use vance_timeline::MediaItemId;
 
@@ -845,11 +845,7 @@ fn worker_iter(inner: &Arc<Inner>, shutdown: &AtomicBool) -> KeepGoing {
 
 /// Drive one extraction end-to-end. Spawns the sidecar, scans to EOF,
 /// writes the slot atomically.
-fn extract(
-    inner: &Inner,
-    shutdown: &AtomicBool,
-    job: &PeakJob,
-) -> Result<u64, PeaksServiceError> {
+fn extract(inner: &Inner, shutdown: &AtomicBool, job: &PeakJob) -> Result<u64, PeaksServiceError> {
     // Early cancel check — caller may have cancelled between dequeue
     // and our first opportunity here.
     {
@@ -1135,7 +1131,10 @@ mod tests {
         let id = job.media_id;
         service.enqueue(job).unwrap();
         let _ = wait_for(&service, id, Duration::from_millis(200), |s| {
-            matches!(s, JobState::Queued | JobState::Running { .. } | JobState::Failed(_))
+            matches!(
+                s,
+                JobState::Queued | JobState::Running { .. } | JobState::Failed(_)
+            )
         });
         let log = log.lock().unwrap();
         assert!(matches!(log.first(), Some((mid, JobState::Queued)) if *mid == id));
@@ -1291,7 +1290,10 @@ mod tests {
         assert!(matches!(first_for_id, Some((_, JobState::Queued))));
         // Then Done.
         let done = log.iter().rev().find(|(mid, _)| *mid == id);
-        assert!(matches!(done, Some((_, JobState::Done { samples_total: 256 }))));
+        assert!(matches!(
+            done,
+            Some((_, JobState::Done { samples_total: 256 }))
+        ));
         drop(log);
         // Stale .err removed.
         assert!(!err.exists());
@@ -1330,7 +1332,9 @@ mod tests {
         service.enqueue(job).unwrap();
         std::thread::sleep(Duration::from_millis(100));
         let log = log.lock().unwrap();
-        assert!(log.iter().any(|(mid, st)| *mid == id && matches!(st, JobState::Queued)));
+        assert!(log
+            .iter()
+            .any(|(mid, st)| *mid == id && matches!(st, JobState::Queued)));
         assert!(
             !log.iter()
                 .any(|(mid, st)| *mid == id && matches!(st, JobState::Done { .. })),
@@ -1399,12 +1403,8 @@ mod tests {
     fn shutdown_rejects_new_enqueues() {
         let tmp = TempDir::new().unwrap();
         let (sink, _log) = capturing_sink();
-        let mut service = PeaksService::start(
-            tmp.path().join("bin"),
-            tmp.path().join("cache"),
-            sink,
-        )
-        .unwrap();
+        let mut service =
+            PeaksService::start(tmp.path().join("bin"), tmp.path().join("cache"), sink).unwrap();
         // Trigger shutdown without consuming `service` (so we can
         // still call enqueue afterwards).
         service.do_shutdown();
@@ -1499,7 +1499,10 @@ mod tests {
             content_hash_prefix: prefix,
             expected_duration_seconds: Some(256.0 / 48_000.0),
         };
-        assert!(matches!(slot_freshness(&slot, &job), FreshnessCheck::Fresh(256)));
+        assert!(matches!(
+            slot_freshness(&slot, &job),
+            FreshnessCheck::Fresh(256)
+        ));
         // 200ms drift is well outside the 100ms tolerance.
         job.expected_duration_seconds = Some(256.0 / 48_000.0 + 0.200);
         assert!(matches!(slot_freshness(&slot, &job), FreshnessCheck::Stale));

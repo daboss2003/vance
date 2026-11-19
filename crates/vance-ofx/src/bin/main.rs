@@ -11,7 +11,9 @@ use vance_ofx::ffi;
 use vance_ofx::protocol::{OfxPluginEntry, OfxRequest, OfxResponse, PROTOCOL_VERSION};
 
 fn main() -> vance_ipc::Result<()> {
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
     tracing::info!("ofx-host sidecar starting");
 
     vance_ipc::serve::<OfxRequest, OfxResponse, _>(|req| match req {

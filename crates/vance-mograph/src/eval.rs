@@ -101,9 +101,7 @@ impl TextProp {
 fn choice_label(inst: &MographInstance, id: &str, idx: usize) -> String {
     use crate::model::ControlKind;
     match inst.control(id).map(|c| &c.kind) {
-        Some(ControlKind::Choice { options, .. }) => {
-            options.get(idx).cloned().unwrap_or_default()
-        }
+        Some(ControlKind::Choice { options, .. }) => options.get(idx).cloned().unwrap_or_default(),
         _ => String::new(),
     }
 }
@@ -168,7 +166,10 @@ mod tests {
         let lane = vec![k(0.0, 0.0, Interp::Linear), k(1.0, 10.0, Interp::Linear)];
         assert_eq!(eval_keys(&lane, -1.0), 0.0, "clamp before first");
         assert_eq!(eval_keys(&lane, 2.0), 10.0, "clamp after last");
-        assert!((eval_keys(&lane, 0.5) - 5.0).abs() < 1e-9, "linear midpoint");
+        assert!(
+            (eval_keys(&lane, 0.5) - 5.0).abs() < 1e-9,
+            "linear midpoint"
+        );
     }
 
     #[test]

@@ -353,7 +353,10 @@ impl PluginClient {
         &mut self,
         instance_id: Uuid,
     ) -> Result<Vec<PluginParam>, PluginClientError> {
-        match self.sidecar.request(&PluginRequest::ListParams { instance_id })? {
+        match self
+            .sidecar
+            .request(&PluginRequest::ListParams { instance_id })?
+        {
             PluginResponse::Params { params } => Ok(params),
             PluginResponse::Error { message } => Err(PluginClientError::Sidecar(message)),
             other => Err(PluginClientError::UnexpectedResponse {
@@ -386,7 +389,10 @@ impl PluginClient {
 
     /// Tear down a single plugin instance.
     pub fn destroy(&mut self, instance_id: Uuid) -> Result<(), PluginClientError> {
-        match self.sidecar.request(&PluginRequest::Destroy { instance_id })? {
+        match self
+            .sidecar
+            .request(&PluginRequest::Destroy { instance_id })?
+        {
             PluginResponse::Ok => Ok(()),
             PluginResponse::Error { message } => Err(PluginClientError::Sidecar(message)),
             other => Err(PluginClientError::UnexpectedResponse {

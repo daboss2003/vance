@@ -59,16 +59,26 @@ fn discovers_test_clap_out_of_process() {
         std::env::set_var("CLAP_PATH", &root);
     }
     let dirs = vance_plugin_host::clap_discovery::default_clap_dirs();
-    assert!(dirs.contains(&root), "CLAP_PATH root not in search dirs: {dirs:?}");
+    assert!(
+        dirs.contains(&root),
+        "CLAP_PATH root not in search dirs: {dirs:?}"
+    );
     let bundles = vance_plugin_host::clap_discovery::scan_bundles(&dirs);
-    assert!(bundles.iter().any(|b| b == &bundle), "staged bundle not scanned");
+    assert!(
+        bundles.iter().any(|b| b == &bundle),
+        "staged bundle not scanned"
+    );
 
     // Drive the REAL subprocess probe path against the built sidecar.
     let descs = vance_plugin_host::clap_discovery::discover_bundles_with_exe(
         &sidecar_exe(),
         &[bundle.clone()],
     );
-    assert_eq!(descs.len(), 1, "expected exactly one staged plugin, got {descs:?}");
+    assert_eq!(
+        descs.len(),
+        1,
+        "expected exactly one staged plugin, got {descs:?}"
+    );
     let d = &descs[0];
     assert!(
         matches!(d.format, vance_audio_plugins::PluginFormat::Clap),
@@ -131,11 +141,18 @@ fn discovers_real_macos_bundle_directory() {
         "bundle dir not scanned: {bundles:?}"
     );
 
-    let descs = vance_plugin_host::clap_discovery::discover_bundles_with_exe(&sidecar_exe(), &[bundle.clone()]);
+    let descs = vance_plugin_host::clap_discovery::discover_bundles_with_exe(
+        &sidecar_exe(),
+        &[bundle.clone()],
+    );
     assert_eq!(descs.len(), 1, "expected the bundled plugin, got {descs:?}");
     assert_eq!(descs[0].name, "Vance Test Gain");
     assert!(descs[0].runnable);
-    assert!(descs[0].id.ends_with("::vance.test.gain"), "got {}", descs[0].id);
+    assert!(
+        descs[0].id.ends_with("::vance.test.gain"),
+        "got {}",
+        descs[0].id
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -162,7 +179,11 @@ fn garbage_bundle_is_skipped_good_one_survives() {
         &[bad.clone(), good.clone()],
     );
     // The bad bundle contributes nothing; the good one is still found.
-    assert_eq!(descs.len(), 1, "bad bundle must be skipped, good kept: {descs:?}");
+    assert_eq!(
+        descs.len(),
+        1,
+        "bad bundle must be skipped, good kept: {descs:?}"
+    );
     assert!(descs[0].id.contains("Good.clap"));
     assert!(descs[0].runnable);
 

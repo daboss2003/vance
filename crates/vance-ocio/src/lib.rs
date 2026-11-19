@@ -169,7 +169,9 @@ mod imp {
         let num_pixels = (size as usize).pow(3) as c_long;
 
         let config_c = match config {
-            Some(p) => Some(CString::new(p.to_string_lossy().into_owned()).map_err(|_| OcioError::NulString)?),
+            Some(p) => Some(
+                CString::new(p.to_string_lossy().into_owned()).map_err(|_| OcioError::NulString)?,
+            ),
             None => None,
         };
         let src_c = CString::new(src).map_err(|_| OcioError::NulString)?;
@@ -208,7 +210,9 @@ mod imp {
 
     pub(super) fn list_colorspaces(config: Option<&Path>) -> Result<Vec<String>, OcioError> {
         let config_c = match config {
-            Some(p) => Some(CString::new(p.to_string_lossy().into_owned()).map_err(|_| OcioError::NulString)?),
+            Some(p) => Some(
+                CString::new(p.to_string_lossy().into_owned()).map_err(|_| OcioError::NulString)?,
+            ),
             None => None,
         };
         let cfg_ptr = config_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());

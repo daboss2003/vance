@@ -150,7 +150,8 @@ impl DiskLru {
         fs::rename(&tmp_path, self.entry_path(key))?;
 
         let len = bytes.len() as u64;
-        self.entries.insert(key.to_string(), DiskEntry { bytes: len });
+        self.entries
+            .insert(key.to_string(), DiskEntry { bytes: len });
         self.lru_order.push(key.to_string());
         self.bytes += len;
         self.append_log("P", key, len)?;
@@ -265,7 +266,8 @@ fn replay_index(
         }
         let s = line.trim_end_matches('\n');
         let mut parts = s.split('\t');
-        let (Some(op), Some(key), Some(bytes_s)) = (parts.next(), parts.next(), parts.next()) else {
+        let (Some(op), Some(key), Some(bytes_s)) = (parts.next(), parts.next(), parts.next())
+        else {
             continue;
         };
         if op.is_empty() || key.is_empty() {

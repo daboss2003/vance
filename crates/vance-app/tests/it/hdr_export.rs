@@ -69,8 +69,16 @@ fn hdr10_source_decodes_autotags_and_exports_hdr10() {
     }
     // Confirm the fixture really is a 10-bit HDR PQ source (guards against a
     // regenerated/bad asset making the test pass vacuously).
-    assert_eq!(probe(&fixture, "pix_fmt"), "yuv420p10le", "fixture must be 10-bit");
-    assert_eq!(probe(&fixture, "color_transfer"), "smpte2084", "fixture must be PQ");
+    assert_eq!(
+        probe(&fixture, "pix_fmt"),
+        "yuv420p10le",
+        "fixture must be 10-bit"
+    );
+    assert_eq!(
+        probe(&fixture, "color_transfer"),
+        "smpte2084",
+        "fixture must be PQ"
+    );
 
     // Engine locates sidecars relative to the workspace root.
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -94,10 +102,16 @@ fn hdr10_source_decodes_autotags_and_exports_hdr10() {
     let media_id = vance_timeline::MediaItemId::from_uuid(media.id.parse().unwrap());
     let track_id = {
         let contents = engine.current_sequence_contents().expect("contents");
-        let v1 = contents.tracks.iter().find(|t| t.kind == "video").expect("V1");
+        let v1 = contents
+            .tracks
+            .iter()
+            .find(|t| t.kind == "video")
+            .expect("V1");
         vance_timeline::TrackId::from_uuid(v1.id.parse().unwrap())
     };
-    engine.insert_clip_at(track_id, media_id, 0.0).expect("insert clip");
+    engine
+        .insert_clip_at(track_id, media_id, 0.0)
+        .expect("insert clip");
 
     let out = std::env::temp_dir().join(format!("vance-hdr-{}.mov", std::process::id()));
     let _ = std::fs::remove_file(&out);
@@ -113,15 +127,34 @@ fn hdr10_source_decodes_autotags_and_exports_hdr10() {
             hdr: true,
         })
         .expect("HDR render_sequence");
-    assert!(outcome.video_frames >= 6, "expected ~10 frames, got {}", outcome.video_frames);
+    assert!(
+        outcome.video_frames >= 6,
+        "expected ~10 frames, got {}",
+        outcome.video_frames
+    );
 
     // (3) The output is a real HEVC Main10 file tagged bt2020 / PQ.
     let meta = std::fs::metadata(&out).expect("output exists");
-    assert!(meta.len() > 5_000, "output suspiciously small: {} bytes", meta.len());
+    assert!(
+        meta.len() > 5_000,
+        "output suspiciously small: {} bytes",
+        meta.len()
+    );
     assert_eq!(probe(&out, "codec_name"), "hevc", "HDR export must be HEVC");
-    assert!(probe(&out, "profile").contains("Main 10"), "must be Main 10 profile");
-    assert_eq!(probe(&out, "color_transfer"), "smpte2084", "output must be PQ-tagged");
-    assert_eq!(probe(&out, "color_primaries"), "bt2020", "output must be Rec.2020-tagged");
+    assert!(
+        probe(&out, "profile").contains("Main 10"),
+        "must be Main 10 profile"
+    );
+    assert_eq!(
+        probe(&out, "color_transfer"),
+        "smpte2084",
+        "output must be PQ-tagged"
+    );
+    assert_eq!(
+        probe(&out, "color_primaries"),
+        "bt2020",
+        "output must be Rec.2020-tagged"
+    );
     let _ = std::fs::remove_file(&out);
 }
 
@@ -136,7 +169,11 @@ fn hlg_source_decodes_and_autotags() {
         eprintln!("HLG fixture missing — skipping");
         return;
     }
-    assert_eq!(probe(&fixture, "color_transfer"), "arib-std-b67", "fixture must be HLG");
+    assert_eq!(
+        probe(&fixture, "color_transfer"),
+        "arib-std-b67",
+        "fixture must be HLG"
+    );
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     std::env::set_current_dir(&workspace_root).expect("chdir");
     let mut engine = Engine::default();

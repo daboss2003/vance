@@ -10,7 +10,10 @@ use vance_ocio::{bake_lut, is_available, OcioError, MAX_LUT_SIZE};
 #[test]
 fn size_bounds_are_enforced() {
     // Validation happens before any FFI, so this holds in both builds.
-    assert!(matches!(bake_lut(None, "a", "b", 1), Err(OcioError::BadSize(1))));
+    assert!(matches!(
+        bake_lut(None, "a", "b", 1),
+        Err(OcioError::BadSize(1))
+    ));
     assert!(matches!(
         bake_lut(None, "a", "b", MAX_LUT_SIZE + 1),
         Err(OcioError::BadSize(_))
@@ -21,7 +24,10 @@ fn size_bounds_are_enforced() {
 #[test]
 fn unavailable_without_feature() {
     assert!(!is_available());
-    assert!(matches!(bake_lut(None, "a", "b", 17), Err(OcioError::Unavailable)));
+    assert!(matches!(
+        bake_lut(None, "a", "b", 17),
+        Err(OcioError::Unavailable)
+    ));
     assert!(vance_ocio::version().is_none());
 }
 
@@ -83,7 +89,10 @@ colorspaces:
         assert_eq!(lut.size, size);
         assert_eq!(lut.values.len(), id.values.len());
         for (a, b) in lut.values.iter().zip(id.values.iter()) {
-            assert!((a - b).abs() < 1e-5, "ref->ref must be identity: {a} vs {b}");
+            assert!(
+                (a - b).abs() < 1e-5,
+                "ref->ref must be identity: {a} vs {b}"
+            );
         }
     }
 

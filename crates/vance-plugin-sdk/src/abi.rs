@@ -66,7 +66,12 @@ mod tests {
 
     #[test]
     fn pack_unpack_round_trips() {
-        for (ptr, len) in [(0u32, 0u32), (1, 2), (0xdead_beef, 0x10), (u32::MAX, u32::MAX)] {
+        for (ptr, len) in [
+            (0u32, 0u32),
+            (1, 2),
+            (0xdead_beef, 0x10),
+            (u32::MAX, u32::MAX),
+        ] {
             let packed = pack_ptr_len(ptr, len);
             assert_eq!(unpack_ptr_len(packed), (ptr, len));
         }

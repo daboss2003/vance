@@ -178,7 +178,10 @@ fn run_cpp(
 fn run_and_collect(mut cmd: Command) -> Result<(), TranscribeError> {
     let out = cmd.output()?;
     if !out.status.success() {
-        let stderr: String = String::from_utf8_lossy(&out.stderr).chars().take(2000).collect();
+        let stderr: String = String::from_utf8_lossy(&out.stderr)
+            .chars()
+            .take(2000)
+            .collect();
         return Err(TranscribeError::Failed {
             code: out.status.code(),
             stderr,

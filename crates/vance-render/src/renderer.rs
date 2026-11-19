@@ -548,7 +548,12 @@ impl GradeNodeParams {
         let w = &self.window;
         let shape = w.shape.min(2) as f32;
         n.win_a = [shape, w.center[0], w.center[1], w.rotation];
-        n.win_b = [w.size[0], w.size[1], w.feather, if w.invert { 1.0 } else { 0.0 }];
+        n.win_b = [
+            w.size[0],
+            w.size[1],
+            w.feather,
+            if w.invert { 1.0 } else { 0.0 },
+        ];
         n
     }
 
@@ -1138,13 +1143,13 @@ impl Renderer {
                         },
                     ],
                 });
-        let pipeline_layout =
-            self.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("vance-render.blit-layout"),
-                    bind_group_layouts: &[Some(&bind_group_layout)],
-                    ..Default::default()
-                });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("vance-render.blit-layout"),
+                bind_group_layouts: &[Some(&bind_group_layout)],
+                ..Default::default()
+            });
         let shader = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1275,15 +1280,18 @@ impl Renderer {
     /// `scale = (1, 1)`. The shader applies the inverse transform to
     /// the output UV before sampling the source frame; out-of-frame
     /// regions render black.
-    pub fn set_transform(
-        &mut self,
-        translate: [f32; 2],
-        scale: [f32; 2],
-        rotation_radians: f32,
-    ) {
+    pub fn set_transform(&mut self, translate: [f32; 2], scale: [f32; 2], rotation_radians: f32) {
         let new_scale = [
-            if scale[0].abs() < 1e-4 { 1e-4 } else { scale[0] },
-            if scale[1].abs() < 1e-4 { 1e-4 } else { scale[1] },
+            if scale[0].abs() < 1e-4 {
+                1e-4
+            } else {
+                scale[0]
+            },
+            if scale[1].abs() < 1e-4 {
+                1e-4
+            } else {
+                scale[1]
+            },
         ];
         if (self.current_params.rotation - rotation_radians).abs() < 1e-5
             && (self.current_params.translate[0] - translate[0]).abs() < 1e-5
@@ -1511,12 +1519,12 @@ impl Renderer {
     /// single sample per channel.
     fn bake_and_upload_curve_atlas(&mut self, curve_inputs: &[(usize, CurveSet)]) {
         let w = vance_timeline::grade::CURVE_LUT_WIDTH; // 256
-        // Atlas grew in 6.8b to host the HSL hue-wheel curves: now
-        // MAX_GRADES × CURVE_ROWS_PER_NODE rows × w cols × 4 channels.
-        // Per node:
-        //   row 3*i     = tone curves   (r=R, g=G, b=B, a=luma) — 6.8.
-        //   row 3*i+1   = HSL-1         (r=hh, g=hs, b=hl, a=ss) — 6.8b.
-        //   row 3*i+2   = HSL-2         (r=ll, g=_, b=_, a=_)    — 6.8b.
+                                                        // Atlas grew in 6.8b to host the HSL hue-wheel curves: now
+                                                        // MAX_GRADES × CURVE_ROWS_PER_NODE rows × w cols × 4 channels.
+                                                        // Per node:
+                                                        //   row 3*i     = tone curves   (r=R, g=G, b=B, a=luma) — 6.8.
+                                                        //   row 3*i+1   = HSL-1         (r=hh, g=hs, b=hl, a=ss) — 6.8b.
+                                                        //   row 3*i+2   = HSL-2         (r=ll, g=_, b=_, a=_)    — 6.8b.
         let h = MAX_GRADES * CURVE_ROWS_PER_NODE;
         let mut atlas = vec![0.0_f32; h * w * 4];
         // Default-fill identity per row TYPE: tone + remap curves are
@@ -1691,8 +1699,10 @@ impl Renderer {
         let working_to_out = matrix_to_row3(&params.working_to_output);
         let same_flags = (0..4).all(|i| self.current_params.pipeline_flags[i] == new_flags[i]);
         let same_in = matrices_equal(&self.current_params.pipeline_in_to_working, &in_to_working);
-        let same_out =
-            matrices_equal(&self.current_params.pipeline_working_to_out, &working_to_out);
+        let same_out = matrices_equal(
+            &self.current_params.pipeline_working_to_out,
+            &working_to_out,
+        );
         if same_flags && same_in && same_out {
             return;
         }
@@ -1729,12 +1739,10 @@ impl Renderer {
             0.0,
             0.0,
         ];
-        let same_key = (0..4).all(|i| {
-            (self.current_params.chroma_key[i] - new_key[i]).abs() < 1e-5
-        });
-        let same_params = (0..2).all(|i| {
-            (self.current_params.chroma_params[i] - new_params[i]).abs() < 1e-5
-        });
+        let same_key =
+            (0..4).all(|i| (self.current_params.chroma_key[i] - new_key[i]).abs() < 1e-5);
+        let same_params =
+            (0..2).all(|i| (self.current_params.chroma_params[i] - new_params[i]).abs() < 1e-5);
         if same_key && same_params {
             return;
         }
@@ -1750,13 +1758,7 @@ impl Renderer {
     /// Set the luma-key params. `direction > 0` keeps pixels brighter
     /// than `threshold`; `< 0` keeps pixels darker. `softness` widens
     /// the falloff. `enable = 0.0` is a passthrough.
-    pub fn set_luma_key(
-        &mut self,
-        threshold: f32,
-        direction: f32,
-        softness: f32,
-        enable: f32,
-    ) {
+    pub fn set_luma_key(&mut self, threshold: f32, direction: f32, softness: f32, enable: f32) {
         let dir = if direction >= 0.0 { 1.0 } else { -1.0 };
         let new = [
             threshold.clamp(0.0, 1.0),
@@ -1817,11 +1819,7 @@ impl Renderer {
         );
     }
 
-    fn upload_frame_inner(
-        &mut self,
-        frame: &FrameData,
-        b_side: bool,
-    ) -> Result<(), RenderError> {
+    fn upload_frame_inner(&mut self, frame: &FrameData, b_side: bool) -> Result<(), RenderError> {
         let (w, h) = (frame.width, frame.height);
         let expected = frame.pixel_format.frame_size(w, h);
         if frame.bytes.len() != expected {
@@ -2109,11 +2107,7 @@ impl Renderer {
     /// `RendererConfig.target_format = Rgba16Float` so `self.pipeline`
     /// matches the float attachment (asserted). The shader emits final PQ/HLG
     /// code values into the float target, which are converted to 16-bit here.
-    pub fn render_to_rgba64_buffer(
-        &self,
-        width: u32,
-        height: u32,
-    ) -> Result<Vec<u8>, RenderError> {
+    pub fn render_to_rgba64_buffer(&self, width: u32, height: u32) -> Result<Vec<u8>, RenderError> {
         if self.target_format != wgpu::TextureFormat::Rgba16Float {
             return Err(RenderError::DeviceRequest(
                 "render_to_rgba64_buffer requires a renderer built with Rgba16Float target".into(),
@@ -2240,7 +2234,13 @@ impl Renderer {
             view_formats: &[],
         });
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-        self.present_rgba(rgba, width, height, &view, wgpu::TextureFormat::Rgba8UnormSrgb)?;
+        self.present_rgba(
+            rgba,
+            width,
+            height,
+            &view,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        )?;
 
         let bytes_per_pixel = 4u32;
         let unpadded_row = width * bytes_per_pixel;
@@ -2487,7 +2487,14 @@ impl Renderer {
         }));
     }
 
-    fn write_plane(&self, tex: &wgpu::Texture, w: u32, h: u32, bytes: &[u8], bytes_per_sample: u32) {
+    fn write_plane(
+        &self,
+        tex: &wgpu::Texture,
+        w: u32,
+        h: u32,
+        bytes: &[u8],
+        bytes_per_sample: u32,
+    ) {
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: tex,
@@ -2621,10 +2628,17 @@ mod hdr_tests {
         // Known ST 2084 anchors: E=0 → a tiny floor (~7e-7, rounds to code 0
         // at 16-bit); E=1 (10000 nits) → 1.
         assert!(pq_oetf_ref(0.0) < 1e-5, "PQ(0) floor: {}", pq_oetf_ref(0.0));
-        assert!((pq_oetf_ref(0.0) * 65535.0).round() as u32 == 0, "PQ(0) rounds to code 0");
+        assert!(
+            (pq_oetf_ref(0.0) * 65535.0).round() as u32 == 0,
+            "PQ(0) rounds to code 0"
+        );
         assert!((pq_oetf_ref(1.0) - 1.0).abs() < 1e-6);
         // 100 nits (E=0.01, SDR reference white) → ≈0.5081 code value.
-        assert!((pq_oetf_ref(0.01) - 0.5081).abs() < 2e-3, "PQ(100 nits) = {}", pq_oetf_ref(0.01));
+        assert!(
+            (pq_oetf_ref(0.01) - 0.5081).abs() < 2e-3,
+            "PQ(100 nits) = {}",
+            pq_oetf_ref(0.01)
+        );
         // Monotonic increasing.
         assert!(pq_oetf_ref(0.001) < pq_oetf_ref(0.01));
         assert!(pq_oetf_ref(0.01) < pq_oetf_ref(0.1));
@@ -2634,7 +2648,9 @@ mod hdr_tests {
     fn f16_round_trips_through_readback_conversion() {
         // f16_to_f32 (HDR readback) must invert f32_to_f16_bits within
         // half-float precision across [0,1] (the PQ output range).
-        for &v in &[0.0f32, 0.001, 0.01, 0.1, 0.25, 0.5, 0.5081, 0.75, 0.999, 1.0] {
+        for &v in &[
+            0.0f32, 0.001, 0.01, 0.1, 0.25, 0.5, 0.5081, 0.75, 0.999, 1.0,
+        ] {
             let back = f16_to_f32(f32_to_f16_bits(v));
             assert!((back - v).abs() <= 1e-3, "f16 round-trip {v} -> {back}");
         }
@@ -2884,7 +2900,10 @@ mod layout_tests {
         ] {
             let mut b = a;
             mutate(&mut b);
-            assert!(!grade_nodes_eq(&a, &b), "qualifier/window-lane change must register as different");
+            assert!(
+                !grade_nodes_eq(&a, &b),
+                "qualifier/window-lane change must register as different"
+            );
         }
     }
 
@@ -2904,7 +2923,7 @@ mod layout_tests {
         let n = p.to_gpu();
         assert_eq!(n.win_a, [2.0, 0.4, 0.6, 0.5]); // shape, cx, cy, rot
         assert_eq!(n.win_b, [0.3, 0.2, 0.15, 1.0]); // sx, sy, feather, invert
-        // Default window is off (shape 0) and identity-mapped.
+                                                    // Default window is off (shape 0) and identity-mapped.
         let off = GradeNodeParams::default().to_gpu();
         assert_eq!(off.win_a[0], 0.0, "window must default off");
     }
@@ -2955,22 +2974,61 @@ mod layout_tests {
     #[test]
     fn window_mask_shape_off_is_identity() {
         for uv in [[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]] {
-            assert_eq!(window_mask_cpu(uv, 0.0, [0.5, 0.5], [0.25, 0.25], 0.0, 0.1, false, 1.0), 1.0);
+            assert_eq!(
+                window_mask_cpu(uv, 0.0, [0.5, 0.5], [0.25, 0.25], 0.0, 0.1, false, 1.0),
+                1.0
+            );
         }
     }
 
     #[test]
     fn window_mask_ellipse_center_in_corner_out() {
-        let m_center = window_mask_cpu([0.5, 0.5], 1.0, [0.5, 0.5], [0.25, 0.25], 0.0, 0.01, false, 1.0);
-        let m_corner = window_mask_cpu([0.0, 0.0], 1.0, [0.5, 0.5], [0.25, 0.25], 0.0, 0.01, false, 1.0);
+        let m_center = window_mask_cpu(
+            [0.5, 0.5],
+            1.0,
+            [0.5, 0.5],
+            [0.25, 0.25],
+            0.0,
+            0.01,
+            false,
+            1.0,
+        );
+        let m_corner = window_mask_cpu(
+            [0.0, 0.0],
+            1.0,
+            [0.5, 0.5],
+            [0.25, 0.25],
+            0.0,
+            0.01,
+            false,
+            1.0,
+        );
         assert!(m_center > 0.99, "center keyed: {m_center}");
         assert!(m_corner < 0.01, "corner excluded: {m_corner}");
     }
 
     #[test]
     fn window_mask_invert_flips() {
-        let m = window_mask_cpu([0.5, 0.5], 1.0, [0.5, 0.5], [0.25, 0.25], 0.0, 0.01, false, 1.0);
-        let mi = window_mask_cpu([0.5, 0.5], 1.0, [0.5, 0.5], [0.25, 0.25], 0.0, 0.01, true, 1.0);
+        let m = window_mask_cpu(
+            [0.5, 0.5],
+            1.0,
+            [0.5, 0.5],
+            [0.25, 0.25],
+            0.0,
+            0.01,
+            false,
+            1.0,
+        );
+        let mi = window_mask_cpu(
+            [0.5, 0.5],
+            1.0,
+            [0.5, 0.5],
+            [0.25, 0.25],
+            0.0,
+            0.01,
+            true,
+            1.0,
+        );
         assert!((m + mi - 1.0).abs() < 1e-5, "invert must be 1-m: {m} {mi}");
     }
 
@@ -2980,9 +3038,30 @@ mod layout_tests {
         // and (0, r) must both land on the boundary (nd==1 -> m~0.5).
         let aspect = 16.0 / 9.0;
         let r = 0.25;
-        let mx = window_mask_cpu([0.5 + r / aspect, 0.5], 1.0, [0.5, 0.5], [r, r], 0.0, 0.01, false, aspect);
-        let my = window_mask_cpu([0.5, 0.5 + r], 1.0, [0.5, 0.5], [r, r], 0.0, 0.01, false, aspect);
-        assert!((mx - my).abs() < 0.05, "circle must be symmetric in pixels: {mx} {my}");
+        let mx = window_mask_cpu(
+            [0.5 + r / aspect, 0.5],
+            1.0,
+            [0.5, 0.5],
+            [r, r],
+            0.0,
+            0.01,
+            false,
+            aspect,
+        );
+        let my = window_mask_cpu(
+            [0.5, 0.5 + r],
+            1.0,
+            [0.5, 0.5],
+            [r, r],
+            0.0,
+            0.01,
+            false,
+            aspect,
+        );
+        assert!(
+            (mx - my).abs() < 0.05,
+            "circle must be symmetric in pixels: {mx} {my}"
+        );
     }
 
     #[test]

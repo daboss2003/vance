@@ -297,8 +297,10 @@ impl AccountsState {
         // token but the old (now-rotated-away) refresh.
         self.store.set("refresh", refresh)?;
         self.store.set("access", access)?;
-        self.store
-            .set("access_exp", &(now() + expires_in - ACCESS_MARGIN_SECS).to_string())?;
+        self.store.set(
+            "access_exp",
+            &(now() + expires_in - ACCESS_MARGIN_SECS).to_string(),
+        )?;
         Ok(())
     }
 
@@ -388,10 +390,7 @@ impl AccountsState {
         // Bind the loopback FIRST so we know the port for the redirect URI.
         let listener =
             TcpListener::bind(("127.0.0.1", 0)).map_err(|e| format!("loopback bind: {e}"))?;
-        let port = listener
-            .local_addr()
-            .map_err(|e| e.to_string())?
-            .port();
+        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
         let enc = vance_publish::form_encode;
@@ -543,7 +542,10 @@ fn aes_open(key: &[u8; 32], nonce_prefixed: &[u8]) -> Option<Vec<u8>> {
     }
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     cipher
-        .decrypt(Nonce::from_slice(&nonce_prefixed[..12]), &nonce_prefixed[12..])
+        .decrypt(
+            Nonce::from_slice(&nonce_prefixed[..12]),
+            &nonce_prefixed[12..],
+        )
         .ok()
 }
 
@@ -620,7 +622,10 @@ impl AccountsState {
                 return Some(vk);
             }
         }
-        let resp = http().get(format!("{}/auth/pubkey", self.base())).send().ok()?;
+        let resp = http()
+            .get(format!("{}/auth/pubkey", self.base()))
+            .send()
+            .ok()?;
         let v: Value = resp.json().ok()?;
         let pk = v["public_key"].as_str()?.to_string();
         let vk = parse_vk(&pk)?;
@@ -677,7 +682,11 @@ impl AccountsState {
                 if let (Some(sealed_str), Some(lease), Some(pt_sha)) =
                     (&rec.sealed_cek, &rec.lease, &rec.plaintext_sha256)
                 {
-                    if self.verify_lease(lease).map(|c| c.sku == *sku).unwrap_or(false) {
+                    if self
+                        .verify_lease(lease)
+                        .map(|c| c.sku == *sku)
+                        .unwrap_or(false)
+                    {
                         if let Ok(sealed) = serde_json::from_str::<Value>(sealed_str) {
                             if let Some(cek) = self.unseal_cek(&sealed) {
                                 keys.insert(sku.clone(), (cek, pt_sha.clone()));
@@ -764,7 +773,11 @@ impl AccountsState {
         use rand::RngCore;
         use x25519_dalek::StaticSecret;
         if let Some(b64) = self.store.get("device_x25519_priv") {
-            if let Some(bytes) = B64.decode(&b64).ok().and_then(|v| <[u8; 32]>::try_from(v).ok()) {
+            if let Some(bytes) = B64
+                .decode(&b64)
+                .ok()
+                .and_then(|v| <[u8; 32]>::try_from(v).ok())
+            {
                 return StaticSecret::from(bytes);
             }
         }
@@ -780,7 +793,11 @@ impl AccountsState {
 
     /// Unseal a CEK sealed to this device (ECIES: ECDH → sha256 KDF → AES-open).
     fn unseal_cek(&self, sealed: &Value) -> Option<[u8; 32]> {
-        let eph_pub: [u8; 32] = B64.decode(sealed["eph_pub"].as_str()?).ok()?.try_into().ok()?;
+        let eph_pub: [u8; 32] = B64
+            .decode(sealed["eph_pub"].as_str()?)
+            .ok()?
+            .try_into()
+            .ok()?;
         let nonce = B64.decode(sealed["nonce"].as_str()?).ok()?;
         let ct = B64.decode(sealed["ct"].as_str()?).ok()?;
         let shared = self
@@ -841,7 +858,9 @@ impl AccountsState {
         if claims.sku != sku {
             return Err("the license doesn't match this effect".into());
         }
-        let cek = self.unseal_cek(sealed).ok_or("couldn't unseal the effect key")?;
+        let cek = self
+            .unseal_cek(sealed)
+            .ok_or("couldn't unseal the effect key")?;
         let plaintext = aes_open(&cek, ciphertext.as_ref()).ok_or("couldn't decrypt the effect")?;
         if sha256_b64(&plaintext) != claims.plaintext_sha256 {
             return Err("the effect failed its integrity check".into());
@@ -1029,9 +1048,7 @@ const OK_PAGE: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8
 
 /// Accept ONE loopback callback and return its `code` query param.
 fn accept_login_code(listener: TcpListener, timeout: Duration) -> Result<String, String> {
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| e.to_string())?;
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     let deadline = Instant::now() + timeout;
     loop {
         if Instant::now() >= deadline {
@@ -1103,14 +1120,22 @@ pub async fn account_status(app: AppHandle, state: St<'_>) -> Result<Value, Stri
     let res = tokio::task::spawn_blocking(move || st.status())
         .await
         .map_err(|e| e.to_string())?;
-    if res.get("signed_in").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if res
+        .get("signed_in")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         state.inner().clone().ensure_watcher(app);
     }
     Ok(res)
 }
 
 #[tauri::command]
-pub async fn account_sign_in(app: AppHandle, state: St<'_>, provider: String) -> Result<Value, String> {
+pub async fn account_sign_in(
+    app: AppHandle,
+    state: St<'_>,
+    provider: String,
+) -> Result<Value, String> {
     let st = state.inner().clone();
     let user = tokio::task::spawn_blocking(move || st.sign_in(&provider))
         .await
@@ -1401,7 +1426,11 @@ pub async fn payment_connect_status(state: St<'_>) -> Result<Value, String> {
 
 /// Report a bad / mis-described / impersonating effect (spec §8a).
 #[tauri::command]
-pub async fn catalog_report(state: St<'_>, sku: String, reason: Option<String>) -> Result<(), String> {
+pub async fn catalog_report(
+    state: St<'_>,
+    sku: String,
+    reason: Option<String>,
+) -> Result<(), String> {
     let st = state.inner().clone();
     tokio::task::spawn_blocking(move || {
         st.send_authed(
@@ -1490,6 +1519,9 @@ mod tests {
         let raw = std::fs::read(&path).unwrap();
         assert!(!raw.windows(12).any(|w| w == b"secret-token"));
         let back = load_file_map(&path);
-        assert_eq!(back.get("refresh").map(String::as_str), Some("secret-token"));
+        assert_eq!(
+            back.get("refresh").map(String::as_str),
+            Some("secret-token")
+        );
     }
 }

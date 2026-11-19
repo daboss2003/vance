@@ -72,7 +72,9 @@ fn lv2_discovered_and_processed_out_of_process() {
 
     // Instantiate + process: the fixture is a 0.5x mono gain. Feed 1.0 on
     // both channels → ~0.5 back.
-    let inst = client.instantiate(descriptor(), 48_000.0, 512).expect("instantiate");
+    let inst = client
+        .instantiate(descriptor(), 48_000.0, 512)
+        .expect("instantiate");
     let block = vec![1.0f32; 64 * 2];
     let out = client.process(inst, &block).expect("process");
     assert_eq!(out.len(), block.len());

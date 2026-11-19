@@ -74,7 +74,14 @@ impl Biquad {
     /// inputs); caller should fall back to an identity in that case.
     /// State is NOT cleared — coefficient updates carry on top of the
     /// existing two-sample history so a slow knob drag stays smooth.
-    pub fn set(&mut self, shape: BiquadShape, sample_rate: f32, freq_hz: f32, gain_db: f32, q: f32) -> bool {
+    pub fn set(
+        &mut self,
+        shape: BiquadShape,
+        sample_rate: f32,
+        freq_hz: f32,
+        gain_db: f32,
+        q: f32,
+    ) -> bool {
         if sample_rate <= 0.0 || freq_hz <= 0.0 || freq_hz >= sample_rate * 0.5 || q <= 0.0 {
             *self = Self::identity();
             return false;
@@ -475,12 +482,20 @@ mod tests {
         for _ in 0..4800 {
             g.tick_stereo(quiet, quiet);
         }
-        assert!(g.current_gain() < 0.05, "gate closed on quiet: {}", g.current_gain());
+        assert!(
+            g.current_gain() < 0.05,
+            "gate closed on quiet: {}",
+            g.current_gain()
+        );
         // Loud signal (0 dB) → gate opens (gain → ~1).
         for _ in 0..4800 {
             g.tick_stereo(0.9, 0.9);
         }
-        assert!(g.current_gain() > 0.9, "gate opened on loud: {}", g.current_gain());
+        assert!(
+            g.current_gain() > 0.9,
+            "gate opened on loud: {}",
+            g.current_gain()
+        );
     }
 
     #[test]
@@ -525,7 +540,10 @@ mod tests {
             rms_output += out_l * out_l;
         }
         // -3 dB cutoff at 1 kHz; 18 kHz should be heavily attenuated.
-        assert!(rms_output < rms_input * 0.01, "high-cut should attenuate 18 kHz");
+        assert!(
+            rms_output < rms_input * 0.01,
+            "high-cut should attenuate 18 kHz"
+        );
     }
 
     #[test]
@@ -563,7 +581,10 @@ mod tests {
             let (l, _) = c.tick_stereo(1.0, 1.0);
             last_l = l;
         }
-        assert!(last_l < 0.6, "compressor must reduce 0 dBFS at -10 dB threshold");
+        assert!(
+            last_l < 0.6,
+            "compressor must reduce 0 dBFS at -10 dB threshold"
+        );
     }
 
     #[test]

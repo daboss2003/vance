@@ -84,7 +84,9 @@ impl ScrubOutput {
             }
             Err(_) => {
                 let _ = handle.join();
-                Err(ScrubError::Thread("owner thread exited during setup".into()))
+                Err(ScrubError::Thread(
+                    "owner thread exited during setup".into(),
+                ))
             }
         }
     }

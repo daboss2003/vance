@@ -53,19 +53,8 @@ fn phase_3_exit_gate_round_trip_five_clip_sequence() {
     for i in 0..5i64 {
         // Lay clips end-to-end at 5-second intervals, sourcing from
         // the same media: timeline [i*5, i*5+5), source [0, 5).
-        let clip = Clip::new(
-            media_id,
-            format!("clip {}", i + 1),
-            t(i * 5),
-            t(0),
-            t(5),
-        )
-        .unwrap();
-        log.apply(EditOp::InsertClip {
-            track_id,
-            clip,
-        })
-        .unwrap();
+        let clip = Clip::new(media_id, format!("clip {}", i + 1), t(i * 5), t(0), t(5)).unwrap();
+        log.apply(EditOp::InsertClip { track_id, clip }).unwrap();
     }
 
     project.sequences.push(Arc::new(log.current().clone()));

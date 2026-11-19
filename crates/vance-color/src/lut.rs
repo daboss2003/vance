@@ -206,24 +206,18 @@ pub fn parse_3dl(text: &str) -> Result<Lut3d, LutError> {
                 raw: raw.chars().take(120).collect(),
             });
         }
-        let r: u32 = parts[0]
-            .parse()
-            .map_err(|_| LutError::MalformedRow {
-                line: line_no,
-                raw: raw.chars().take(120).collect(),
-            })?;
-        let g: u32 = parts[1]
-            .parse()
-            .map_err(|_| LutError::MalformedRow {
-                line: line_no,
-                raw: raw.chars().take(120).collect(),
-            })?;
-        let b: u32 = parts[2]
-            .parse()
-            .map_err(|_| LutError::MalformedRow {
-                line: line_no,
-                raw: raw.chars().take(120).collect(),
-            })?;
+        let r: u32 = parts[0].parse().map_err(|_| LutError::MalformedRow {
+            line: line_no,
+            raw: raw.chars().take(120).collect(),
+        })?;
+        let g: u32 = parts[1].parse().map_err(|_| LutError::MalformedRow {
+            line: line_no,
+            raw: raw.chars().take(120).collect(),
+        })?;
+        let b: u32 = parts[2].parse().map_err(|_| LutError::MalformedRow {
+            line: line_no,
+            raw: raw.chars().take(120).collect(),
+        })?;
         max_seen = max_seen.max(r).max(g).max(b);
         rows.push((r, g, b));
     }
@@ -280,18 +274,24 @@ fn parse_three(s: &str, line: usize, raw: &str) -> Result<[f32; 3], LutError> {
             raw: raw.chars().take(120).collect(),
         });
     }
-    let r = parts[0].parse::<f32>().map_err(|_| LutError::MalformedRow {
-        line,
-        raw: raw.chars().take(120).collect(),
-    })?;
-    let g = parts[1].parse::<f32>().map_err(|_| LutError::MalformedRow {
-        line,
-        raw: raw.chars().take(120).collect(),
-    })?;
-    let b = parts[2].parse::<f32>().map_err(|_| LutError::MalformedRow {
-        line,
-        raw: raw.chars().take(120).collect(),
-    })?;
+    let r = parts[0]
+        .parse::<f32>()
+        .map_err(|_| LutError::MalformedRow {
+            line,
+            raw: raw.chars().take(120).collect(),
+        })?;
+    let g = parts[1]
+        .parse::<f32>()
+        .map_err(|_| LutError::MalformedRow {
+            line,
+            raw: raw.chars().take(120).collect(),
+        })?;
+    let b = parts[2]
+        .parse::<f32>()
+        .map_err(|_| LutError::MalformedRow {
+            line,
+            raw: raw.chars().take(120).collect(),
+        })?;
     Ok([r, g, b])
 }
 

@@ -30,7 +30,11 @@ fn vsfx_discovers_compiles_and_renders() {
     };
 
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("com.you.brighten.vsfx"), shaderpkg::build(&pkg)).unwrap();
+    std::fs::write(
+        dir.path().join("com.you.brighten.vsfx"),
+        shaderpkg::build(&pkg),
+    )
+    .unwrap();
 
     // Discovery lists it WITHOUT a GPU, flagged as a shader effect.
     let reg = PluginRegistry::scan(&[dir.path().to_path_buf()]);
@@ -39,7 +43,9 @@ fn vsfx_discovers_compiles_and_renders() {
     assert_eq!(disc.manifest.params[0].key, "amount");
 
     // The engine reads the body + compiles + runs it (real GPU, if present).
-    let body = shaderpkg::parse(&std::fs::read(&disc.path).unwrap()).unwrap().shader;
+    let body = shaderpkg::parse(&std::fs::read(&disc.path).unwrap())
+        .unwrap()
+        .shader;
     let fx = match ShaderEffect::compile(&body) {
         Ok(fx) => fx,
         Err(e) if e.contains("adapter") => {
@@ -50,5 +56,9 @@ fn vsfx_discovers_compiles_and_renders() {
     };
     let mut rgba = vec![100u8, 100, 100, 255].repeat(4); // 2×2 gray
     fx.process(&mut rgba, 2, 2, &[0.5]).unwrap();
-    assert!((rgba[0] as i32 - 50).abs() <= 1, "100·0.5 → ~50, got {}", rgba[0]);
+    assert!(
+        (rgba[0] as i32 - 50).abs() <= 1,
+        "100·0.5 → ~50, got {}",
+        rgba[0]
+    );
 }

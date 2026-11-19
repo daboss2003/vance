@@ -58,23 +58,12 @@ fn build_huge_project() -> Project {
     for tk in 0..N_TRACKS {
         let track_id = seq.tracks[tk].id;
         for i in 0..CLIPS_PER_TRACK {
-            let c = Clip::new(
-                media_id,
-                "c",
-                t(i as i64 * 5),
-                t(0),
-                t(4),
-            )
-            .unwrap();
+            let c = Clip::new(media_id, "c", t(i as i64 * 5), t(0), t(4)).unwrap();
             seq = ops::insert_clip(&seq, track_id, c).unwrap();
         }
     }
 
-    assert_eq!(
-        seq.clip_count(),
-        TOTAL_CLIPS,
-        "assembled the right shape"
-    );
+    assert_eq!(seq.clip_count(), TOTAL_CLIPS, "assembled the right shape");
     p.sequences.push(Arc::new(seq));
     p
 }
@@ -118,11 +107,7 @@ fn undo_redo_under_one_ms() {
 
     let mut log = EditLog::new(seq);
     let clip = Clip::new(media, "c", t(0), t(0), t(5)).unwrap();
-    log.apply(EditOp::InsertClip {
-        track_id,
-        clip,
-    })
-    .unwrap();
+    log.apply(EditOp::InsertClip { track_id, clip }).unwrap();
 
     // Time a few hundred undo/redo cycles to average out OS scheduler
     // jitter, then check the per-op average.
@@ -154,12 +139,7 @@ fn undo_redo_under_one_ms() {
 #[test]
 fn small_huge_project_builder_integrity() {
     let mut p = Project::new("small");
-    let media = MediaItem::new(
-        PathBuf::from("/tmp/x.mov"),
-        "x",
-        MediaKind::Video,
-        t(1000),
-    );
+    let media = MediaItem::new(PathBuf::from("/tmp/x.mov"), "x", MediaKind::Video, t(1000));
     let media_id = media.id;
     p.media.insert(media_id, Arc::new(media));
 

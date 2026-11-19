@@ -90,7 +90,10 @@ fn gray_ramp_makes_a_diagonal_waveform() {
         }
         prev = p;
     }
-    assert!(increases > 200, "ramp should climb across most columns: {increases}");
+    assert!(
+        increases > 200,
+        "ramp should climb across most columns: {increases}"
+    );
     assert_eq!(peak_level(0), 0);
     assert!(peak_level(255) >= 254);
 }
@@ -146,7 +149,10 @@ fn to_bytes_layout_has_expected_size_and_magic() {
     let vec = (CFG.vector_size * CFG.vector_size) as usize * 4;
     let targets = d.vectorscope.targets.len() * 2 * 4;
     assert_eq!(bytes.len(), header + hist + wf + parade + vec + targets);
-    assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), vance_scopes::SCOPE_BLOB_MAGIC);
+    assert_eq!(
+        u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+        vance_scopes::SCOPE_BLOB_MAGIC
+    );
 }
 
 #[test]

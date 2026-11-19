@@ -33,7 +33,10 @@ fn present_rgba_round_trips_pixels() {
     for (a, b) in input.iter().zip(out.iter()) {
         max_diff = max_diff.max((*a as i32 - *b as i32).abs());
     }
-    assert!(max_diff <= 2, "preview blit altered pixels (max diff {max_diff})");
+    assert!(
+        max_diff <= 2,
+        "preview blit altered pixels (max diff {max_diff})"
+    );
 }
 
 #[test]

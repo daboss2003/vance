@@ -116,7 +116,11 @@ pub fn extract_patch(
         let row_off = ((y0 as u32 + y) * view.stride + x0 as u32) as usize;
         data.extend_from_slice(&view.bytes[row_off..row_off + side as usize]);
     }
-    Ok(LumaPatch { data, w: side, h: side })
+    Ok(LumaPatch {
+        data,
+        w: side,
+        h: side,
+    })
 }
 
 /// ZNCC between two equal-length patches expressed as raw bytes. Each
@@ -264,7 +268,12 @@ mod tests {
         v
     }
     fn view<'a>(bytes: &'a [u8], w: u32, h: u32) -> LumaView<'a> {
-        LumaView { bytes, stride: w, w, h }
+        LumaView {
+            bytes,
+            stride: w,
+            w,
+            h,
+        }
     }
     // Frame with a sharp dark blob centered at (cx, cy) — gives the
     // tracker an unambiguous correlation peak.
@@ -286,7 +295,11 @@ mod tests {
         let tpl = extract_patch(&v, (32, 24), 7).unwrap();
         let r = track_ncc(&tpl, &v, (32, 24), 4, 7).unwrap();
         assert_eq!(r.center_px, (32, 24));
-        assert!((r.score - 1.0).abs() < 1e-4, "perfect match score {}", r.score);
+        assert!(
+            (r.score - 1.0).abs() < 1e-4,
+            "perfect match score {}",
+            r.score
+        );
     }
 
     #[test]
@@ -308,7 +321,9 @@ mod tests {
         // 5 frames; blob moves +2 px in x each frame.
         let a = blob_frame(64, 48, 16, 24);
         let tpl = extract_patch(&view(&a, 64, 48), (16, 24), 6).unwrap();
-        let frames: Vec<Vec<u8>> = (1..=5).map(|i| blob_frame(64, 48, 16 + 2 * i, 24)).collect();
+        let frames: Vec<Vec<u8>> = (1..=5)
+            .map(|i| blob_frame(64, 48, 16 + 2 * i, 24))
+            .collect();
         let views: Vec<LumaView> = frames.iter().map(|f| view(f, 64, 48)).collect();
         let trail = track_sequence(&tpl, views, (16, 24), 4, 6).unwrap();
         let xs: Vec<i32> = trail.iter().map(|r| r.center_px.0).collect();
@@ -344,15 +359,30 @@ mod tests {
     fn patch_too_big_errors() {
         let f = blob_frame(16, 16, 8, 8);
         let v = view(&f, 16, 16);
-        assert!(matches!(extract_patch(&v, (8, 8), 10), Err(TrackError::PatchTooBig(_, _, _))));
+        assert!(matches!(
+            extract_patch(&v, (8, 8), 10),
+            Err(TrackError::PatchTooBig(_, _, _))
+        ));
     }
 
     #[test]
     fn buffer_too_small_errors() {
         let bytes = vec![0u8; 10];
-        let v = LumaView { bytes: &bytes, stride: 16, w: 16, h: 16 };
-        let tpl = LumaPatch { data: vec![0u8; 9], w: 3, h: 3 };
-        assert!(matches!(track_ncc(&tpl, &v, (8, 8), 2, 1), Err(TrackError::BufferTooSmall { .. })));
+        let v = LumaView {
+            bytes: &bytes,
+            stride: 16,
+            w: 16,
+            h: 16,
+        };
+        let tpl = LumaPatch {
+            data: vec![0u8; 9],
+            w: 3,
+            h: 3,
+        };
+        assert!(matches!(
+            track_ncc(&tpl, &v, (8, 8), 2, 1),
+            Err(TrackError::BufferTooSmall { .. })
+        ));
     }
 
     #[test]

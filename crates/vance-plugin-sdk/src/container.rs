@@ -107,7 +107,10 @@ mod tests {
 
     #[test]
     fn rejects_non_vef_and_truncated() {
-        assert!(matches!(parse(b"\0asm not vef"), Err(ContainerError::BadMagic)));
+        assert!(matches!(
+            parse(b"\0asm not vef"),
+            Err(ContainerError::BadMagic)
+        ));
         let mut vef = build(&sample(), b"x");
         vef.truncate(6); // cut inside the header
         assert!(parse(&vef).is_err());

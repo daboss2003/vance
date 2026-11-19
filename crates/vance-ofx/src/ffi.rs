@@ -95,12 +95,11 @@ type GetPlugin = unsafe extern "C" fn(c_int) -> *const OfxPlugin;
 pub fn enumerate(binary_path: &std::path::Path) -> Result<Vec<OfxPluginInfo>, OfxFfiError> {
     // SAFETY: loading an arbitrary shared library is inherently
     // unsafe; the sidecar process boundary is the containment.
-    let lib = unsafe { libloading::Library::new(binary_path) }.map_err(|source| {
-        OfxFfiError::Open {
+    let lib =
+        unsafe { libloading::Library::new(binary_path) }.map_err(|source| OfxFfiError::Open {
             path: binary_path.display().to_string(),
             source,
-        }
-    })?;
+        })?;
 
     let count = unsafe {
         let f: libloading::Symbol<GetNumberOfPlugins> = lib

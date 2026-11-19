@@ -244,7 +244,10 @@ pub fn render_text(
     // block itself is sized to the union glyph INK bbox below so no
     // glyph edge is ever clipped (negative left bearing, ink above the
     // ascent, right overhang past the advance, descenders below).
-    let widths: Vec<f32> = lines.iter().map(|l| line_width(font, l, size, tracking)).collect();
+    let widths: Vec<f32> = lines
+        .iter()
+        .map(|l| line_width(font, l, size, tracking))
+        .collect();
     let content_w = widths.iter().cloned().fold(1.0f32, f32::max).max(1.0);
 
     // Pass 1 — place + rasterize every glyph, tracking the ink bbox.
@@ -256,8 +259,12 @@ pub fn render_text(
         bitmap: Vec<u8>,
     }
     let mut placed: Vec<Placed> = Vec::new();
-    let (mut min_x, mut min_y, mut max_x, mut max_y) =
-        (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    );
     for (li, line) in lines.iter().enumerate() {
         let lw = widths[li];
         let x_start = match align {
@@ -536,15 +543,30 @@ mod tests {
         };
         let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).unwrap();
         // 'jÉf' exercises left bearing (j), tall ink (É), right overhang (f).
-        let block = render_text(&font, "jÉf", 120.0, [1.0, 1.0, 1.0, 1.0], Align::Left, 1.2, 0.0, None);
+        let block = render_text(
+            &font,
+            "jÉf",
+            120.0,
+            [1.0, 1.0, 1.0, 1.0],
+            Align::Left,
+            1.2,
+            0.0,
+            None,
+        );
         let img = &block.image;
         let has_ink_col = |x: u32| (0..img.height).any(|y| alpha(img, x, y) > 0);
         let has_ink_row = |y: u32| (0..img.width).any(|x| alpha(img, x, y) > 0);
         assert!(img.width >= 2 && img.height >= 2);
         // Left bearing + top ascent are the genuine old clip bugs: ink must
         // reach the very first column/row.
-        assert!(has_ink_col(0), "leftmost column must carry ink (left bearing not clipped)");
-        assert!(has_ink_row(0), "topmost row must carry ink (ink above ascent not clipped)");
+        assert!(
+            has_ink_col(0),
+            "leftmost column must carry ink (left bearing not clipped)"
+        );
+        assert!(
+            has_ink_row(0),
+            "topmost row must carry ink (ink above ascent not clipped)"
+        );
         // Right overhang + descender: ink must reach the last column/row
         // (allowing the ≤1px ceil pad on the far edge).
         assert!(
@@ -571,6 +593,9 @@ mod tests {
             opacity: 1.0,
         };
         composite(&mut canvas, &layer, x);
-        assert!(alpha(&canvas, 20, 20) > 250, "rotated square still centered");
+        assert!(
+            alpha(&canvas, 20, 20) > 250,
+            "rotated square still centered"
+        );
     }
 }

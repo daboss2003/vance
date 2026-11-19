@@ -202,7 +202,9 @@ pub enum PeakError {
     },
 
     /// Level directory points outside the file (post overflow-check).
-    #[error("level {level} payload out of range: offset {offset} + len {len} > file_len {file_len}")]
+    #[error(
+        "level {level} payload out of range: offset {offset} + len {len} > file_len {file_len}"
+    )]
     LevelOutOfRange {
         /// Which level.
         level: u8,
@@ -215,7 +217,9 @@ pub enum PeakError {
     },
 
     /// Caller asked for a bucket range that doesn't fit the level.
-    #[error("range out of bounds: level {level} has {available} buckets, asked for [{start}..{end})")]
+    #[error(
+        "range out of bounds: level {level} has {available} buckets, asked for [{start}..{end})"
+    )]
     RangeOutOfBounds {
         /// Which level.
         level: u8,
@@ -531,7 +535,9 @@ impl PeakBuilder {
     pub fn new() -> Self {
         Self {
             l0: Vec::new(),
-            derived: (0..LEVEL_COUNT_MAX as usize - 1).map(|_| Vec::new()).collect(),
+            derived: (0..LEVEL_COUNT_MAX as usize - 1)
+                .map(|_| Vec::new())
+                .collect(),
             windows: (0..LEVEL_COUNT_MAX as usize - 1)
                 .map(|_| Vec::with_capacity(DECIMATION))
                 .collect(),
@@ -637,8 +643,7 @@ impl PeakBuilder {
         // Drain partial windows from L0→L1, then L1→L2, etc.
         for level_index in 0..self.windows.len() {
             if !self.windows[level_index].is_empty() {
-                let window: Vec<BuilderBucket> =
-                    self.windows[level_index].drain(..).collect();
+                let window: Vec<BuilderBucket> = self.windows[level_index].drain(..).collect();
                 let derived = decimate(&window);
                 self.derived[level_index].push(derived.bucket);
                 // Propagate this partial-derived bucket into the next
@@ -858,29 +863,29 @@ pub fn encode(header: &PeakHeader, finished: &FinishedPeaks) -> Result<Vec<u8>, 
 }
 
 fn build_directory(levels: &[Vec<Bucket>]) -> Result<Vec<LevelDir>, PeakError> {
-    let dir_size = LEVEL_DIR_ENTRY_SIZE.checked_mul(levels.len()).ok_or(
-        PeakError::InconsistentDirectory {
+    let dir_size =
+        LEVEL_DIR_ENTRY_SIZE
+            .checked_mul(levels.len())
+            .ok_or(PeakError::InconsistentDirectory {
+                level: 0,
+                kind: DirectoryProblem::OffsetArithmeticOverflow,
+            })?;
+    let dir_start = HEADER_SIZE
+        .checked_add(dir_size)
+        .ok_or(PeakError::InconsistentDirectory {
             level: 0,
             kind: DirectoryProblem::OffsetArithmeticOverflow,
-        },
-    )?;
-    let dir_start = HEADER_SIZE.checked_add(dir_size).ok_or(
-        PeakError::InconsistentDirectory {
-            level: 0,
-            kind: DirectoryProblem::OffsetArithmeticOverflow,
-        },
-    )?;
+        })?;
     let first_payload = align_up_u64(dir_start as u64, 4);
 
     let mut entries = Vec::with_capacity(levels.len());
     let mut cursor = first_payload;
     for (i, level) in levels.iter().enumerate() {
-        let bucket_count = u32::try_from(level.len()).map_err(|_| {
-            PeakError::InconsistentDirectory {
+        let bucket_count =
+            u32::try_from(level.len()).map_err(|_| PeakError::InconsistentDirectory {
                 level: i as u8,
                 kind: DirectoryProblem::OffsetArithmeticOverflow,
-            }
-        })?;
+            })?;
         let entry = LevelDir {
             samples_per_bucket: samples_per_bucket(i as u8).ok_or(
                 PeakError::InconsistentDirectory {
@@ -893,12 +898,12 @@ fn build_directory(levels: &[Vec<Bucket>]) -> Result<Vec<LevelDir>, PeakError> {
             level_idx: i as u8,
         };
         let payload_len = entry.payload_len();
-        let next = cursor.checked_add(payload_len).ok_or(
-            PeakError::InconsistentDirectory {
+        let next = cursor
+            .checked_add(payload_len)
+            .ok_or(PeakError::InconsistentDirectory {
                 level: i as u8,
                 kind: DirectoryProblem::OffsetArithmeticOverflow,
-            },
-        )?;
+            })?;
         cursor = align_up_u64(next, 4);
         entries.push(entry);
     }
@@ -909,13 +914,13 @@ fn file_byte_len(dir_entries: &[LevelDir]) -> Result<usize, PeakError> {
     let last = dir_entries
         .last()
         .expect("at least one level is enforced upstream");
-    let raw = last
-        .offset
-        .checked_add(last.payload_len())
-        .ok_or(PeakError::InconsistentDirectory {
-            level: last.level_idx,
-            kind: DirectoryProblem::OffsetArithmeticOverflow,
-        })?;
+    let raw =
+        last.offset
+            .checked_add(last.payload_len())
+            .ok_or(PeakError::InconsistentDirectory {
+                level: last.level_idx,
+                kind: DirectoryProblem::OffsetArithmeticOverflow,
+            })?;
     let aligned = align_up_u64(raw, 4);
     usize::try_from(aligned).map_err(|_| PeakError::FileTooLarge { bytes: aligned })
 }
@@ -1071,12 +1076,10 @@ impl PeakFile {
             }
             // (b) samples_per_bucket must follow the 256 × 4^level
             //     spec.
-            let expected_spb = samples_per_bucket(i as u8).ok_or(
-                PeakError::UnsupportedLayout {
-                    lane_count: header.lane_count,
-                    level_count: header.level_count,
-                },
-            )?;
+            let expected_spb = samples_per_bucket(i as u8).ok_or(PeakError::UnsupportedLayout {
+                lane_count: header.lane_count,
+                level_count: header.level_count,
+            })?;
             if slot.samples_per_bucket != expected_spb {
                 return Err(PeakError::InconsistentDirectory {
                     level: i as u8,
@@ -1114,13 +1117,12 @@ impl PeakFile {
                     },
                 });
             }
-            let payload_end = slot
-                .offset
-                .checked_add(slot.payload_len())
-                .ok_or(PeakError::InconsistentDirectory {
+            let payload_end = slot.offset.checked_add(slot.payload_len()).ok_or(
+                PeakError::InconsistentDirectory {
                     level: i as u8,
                     kind: DirectoryProblem::OffsetArithmeticOverflow,
-                })?;
+                },
+            )?;
             if payload_end > file_len {
                 return Err(PeakError::LevelOutOfRange {
                     level: i as u8,
@@ -1197,31 +1199,31 @@ impl PeakFile {
         bucket_start: u32,
         dst: &mut [u8],
     ) -> Result<(), PeakError> {
-        let lane_within = (bucket_start as u64)
-            .checked_mul(2)
-            .ok_or(PeakError::LevelOutOfRange {
-                level,
-                offset: lane_offset,
-                len: dst.len() as u64,
-                file_len: self.file_len,
-            })?;
-        let abs =
-            lane_offset
-                .checked_add(lane_within)
+        let lane_within =
+            (bucket_start as u64)
+                .checked_mul(2)
                 .ok_or(PeakError::LevelOutOfRange {
                     level,
                     offset: lane_offset,
                     len: dst.len() as u64,
                     file_len: self.file_len,
                 })?;
-        let abs_end = abs.checked_add(dst.len() as u64).ok_or(
-            PeakError::LevelOutOfRange {
+        let abs = lane_offset
+            .checked_add(lane_within)
+            .ok_or(PeakError::LevelOutOfRange {
+                level,
+                offset: lane_offset,
+                len: dst.len() as u64,
+                file_len: self.file_len,
+            })?;
+        let abs_end = abs
+            .checked_add(dst.len() as u64)
+            .ok_or(PeakError::LevelOutOfRange {
                 level,
                 offset: abs,
                 len: dst.len() as u64,
                 file_len: self.file_len,
-            },
-        )?;
+            })?;
         if abs_end > self.file_len {
             return Err(PeakError::LevelOutOfRange {
                 level,
@@ -1815,7 +1817,11 @@ mod tests {
         match res.unwrap_err() {
             PeakError::InconsistentDirectory {
                 level: 0,
-                kind: DirectoryProblem::LevelIdxMismatch { found: 99, expected: 0 },
+                kind:
+                    DirectoryProblem::LevelIdxMismatch {
+                        found: 99,
+                        expected: 0,
+                    },
             } => {}
             e => panic!("unexpected: {e:?}"),
         }
@@ -1834,7 +1840,11 @@ mod tests {
         match res.unwrap_err() {
             PeakError::InconsistentDirectory {
                 level: 0,
-                kind: DirectoryProblem::SamplesPerBucketMismatch { found: 0, expected: 256 },
+                kind:
+                    DirectoryProblem::SamplesPerBucketMismatch {
+                        found: 0,
+                        expected: 256,
+                    },
             } => {}
             e => panic!("unexpected: {e:?}"),
         }
@@ -1852,7 +1862,11 @@ mod tests {
         match res.unwrap_err() {
             PeakError::InconsistentDirectory {
                 level: 0,
-                kind: DirectoryProblem::BucketCountMismatch { found: 99, expected: 16 },
+                kind:
+                    DirectoryProblem::BucketCountMismatch {
+                        found: 99,
+                        expected: 16,
+                    },
             } => {}
             e => panic!("unexpected: {e:?}"),
         }
@@ -1885,8 +1899,7 @@ mod tests {
             // count so offset + payload_len overflows u64.
             let off_field = HEADER_SIZE + 8;
             let bc_field = HEADER_SIZE + 4;
-            bytes[off_field..off_field + 8]
-                .copy_from_slice(&(u64::MAX - 10).to_le_bytes());
+            bytes[off_field..off_field + 8].copy_from_slice(&(u64::MAX - 10).to_le_bytes());
             // bucket_count = 16 (matches expected) — but offset+len overflows
             // because final offset goes past u64::MAX. Also set total_samples
             // so bucket_count check passes (total stays as-is from sample_header).
@@ -1976,11 +1989,7 @@ mod tests {
         let leftovers: Vec<_> = fs::read_dir(tmp.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .ends_with(".peaks.tmp")
-            })
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".peaks.tmp"))
             .collect();
         assert!(
             leftovers.is_empty(),
@@ -2032,11 +2041,7 @@ mod tests {
         let leftovers: Vec<_> = fs::read_dir(tmp.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .ends_with(".peaks.tmp")
-            })
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".peaks.tmp"))
             .collect();
         assert!(
             leftovers.is_empty(),
@@ -2051,9 +2056,7 @@ mod tests {
             levels: Vec::new(),
         };
         match encode(&sample_header(), &finished).unwrap_err() {
-            PeakError::UnsupportedLayout {
-                level_count: 0, ..
-            } => {}
+            PeakError::UnsupportedLayout { level_count: 0, .. } => {}
             e => panic!("expected UnsupportedLayout{{level_count:0}}, got {e:?}"),
         }
     }
@@ -2062,9 +2065,7 @@ mod tests {
     fn encode_rejects_too_many_levels() {
         let finished = FinishedPeaks {
             total_frames: 0,
-            levels: (0..=LEVEL_COUNT_MAX as usize)
-                .map(|_| Vec::new())
-                .collect(),
+            levels: (0..=LEVEL_COUNT_MAX as usize).map(|_| Vec::new()).collect(),
         };
         match encode(&sample_header(), &finished).unwrap_err() {
             PeakError::UnsupportedLayout { level_count, .. } => {
@@ -2101,11 +2102,7 @@ mod tests {
         let leftovers: Vec<_> = fs::read_dir(tmp.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .contains(".peaks.tmp")
-            })
+            .filter(|e| e.file_name().to_string_lossy().contains(".peaks.tmp"))
             .collect();
         assert!(leftovers.is_empty(), "tmp cleaned: {leftovers:?}");
     }

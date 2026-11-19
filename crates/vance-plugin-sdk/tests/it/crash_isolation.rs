@@ -100,7 +100,10 @@ fn infinite_loop_is_bounded_by_fuel() {
     let mut plugin = WasmPlugin::load(&bytes).expect("load");
     let mut frame = vec![0u8; 2 * 2 * 4];
     let err = plugin.process(&mut frame, 2, 2, &[]).unwrap_err();
-    assert!(matches!(err, PluginError::Trap(_)), "expected fuel trap, got {err:?}");
+    assert!(
+        matches!(err, PluginError::Trap(_)),
+        "expected fuel trap, got {err:?}"
+    );
 }
 
 #[test]
@@ -128,7 +131,10 @@ fn abi_version_mismatch_is_rejected() {
     );
     let bytes = wat::parse_str(&wat).unwrap();
     let err = expect_load_err(&bytes);
-    assert!(matches!(err, PluginError::AbiMismatch { plugin: 99, .. }), "got {err:?}");
+    assert!(
+        matches!(err, PluginError::AbiMismatch { plugin: 99, .. }),
+        "got {err:?}"
+    );
 }
 
 #[test]

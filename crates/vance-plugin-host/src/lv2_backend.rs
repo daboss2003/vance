@@ -292,7 +292,11 @@ pub fn discover() -> Vec<PluginDescriptor> {
         let uri = plugin.uri();
         // A name() helper isn't on every livi version; fall back to the
         // URI's tail for a human label.
-        let name = uri.rsplit(['#', '/', ':']).next().unwrap_or(&uri).to_string();
+        let name = uri
+            .rsplit(['#', '/', ':'])
+            .next()
+            .unwrap_or(&uri)
+            .to_string();
         out.push(PluginDescriptor {
             format: PluginFormat::Lv2,
             id: uri,

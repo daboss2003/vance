@@ -9,7 +9,11 @@ use vance_app_lib::engine::Engine;
 
 fn video_track(engine: &Engine) -> vance_timeline::TrackId {
     let contents = engine.current_sequence_contents().expect("contents");
-    let v1 = contents.tracks.iter().find(|t| t.kind == "video").expect("V1");
+    let v1 = contents
+        .tracks
+        .iter()
+        .find(|t| t.kind == "video")
+        .expect("V1");
     vance_timeline::TrackId::from_uuid(v1.id.parse().unwrap())
 }
 
@@ -31,55 +35,85 @@ fn project_bundle_round_trips_new_fields() {
         let mograph = {
             let cat = e.mograph_catalog();
             let (key, _) = cat.first().cloned().expect("a mograph template");
-            e.create_mograph_media(key, Some("Title".into())).expect("mograph media")
+            e.create_mograph_media(key, Some("Title".into()))
+                .expect("mograph media")
         };
         let fusion_id = vance_timeline::MediaItemId::from_uuid(fusion.id.parse().unwrap());
         let mograph_id = vance_timeline::MediaItemId::from_uuid(mograph.id.parse().unwrap());
 
         let track = video_track(&e);
-        e.insert_clip_at(track, fusion_id, 0.0).expect("insert fusion");
-        e.insert_clip_at(track, mograph_id, 3.0).expect("insert mograph");
+        e.insert_clip_at(track, fusion_id, 0.0)
+            .expect("insert fusion");
+        e.insert_clip_at(track, mograph_id, 3.0)
+            .expect("insert mograph");
 
         // Review comments (one resolved, one with a reply) + a caption.
-        let c1 = e.add_review_comment(1500, "sam".into(), "tighten this".into()).expect("comment");
+        let c1 = e
+            .add_review_comment(1500, "sam".into(), "tighten this".into())
+            .expect("comment");
         e.reply_review_comment(
             vance_timeline::id::CommentId::from_uuid(c1.parse().unwrap()),
             "lee".into(),
             "agreed".into(),
         )
         .expect("reply");
-        let c2 = e.add_review_comment(2500, "sam".into(), "done".into()).expect("comment2");
+        let c2 = e
+            .add_review_comment(2500, "sam".into(), "done".into())
+            .expect("comment2");
         e.resolve_review_comment(
             vance_timeline::id::CommentId::from_uuid(c2.parse().unwrap()),
             true,
         )
         .expect("resolve");
-        e.add_caption(1000, 3000, "hello world".into()).expect("caption");
+        e.add_caption(1000, 3000, "hello world".into())
+            .expect("caption");
 
-        e.save_project(Some(bundle.to_string_lossy().to_string())).expect("save");
+        e.save_project(Some(bundle.to_string_lossy().to_string()))
+            .expect("save");
         (fusion_id, mograph_id)
     };
 
     // --- reload in a fresh engine and verify everything survived ---
     let mut e = Engine::default();
-    e.load_project(&bundle.to_string_lossy()).expect("load project");
+    e.load_project(&bundle.to_string_lossy())
+        .expect("load project");
 
     // Media library: both synthetic items are back, with their kinds.
     let media = e.media_list();
-    assert!(media.iter().any(|m| m.id == fusion_id.to_string() && m.kind == "fusion"), "fusion media");
-    assert!(media.iter().any(|m| m.id == mograph_id.to_string() && m.kind == "mograph"), "mograph media");
+    assert!(
+        media
+            .iter()
+            .any(|m| m.id == fusion_id.to_string() && m.kind == "fusion"),
+        "fusion media"
+    );
+    assert!(
+        media
+            .iter()
+            .any(|m| m.id == mograph_id.to_string() && m.kind == "mograph"),
+        "mograph media"
+    );
 
     // The Fusion node graph survived intact (output node + nodes present).
     let comp = e.fusion_comp(fusion_id).expect("fusion comp back");
-    assert!(!comp.nodes.is_empty() && !comp.output.is_empty(), "fusion graph intact");
+    assert!(
+        !comp.nodes.is_empty() && !comp.output.is_empty(),
+        "fusion graph intact"
+    );
     assert_eq!(comp.width, 640, "fusion canvas size preserved");
 
     // The MoGraph instance survived.
-    assert!(e.mograph_instance(mograph_id).is_some(), "mograph instance back");
+    assert!(
+        e.mograph_instance(mograph_id).is_some(),
+        "mograph instance back"
+    );
 
     // Two clips on V1.
     let contents = e.current_sequence_contents().expect("contents");
-    let v1 = contents.tracks.iter().find(|t| t.kind == "video").expect("V1");
+    let v1 = contents
+        .tracks
+        .iter()
+        .find(|t| t.kind == "video")
+        .expect("V1");
     assert_eq!(v1.clips.len(), 2, "both clips survived");
 
     // Review comments: 2 back, sorted, with the reply + resolved state.

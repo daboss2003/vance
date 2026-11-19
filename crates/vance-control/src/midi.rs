@@ -45,17 +45,26 @@ mod tests {
         // Note On ch1 note 60 vel 100 → button 60 pressed.
         assert_eq!(
             decode(&[0x90, 60, 100]),
-            Some(ControlEvent::Button { id: 60, pressed: true })
+            Some(ControlEvent::Button {
+                id: 60,
+                pressed: true
+            })
         );
         // Note On vel 0 = note off.
         assert_eq!(
             decode(&[0x90, 60, 0]),
-            Some(ControlEvent::Button { id: 60, pressed: false })
+            Some(ControlEvent::Button {
+                id: 60,
+                pressed: false
+            })
         );
         // Note Off.
         assert_eq!(
             decode(&[0x80, 60, 0]),
-            Some(ControlEvent::Button { id: 60, pressed: false })
+            Some(ControlEvent::Button {
+                id: 60,
+                pressed: false
+            })
         );
         // CC 7 (volume) value 127 → fader 7 = 1.0.
         match decode(&[0xB2, 7, 127]) {

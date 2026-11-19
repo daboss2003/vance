@@ -21,14 +21,19 @@ fn main() -> Result<()> {
         let mut args = std::env::args_os().skip(1);
         if let Some(flag) = args.next() {
             if flag == vance_plugin_host::clap_discovery::PROBE_FLAG {
-                let path = args.next().map(std::path::PathBuf::from).unwrap_or_default();
+                let path = args
+                    .next()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_default();
                 vance_plugin_host::clap_discovery::probe_main(&path);
             }
         }
     }
 
     // Stderr is inherited by the parent so tracing surfaces there.
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
     tracing::info!("plugin-host sidecar starting");
 
     let mut router = Router::new();

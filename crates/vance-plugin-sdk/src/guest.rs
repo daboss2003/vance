@@ -101,25 +101,13 @@ macro_rules! export_plugin {
         }
 
         #[no_mangle]
-        pub extern "C" fn vance_process(
-            buf: i32,
-            w: i32,
-            h: i32,
-            params: i32,
-            plen: i32,
-        ) -> i32 {
+        pub extern "C" fn vance_process(buf: i32, w: i32, h: i32, params: i32, plen: i32) -> i32 {
             let pixels = (w as usize) * (h as usize) * 4;
             // SAFETY: the host guarantees `buf` points at `pixels`
             // bytes and `params` at `plen` bytes of valid guest memory.
-            let rgba = unsafe {
-                ::std::slice::from_raw_parts_mut(buf as *mut u8, pixels)
-            };
-            let param_slice = unsafe {
-                ::std::slice::from_raw_parts(
-                    params as *const f32,
-                    (plen as usize) / 4,
-                )
-            };
+            let rgba = unsafe { ::std::slice::from_raw_parts_mut(buf as *mut u8, pixels) };
+            let param_slice =
+                unsafe { ::std::slice::from_raw_parts(params as *const f32, (plen as usize) / 4) };
             <$ty as $crate::guest::Plugin>::process(rgba, w as u32, h as u32, param_slice);
             0
         }
@@ -136,11 +124,14 @@ macro_rules! export_plugin {
             let pixels = (w as usize) * (h as usize) * 4;
             let a_rgba = unsafe { ::std::slice::from_raw_parts_mut(a as *mut u8, pixels) };
             let b_rgba = unsafe { ::std::slice::from_raw_parts(b as *const u8, pixels) };
-            let param_slice = unsafe {
-                ::std::slice::from_raw_parts(params as *const f32, (plen as usize) / 4)
-            };
+            let param_slice =
+                unsafe { ::std::slice::from_raw_parts(params as *const f32, (plen as usize) / 4) };
             <$ty as $crate::guest::Plugin>::process_transition(
-                a_rgba, b_rgba, w as u32, h as u32, param_slice,
+                a_rgba,
+                b_rgba,
+                w as u32,
+                h as u32,
+                param_slice,
             );
             0
         }

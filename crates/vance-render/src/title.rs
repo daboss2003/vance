@@ -180,12 +180,10 @@ pub(crate) fn rgb_to_yuv420p_rec709(rgb: &[u8], w: u32, h: u32) -> Vec<u8> {
             let y_full = 0.2126 * r + 0.7152 * g + 0.0722 * b;
             // Cb = (B - Y) * (224 / 2 / (255 * (1 - 0.0722))) + 128
             // Simplified per Rec.709 limited-range:
-            let cb = ((b - y_full) * (224.0 / 2.0) / (255.0 - 16.0)
-                + 128.0)
-                .clamp(0.0, 255.0) as u8;
-            let cr = ((r - y_full) * (224.0 / 2.0) / (255.0 - 16.0)
-                + 128.0)
-                .clamp(0.0, 255.0) as u8;
+            let cb =
+                ((b - y_full) * (224.0 / 2.0) / (255.0 - 16.0) + 128.0).clamp(0.0, 255.0) as u8;
+            let cr =
+                ((r - y_full) * (224.0 / 2.0) / (255.0 - 16.0) + 128.0).clamp(0.0, 255.0) as u8;
             u_plane[(cy * cw + cx) as usize] = cb;
             v_plane[(cy * cw + cx) as usize] = cr;
         }
@@ -205,15 +203,14 @@ fn load_default_font() -> Result<&'static fontdue::Font, TitleError> {
         for p in candidates.iter() {
             if p.exists() {
                 match std::fs::read(p) {
-                    Ok(bytes) => match fontdue::Font::from_bytes(
-                        bytes,
-                        fontdue::FontSettings::default(),
-                    ) {
-                        Ok(f) => return Ok(f),
-                        Err(e) => {
-                            tracing::warn!(?p, ?e, "title: font parse failed");
+                    Ok(bytes) => {
+                        match fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()) {
+                            Ok(f) => return Ok(f),
+                            Err(e) => {
+                                tracing::warn!(?p, ?e, "title: font parse failed");
+                            }
                         }
-                    },
+                    }
                     Err(e) => tracing::warn!(?p, ?e, "title: font read failed"),
                 }
             }

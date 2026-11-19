@@ -85,7 +85,10 @@ mod tests {
     fn decodes_keys_report_and_edges() {
         // id 4, keys 0x0001 and 0x0034, then zero.
         let r = [0x04u8, 0x01, 0x00, 0x34, 0x00, 0x00, 0x00];
-        assert_eq!(decode(&r), Some(SpeedEditorReport::Keys(vec![0x0001, 0x0034])));
+        assert_eq!(
+            decode(&r),
+            Some(SpeedEditorReport::Keys(vec![0x0001, 0x0034]))
+        );
         // Edges: from {1} to {1, 0x34} → pressed 0x34; to {} → released both.
         let (p, _) = key_edges(&[0x0001], &[0x0001, 0x0034]);
         assert_eq!(p, vec![0x0034]);

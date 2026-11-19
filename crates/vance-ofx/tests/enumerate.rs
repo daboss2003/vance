@@ -102,10 +102,7 @@ fn discovery_plus_sidecar_lists_synthetic_bundle() {
         .expect("list");
     let _ = client.shutdown();
 
-    assert!(
-        errors.is_empty(),
-        "unexpected enumerate errors: {errors:?}"
-    );
+    assert!(errors.is_empty(), "unexpected enumerate errors: {errors:?}");
     assert_eq!(plugins.len(), 1, "expected one fake plugin");
     assert_eq!(plugins[0].identifier, "com.vance.test.invert");
     assert_eq!(plugins[0].bundle, "Invert");

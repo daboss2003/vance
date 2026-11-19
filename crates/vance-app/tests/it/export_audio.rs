@@ -34,8 +34,7 @@ fn tool(name: &str) -> bool {
 /// collide on temp paths.
 static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn uniq() -> u64 {
-    std::process::id() as u64 * 1_000_000
-        + SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    std::process::id() as u64 * 1_000_000 + SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn sidecars_present() -> bool {
@@ -59,7 +58,16 @@ fn build_av_source() -> Option<PathBuf> {
         .arg("-i")
         .arg(audio_fixture())
         .args([
-            "-t", "2", "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264", "-c:a", "aac",
+            "-t",
+            "2",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
             "-shortest",
         ])
         .arg(&out)
@@ -92,7 +100,16 @@ fn export_and_measure_rms(engine: &mut Engine) -> Option<f64> {
     let ok = Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(&out)
-        .args(["-map", "0:a:0", "-ac", "1", "-f", "f32le", "-acodec", "pcm_f32le"])
+        .args([
+            "-map",
+            "0:a:0",
+            "-ac",
+            "1",
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+        ])
         .arg(&raw)
         .status()
         .ok()?
@@ -115,7 +132,10 @@ fn export_and_measure_rms(engine: &mut Engine) -> Option<f64> {
     Some(sumsq / n as f64)
 }
 
-fn setup(engine: &mut Engine, av: &PathBuf) -> Option<(vance_timeline::TrackId, vance_timeline::ClipId)> {
+fn setup(
+    engine: &mut Engine,
+    av: &PathBuf,
+) -> Option<(vance_timeline::TrackId, vance_timeline::ClipId)> {
     engine.new_project("audio-export".into()).ok()?;
     let media = engine
         .import_media_file(&av.canonicalize().ok()?.to_string_lossy())

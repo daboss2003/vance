@@ -16,9 +16,9 @@
 #![warn(missing_docs)]
 
 pub mod lut;
+pub mod pipeline;
 pub mod space;
 pub mod transform;
-pub mod pipeline;
 
 pub use lut::{load_from_path as load_lut, parse_3dl, parse_cube, Lut3d, LutError};
 pub use pipeline::{Pipeline, PipelineParams};

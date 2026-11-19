@@ -372,7 +372,9 @@ pub fn overwrite_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Result<S
     };
     // Overwriting re-IDs trimmed survivors / removes covered clips, so any
     // connection to a vanished id is pruned (GOAT-6 integrity).
-    Ok(prune_dangling_connections(replace_track(seq, idx, new_track)))
+    Ok(prune_dangling_connections(replace_track(
+        seq, idx, new_track,
+    )))
 }
 
 // ---- clip removal -----------------------------------------------------------
@@ -403,16 +405,14 @@ pub fn remove_clip(seq: &Sequence, track_id: TrackId, clip_id: ClipId) -> Result
         output: track.output,
         sends: track.sends.clone(),
     };
-    Ok(prune_dangling_connections(replace_track(seq, idx, new_track)))
+    Ok(prune_dangling_connections(replace_track(
+        seq, idx, new_track,
+    )))
 }
 
 /// Remove `clip_id` from `track_id` and shift every later clip on the
 /// same track left by the removed clip's duration so the gap closes.
-pub fn ripple_remove_clip(
-    seq: &Sequence,
-    track_id: TrackId,
-    clip_id: ClipId,
-) -> Result<Sequence> {
+pub fn ripple_remove_clip(seq: &Sequence, track_id: TrackId, clip_id: ClipId) -> Result<Sequence> {
     let (idx, track) = find_track(seq, track_id)?;
     ensure_unlocked(&track)?;
     let (clip_idx, removed) = find_clip(&track, clip_id)?;
@@ -449,7 +449,9 @@ pub fn ripple_remove_clip(
         output: track.output,
         sends: track.sends.clone(),
     };
-    Ok(prune_dangling_connections(replace_track(seq, idx, new_track)))
+    Ok(prune_dangling_connections(replace_track(
+        seq, idx, new_track,
+    )))
 }
 
 // ---- per-clip edits ---------------------------------------------------------
@@ -512,7 +514,9 @@ pub fn slide(
     let new_in = add(c.timeline_in, delta);
     let new_out = add(c.timeline_out(), delta);
     if new_in.0 < vance_core::Rational::ZERO {
-        return Err(TimelineError::invalid("slide would move timeline_in negative"));
+        return Err(TimelineError::invalid(
+            "slide would move timeline_in negative",
+        ));
     }
     if range_overlaps_existing(&track.clips, new_in, new_out, Some(clip_idx)) {
         return Err(TimelineError::invalid("slide would overlap a neighbor"));
@@ -984,11 +988,7 @@ pub fn set_track_solo(seq: &Sequence, track_id: TrackId, solo: bool) -> Result<S
 }
 
 /// Set `Track.gain_db` (Phase 7.3). Rejects locked tracks.
-pub fn set_track_gain_db(
-    seq: &Sequence,
-    track_id: TrackId,
-    gain_db: f32,
-) -> Result<Sequence> {
+pub fn set_track_gain_db(seq: &Sequence, track_id: TrackId, gain_db: f32) -> Result<Sequence> {
     let (idx, track) = find_track(seq, track_id)?;
     ensure_unlocked(&track)?;
     let sanitized = sanitize_gain_db(gain_db)?;
@@ -1145,11 +1145,7 @@ pub fn add_audio_effect(
 /// Phase 7.7 — Remove an audio effect at `index`. Returns the
 /// unchanged sequence if `index` is out of range so chained
 /// EditOps never panic on stale indices.
-pub fn remove_audio_effect(
-    seq: &Sequence,
-    track_id: TrackId,
-    index: usize,
-) -> Result<Sequence> {
+pub fn remove_audio_effect(seq: &Sequence, track_id: TrackId, index: usize) -> Result<Sequence> {
     let (idx, track) = find_track(seq, track_id)?;
     ensure_unlocked(&track)?;
     if index >= track.audio_effects.len() {
@@ -1519,9 +1515,7 @@ fn sanitize_fade(
         return Err(TimelineError::invalid("fade duration must be finite"));
     }
     if duration_seconds < 0.0 {
-        return Err(TimelineError::invalid(
-            "fade duration must be non-negative",
-        ));
+        return Err(TimelineError::invalid("fade duration must be non-negative"));
     }
     let clip_dur = clip.duration().0.as_f64();
     if duration_seconds > clip_dur {
@@ -1670,9 +1664,7 @@ pub fn add_transition_at_cut_with_id(
         params: std::collections::BTreeMap::new(),
     };
     for existing in track.transitions.iter() {
-        if new_t.window_in() < existing.window_out()
-            && existing.window_in() < new_t.window_out()
-        {
+        if new_t.window_in() < existing.window_out() && existing.window_in() < new_t.window_out() {
             return Err(TimelineError::invalid(
                 "transition window overlaps an existing transition",
             ));
@@ -1920,7 +1912,11 @@ pub fn set_bus_output(seq: &Sequence, bus_id: BusId, output: BusOutput) -> Resul
 }
 
 /// Route a track's main output (to master or a bus). Rejects a missing bus.
-pub fn route_track_to_bus(seq: &Sequence, track_id: TrackId, output: BusOutput) -> Result<Sequence> {
+pub fn route_track_to_bus(
+    seq: &Sequence,
+    track_id: TrackId,
+    output: BusOutput,
+) -> Result<Sequence> {
     let (idx, track) = find_track(seq, track_id)?;
     if let BusOutput::Bus(target) = output {
         find_bus(seq, target)?;
@@ -2020,7 +2016,9 @@ pub fn add_bus_send(seq: &Sequence, bus_id: BusId, send: Send) -> Result<Sequenc
     let mut buses = seq.buses.clone();
     buses[idx].sends.push(send);
     if bus_graph_cycle(&buses).is_some() {
-        return Err(TimelineError::invalid("bus send would create a feedback cycle"));
+        return Err(TimelineError::invalid(
+            "bus send would create a feedback cycle",
+        ));
     }
     Ok(with_buses(seq, buses))
 }
@@ -2154,8 +2152,9 @@ pub fn magnetic_move_clip(
     let _ = idx;
     let mut delta = sub(new_timeline_in, clip.timeline_in);
 
-    let moved: std::collections::HashSet<ClipId> =
-        connected_subtree(&seq.connections, clip_id).into_iter().collect();
+    let moved: std::collections::HashSet<ClipId> = connected_subtree(&seq.connections, clip_id)
+        .into_iter()
+        .collect();
 
     // Clamp delta so the earliest moved clip stays at or after t=0.
     let mut earliest = clip.timeline_in;
@@ -2200,7 +2199,12 @@ pub fn magnetic_move_clip(
                 if a.id == b.id || moved.contains(&b.id) {
                     continue;
                 }
-                if intervals_overlap(a.timeline_in, a.timeline_out(), b.timeline_in, b.timeline_out()) {
+                if intervals_overlap(
+                    a.timeline_in,
+                    a.timeline_out(),
+                    b.timeline_in,
+                    b.timeline_out(),
+                ) {
                     return Err(TimelineError::invalid(
                         "magnetic move would overlap an existing clip",
                     ));
@@ -2307,8 +2311,7 @@ pub fn magnetic_ripple_insert(seq: &Sequence, track_id: TrackId, clip: Clip) -> 
         if t.locked {
             continue;
         }
-        if t
-            .clips
+        if t.clips
             .iter()
             .any(|c| c.timeline_in < at && c.timeline_out() > at)
         {
@@ -2517,7 +2520,11 @@ mod tests {
         assert_eq!(seq.buses.len(), 1);
         assert_eq!(seq.tracks[0].sends.len(), 0, "send to removed bus dropped");
         let music_bus = seq.buses.iter().find(|b| b.id == music).unwrap();
-        assert_eq!(music_bus.output, BusOutput::Master, "Music re-routed to master");
+        assert_eq!(
+            music_bus.output,
+            BusOutput::Master,
+            "Music re-routed to master"
+        );
     }
 
     #[test]
@@ -2528,11 +2535,23 @@ mod tests {
         let seq = Sequence::new("S", FrameRate::FPS_24);
         let mut log = EditLog::new(seq);
         let tid = TrackId::new();
-        log.apply(EditOp::AddTrack { track_id: tid, kind: TrackKind::Audio, name: "A1".into() })
-            .unwrap();
+        log.apply(EditOp::AddTrack {
+            track_id: tid,
+            kind: TrackKind::Audio,
+            name: "A1".into(),
+        })
+        .unwrap();
         let bus = BusId::new();
-        log.apply(EditOp::AddBus { bus_id: bus, name: "Music".into() }).unwrap();
-        log.apply(EditOp::RouteTrackToBus { track_id: tid, output: BusOutput::Bus(bus) }).unwrap();
+        log.apply(EditOp::AddBus {
+            bus_id: bus,
+            name: "Music".into(),
+        })
+        .unwrap();
+        log.apply(EditOp::RouteTrackToBus {
+            track_id: tid,
+            output: BusOutput::Bus(bus),
+        })
+        .unwrap();
         assert_eq!(log.current().buses.len(), 1);
         assert_eq!(log.current().tracks[0].output, BusOutput::Bus(bus));
         // Undo the route, then the bus add.
@@ -2569,16 +2588,46 @@ mod tests {
         let m = seq.buses.iter().find(|b| b.id == music).unwrap();
         assert!(matches!(m.inserts[1], AudioEffectSpec::Limiter { .. }));
         let seq = remove_bus_insert(&seq, music, 0).unwrap();
-        assert_eq!(seq.buses.iter().find(|b| b.id == music).unwrap().inserts.len(), 1);
+        assert_eq!(
+            seq.buses
+                .iter()
+                .find(|b| b.id == music)
+                .unwrap()
+                .inserts
+                .len(),
+            1
+        );
 
         // Bus send: Music → Reverb is fine; self-send + feedback rejected.
         let seq = add_bus_send(&seq, music, Send::to(reverb)).unwrap();
-        assert_eq!(seq.buses.iter().find(|b| b.id == music).unwrap().sends.len(), 1);
-        assert!(add_bus_send(&seq, music, Send::to(music)).is_err(), "self-send");
+        assert_eq!(
+            seq.buses
+                .iter()
+                .find(|b| b.id == music)
+                .unwrap()
+                .sends
+                .len(),
+            1
+        );
+        assert!(
+            add_bus_send(&seq, music, Send::to(music)).is_err(),
+            "self-send"
+        );
         // Reverb → Music would close a loop (Music already sends to Reverb).
-        assert!(add_bus_send(&seq, reverb, Send::to(music)).is_err(), "feedback");
+        assert!(
+            add_bus_send(&seq, reverb, Send::to(music)).is_err(),
+            "feedback"
+        );
         let seq = remove_bus_send(&seq, music, 0).unwrap();
-        assert_eq!(seq.buses.iter().find(|b| b.id == music).unwrap().sends.len(), 0);
+        assert_eq!(
+            seq.buses
+                .iter()
+                .find(|b| b.id == music)
+                .unwrap()
+                .sends
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -2590,11 +2639,26 @@ mod tests {
         let mut log = EditLog::new(Sequence::new("S", FrameRate::FPS_24));
         let bus = BusId::new();
         let rev = BusId::new();
-        log.apply(EditOp::AddBus { bus_id: bus, name: "Music".into() }).unwrap();
-        log.apply(EditOp::AddBus { bus_id: rev, name: "Reverb".into() }).unwrap();
-        log.apply(EditOp::AddBusInsert { bus_id: bus, effect: AudioEffectSpec::default_eq6() })
-            .unwrap();
-        log.apply(EditOp::AddBusSend { bus_id: bus, send: Send::to(rev) }).unwrap();
+        log.apply(EditOp::AddBus {
+            bus_id: bus,
+            name: "Music".into(),
+        })
+        .unwrap();
+        log.apply(EditOp::AddBus {
+            bus_id: rev,
+            name: "Reverb".into(),
+        })
+        .unwrap();
+        log.apply(EditOp::AddBusInsert {
+            bus_id: bus,
+            effect: AudioEffectSpec::default_eq6(),
+        })
+        .unwrap();
+        log.apply(EditOp::AddBusSend {
+            bus_id: bus,
+            send: Send::to(rev),
+        })
+        .unwrap();
         let cur = log.current();
         let m = cur.buses.iter().find(|b| b.id == bus).unwrap();
         assert_eq!(m.inserts.len(), 1);
@@ -2839,7 +2903,13 @@ mod tests {
         let e = clip.effects.iter().find(|e| e.id == ids[1]).unwrap();
         assert!(!e.enabled);
         // Other effects untouched.
-        assert!(clip.effects.iter().find(|e| e.id == ids[0]).unwrap().enabled);
+        assert!(
+            clip.effects
+                .iter()
+                .find(|e| e.id == ids[0])
+                .unwrap()
+                .enabled
+        );
     }
 
     #[test]
@@ -2925,12 +2995,12 @@ mod tests {
             frame_rate: seq.frame_rate,
             tracks,
             markers: seq.markers.clone(),
-        master_gain_db: seq.master_gain_db,
-        buses: seq.buses.clone(),
-        connections: seq.connections.clone(),
-        magnetic: seq.magnetic,
-        captions: seq.captions.clone(),
-        review_comments: seq.review_comments.clone(),
+            master_gain_db: seq.master_gain_db,
+            buses: seq.buses.clone(),
+            connections: seq.connections.clone(),
+            magnetic: seq.magnetic,
+            captions: seq.captions.clone(),
+            review_comments: seq.review_comments.clone(),
         }
     }
 
@@ -3248,7 +3318,11 @@ mod tests {
         let a = seq.tracks[0].clips.iter().find(|c| c.id == aid).unwrap();
         let tclip = seq.tracks[1].clips.iter().find(|c| c.id == tid).unwrap();
         assert_eq!(a.timeline_in, t(4), "anchor moved");
-        assert_eq!(tclip.timeline_in, t(5), "connected clip dragged by same delta");
+        assert_eq!(
+            tclip.timeline_in,
+            t(5),
+            "connected clip dragged by same delta"
+        );
     }
 
     #[test]
@@ -3397,7 +3471,10 @@ mod tests {
         let connected: std::collections::HashSet<ClipId> =
             seq.connections.iter().map(|c| c.connected).collect();
         for c in v2_clips {
-            assert!(connected.contains(&c.id), "each half is connected to the anchor");
+            assert!(
+                connected.contains(&c.id),
+                "each half is connected to the anchor"
+            );
         }
     }
 
@@ -3406,7 +3483,11 @@ mod tests {
         use crate::edit_log::{EditLog, EditOp};
         let (seq, v1, _v2, aid, tid, _m) = two_track_with_clips();
         let mut log = EditLog::new(seq);
-        log.apply(EditOp::ConnectClip { anchor: aid, connected: tid }).unwrap();
+        log.apply(EditOp::ConnectClip {
+            anchor: aid,
+            connected: tid,
+        })
+        .unwrap();
         log.apply(EditOp::MagneticMoveClip {
             track_id: v1,
             clip_id: aid,
@@ -3419,7 +3500,11 @@ mod tests {
             "connected clip moved with anchor"
         );
         log.undo().unwrap();
-        assert_eq!(log.current().tracks[1].clips[0].timeline_in, t(1), "move undone");
+        assert_eq!(
+            log.current().tracks[1].clips[0].timeline_in,
+            t(1),
+            "move undone"
+        );
         log.undo().unwrap();
         assert!(log.current().connections.is_empty(), "connect undone");
         log.redo().unwrap();
@@ -3441,7 +3526,11 @@ mod tests {
         })
         .unwrap();
         assert_eq!(log.current().captions[0].text, "hello world");
-        log.apply(EditOp::SplitCaption { cue_id: cid, at_ms: 2000 }).unwrap();
+        log.apply(EditOp::SplitCaption {
+            cue_id: cid,
+            at_ms: 2000,
+        })
+        .unwrap();
         assert_eq!(log.current().captions.len(), 2, "split");
         // Undo split + edit + add.
         log.undo().unwrap();

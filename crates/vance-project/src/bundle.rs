@@ -132,10 +132,10 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::TempDir;
+    use vance_core::{FrameRate, RationalTime};
     use vance_timeline::{
         Clip, EditLog, EditOp, MediaItem, MediaKind, Project, Sequence, TrackId, TrackKind,
     };
-    use vance_core::{FrameRate, RationalTime};
 
     fn t(num: i64) -> RationalTime {
         RationalTime::new(num, 1).unwrap()
@@ -162,11 +162,7 @@ mod tests {
         })
         .unwrap();
         let clip = Clip::new(media_id, "clip.mov", t(0), t(0), t(5)).unwrap();
-        log.apply(EditOp::InsertClip {
-            track_id,
-            clip,
-        })
-        .unwrap();
+        log.apply(EditOp::InsertClip { track_id, clip }).unwrap();
 
         p.sequences.push(Arc::new(log.current().clone()));
         p
@@ -208,9 +204,13 @@ mod tests {
         let bundle = tmp.path().join("Anim.vance");
 
         let mut p = Project::new("Anim");
-        let media =
-            MediaItem::new(PathBuf::from("/tmp/c.mov"), "c.mov", MediaKind::Video, t(30))
-                .with_frame_rate(FrameRate::FPS_24);
+        let media = MediaItem::new(
+            PathBuf::from("/tmp/c.mov"),
+            "c.mov",
+            MediaKind::Video,
+            t(30),
+        )
+        .with_frame_rate(FrameRate::FPS_24);
         let media_id = media.id;
         p.media.insert(media_id, Arc::new(media));
 

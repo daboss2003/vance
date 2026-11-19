@@ -19,7 +19,14 @@ fn sidecars_present() -> bool {
 }
 fn probe(path: &PathBuf, field: &str) -> String {
     let out = Command::new("ffprobe")
-        .args(["-hide_banner", "-loglevel", "error", "-select_streams", "v:0", "-show_entries"])
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+        ])
         .arg(format!("stream={field}"))
         .args(["-of", "default=noprint_wrappers=1:nokey=1"])
         .arg(path)
@@ -41,7 +48,9 @@ fn odd_dimensions_export_crops_to_even() {
     chdir_root();
     let mut e = Engine::default();
     e.new_project("x".into()).unwrap();
-    let f = e.create_fusion_media(Some("c".into()), 321, 241, 1.0).unwrap();
+    let f = e
+        .create_fusion_media(Some("c".into()), 321, 241, 1.0)
+        .unwrap();
     let media_id = vance_timeline::MediaItemId::from_uuid(f.id.parse().unwrap());
     let track = {
         let c = e.current_sequence_contents().unwrap();
@@ -57,7 +66,8 @@ fn odd_dimensions_export_crops_to_even() {
         ("prores", EncoderPreset::ProRes422HQ),
         ("h264", EncoderPreset::H264 { crf: 23 }),
     ] {
-        let out = std::env::temp_dir().join(format!("vance-odd-{label}-{}.mov", std::process::id()));
+        let out =
+            std::env::temp_dir().join(format!("vance-odd-{label}-{}.mov", std::process::id()));
         let _ = std::fs::remove_file(&out);
         e.render_sequence(RenderOptions {
             output_path: out.to_string_lossy().to_string(),
@@ -73,7 +83,11 @@ fn odd_dimensions_export_crops_to_even() {
         let w: i64 = probe(&out, "width").parse().unwrap_or(0);
         let h: i64 = probe(&out, "height").parse().unwrap_or(0);
         // Rounded down to even (321→320, 241→240).
-        assert_eq!((w, h), (320, 240), "{label}: dims must round to even 320x240, got {w}x{h}");
+        assert_eq!(
+            (w, h),
+            (320, 240),
+            "{label}: dims must round to even 320x240, got {w}x{h}"
+        );
         let _ = std::fs::remove_file(&out);
     }
 }
@@ -89,8 +103,20 @@ fn audio_only_file_imports_via_audio_decoder() {
     let wav = std::env::temp_dir().join(format!("vance-tone-{}.wav", std::process::id()));
     let _ = std::fs::remove_file(&wav);
     let made = Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
-               "sine=frequency=440:duration=1", "-ac", "2", "-ar", "48000"])
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1",
+            "-ac",
+            "2",
+            "-ar",
+            "48000",
+        ])
         .arg(&wav)
         .status()
         .map(|s| s.success())
@@ -107,7 +133,11 @@ fn audio_only_file_imports_via_audio_decoder() {
         .import_audio_file(&wav.canonicalize().unwrap().to_string_lossy())
         .expect("audio-only file must import via the audio decoder");
     assert_eq!(info.kind, "audio", "must register as audio-kind media");
-    assert!(info.duration_seconds > 0.5, "duration probed: {}", info.duration_seconds);
+    assert!(
+        info.duration_seconds > 0.5,
+        "duration probed: {}",
+        info.duration_seconds
+    );
     let _ = std::fs::remove_file(&wav);
 }
 
@@ -116,9 +146,12 @@ fn captions_srt_and_vtt_round_trip_tricky_text() {
     let mut e = Engine::default();
     e.new_project("x".into()).unwrap();
     // Tricky cues: multi-line, unicode, punctuation, adjacent timings.
-    e.add_caption(0, 1500, "First line\nsecond line".into()).unwrap();
-    e.add_caption(1500, 3000, "Café — déjà vu, 100% sure?".into()).unwrap();
-    e.add_caption(3000, 4200, "<i>emphasis</i> & symbols: 3 < 5".into()).unwrap();
+    e.add_caption(0, 1500, "First line\nsecond line".into())
+        .unwrap();
+    e.add_caption(1500, 3000, "Café — déjà vu, 100% sure?".into())
+        .unwrap();
+    e.add_caption(3000, 4200, "<i>emphasis</i> & symbols: 3 < 5".into())
+        .unwrap();
     let original: Vec<(i64, i64, String)> = e
         .captions()
         .iter()
@@ -127,14 +160,17 @@ fn captions_srt_and_vtt_round_trip_tricky_text() {
     assert_eq!(original.len(), 3);
 
     for (ext, vtt) in [("srt", false), ("vtt", true)] {
-        let path = std::env::temp_dir()
-            .join(format!("vance-cap-{}-{}.{ext}", std::process::id(), ext));
+        let path =
+            std::env::temp_dir().join(format!("vance-cap-{}-{}.{ext}", std::process::id(), ext));
         let _ = std::fs::remove_file(&path);
-        e.export_captions(&path.to_string_lossy(), vtt).expect("export captions");
+        e.export_captions(&path.to_string_lossy(), vtt)
+            .expect("export captions");
         // Re-import into a fresh engine/sequence and compare timings + text.
         let mut e2 = Engine::default();
         e2.new_project("y".into()).unwrap();
-        let n = e2.import_captions(&path.to_string_lossy()).expect("import captions");
+        let n = e2
+            .import_captions(&path.to_string_lossy())
+            .expect("import captions");
         assert_eq!(n, 3, "{ext}: all 3 cues re-imported");
         let back: Vec<(i64, i64, String)> = e2
             .captions()
@@ -144,7 +180,11 @@ fn captions_srt_and_vtt_round_trip_tricky_text() {
         for (i, (o, b)) in original.iter().zip(back.iter()).enumerate() {
             assert_eq!(o.0, b.0, "{ext} cue {i} start");
             assert_eq!(o.1, b.1, "{ext} cue {i} end");
-            assert_eq!(o.2, b.2, "{ext} cue {i} text (round-trip): {:?} vs {:?}", o.2, b.2);
+            assert_eq!(
+                o.2, b.2,
+                "{ext} cue {i} text (round-trip): {:?} vs {:?}",
+                o.2, b.2
+            );
         }
         let _ = std::fs::remove_file(&path);
     }

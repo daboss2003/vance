@@ -223,9 +223,13 @@ impl Tool {
             Tool::Demucs => &["demucs"],
             Tool::BackgroundRemover => &["backgroundremover"],
             // Image generation via Hugging Face diffusers + a bundled wrapper.
-            Tool::StableDiffusion => {
-                &["torch", "diffusers", "transformers", "accelerate", "safetensors"]
-            }
+            Tool::StableDiffusion => &[
+                "torch",
+                "diffusers",
+                "transformers",
+                "accelerate",
+                "safetensors",
+            ],
         }
     }
     /// How Vance installs this tool: `"pip"` (into the managed venv) or
@@ -443,7 +447,11 @@ fn ensure_venv(on: &mut Progress) -> Result<PathBuf, InstallError> {
     let python = ensure_python(on)?;
     on("setup", "Creating a private Python environment…", None);
     let venv = venv_dir()?;
-    let out = Command::new(&python).arg("-m").arg("venv").arg(&venv).output()?;
+    let out = Command::new(&python)
+        .arg("-m")
+        .arg("venv")
+        .arg(&venv)
+        .output()?;
     if !out.status.success() {
         return Err(pip_err("creating venv", &out));
     }
@@ -457,11 +465,31 @@ const PBS_TAG: &str = "20260807";
 const PBS_VERSION: &str = "3.12.13";
 /// `(platform_key, release-triple, sha256)` for the `install_only` tarball.
 const PBS_PYTHON: &[(&str, &str, &str)] = &[
-    ("macos-aarch64", "aarch64-apple-darwin", "4201588fc5051c2ba988abbe1f033d318965ee378fadf7fb7ef79882ba7be84b"),
-    ("macos-x86_64", "x86_64-apple-darwin", "ce9dc826a3215d5deadf6d7ba409a882b8d431192c4c06deb34ff00f93ceb4f5"),
-    ("linux-aarch64", "aarch64-unknown-linux-gnu", "e2a33a26bae0f0975a9786c2e3beaee9cfeb35f856bdd273ff10ae35cf7e06ce"),
-    ("linux-x86_64", "x86_64-unknown-linux-gnu", "5bd6f36fd7ef02b909234c94dca9994ef0da06ace3bc3cece4fe27870e9cdbbe"),
-    ("windows-x86_64", "x86_64-pc-windows-msvc", "6cf2be701aa7e9470454c9c86285c1bcc1832518d63e39c3e34e9d8ea1cbb99f"),
+    (
+        "macos-aarch64",
+        "aarch64-apple-darwin",
+        "4201588fc5051c2ba988abbe1f033d318965ee378fadf7fb7ef79882ba7be84b",
+    ),
+    (
+        "macos-x86_64",
+        "x86_64-apple-darwin",
+        "ce9dc826a3215d5deadf6d7ba409a882b8d431192c4c06deb34ff00f93ceb4f5",
+    ),
+    (
+        "linux-aarch64",
+        "aarch64-unknown-linux-gnu",
+        "e2a33a26bae0f0975a9786c2e3beaee9cfeb35f856bdd273ff10ae35cf7e06ce",
+    ),
+    (
+        "linux-x86_64",
+        "x86_64-unknown-linux-gnu",
+        "5bd6f36fd7ef02b909234c94dca9994ef0da06ace3bc3cece4fe27870e9cdbbe",
+    ),
+    (
+        "windows-x86_64",
+        "x86_64-pc-windows-msvc",
+        "6cf2be701aa7e9470454c9c86285c1bcc1832518d63e39c3e34e9d8ea1cbb99f",
+    ),
 ];
 
 /// A Python to bootstrap the venv from: the system one, else Vance's managed
@@ -495,7 +523,11 @@ fn provision_python(on: &mut Progress) -> Result<PathBuf, InstallError> {
     );
     let tools = tools_dir()?;
     let tgz = tools.join("python-download.tar.gz");
-    on("setup", &format!("Downloading a private Python {PBS_VERSION} runtime…"), Some(0.0));
+    on(
+        "setup",
+        &format!("Downloading a private Python {PBS_VERSION} runtime…"),
+        Some(0.0),
+    );
     download_to_file(&url, sha, &tgz, "Python runtime", "setup", on)?;
 
     on("setup", "Unpacking Python…", None);
@@ -513,7 +545,10 @@ fn provision_python(on: &mut Progress) -> Result<PathBuf, InstallError> {
             code: out.status.code(),
             stderr: format!(
                 "unpacking Python: {}",
-                String::from_utf8_lossy(&out.stderr).chars().take(500).collect::<String>()
+                String::from_utf8_lossy(&out.stderr)
+                    .chars()
+                    .take(500)
+                    .collect::<String>()
             ),
         });
     }
@@ -532,7 +567,10 @@ fn download_to_file(
 ) -> Result<(), InstallError> {
     use std::io::{Read, Write};
     let client = http_client()?;
-    let mut resp = client.get(url).send().map_err(|e| InstallError::Http(e.to_string()))?;
+    let mut resp = client
+        .get(url)
+        .send()
+        .map_err(|e| InstallError::Http(e.to_string()))?;
     if !resp.status().is_success() {
         return Err(InstallError::Http(format!("{url} {}", resp.status())));
     }
@@ -546,7 +584,9 @@ fn download_to_file(
     let mut done: u64 = 0;
     let mut last_emit: u64 = 0;
     loop {
-        let read = resp.read(&mut buf).map_err(|e| InstallError::Http(e.to_string()))?;
+        let read = resp
+            .read(&mut buf)
+            .map_err(|e| InstallError::Http(e.to_string()))?;
         if read == 0 {
             break;
         }
@@ -555,9 +595,19 @@ fn download_to_file(
         done += read as u64;
         if done - last_emit >= 1_048_576 {
             last_emit = done;
-            let pct = total.map(|t| if t > 0 { (done as f32 / t as f32 * 100.0).min(100.0) } else { 0.0 });
+            let pct = total.map(|t| {
+                if t > 0 {
+                    (done as f32 / t as f32 * 100.0).min(100.0)
+                } else {
+                    0.0
+                }
+            });
             let detail = match total {
-                Some(t) => format!("Downloading {label} — {} / {}", human_bytes(done), human_bytes(t)),
+                Some(t) => format!(
+                    "Downloading {label} — {} / {}",
+                    human_bytes(done),
+                    human_bytes(t)
+                ),
                 None => format!("Downloading {label} — {}", human_bytes(done)),
             };
             on(phase, &detail, pct);
@@ -565,10 +615,17 @@ fn download_to_file(
     }
     file.flush()?;
     drop(file);
-    let got_hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let got_hex: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     if !got_hex.eq_ignore_ascii_case(sha256_want) {
         let _ = std::fs::remove_file(dest);
-        return Err(InstallError::Checksum { got: got_hex, want: sha256_want.to_string() });
+        return Err(InstallError::Checksum {
+            got: got_hex,
+            want: sha256_want.to_string(),
+        });
     }
     Ok(())
 }
@@ -589,13 +646,21 @@ fn install_via_pip(tool: Tool, on: &mut Progress) -> Result<PathBuf, InstallErro
     const NET: [&str; 4] = ["--retries", "10", "--timeout", "60"];
     on("pip", "Updating the package installer (pip)…", None);
     let mut up = Command::new(&vpython);
-    up.args(["-m", "pip", "install", "--upgrade"]).args(NET).arg("pip");
+    up.args(["-m", "pip", "install", "--upgrade"])
+        .args(NET)
+        .arg("pip");
     run_streaming(up, "pip", "upgrading pip", on)?;
 
     let joined = packages.join(" ");
-    on("pip", &format!("Installing {joined} (this can take a while)…"), None);
+    on(
+        "pip",
+        &format!("Installing {joined} (this can take a while)…"),
+        None,
+    );
     let mut inst = Command::new(&vpython);
-    inst.args(["-m", "pip", "install", "--upgrade"]).args(NET).args(packages);
+    inst.args(["-m", "pip", "install", "--upgrade"])
+        .args(NET)
+        .args(packages);
     run_streaming(inst, "pip", &format!("installing {joined}"), on)?;
 
     // Image generation is a bundled diffusers wrapper (no CLI on PyPI): drop the
@@ -616,7 +681,11 @@ fn finish_diffusers(vpython: &std::path::Path, on: &mut Progress) -> Result<Path
     // resumes: torch/diffusers are cached, the model download resumes).
     let script = sync_imagegen_script()?;
     let model = diffusers_model();
-    on("download", &format!("Downloading the image model ({model})…"), Some(0.0));
+    on(
+        "download",
+        &format!("Downloading the image model ({model})…"),
+        Some(0.0),
+    );
     let mut cmd = Command::new(vpython);
     cmd.arg(&script)
         .arg("--prewarm")
@@ -643,7 +712,9 @@ fn run_streaming(
     // Pipe stdin and DON'T take it: any child that watches its stdin (our
     // imagegen wrapper) then sees EOF the instant Vance dies (even on
     // force-quit), so long jobs can't outlive the app orphaned.
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     let mut readers = Vec::new();
@@ -722,7 +793,11 @@ fn install_via_manifest(tool: Tool, on: &mut Progress) -> Result<PathBuf, Instal
     let n = artifacts.len();
     for (i, art) in artifacts.iter().enumerate() {
         let name = art.dest.rsplit('/').next().unwrap_or(&art.dest).to_string();
-        on("download", &format!("Downloading {name} ({}/{n})…", i + 1), Some(0.0));
+        on(
+            "download",
+            &format!("Downloading {name} ({}/{n})…", i + 1),
+            Some(0.0),
+        );
         place_artifact(&client, art, &name, on)?;
     }
     // Validate via the SAME resolve() the rest of the app uses, so a manifest
@@ -763,7 +838,9 @@ fn place_artifact(
     let mut done: u64 = 0;
     let mut last_emit: u64 = 0;
     loop {
-        let read = resp.read(&mut buf).map_err(|e| InstallError::Http(e.to_string()))?;
+        let read = resp
+            .read(&mut buf)
+            .map_err(|e| InstallError::Http(e.to_string()))?;
         if read == 0 {
             break;
         }
@@ -772,10 +849,19 @@ fn place_artifact(
         done += read as u64;
         if done - last_emit >= 1_048_576 {
             last_emit = done;
-            let pct = total
-                .map(|t| if t > 0 { (done as f32 / t as f32 * 100.0).min(100.0) } else { 0.0 });
+            let pct = total.map(|t| {
+                if t > 0 {
+                    (done as f32 / t as f32 * 100.0).min(100.0)
+                } else {
+                    0.0
+                }
+            });
             let detail = match total {
-                Some(t) => format!("Downloading {name} — {} / {}", human_bytes(done), human_bytes(t)),
+                Some(t) => format!(
+                    "Downloading {name} — {} / {}",
+                    human_bytes(done),
+                    human_bytes(t)
+                ),
                 None => format!("Downloading {name} — {}", human_bytes(done)),
             };
             on("download", &detail, pct);
@@ -784,7 +870,11 @@ fn place_artifact(
     file.flush()?;
     drop(file);
 
-    let got_hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let got_hex: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     if !got_hex.eq_ignore_ascii_case(&art.sha256) {
         let _ = std::fs::remove_file(&tmp);
         return Err(InstallError::Checksum {
@@ -1037,7 +1127,10 @@ mod tests {
         let hex = |b: &[u8]| {
             let mut h = Sha256::new();
             h.update(b);
-            h.finalize().iter().map(|x| format!("{x:02x}")).collect::<String>()
+            h.finalize()
+                .iter()
+                .map(|x| format!("{x:02x}"))
+                .collect::<String>()
         };
         assert!(hex(b"").eq_ignore_ascii_case(empty));
         assert!(!hex(b"x").eq_ignore_ascii_case(empty));
@@ -1077,12 +1170,19 @@ mod tests {
             return;
         }
         let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("echo out-line; echo err-line 1>&2; exit 0");
+        cmd.arg("-c")
+            .arg("echo out-line; echo err-line 1>&2; exit 0");
         let mut lines: Vec<String> = Vec::new();
         let mut on = |_p: &str, detail: &str, _pct: Option<f32>| lines.push(detail.to_string());
         assert!(run_streaming(cmd, "pip", "test", &mut on).is_ok());
-        assert!(lines.iter().any(|l| l == "out-line"), "missing stdout: {lines:?}");
-        assert!(lines.iter().any(|l| l == "err-line"), "missing stderr: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l == "out-line"),
+            "missing stdout: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == "err-line"),
+            "missing stderr: {lines:?}"
+        );
     }
 
     #[test]
@@ -1105,7 +1205,11 @@ mod tests {
     #[test]
     fn pbs_covers_common_platforms_with_valid_hashes() {
         for key in [
-            "macos-aarch64", "macos-x86_64", "linux-x86_64", "linux-aarch64", "windows-x86_64",
+            "macos-aarch64",
+            "macos-x86_64",
+            "linux-x86_64",
+            "linux-aarch64",
+            "windows-x86_64",
         ] {
             assert!(
                 PBS_PYTHON.iter().any(|(k, _, _)| *k == key),

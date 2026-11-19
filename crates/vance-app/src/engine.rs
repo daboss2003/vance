@@ -8,6 +8,7 @@
 //! intended to be called from Tauri command handlers.
 
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -16,9 +17,8 @@ use std::time::{Duration, Instant};
 use vance_audio::AudioPlayer;
 use vance_decoder::{DecoderClient, StreamInfo};
 use vance_render::{render_title_yuv420, Renderer, RendererConfig};
-use std::collections::HashMap;
 use vance_timeline::{
-    Clip, Effect, EditLog, EditOp, EffectId, EffectValue, MediaItem, MediaItemId, MediaKind,
+    Clip, EditLog, EditOp, Effect, EffectId, EffectValue, MediaItem, MediaItemId, MediaKind,
     Project, Sequence, SequenceId, TitleParams, Track, TrackId, TrackKind,
 };
 
@@ -314,8 +314,7 @@ fn rt_to_seconds(t: vance_core::RationalTime) -> f64 {
 /// human-readable.
 fn seconds_to_rt(s: f64) -> vance_core::RationalTime {
     let ms = (s * 1000.0).round() as i64;
-    vance_core::RationalTime::new(ms.max(0), 1000)
-        .unwrap_or(vance_core::RationalTime::ZERO)
+    vance_core::RationalTime::new(ms.max(0), 1000).unwrap_or(vance_core::RationalTime::ZERO)
 }
 
 /// Current wall-clock time as Unix seconds (UTC), for review-comment
@@ -339,10 +338,7 @@ struct FirstClipHit {
 /// Look up `(timeline_in_seconds, source_in_seconds)` for a clip by
 /// ID anywhere in the sequence. Used to anchor playback for the
 /// playhead-translation math.
-fn clip_anchor_seconds(
-    seq: &Sequence,
-    clip_id: vance_timeline::ClipId,
-) -> Option<(f64, f64)> {
+fn clip_anchor_seconds(seq: &Sequence, clip_id: vance_timeline::ClipId) -> Option<(f64, f64)> {
     for track in seq.tracks.iter() {
         for clip in track.clips.iter() {
             if clip.id == clip_id {
@@ -394,19 +390,16 @@ struct ClipTransform {
     rotation_radians: f32,
 }
 
-fn eval_clip_transform(
-    effects: &[vance_timeline::Effect],
-    t_seconds: f64,
-) -> ClipTransform {
+fn eval_clip_transform(effects: &[vance_timeline::Effect], t_seconds: f64) -> ClipTransform {
     let mut t = ClipTransform {
         translate: [0.0, 0.0],
         scale: [1.0, 1.0],
         rotation_radians: 0.0,
     };
-    let eval = |k: &str,
-                ps: &std::collections::BTreeMap<String, EffectValue>|
-     -> Option<f32> {
-        ps.get(k).and_then(|p| p.eval_number(t_seconds)).map(|v| v as f32)
+    let eval = |k: &str, ps: &std::collections::BTreeMap<String, EffectValue>| -> Option<f32> {
+        ps.get(k)
+            .and_then(|p| p.eval_number(t_seconds))
+            .map(|v| v as f32)
     };
     for e in effects {
         if !e.enabled || e.kind != "transform" {
@@ -416,8 +409,7 @@ fn eval_clip_transform(
         t.translate[1] += eval("translate_y", &e.params).unwrap_or(0.0);
         t.scale[0] *= eval("scale_x", &e.params).unwrap_or(1.0);
         t.scale[1] *= eval("scale_y", &e.params).unwrap_or(1.0);
-        t.rotation_radians +=
-            eval("rotation", &e.params).unwrap_or(0.0).to_radians();
+        t.rotation_radians += eval("rotation", &e.params).unwrap_or(0.0).to_radians();
     }
     t
 }
@@ -485,9 +477,7 @@ fn reframe_transform(
 /// none are attached.
 fn eval_clip_crop(effects: &[vance_timeline::Effect], t_seconds: f64) -> [f32; 4] {
     let mut crop = [0.0_f32; 4];
-    let eval = |k: &str,
-                ps: &std::collections::BTreeMap<String, EffectValue>|
-     -> f32 {
+    let eval = |k: &str, ps: &std::collections::BTreeMap<String, EffectValue>| -> f32 {
         ps.get(k)
             .and_then(|p| p.eval_number(t_seconds))
             .map(|v| v as f32)
@@ -508,16 +498,13 @@ fn eval_clip_crop(effects: &[vance_timeline::Effect], t_seconds: f64) -> [f32; 4
 /// Brightness/contrast values aggregated from every enabled
 /// "color" effect on the clip; brightness sums, contrast multiplies.
 /// Defaults to `(brightness=0, contrast=1)` (passthrough).
-fn eval_clip_brightness_contrast(
-    effects: &[vance_timeline::Effect],
-    t_seconds: f64,
-) -> (f32, f32) {
+fn eval_clip_brightness_contrast(effects: &[vance_timeline::Effect], t_seconds: f64) -> (f32, f32) {
     let mut brightness = 0.0_f32;
     let mut contrast = 1.0_f32;
-    let eval = |k: &str,
-                ps: &std::collections::BTreeMap<String, EffectValue>|
-     -> Option<f32> {
-        ps.get(k).and_then(|p| p.eval_number(t_seconds)).map(|v| v as f32)
+    let eval = |k: &str, ps: &std::collections::BTreeMap<String, EffectValue>| -> Option<f32> {
+        ps.get(k)
+            .and_then(|p| p.eval_number(t_seconds))
+            .map(|v| v as f32)
     };
     for e in effects {
         if !e.enabled || e.kind != "color" {
@@ -529,11 +516,7 @@ fn eval_clip_brightness_contrast(
     (brightness, contrast)
 }
 
-fn clip_crop_at(
-    seq: &Sequence,
-    clip_id: vance_timeline::ClipId,
-    t_seconds: f64,
-) -> [f32; 4] {
+fn clip_crop_at(seq: &Sequence, clip_id: vance_timeline::ClipId, t_seconds: f64) -> [f32; 4] {
     for track in seq.tracks.iter() {
         if let Some(clip) = track.clips.iter().find(|c| c.id == clip_id) {
             return eval_clip_crop(&clip.effects, t_seconds);
@@ -588,9 +571,11 @@ fn eval_keyframes_or(kfs: &[vance_timeline::Keyframe], t: f64, default: f64) -> 
     }
     // Reuse the existing linear-interp evaluator by wrapping in an
     // EffectValue::Keyframes (cheap clone of small Vec).
-    EffectValue::Keyframes { keyframes: kfs.to_vec() }
-        .eval_number(t)
-        .unwrap_or(default)
+    EffectValue::Keyframes {
+        keyframes: kfs.to_vec(),
+    }
+    .eval_number(t)
+    .unwrap_or(default)
 }
 
 fn eval_clip_grades(
@@ -599,18 +584,21 @@ fn eval_clip_grades(
     matte_node: Option<EffectId>,
 ) -> Vec<vance_render::GradeNodeParams> {
     use vance_timeline::grade as gk;
-    let num = |ps: &std::collections::BTreeMap<String, EffectValue>, k: &str, default: f32| -> f32 {
-        ps.get(k)
-            .and_then(|p| p.eval_number(t_seconds))
-            .map(|v| v as f32)
-            .unwrap_or(default)
-    };
+    let num =
+        |ps: &std::collections::BTreeMap<String, EffectValue>, k: &str, default: f32| -> f32 {
+            ps.get(k)
+                .and_then(|p| p.eval_number(t_seconds))
+                .map(|v| v as f32)
+                .unwrap_or(default)
+        };
     // Curve control points live in an `EffectValue::Keyframes` whose
     // points are (input level, output level) pairs — static, NOT read
     // at `t_seconds` (the curve shape itself isn't keyframe-animated in
     // 6.8). Absent/other variants yield an empty list, which the baker
     // treats as the identity ramp.
-    let curve = |ps: &std::collections::BTreeMap<String, EffectValue>, k: &str| -> Vec<vance_timeline::Keyframe> {
+    let curve = |ps: &std::collections::BTreeMap<String, EffectValue>,
+                 k: &str|
+     -> Vec<vance_timeline::Keyframe> {
         match ps.get(k) {
             Some(EffectValue::Keyframes { keyframes: pts }) => pts.clone(),
             _ => Vec::new(),
@@ -778,15 +766,13 @@ fn eval_clip_chroma_key(
     effects: &[vance_timeline::Effect],
     t_seconds: f64,
 ) -> ([f32; 3], f32, f32, f32) {
-    let eval = |k: &str,
-                ps: &std::collections::BTreeMap<String, EffectValue>,
-                fallback: f32|
-     -> f32 {
-        ps.get(k)
-            .and_then(|p| p.eval_number(t_seconds))
-            .map(|v| v as f32)
-            .unwrap_or(fallback)
-    };
+    let eval =
+        |k: &str, ps: &std::collections::BTreeMap<String, EffectValue>, fallback: f32| -> f32 {
+            ps.get(k)
+                .and_then(|p| p.eval_number(t_seconds))
+                .map(|v| v as f32)
+                .unwrap_or(fallback)
+        };
     for e in effects {
         if !e.enabled || e.kind != "chroma_key" {
             continue;
@@ -804,19 +790,14 @@ fn eval_clip_chroma_key(
 /// First enabled "luma_key" effect. Returns
 /// `(threshold, direction, softness, enable)`. `direction > 0` keeps
 /// pixels brighter than `threshold`; `< 0` keeps darker.
-fn eval_clip_luma_key(
-    effects: &[vance_timeline::Effect],
-    t_seconds: f64,
-) -> (f32, f32, f32, f32) {
-    let eval = |k: &str,
-                ps: &std::collections::BTreeMap<String, EffectValue>,
-                fallback: f32|
-     -> f32 {
-        ps.get(k)
-            .and_then(|p| p.eval_number(t_seconds))
-            .map(|v| v as f32)
-            .unwrap_or(fallback)
-    };
+fn eval_clip_luma_key(effects: &[vance_timeline::Effect], t_seconds: f64) -> (f32, f32, f32, f32) {
+    let eval =
+        |k: &str, ps: &std::collections::BTreeMap<String, EffectValue>, fallback: f32| -> f32 {
+            ps.get(k)
+                .and_then(|p| p.eval_number(t_seconds))
+                .map(|v| v as f32)
+                .unwrap_or(fallback)
+        };
     for e in effects {
         if !e.enabled || e.kind != "luma_key" {
             continue;
@@ -858,10 +839,7 @@ fn clip_luma_key_at(
     (0.5, 1.0, 0.05, 0.0)
 }
 
-fn first_clip_after(
-    seq: &Sequence,
-    after_t: vance_core::RationalTime,
-) -> Option<FirstClipHit> {
+fn first_clip_after(seq: &Sequence, after_t: vance_core::RationalTime) -> Option<FirstClipHit> {
     let mut best: Option<FirstClipHit> = None;
     for track in seq.tracks.iter() {
         if track.kind != TrackKind::Video || !track.enabled {
@@ -1040,7 +1018,10 @@ impl From<&Project> for ProjectInfo {
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
             ocio_view: p.ocio_view.as_ref().map(|v| OcioViewInfo {
-                config_path: v.config_path.as_ref().map(|c| c.to_string_lossy().into_owned()),
+                config_path: v
+                    .config_path
+                    .as_ref()
+                    .map(|c| c.to_string_lossy().into_owned()),
                 src: v.src.clone(),
                 dst: v.dst.clone(),
                 size: v.size,
@@ -1188,7 +1169,8 @@ impl EntitlementGate {
         let plaintext = cipher
             .decrypt(Nonce::from_slice(&body[..12]), &body[12..])
             .ok()?;
-        let got = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(&plaintext));
+        let got =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(&plaintext));
         if got != entry.plaintext_sha256 {
             return None;
         }
@@ -1214,7 +1196,8 @@ mod entitlement_gate_tests {
             .unwrap();
         let mut body = nonce.to_vec();
         body.extend_from_slice(&ct); // .vef body layout: nonce || ciphertext
-        let sha = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(&plaintext));
+        let sha =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(&plaintext));
 
         let gate = EntitlementGate::default();
         gate.set_keys(std::collections::HashMap::from([(
@@ -1222,7 +1205,10 @@ mod entitlement_gate_tests {
             (cek, sha),
         )]));
         assert_eq!(gate.decrypt("com.x.a", &body).unwrap(), plaintext);
-        assert!(gate.decrypt("com.x.other", &body).is_none(), "no key for id");
+        assert!(
+            gate.decrypt("com.x.other", &body).is_none(),
+            "no key for id"
+        );
 
         // A key whose lease-signed hash disagrees with the plaintext → rejected.
         gate.set_keys(std::collections::HashMap::from([(
@@ -1316,7 +1302,10 @@ pub struct Engine {
     /// (without an explicit rescan).
     pub(crate) loaded_plugins: std::collections::HashMap<
         String,
-        (vance_plugin_sdk::host::WasmPlugin, Option<std::time::SystemTime>),
+        (
+            vance_plugin_sdk::host::WasmPlugin,
+            Option<std::time::SystemTime>,
+        ),
     >,
     /// M6 — compiled shader effects (`shader:<id>`), keyed by id, with the source
     /// `.vsfx` mtime for edit-reload. Parallel to `loaded_plugins`.
@@ -1760,9 +1749,7 @@ impl Engine {
             .ok_or(EngineError::NoFileOpen)?;
         let (tb_n, tb_d) = info.time_base;
         if tb_d == 0 {
-            return Err(EngineError::Project(
-                "source time base is unusable".into(),
-            ));
+            return Err(EngineError::Project("source time base is unusable".into()));
         }
 
         // Map mark PTS → source seconds. Default to (0, media.duration).
@@ -1771,9 +1758,7 @@ impl Engine {
             .source_mark_out_pts
             .or(info.duration_pts)
             .ok_or_else(|| {
-                EngineError::Project(
-                    "source media has no duration; mark an out-point first".into(),
-                )
+                EngineError::Project("source media has no duration; mark an out-point first".into())
             })?;
         if mark_out_pts <= mark_in_pts {
             return Err(EngineError::Project(
@@ -1820,7 +1805,10 @@ impl Engine {
     /// Decode the Source media at `target_pts` and render it into
     /// the Source viewport.
     pub fn decode_source_at(&mut self, target_pts: i64) -> Result<i64, EngineError> {
-        let dec = self.source_decoder.as_mut().ok_or(EngineError::NoFileOpen)?;
+        let dec = self
+            .source_decoder
+            .as_mut()
+            .ok_or(EngineError::NoFileOpen)?;
         let frame = dec.decode_at(target_pts)?;
         let pts = frame.pts;
         let viewport = self
@@ -2003,9 +1991,9 @@ impl Engine {
         let preview_wasm = self.preview_wasm.take();
         match preview_wasm {
             Some((effects, clip_t))
-                if effects
-                    .iter()
-                    .any(|e| e.enabled && (e.kind.starts_with("wasm:") || e.kind.starts_with("shader:"))) =>
+                if effects.iter().any(|e| {
+                    e.enabled && (e.kind.starts_with("wasm:") || e.kind.starts_with("shader:"))
+                }) =>
             {
                 self.upload_render_with_wasm(
                     &render_state,
@@ -2152,10 +2140,27 @@ impl Engine {
             return self.decode_transition_at(seq, active_tr, 0.0);
         };
         let to_clip_t = to_src_pts - to_src_in;
-        self.apply_wasm_transition(&mut a, &b, w, h, plugin_id, &active_tr.params, active_tr.mix, to_clip_t);
+        self.apply_wasm_transition(
+            &mut a,
+            &b,
+            w,
+            h,
+            plugin_id,
+            &active_tr.params,
+            active_tr.mix,
+            to_clip_t,
+        );
 
-        let viewport = self.viewport.as_ref().ok_or(EngineError::NoViewport)?.clone();
-        let render_state = self.render_state.as_ref().ok_or(EngineError::NoViewport)?.clone();
+        let viewport = self
+            .viewport
+            .as_ref()
+            .ok_or(EngineError::NoViewport)?
+            .clone();
+        let render_state = self
+            .render_state
+            .as_ref()
+            .ok_or(EngineError::NoViewport)?
+            .clone();
         self.present_rgba_to_surface(&render_state, &viewport, &a, w, h)?;
         self.last_resume_pts = Some(pts_a);
         Ok(pts_a)
@@ -2274,10 +2279,7 @@ impl Engine {
 
     /// Wraps the heavy lifting so `start_playback` and the title-mode
     /// entry point share thread setup, atomics, and join handling.
-    fn start_playback_inner(
-        &mut self,
-        kind: StartPlaybackKind,
-    ) -> Result<(), EngineError> {
+    fn start_playback_inner(&mut self, kind: StartPlaybackKind) -> Result<(), EngineError> {
         // Scrubbing and playback both drive the default output device;
         // they're mutually exclusive. Tear down any scrub session before
         // starting playback (the reverse — scrub_begin → stop_playback —
@@ -2325,9 +2327,7 @@ impl Engine {
                 };
                 let (audio_owner, audio_sync) = if use_mixer {
                     match self.start_mixer_session(from_seconds) {
-                        Ok((owner, sync)) => {
-                            (Some(AudioBackend::Mixer(owner)), Some(sync))
-                        }
+                        Ok((owner, sync)) => (Some(AudioBackend::Mixer(owner)), Some(sync)),
                         Err(e) => {
                             tracing::warn!(
                                 ?e,
@@ -2453,8 +2453,7 @@ impl Engine {
         let last_pts_clone = last_pts.clone();
         let ended_at_eos = Arc::new(AtomicBool::new(false));
         let ended_at_eos_clone = ended_at_eos.clone();
-        let chain_resume_micros =
-            Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN));
+        let chain_resume_micros = Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN));
         let chain_resume_micros_clone = chain_resume_micros.clone();
         let last_bounds = self.last_bounds;
         // Consume the effects snapshot stashed by play_sequence
@@ -2558,17 +2557,16 @@ impl Engine {
         // Phase 7.3: clear the snapshot bus so subsequent EditOps
         // don't try to publish to a torn-down mixer.
         self.end_mixer_session();
-        let resume_pts = if session.ended_at_eos.load(Ordering::Acquire)
-            && self.playing_clip_anchor.is_none()
-        {
-            // Single-file EOS → restart from 0 next time so Play means
-            // "play again". In sequence mode this would force the
-            // playhead back to t=0 on every clip end, which is jarring;
-            // the UI is responsible for rewinding (see togglePlayback).
-            0
-        } else {
-            session.last_pts.load(Ordering::Acquire)
-        };
+        let resume_pts =
+            if session.ended_at_eos.load(Ordering::Acquire) && self.playing_clip_anchor.is_none() {
+                // Single-file EOS → restart from 0 next time so Play means
+                // "play again". In sequence mode this would force the
+                // playhead back to t=0 on every clip end, which is jarring;
+                // the UI is responsible for rewinding (see togglePlayback).
+                0
+            } else {
+                session.last_pts.load(Ordering::Acquire)
+            };
         match session.handle.join() {
             Ok(out) => {
                 // Primary decoder is only set when the session was
@@ -2631,8 +2629,10 @@ impl Engine {
         self.ocio_lut_cache = None;
         let mut project = Project::new(name);
         let mut seq = Sequence::new("Sequence 01", vance_core::FrameRate::FPS_24);
-        seq.tracks.push(Arc::new(Track::new(TrackKind::Video, "V1")));
-        seq.tracks.push(Arc::new(Track::new(TrackKind::Audio, "A1")));
+        seq.tracks
+            .push(Arc::new(Track::new(TrackKind::Video, "V1")));
+        seq.tracks
+            .push(Arc::new(Track::new(TrackKind::Audio, "A1")));
         let seq_id = seq.id;
         let seq_for_log = seq.clone();
         project.sequences.push(Arc::new(seq));
@@ -2673,9 +2673,8 @@ impl Engine {
         // seconds. duration_pts can be None if the container didn't
         // declare one; in that case we pessimistically pick 60 s so
         // there's something draggable. Real fix in a later milestone.
-        let duration = duration_from_stream(&stream).unwrap_or_else(|| {
-            vance_core::RationalTime::new(60, 1).expect("60s rational")
-        });
+        let duration = duration_from_stream(&stream)
+            .unwrap_or_else(|| vance_core::RationalTime::new(60, 1).expect("60s rational"));
 
         // Frame rate as a RationalTime is the inverse; we keep the raw
         // FrameRate on MediaItem since rate is meaningful per kind.
@@ -2868,12 +2867,13 @@ impl Engine {
         media_id: MediaItemId,
         space: Option<&str>,
     ) -> Result<(), EngineError> {
-        let resolved = match space {
-            None | Some("") => None,
-            Some(s) => Some(color_space_from_str(s).ok_or_else(|| {
-                EngineError::Project(format!("unknown color space label: {s}"))
-            })?),
-        };
+        let resolved =
+            match space {
+                None | Some("") => None,
+                Some(s) => Some(color_space_from_str(s).ok_or_else(|| {
+                    EngineError::Project(format!("unknown color space label: {s}"))
+                })?),
+            };
         let project = self
             .current_project
             .as_mut()
@@ -2890,10 +2890,7 @@ impl Engine {
     }
 
     /// Replace the project's working color space. Phase 6.2.
-    pub fn set_project_working_color_space(
-        &mut self,
-        space: &str,
-    ) -> Result<(), EngineError> {
+    pub fn set_project_working_color_space(&mut self, space: &str) -> Result<(), EngineError> {
         let space = color_space_from_str(space)
             .ok_or_else(|| EngineError::Project(format!("unknown color space label: {space}")))?;
         let project = self
@@ -2908,18 +2905,13 @@ impl Engine {
     /// view-LUT slot picks it up on the next `apply_view_lut` call —
     /// done immediately so the viewport reflects the change.
     /// Phase 6.5.
-    pub fn set_project_view_lut(
-        &mut self,
-        path: Option<&str>,
-    ) -> Result<(), EngineError> {
+    pub fn set_project_view_lut(&mut self, path: Option<&str>) -> Result<(), EngineError> {
         {
             let project = self
                 .current_project
                 .as_mut()
                 .ok_or(EngineError::NoProject)?;
-            project.view_lut_path = path
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from);
+            project.view_lut_path = path.filter(|s| !s.is_empty()).map(PathBuf::from);
         }
         self.apply_view_lut();
         Ok(())
@@ -3071,10 +3063,7 @@ impl Engine {
     /// List the colorspace names in an OCIO config (for UI pickers).
     /// `config` is an `.ocio` path or `None` for the `$OCIO` env config.
     /// Phase 6.1b.
-    pub fn ocio_list_colorspaces(
-        &self,
-        config: Option<&str>,
-    ) -> Result<Vec<String>, EngineError> {
+    pub fn ocio_list_colorspaces(&self, config: Option<&str>) -> Result<Vec<String>, EngineError> {
         if !vance_ocio::is_available() {
             return Err(EngineError::Ocio(
                 "OpenColorIO support is not enabled in this build".into(),
@@ -3162,7 +3151,9 @@ impl Engine {
                 // Scheduler/other path holds the lock — never block it.
                 return Ok(self.last_scopes.clone());
             };
-            guard.renderer.render_scope_buffer(width, height, pre_view_lut)?
+            guard
+                .renderer
+                .render_scope_buffer(width, height, pre_view_lut)?
         };
         let data = vance_scopes::compute_all(&rgba, width, height, &cfg)
             .map_err(|e| EngineError::Scopes(e.to_string()))?;
@@ -3249,8 +3240,14 @@ impl Engine {
         control_id: String,
         value: vance_mograph::ControlValue,
     ) -> Result<bool, EngineError> {
-        let project = self.current_project.as_mut().ok_or(EngineError::NoProject)?;
-        let arc = project.media.get(&media_id).ok_or(EngineError::MediaNotFound)?;
+        let project = self
+            .current_project
+            .as_mut()
+            .ok_or(EngineError::NoProject)?;
+        let arc = project
+            .media
+            .get(&media_id)
+            .ok_or(EngineError::MediaNotFound)?;
         let mut item = (**arc).clone();
         let Some(inst) = item.mograph.as_mut() else {
             return Err(EngineError::Project("media is not a mograph".into()));
@@ -3308,8 +3305,14 @@ impl Engine {
         media_id: MediaItemId,
         comp: vance_fusion::Comp,
     ) -> Result<(), EngineError> {
-        let project = self.current_project.as_mut().ok_or(EngineError::NoProject)?;
-        let arc = project.media.get(&media_id).ok_or(EngineError::MediaNotFound)?;
+        let project = self
+            .current_project
+            .as_mut()
+            .ok_or(EngineError::NoProject)?;
+        let arc = project
+            .media
+            .get(&media_id)
+            .ok_or(EngineError::MediaNotFound)?;
         let mut item = (**arc).clone();
         if item.fusion.is_none() {
             return Err(EngineError::Project("media is not a fusion comp".into()));
@@ -3372,7 +3375,9 @@ impl Engine {
                 .current_project
                 .as_ref()
                 .ok_or(EngineError::NoProject)?;
-            let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+            let seq_id = self
+                .current_sequence_id
+                .ok_or(EngineError::NoCurrentSequence)?;
             let seq = project
                 .sequence(seq_id)
                 .ok_or(EngineError::SequenceNotFound)?;
@@ -3474,8 +3479,13 @@ impl Engine {
         // entry-time values into the renderer so the first frame
         // looks right before the loop has a chance to update.
         let (entry_xform, entry_crop, entry_color, entry_chroma, entry_luma, clip_effects_snapshot) = {
-            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
-            let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+            let project = self
+                .current_project
+                .as_ref()
+                .ok_or(EngineError::NoProject)?;
+            let seq_id = self
+                .current_sequence_id
+                .ok_or(EngineError::NoCurrentSequence)?;
             let seq = project
                 .sequence(seq_id)
                 .ok_or(EngineError::SequenceNotFound)?;
@@ -3499,8 +3509,13 @@ impl Engine {
             (xform, crop, color, chroma, luma, effects)
         };
         let entry_pipeline = {
-            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
-            let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+            let project = self
+                .current_project
+                .as_ref()
+                .ok_or(EngineError::NoProject)?;
+            let seq_id = self
+                .current_sequence_id
+                .ok_or(EngineError::NoCurrentSequence)?;
             let seq = project
                 .sequence(seq_id)
                 .ok_or(EngineError::SequenceNotFound)?;
@@ -3524,8 +3539,10 @@ impl Engine {
                 entry_xform.scale,
                 entry_xform.rotation_radians,
             );
-            rs.renderer.set_brightness_contrast(entry_color.0, entry_color.1);
-            rs.renderer.set_crop(entry_crop[0], entry_crop[1], entry_crop[2], entry_crop[3]);
+            rs.renderer
+                .set_brightness_contrast(entry_color.0, entry_color.1);
+            rs.renderer
+                .set_crop(entry_crop[0], entry_crop[1], entry_crop[2], entry_crop[3]);
             rs.renderer.set_mix_factor(0.0);
             rs.renderer.set_chroma_key(
                 entry_chroma.0,
@@ -3533,12 +3550,8 @@ impl Engine {
                 entry_chroma.2,
                 entry_chroma.3,
             );
-            rs.renderer.set_luma_key(
-                entry_luma.0,
-                entry_luma.1,
-                entry_luma.2,
-                entry_luma.3,
-            );
+            rs.renderer
+                .set_luma_key(entry_luma.0, entry_luma.1, entry_luma.2, entry_luma.3);
             rs.renderer.set_grades(&eval_clip_grades(
                 &clip_effects_snapshot,
                 source_pts_seconds - anchor_source_in,
@@ -3601,17 +3614,14 @@ impl Engine {
         } else {
             return Some(anchor.timeline_in_seconds);
         };
-        let source_sec = (stream_pts as f64) * (anchor.time_base_num as f64)
-            / (anchor.time_base_den as f64);
+        let source_sec =
+            (stream_pts as f64) * (anchor.time_base_num as f64) / (anchor.time_base_den as f64);
         Some(anchor.timeline_in_seconds + (source_sec - anchor.source_in_seconds))
     }
 
     /// Open `path` in the transition decoder, spawning the sidecar
     /// process on first use. Idempotent when `path` is already loaded.
-    fn ensure_transition_decoder(
-        &mut self,
-        path: &str,
-    ) -> Result<(), EngineError> {
+    fn ensure_transition_decoder(&mut self, path: &str) -> Result<(), EngineError> {
         if self.transition_decoder.is_none() {
             let bin = locate_decoder_binary()?;
             let client = DecoderClient::spawn(bin)?;
@@ -3664,7 +3674,9 @@ impl Engine {
                     let info = self
                         .stream_info
                         .as_ref()
-                        .ok_or_else(|| EngineError::Project("stream info missing post-open".into()))?
+                        .ok_or_else(|| {
+                            EngineError::Project("stream info missing post-open".into())
+                        })?
                         .clone();
                     let (tb_n, tb_d) = info.time_base;
                     let from_src_sec = rt_to_seconds(active_tr.from.source_pts);
@@ -3705,9 +3717,7 @@ impl Engine {
                 let to_info = self
                     .transition_stream_info
                     .as_ref()
-                    .ok_or_else(|| {
-                        EngineError::Project("transition stream info missing".into())
-                    })?
+                    .ok_or_else(|| EngineError::Project("transition stream info missing".into()))?
                     .clone();
                 let (to_tb_n, to_tb_d) = to_info.time_base;
                 let to_src_sec = rt_to_seconds(active_tr.to.source_pts);
@@ -3742,10 +3752,15 @@ impl Engine {
                 .set_transform(xform.translate, xform.scale, xform.rotation_radians);
             rs.renderer.set_brightness_contrast(color.0, color.1);
             rs.renderer.set_crop(crop[0], crop[1], crop[2], crop[3]);
-            rs.renderer.set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
-            rs.renderer.set_luma_key(luma.0, luma.1, luma.2, luma.3);
             rs.renderer
-                .set_grades(&clip_grades_at(seq, from_clip_id, from_clip_t, self.matte_node));
+                .set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
+            rs.renderer.set_luma_key(luma.0, luma.1, luma.2, luma.3);
+            rs.renderer.set_grades(&clip_grades_at(
+                seq,
+                from_clip_id,
+                from_clip_t,
+                self.matte_node,
+            ));
             rs.renderer.set_mix_factor(active_tr.mix);
             if let Some(p) = a_pipeline {
                 rs.renderer.set_pipeline(p);
@@ -3754,7 +3769,11 @@ impl Engine {
         }
         self.apply_lut_for_clip(from_clip_id);
 
-        let viewport = self.viewport.as_ref().ok_or(EngineError::NoViewport)?.clone();
+        let viewport = self
+            .viewport
+            .as_ref()
+            .ok_or(EngineError::NoViewport)?
+            .clone();
         let render_state = self
             .render_state
             .as_ref()
@@ -3800,7 +3819,10 @@ impl Engine {
         let effective_tl_in = anchor_timeline_in + entry_offset;
         // Push the clip's effect chain into the renderer for frame 1.
         let (xform, crop, color, chroma, luma, effects) = {
-            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
+            let project = self
+                .current_project
+                .as_ref()
+                .ok_or(EngineError::NoProject)?;
             let seq_id = self
                 .current_sequence_id
                 .ok_or(EngineError::NoCurrentSequence)?;
@@ -3840,9 +3862,11 @@ impl Engine {
                 .set_transform(xform.translate, xform.scale, xform.rotation_radians);
             rs.renderer.set_brightness_contrast(color.0, color.1);
             rs.renderer.set_crop(crop[0], crop[1], crop[2], crop[3]);
-            rs.renderer.set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
+            rs.renderer
+                .set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
             rs.renderer.set_luma_key(luma.0, luma.1, luma.2, luma.3);
-            rs.renderer.set_grades(&eval_clip_grades(&effects, 0.0, self.matte_node));
+            rs.renderer
+                .set_grades(&eval_clip_grades(&effects, 0.0, self.matte_node));
             rs.renderer.set_mix_factor(0.0);
             if let Some(p) = title_pipeline {
                 rs.renderer.set_pipeline(p);
@@ -3963,7 +3987,10 @@ impl Engine {
         // the clip-relative time. Titles aren't usually animated but
         // we honor their effects for consistency.
         let (xform, crop, color, chroma, luma, grades) = {
-            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
+            let project = self
+                .current_project
+                .as_ref()
+                .ok_or(EngineError::NoProject)?;
             let seq_id = self
                 .current_sequence_id
                 .ok_or(EngineError::NoCurrentSequence)?;
@@ -3995,7 +4022,8 @@ impl Engine {
                 .set_transform(xform.translate, xform.scale, xform.rotation_radians);
             rs.renderer.set_brightness_contrast(color.0, color.1);
             rs.renderer.set_crop(crop[0], crop[1], crop[2], crop[3]);
-            rs.renderer.set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
+            rs.renderer
+                .set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
             rs.renderer.set_luma_key(luma.0, luma.1, luma.2, luma.3);
             rs.renderer.set_grades(&grades);
             rs.renderer.set_mix_factor(0.0);
@@ -4016,7 +4044,11 @@ impl Engine {
             time_base_den: 1000,
             opacity,
         });
-        let viewport = self.viewport.as_ref().ok_or(EngineError::NoViewport)?.clone();
+        let viewport = self
+            .viewport
+            .as_ref()
+            .ok_or(EngineError::NoViewport)?
+            .clone();
         let render_state = self
             .render_state
             .as_ref()
@@ -4149,7 +4181,8 @@ impl Engine {
                 .set_transform(xform.translate, xform.scale, xform.rotation_radians);
             rs.renderer.set_brightness_contrast(bc.0, bc.1);
             rs.renderer.set_crop(crop[0], crop[1], crop[2], crop[3]);
-            rs.renderer.set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
+            rs.renderer
+                .set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
             rs.renderer.set_luma_key(luma.0, luma.1, luma.2, luma.3);
             rs.renderer.set_grades(&grades);
             if let Some(p) = pipeline_params {
@@ -4238,8 +4271,13 @@ impl Engine {
                 vance_audio::audio_plugin::DEFAULT_BLOCK as u32,
             )
         });
-        let out =
-            self.bounce_range_with(&mut audio, start_s, end_s, sample_rate, plugin_host.as_mut());
+        let out = self.bounce_range_with(
+            &mut audio,
+            start_s,
+            end_s,
+            sample_rate,
+            plugin_host.as_mut(),
+        );
         let _ = audio.shutdown();
         out
     }
@@ -4258,13 +4296,21 @@ impl Engine {
         mut plugin_host: Option<&mut vance_audio::remote_plugin::RemotePluginHost>,
     ) -> Result<Vec<f32>, EngineError> {
         let snapshot = {
-            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
-            let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
-            let seq = project.sequence(seq_id).ok_or(EngineError::SequenceNotFound)?;
+            let project = self
+                .current_project
+                .as_ref()
+                .ok_or(EngineError::NoProject)?;
+            let seq_id = self
+                .current_sequence_id
+                .ok_or(EngineError::NoCurrentSequence)?;
+            let seq = project
+                .sequence(seq_id)
+                .ok_or(EngineError::SequenceNotFound)?;
             build_mixer_snapshot(seq)
         };
         let master_lin = snapshot.master_gain_linear;
-        let total_frames = (((end_s - start_s) * sample_rate as f64).round() as i64).max(0) as usize;
+        let total_frames =
+            (((end_s - start_s) * sample_rate as f64).round() as i64).max(0) as usize;
         let mut master = vec![0.0f32; total_frames * 2];
         if total_frames == 0 {
             return Ok(master);
@@ -4281,9 +4327,16 @@ impl Engine {
             duration: f64,
         }
         let (clip_jobs, audio_tracks): (Vec<ClipJob>, Vec<uuid::Uuid>) = {
-            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
-            let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
-            let seq = project.sequence(seq_id).ok_or(EngineError::SequenceNotFound)?;
+            let project = self
+                .current_project
+                .as_ref()
+                .ok_or(EngineError::NoProject)?;
+            let seq_id = self
+                .current_sequence_id
+                .ok_or(EngineError::NoCurrentSequence)?;
+            let seq = project
+                .sequence(seq_id)
+                .ok_or(EngineError::SequenceNotFound)?;
             let mut jobs = Vec::new();
             let mut tracks = Vec::new();
             for track in &seq.tracks {
@@ -4332,8 +4385,7 @@ impl Engine {
             if clip_tl_end <= clip_tl_start {
                 continue;
             }
-            let out_frames =
-                ((clip_tl_end - clip_tl_start) * sample_rate as f64).round() as usize;
+            let out_frames = ((clip_tl_end - clip_tl_start) * sample_rate as f64).round() as usize;
             if out_frames == 0 {
                 continue;
             }
@@ -4387,8 +4439,7 @@ impl Engine {
                 .get(&job.clip_id)
                 .map(|c| c.pan_linear)
                 .unwrap_or([1.0, 1.0]);
-            let out_start_frame =
-                ((clip_tl_start - start_s) * sample_rate as f64).round() as usize;
+            let out_start_frame = ((clip_tl_start - start_s) * sample_rate as f64).round() as usize;
             let Some(track_buf) = track_bufs.get_mut(&job.track_id) else {
                 continue;
             };
@@ -4469,7 +4520,11 @@ impl Engine {
         for (bus_id, bm) in snapshot.buses.iter() {
             if !bm.audio_effects.is_empty() {
                 let mut dsp = vance_audio::TrackDspState::new();
-                dsp.reconcile_with(&bm.audio_effects, sample_rate as f32, plugin_host.as_deref_mut());
+                dsp.reconcile_with(
+                    &bm.audio_effects,
+                    sample_rate as f32,
+                    plugin_host.as_deref_mut(),
+                );
                 bus_dsp.insert(*bus_id, dsp);
             }
         }
@@ -4556,10 +4611,7 @@ impl Engine {
     /// Returns `None` when the result would route through an HDR /
     /// log transfer the built-in path can't handle yet — the OCIO
     /// shim (6.1b) will fill that in.
-    fn pipeline_for_media(
-        &self,
-        media_id: MediaItemId,
-    ) -> Option<vance_color::PipelineParams> {
+    fn pipeline_for_media(&self, media_id: MediaItemId) -> Option<vance_color::PipelineParams> {
         let project = self.current_project.as_ref()?;
         let media = project.media.get(&media_id)?;
         let input = media
@@ -4581,11 +4633,11 @@ impl Engine {
     /// audio) or a title spec (for synthetic clips). Returns the
     /// path-or-title plus the clip's display kind so callers can
     /// branch cheaply.
-    fn media_for_active(
-        &self,
-        media_id: MediaItemId,
-    ) -> Result<MediaResolved, EngineError> {
-        let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
+    fn media_for_active(&self, media_id: MediaItemId) -> Result<MediaResolved, EngineError> {
+        let project = self
+            .current_project
+            .as_ref()
+            .ok_or(EngineError::NoProject)?;
         let media = project
             .media
             .get(&media_id)
@@ -4619,7 +4671,9 @@ impl Engine {
                         }
                     }
                 }
-                Ok(MediaResolved::File(media.path.to_string_lossy().into_owned()))
+                Ok(MediaResolved::File(
+                    media.path.to_string_lossy().into_owned(),
+                ))
             }
         }
     }
@@ -4634,17 +4688,20 @@ impl Engine {
             let project = self.current_project.as_ref();
             let seq_id = self.current_sequence_id;
             match (project, seq_id) {
-                (Some(p), Some(id)) => p
-                    .sequence(id)
-                    .and_then(|s| {
-                        vance_timeline::transition_at(s, seconds_to_rt(timeline_seconds))
-                    }),
+                (Some(p), Some(id)) => p.sequence(id).and_then(|s| {
+                    vance_timeline::transition_at(s, seconds_to_rt(timeline_seconds))
+                }),
                 _ => None,
             }
         } {
             let seq = {
-                let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
-                let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+                let project = self
+                    .current_project
+                    .as_ref()
+                    .ok_or(EngineError::NoProject)?;
+                let seq_id = self
+                    .current_sequence_id
+                    .ok_or(EngineError::NoCurrentSequence)?;
                 project
                     .sequence(seq_id)
                     .ok_or(EngineError::SequenceNotFound)?
@@ -4675,7 +4732,9 @@ impl Engine {
                 .current_project
                 .as_ref()
                 .ok_or(EngineError::NoProject)?;
-            let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+            let seq_id = self
+                .current_sequence_id
+                .ok_or(EngineError::NoCurrentSequence)?;
             let seq = project
                 .sequence(seq_id)
                 .ok_or(EngineError::SequenceNotFound)?;
@@ -4749,8 +4808,13 @@ impl Engine {
         // before opening the file — render state stays consistent if
         // open_file fails later.
         let pipeline_params = {
-            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
-            let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+            let project = self
+                .current_project
+                .as_ref()
+                .ok_or(EngineError::NoProject)?;
+            let seq_id = self
+                .current_sequence_id
+                .ok_or(EngineError::NoCurrentSequence)?;
             let seq = project
                 .sequence(seq_id)
                 .ok_or(EngineError::SequenceNotFound)?;
@@ -4767,9 +4831,21 @@ impl Engine {
             self.pipeline_for_media(media_id)
         };
         self.open_file(&media_path)?;
-        let (xform_for_decode, crop_for_decode, color_for_decode, chroma_for_decode, luma_for_decode, grades_for_decode) = {
-            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
-            let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+        let (
+            xform_for_decode,
+            crop_for_decode,
+            color_for_decode,
+            chroma_for_decode,
+            luma_for_decode,
+            grades_for_decode,
+        ) = {
+            let project = self
+                .current_project
+                .as_ref()
+                .ok_or(EngineError::NoProject)?;
+            let seq_id = self
+                .current_sequence_id
+                .ok_or(EngineError::NoCurrentSequence)?;
             let seq = project
                 .sequence(seq_id)
                 .ok_or(EngineError::SequenceNotFound)?;
@@ -4791,7 +4867,8 @@ impl Engine {
                 xform_for_decode.scale,
                 xform_for_decode.rotation_radians,
             );
-            rs.renderer.set_brightness_contrast(color_for_decode.0, color_for_decode.1);
+            rs.renderer
+                .set_brightness_contrast(color_for_decode.0, color_for_decode.1);
             rs.renderer.set_crop(
                 crop_for_decode[0],
                 crop_for_decode[1],
@@ -4851,9 +4928,9 @@ impl Engine {
                     })
                 })
                 .filter(|effects| {
-                    effects
-                        .iter()
-                        .any(|e| e.enabled && (e.kind.starts_with("wasm:") || e.kind.starts_with("shader:")))
+                    effects.iter().any(|e| {
+                        e.enabled && (e.kind.starts_with("wasm:") || e.kind.starts_with("shader:"))
+                    })
                 })
                 .map(|effects| (effects, clip_t))
         };
@@ -5048,9 +5125,8 @@ impl Engine {
         }
         // step_pts = (fr_den / fr_num) sec/frame  /  (tb_num / tb_den) sec/tick
         //          = fr_den * tb_den / (fr_num * tb_num)
-        let step_pts = ((fr_den as i128 * tb_den as i128)
-            / (fr_num as i128 * tb_num as i128))
-            .max(1) as i64;
+        let step_pts =
+            ((fr_den as i128 * tb_den as i128) / (fr_num as i128 * tb_num as i128)).max(1) as i64;
         // start_seconds (source-time) -> stream PTS in tb units.
         let start_pts = (start_source_seconds * tb_den as f64 / tb_num as f64).round() as i64;
 
@@ -5060,9 +5136,16 @@ impl Engine {
         // decoder (e.g. the user opened a different file in the Source
         // monitor) would silently track frames from the wrong media.
         let (source_in_seconds, expected_path, mut cx_kfs, mut cy_kfs) = {
-            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
-            let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
-            let seq = project.sequence(seq_id).ok_or(EngineError::SequenceNotFound)?;
+            let project = self
+                .current_project
+                .as_ref()
+                .ok_or(EngineError::NoProject)?;
+            let seq_id = self
+                .current_sequence_id
+                .ok_or(EngineError::NoCurrentSequence)?;
+            let seq = project
+                .sequence(seq_id)
+                .ok_or(EngineError::SequenceNotFound)?;
             let clip = seq
                 .tracks
                 .iter()
@@ -5157,9 +5240,9 @@ impl Engine {
             for i in 1..n_frames {
                 let pts = start_pts + (i as i64) * step_pts;
                 let dec = self.decoder.as_mut().ok_or(EngineError::NoFileOpen)?;
-                let frame = dec
-                    .decode_at(pts)
-                    .map_err(|e| EngineError::Project(format!("tracker decode @ pts {pts}: {e}")))?;
+                let frame = dec.decode_at(pts).map_err(|e| {
+                    EngineError::Project(format!("tracker decode @ pts {pts}: {e}"))
+                })?;
                 let stride = frame.strides[0];
                 let bytes_end = (frame.height * stride) as usize;
                 let view = vance_tracker::LumaView {
@@ -5275,27 +5358,46 @@ impl Engine {
         let patch_half_i = patch_half as i32;
         let search_radius_i = search_radius as i32;
 
-        let info = self.stream_info.as_ref().ok_or(EngineError::NoFileOpen)?.clone();
+        let info = self
+            .stream_info
+            .as_ref()
+            .ok_or(EngineError::NoFileOpen)?
+            .clone();
         let (tb_num, tb_den) = info.time_base;
         let (fr_num, fr_den) = info.frame_rate;
         if tb_num == 0 || tb_den == 0 || fr_num == 0 || fr_den == 0 {
-            return Err(EngineError::Project("reframe: invalid time_base/frame_rate".into()));
+            return Err(EngineError::Project(
+                "reframe: invalid time_base/frame_rate".into(),
+            ));
         }
-        let step_pts = ((fr_den as i128 * tb_den as i128) / (fr_num as i128 * tb_num as i128))
-            .max(1) as i64;
+        let step_pts =
+            ((fr_den as i128 * tb_den as i128) / (fr_num as i128 * tb_num as i128)).max(1) as i64;
         let start_pts = (start_source_seconds * tb_den as f64 / tb_num as f64).round() as i64;
 
         let (source_in_seconds, expected_path) = {
-            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
-            let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
-            let seq = project.sequence(seq_id).ok_or(EngineError::SequenceNotFound)?;
+            let project = self
+                .current_project
+                .as_ref()
+                .ok_or(EngineError::NoProject)?;
+            let seq_id = self
+                .current_sequence_id
+                .ok_or(EngineError::NoCurrentSequence)?;
+            let seq = project
+                .sequence(seq_id)
+                .ok_or(EngineError::SequenceNotFound)?;
             let clip = seq
                 .tracks
                 .iter()
                 .find_map(|t| t.clips.iter().find(|c| c.id == clip_id))
                 .ok_or(EngineError::Project("reframe: clip not found".into()))?;
-            let media = project.media.get(&clip.media).ok_or(EngineError::MediaNotFound)?;
-            (rt_to_seconds(clip.source_in), media.path.to_string_lossy().into_owned())
+            let media = project
+                .media
+                .get(&clip.media)
+                .ok_or(EngineError::MediaNotFound)?;
+            (
+                rt_to_seconds(clip.source_in),
+                media.path.to_string_lossy().into_owned(),
+            )
         };
         match self.current_media_path.as_deref() {
             Some(p) if p == expected_path => {}
@@ -5306,8 +5408,9 @@ impl Engine {
                 )));
             }
         }
-        let pts_to_clip_t =
-            |pts: i64| -> f64 { (pts as f64) * (tb_num as f64) / (tb_den as f64) - source_in_seconds };
+        let pts_to_clip_t = |pts: i64| -> f64 {
+            (pts as f64) * (tb_num as f64) / (tb_den as f64) - source_in_seconds
+        };
 
         let seed = (seed_cx.clamp(0.0, 1.0), seed_cy.clamp(0.0, 1.0));
         // Anchor frame → template + source dims.
@@ -5351,14 +5454,18 @@ impl Engine {
                 w: frame.width,
                 h: frame.height,
             };
-            let Ok(r) = vance_tracker::track_ncc(&template, &view, prev_px, search_radius_i, patch_half_i)
+            let Ok(r) =
+                vance_tracker::track_ncc(&template, &view, prev_px, search_radius_i, patch_half_i)
             else {
                 break;
             };
             prev_px = r.center_px;
             sum_score += r.score;
             scored += 1;
-            trail.push((pts_to_clip_t(pts), vance_tracker::px_to_uv(r.center_px, frame.width, frame.height)));
+            trail.push((
+                pts_to_clip_t(pts),
+                vance_tracker::px_to_uv(r.center_px, frame.width, frame.height),
+            ));
         }
 
         // Build keyframed translate (per frame) + constant scale.
@@ -5384,9 +5491,16 @@ impl Engine {
         // reframe previously authored (tagged with a "reframe" marker param),
         // leaving the user's own manual transforms untouched.
         let prior: Vec<EffectId> = {
-            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
-            let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
-            let seq = project.sequence(seq_id).ok_or(EngineError::SequenceNotFound)?;
+            let project = self
+                .current_project
+                .as_ref()
+                .ok_or(EngineError::NoProject)?;
+            let seq_id = self
+                .current_sequence_id
+                .ok_or(EngineError::NoCurrentSequence)?;
+            let seq = project
+                .sequence(seq_id)
+                .ok_or(EngineError::SequenceNotFound)?;
             seq.tracks
                 .iter()
                 .find(|t| t.id == track_id)
@@ -5405,8 +5519,14 @@ impl Engine {
         }
 
         let mut params: std::collections::BTreeMap<String, EffectValue> = Default::default();
-        params.insert("translate_x".into(), EffectValue::Keyframes { keyframes: tx_kfs });
-        params.insert("translate_y".into(), EffectValue::Keyframes { keyframes: ty_kfs });
+        params.insert(
+            "translate_x".into(),
+            EffectValue::Keyframes { keyframes: tx_kfs },
+        );
+        params.insert(
+            "translate_y".into(),
+            EffectValue::Keyframes { keyframes: ty_kfs },
+        );
         params.insert("scale_x".into(), EffectValue::Number(scale[0] as f64));
         params.insert("scale_y".into(), EffectValue::Number(scale[1] as f64));
         params.insert("rotation".into(), EffectValue::Number(0.0));
@@ -5419,7 +5539,11 @@ impl Engine {
         let end_t = trail.last().map(|(t, _)| *t).unwrap_or(start_t);
         Ok(TrackSummary {
             frames_tracked: trail.len() as u32,
-            mean_score: if scored > 0 { sum_score / scored as f32 } else { 1.0 },
+            mean_score: if scored > 0 {
+                sum_score / scored as f32
+            } else {
+                1.0
+            },
             start_clip_seconds: start_t,
             end_clip_seconds: end_t,
         })
@@ -5457,9 +5581,16 @@ impl Engine {
         clip_id: vance_timeline::ClipId,
         effect_id: EffectId,
     ) -> Result<String, EngineError> {
-        let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
-        let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
-        let seq = project.sequence(seq_id).ok_or(EngineError::SequenceNotFound)?;
+        let project = self
+            .current_project
+            .as_ref()
+            .ok_or(EngineError::NoProject)?;
+        let seq_id = self
+            .current_sequence_id
+            .ok_or(EngineError::NoCurrentSequence)?;
+        let seq = project
+            .sequence(seq_id)
+            .ok_or(EngineError::SequenceNotFound)?;
         let track = seq
             .tracks
             .iter()
@@ -5529,11 +5660,24 @@ impl Engine {
         // groups carry a master lane; log groups don't.
         let wheel_keys = |g: gc::WheelGroup| -> ([&'static str; 3], Option<&'static str>) {
             match g {
-                gc::WheelGroup::Lift => ([gk::KEY_LIFT_R, gk::KEY_LIFT_G, gk::KEY_LIFT_B], Some(gk::KEY_LIFT_Y)),
-                gc::WheelGroup::Gamma => ([gk::KEY_GAMMA_R, gk::KEY_GAMMA_G, gk::KEY_GAMMA_B], Some(gk::KEY_GAMMA_Y)),
-                gc::WheelGroup::Gain => ([gk::KEY_GAIN_R, gk::KEY_GAIN_G, gk::KEY_GAIN_B], Some(gk::KEY_GAIN_Y)),
-                gc::WheelGroup::Offset => ([gk::KEY_OFFSET_R, gk::KEY_OFFSET_G, gk::KEY_OFFSET_B], None),
-                gc::WheelGroup::Shadow => ([gk::KEY_SHADOW_R, gk::KEY_SHADOW_G, gk::KEY_SHADOW_B], None),
+                gc::WheelGroup::Lift => (
+                    [gk::KEY_LIFT_R, gk::KEY_LIFT_G, gk::KEY_LIFT_B],
+                    Some(gk::KEY_LIFT_Y),
+                ),
+                gc::WheelGroup::Gamma => (
+                    [gk::KEY_GAMMA_R, gk::KEY_GAMMA_G, gk::KEY_GAMMA_B],
+                    Some(gk::KEY_GAMMA_Y),
+                ),
+                gc::WheelGroup::Gain => (
+                    [gk::KEY_GAIN_R, gk::KEY_GAIN_G, gk::KEY_GAIN_B],
+                    Some(gk::KEY_GAIN_Y),
+                ),
+                gc::WheelGroup::Offset => {
+                    ([gk::KEY_OFFSET_R, gk::KEY_OFFSET_G, gk::KEY_OFFSET_B], None)
+                }
+                gc::WheelGroup::Shadow => {
+                    ([gk::KEY_SHADOW_R, gk::KEY_SHADOW_G, gk::KEY_SHADOW_B], None)
+                }
                 gc::WheelGroup::Mid => ([gk::KEY_MID_R, gk::KEY_MID_G, gk::KEY_MID_B], None),
                 gc::WheelGroup::Highlight => ([gk::KEY_HI_R, gk::KEY_HI_G, gk::KEY_HI_B], None),
             }
@@ -5570,9 +5714,17 @@ impl Engine {
 
         for cmd in cmds {
             match cmd {
-                gc::GradingCommand::AddGradeNode { track_id, clip_id, mode, label: lbl } => {
+                gc::GradingCommand::AddGradeNode {
+                    track_id,
+                    clip_id,
+                    mode,
+                    label: lbl,
+                } => {
                     let mut params = std::collections::BTreeMap::new();
-                    params.insert(gk::KEY_MODE.to_string(), EffectValue::String(mode_str(*mode).to_string()));
+                    params.insert(
+                        gk::KEY_MODE.to_string(),
+                        EffectValue::String(mode_str(*mode).to_string()),
+                    );
                     if let Some(l) = lbl {
                         params.insert(gk::KEY_LABEL.to_string(), EffectValue::String(l.clone()));
                     }
@@ -5592,7 +5744,11 @@ impl Engine {
                         effect_id: vance_grading_cmd::Uuid::from(new_id.to_string()),
                     });
                 }
-                gc::GradingCommand::RemoveGradeNode { track_id, clip_id, effect_id } => {
+                gc::GradingCommand::RemoveGradeNode {
+                    track_id,
+                    clip_id,
+                    effect_id,
+                } => {
                     pending.push(EditOp::RemoveEffectFromClip {
                         track_id: parse_track(track_id)?,
                         clip_id: parse_clip(clip_id)?,
@@ -5600,7 +5756,12 @@ impl Engine {
                     });
                     outcomes.push(gc::GradingCommandOutcome::None);
                 }
-                gc::GradingCommand::ReorderGradeNode { track_id, clip_id, effect_id, new_index } => {
+                gc::GradingCommand::ReorderGradeNode {
+                    track_id,
+                    clip_id,
+                    effect_id,
+                    new_index,
+                } => {
                     pending.push(EditOp::MoveEffectOnClip {
                         track_id: parse_track(track_id)?,
                         clip_id: parse_clip(clip_id)?,
@@ -5609,7 +5770,12 @@ impl Engine {
                     });
                     outcomes.push(gc::GradingCommandOutcome::None);
                 }
-                gc::GradingCommand::SetGradeNodeEnabled { track_id, clip_id, effect_id, enabled } => {
+                gc::GradingCommand::SetGradeNodeEnabled {
+                    track_id,
+                    clip_id,
+                    effect_id,
+                    enabled,
+                } => {
                     pending.push(EditOp::SetEffectEnabled {
                         track_id: parse_track(track_id)?,
                         clip_id: parse_clip(clip_id)?,
@@ -5618,7 +5784,12 @@ impl Engine {
                     });
                     outcomes.push(gc::GradingCommandOutcome::None);
                 }
-                gc::GradingCommand::SetGradeNodeLabel { track_id, clip_id, effect_id, label: lbl } => {
+                gc::GradingCommand::SetGradeNodeLabel {
+                    track_id,
+                    clip_id,
+                    effect_id,
+                    label: lbl,
+                } => {
                     pending.push(EditOp::UpdateEffectParams {
                         track_id: parse_track(track_id)?,
                         clip_id: parse_clip(clip_id)?,
@@ -5627,16 +5798,32 @@ impl Engine {
                     });
                     outcomes.push(gc::GradingCommandOutcome::None);
                 }
-                gc::GradingCommand::SetNodeMode { track_id, clip_id, effect_id, mode } => {
+                gc::GradingCommand::SetNodeMode {
+                    track_id,
+                    clip_id,
+                    effect_id,
+                    mode,
+                } => {
                     pending.push(EditOp::UpdateEffectParams {
                         track_id: parse_track(track_id)?,
                         clip_id: parse_clip(clip_id)?,
                         effect_id: parse_effect(effect_id)?,
-                        params: vec![(gk::KEY_MODE.to_string(), EffectValue::String(mode_str(*mode).to_string()))],
+                        params: vec![(
+                            gk::KEY_MODE.to_string(),
+                            EffectValue::String(mode_str(*mode).to_string()),
+                        )],
                     });
                     outcomes.push(gc::GradingCommandOutcome::None);
                 }
-                gc::GradingCommand::SetWheel { track_id, clip_id, effect_id, group, rgb, master, reset } => {
+                gc::GradingCommand::SetWheel {
+                    track_id,
+                    clip_id,
+                    effect_id,
+                    group,
+                    rgb,
+                    master,
+                    reset,
+                } => {
                     // Reject mismatched mode (primary wheels on a log
                     // node, log wheels on a primary node) — otherwise
                     // the params write succeeds but the renderer's
@@ -5689,7 +5876,13 @@ impl Engine {
                     }
                     outcomes.push(gc::GradingCommandOutcome::None);
                 }
-                gc::GradingCommand::SetToneCurve { track_id, clip_id, effect_id, channel, points } => {
+                gc::GradingCommand::SetToneCurve {
+                    track_id,
+                    clip_id,
+                    effect_id,
+                    channel,
+                    points,
+                } => {
                     let tid = parse_track(track_id)?;
                     let cid = parse_clip(clip_id)?;
                     let eid = parse_effect(effect_id)?;
@@ -5717,7 +5910,13 @@ impl Engine {
                     });
                     outcomes.push(gc::GradingCommandOutcome::None);
                 }
-                gc::GradingCommand::SetHslCurve { track_id, clip_id, effect_id, curve, points } => {
+                gc::GradingCommand::SetHslCurve {
+                    track_id,
+                    clip_id,
+                    effect_id,
+                    curve,
+                    points,
+                } => {
                     let tid = parse_track(track_id)?;
                     let cid = parse_clip(clip_id)?;
                     let eid = parse_effect(effect_id)?;
@@ -5742,11 +5941,23 @@ impl Engine {
                     });
                     outcomes.push(gc::GradingCommandOutcome::None);
                 }
-                gc::GradingCommand::SetQualifier { track_id, clip_id, effect_id, enabled, invert, hue, sat, luma } => {
+                gc::GradingCommand::SetQualifier {
+                    track_id,
+                    clip_id,
+                    effect_id,
+                    enabled,
+                    invert,
+                    hue,
+                    sat,
+                    luma,
+                } => {
                     let mut params: Vec<(String, EffectValue)> = Vec::new();
                     let mut push_bool = |k: &str, b: Option<bool>| {
                         if let Some(b) = b {
-                            params.push((k.to_string(), EffectValue::Number(if b { 1.0 } else { 0.0 })));
+                            params.push((
+                                k.to_string(),
+                                EffectValue::Number(if b { 1.0 } else { 0.0 }),
+                            ));
                         }
                     };
                     push_bool(gk::KEY_QUAL_ENABLE, *enabled);
@@ -5781,7 +5992,17 @@ impl Engine {
                     }
                     outcomes.push(gc::GradingCommandOutcome::None);
                 }
-                gc::GradingCommand::SetWindow { track_id, clip_id, effect_id, shape, center, size, rotation, feather, invert } => {
+                gc::GradingCommand::SetWindow {
+                    track_id,
+                    clip_id,
+                    effect_id,
+                    shape,
+                    center,
+                    size,
+                    rotation,
+                    feather,
+                    invert,
+                } => {
                     let mut params: Vec<(String, EffectValue)> = Vec::new();
                     if let Some(s) = shape {
                         let v = match s {
@@ -5792,21 +6013,42 @@ impl Engine {
                         params.push((gk::KEY_WIN_SHAPE.to_string(), EffectValue::Number(v)));
                     }
                     if let Some(c) = center {
-                        params.push((gk::KEY_WIN_CENTER_X.to_string(), EffectValue::Number(c[0] as f64)));
-                        params.push((gk::KEY_WIN_CENTER_Y.to_string(), EffectValue::Number(c[1] as f64)));
+                        params.push((
+                            gk::KEY_WIN_CENTER_X.to_string(),
+                            EffectValue::Number(c[0] as f64),
+                        ));
+                        params.push((
+                            gk::KEY_WIN_CENTER_Y.to_string(),
+                            EffectValue::Number(c[1] as f64),
+                        ));
                     }
                     if let Some(s) = size {
-                        params.push((gk::KEY_WIN_SIZE_X.to_string(), EffectValue::Number(s[0] as f64)));
-                        params.push((gk::KEY_WIN_SIZE_Y.to_string(), EffectValue::Number(s[1] as f64)));
+                        params.push((
+                            gk::KEY_WIN_SIZE_X.to_string(),
+                            EffectValue::Number(s[0] as f64),
+                        ));
+                        params.push((
+                            gk::KEY_WIN_SIZE_Y.to_string(),
+                            EffectValue::Number(s[1] as f64),
+                        ));
                     }
                     if let Some(r) = rotation {
-                        params.push((gk::KEY_WIN_ROTATION.to_string(), EffectValue::Number(*r as f64)));
+                        params.push((
+                            gk::KEY_WIN_ROTATION.to_string(),
+                            EffectValue::Number(*r as f64),
+                        ));
                     }
                     if let Some(f) = feather {
-                        params.push((gk::KEY_WIN_FEATHER.to_string(), EffectValue::Number(*f as f64)));
+                        params.push((
+                            gk::KEY_WIN_FEATHER.to_string(),
+                            EffectValue::Number(*f as f64),
+                        ));
                     }
                     if let Some(i) = invert {
-                        params.push((gk::KEY_WIN_INVERT.to_string(), EffectValue::Number(if *i { 1.0 } else { 0.0 })));
+                        params.push((
+                            gk::KEY_WIN_INVERT.to_string(),
+                            EffectValue::Number(if *i { 1.0 } else { 0.0 }),
+                        ));
                     }
                     if !params.is_empty() {
                         pending.push(EditOp::UpdateEffectParams {
@@ -5820,7 +6062,15 @@ impl Engine {
                 }
                 // ---- Project-level + tracker: flush the pending compound
                 // first (preserves command order), then call inline.
-                gc::GradingCommand::TrackWindow { track_id, clip_id, effect_id, start_source_seconds, n_frames, patch_half, search_radius } => {
+                gc::GradingCommand::TrackWindow {
+                    track_id,
+                    clip_id,
+                    effect_id,
+                    start_source_seconds,
+                    n_frames,
+                    patch_half,
+                    search_radius,
+                } => {
                     flush(self, &mut pending, &label)?;
                     let summary = self.track_window(
                         parse_track(track_id)?,
@@ -5838,7 +6088,12 @@ impl Engine {
                         end_clip_seconds: summary.end_clip_seconds,
                     });
                 }
-                gc::GradingCommand::SetOcioViewTransform { config, src, dst, size } => {
+                gc::GradingCommand::SetOcioViewTransform {
+                    config,
+                    src,
+                    dst,
+                    size,
+                } => {
                     flush(self, &mut pending, &label)?;
                     self.set_ocio_view_transform(config.as_deref(), src, dst, *size)?;
                     outcomes.push(gc::GradingCommandOutcome::None);
@@ -5899,20 +6154,12 @@ impl Engine {
     /// whole point of mixer controls is live response. The snapshot
     /// republish inside `apply_edit_op` makes the change audible
     /// within one mixer buffer (~5-21 ms at the cpal default).
-    pub fn set_track_mute(
-        &mut self,
-        track_id: TrackId,
-        mute: bool,
-    ) -> Result<(), EngineError> {
+    pub fn set_track_mute(&mut self, track_id: TrackId, mute: bool) -> Result<(), EngineError> {
         self.apply_edit_op(EditOp::SetTrackMute { track_id, mute })
     }
 
     /// Phase 7.3: set a track's solo flag.
-    pub fn set_track_solo(
-        &mut self,
-        track_id: TrackId,
-        solo: bool,
-    ) -> Result<(), EngineError> {
+    pub fn set_track_solo(&mut self, track_id: TrackId, solo: bool) -> Result<(), EngineError> {
         self.apply_edit_op(EditOp::SetTrackSolo { track_id, solo })
     }
 
@@ -6202,7 +6449,10 @@ impl Engine {
         track_id: TrackId,
         keyframes: Vec<vance_timeline::Keyframe>,
     ) -> Result<(), EngineError> {
-        self.apply_edit_op(EditOp::SetTrackGainKeyframes { track_id, keyframes })
+        self.apply_edit_op(EditOp::SetTrackGainKeyframes {
+            track_id,
+            keyframes,
+        })
     }
 
     /// Phase 7.4: replace a clip's gain automation lane (clip-relative
@@ -6437,10 +6687,7 @@ impl Engine {
         let _ = project;
 
         // Apply through the edit log so it's undoable.
-        self.apply_edit_op(EditOp::InsertClip {
-            track_id,
-            clip,
-        })?;
+        self.apply_edit_op(EditOp::InsertClip { track_id, clip })?;
         Ok(new_clip_id.to_string())
     }
 
@@ -6448,7 +6695,9 @@ impl Engine {
 
     /// Whether the current sequence is in magnetic-timeline mode.
     pub fn is_magnetic(&self) -> bool {
-        self.current_sequence_ref().map(|s| s.magnetic).unwrap_or(false)
+        self.current_sequence_ref()
+            .map(|s| s.magnetic)
+            .unwrap_or(false)
     }
 
     /// Toggle magnetic-timeline mode on the current sequence.
@@ -6544,8 +6793,14 @@ impl Engine {
         media_id: MediaItemId,
         timeline_in: vance_core::RationalTime,
     ) -> Result<Clip, EngineError> {
-        let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
-        let media = project.media.get(&media_id).ok_or(EngineError::MediaNotFound)?;
+        let project = self
+            .current_project
+            .as_ref()
+            .ok_or(EngineError::NoProject)?;
+        let media = project
+            .media
+            .get(&media_id)
+            .ok_or(EngineError::MediaNotFound)?;
         Clip::new(
             media.id,
             media.display_name.clone(),
@@ -6747,7 +7002,8 @@ impl Engine {
         track_id: TrackId,
         clip_id: vance_timeline::ClipId,
     ) -> Option<MediaItemId> {
-        self.clip_media_and_range(track_id, clip_id).map(|(m, _, _)| m)
+        self.clip_media_and_range(track_id, clip_id)
+            .map(|(m, _, _)| m)
     }
 
     /// GOAT-8 — a clip's media id + its active source range in seconds
@@ -6772,7 +7028,6 @@ impl Engine {
         let dur = rt_to_seconds(clip.duration());
         Some((clip.media, start, dur))
     }
-
 
     /// The on-disk path of a media item (for transcription). `None` for
     /// synthetic / missing media.
@@ -6800,7 +7055,9 @@ impl Engine {
             .current_project
             .as_ref()
             .ok_or(EngineError::NoProject)?;
-        let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+        let seq_id = self
+            .current_sequence_id
+            .ok_or(EngineError::NoCurrentSequence)?;
         project
             .sequence(seq_id)
             .map(|arc| arc.as_ref())
@@ -6811,13 +7068,16 @@ impl Engine {
     /// log's new `current()` Sequence back into `project.sequences`
     /// so reads (rendering, save, scene_plan) see the latest state.
     fn apply_edit_op(&mut self, op: EditOp) -> Result<(), EngineError> {
-        let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+        let seq_id = self
+            .current_sequence_id
+            .ok_or(EngineError::NoCurrentSequence)?;
         let touches_mixer = op_touches_mixer(&op);
         let log = self
             .edit_logs
             .get_mut(&seq_id)
             .ok_or(EngineError::NoCurrentSequence)?;
-        log.apply(op).map_err(|e| EngineError::Project(e.to_string()))?;
+        log.apply(op)
+            .map_err(|e| EngineError::Project(e.to_string()))?;
         let new_seq = log.current().clone();
         let project = self
             .current_project
@@ -6856,7 +7116,9 @@ impl Engine {
     /// `false` if there's nothing to undo.
     pub fn undo(&mut self) -> Result<bool, EngineError> {
         self.pause_for_edit();
-        let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+        let seq_id = self
+            .current_sequence_id
+            .ok_or(EngineError::NoCurrentSequence)?;
         let log = self
             .edit_logs
             .get_mut(&seq_id)
@@ -6883,7 +7145,9 @@ impl Engine {
     /// if there's nothing to redo.
     pub fn redo(&mut self) -> Result<bool, EngineError> {
         self.pause_for_edit();
-        let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+        let seq_id = self
+            .current_sequence_id
+            .ok_or(EngineError::NoCurrentSequence)?;
         let log = self
             .edit_logs
             .get_mut(&seq_id)
@@ -6930,7 +7194,9 @@ impl Engine {
     /// Tag the current edit-history node with a checkpoint / branch name
     /// (e.g. "v2 — punchier open"), so the user can jump back to it later.
     pub fn checkpoint_history(&mut self, name: String) -> Result<(), EngineError> {
-        let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+        let seq_id = self
+            .current_sequence_id
+            .ok_or(EngineError::NoCurrentSequence)?;
         let log = self
             .edit_logs
             .get_mut(&seq_id)
@@ -6945,7 +7211,9 @@ impl Engine {
     /// if the id is out of range.
     pub fn goto_history(&mut self, node_id: usize) -> Result<bool, EngineError> {
         self.pause_for_edit();
-        let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
+        let seq_id = self
+            .current_sequence_id
+            .ok_or(EngineError::NoCurrentSequence)?;
         let log = self
             .edit_logs
             .get_mut(&seq_id)
@@ -6975,10 +7243,12 @@ impl Engine {
             .ok_or(EngineError::NoProject)?;
         let target = match path {
             Some(p) => PathBuf::from(p),
-            None => self
-                .current_project_path
-                .clone()
-                .ok_or_else(|| EngineError::Project("project has no save path; call save_project with an explicit path first".into()))?,
+            None => self.current_project_path.clone().ok_or_else(|| {
+                EngineError::Project(
+                    "project has no save path; call save_project with an explicit path first"
+                        .into(),
+                )
+            })?,
         };
         vance_project::save(project, &target).map_err(|e| EngineError::Project(e.to_string()))?;
         self.current_project_path = Some(target);
@@ -7187,10 +7457,7 @@ impl Engine {
         // to the EOS-driven "next clip start" path.
         if chain_resume != i64::MIN {
             let resume_t = (chain_resume as f64) / 1_000_000.0;
-            tracing::info!(
-                resume_t,
-                "playback: chaining to post-transition position",
-            );
+            tracing::info!(resume_t, "playback: chaining to post-transition position",);
             if self.play_sequence(resume_t).is_ok() {
                 return true;
             }
@@ -7568,8 +7835,11 @@ pub fn compute_sched_plan(
 
     let wanted: HashSet<uuid::Uuid> = candidates.iter().map(|c| c.clip_id).collect();
 
-    let to_remove: Vec<uuid::Uuid> =
-        live.iter().filter(|id| !wanted.contains(id)).copied().collect();
+    let to_remove: Vec<uuid::Uuid> = live
+        .iter()
+        .filter(|id| !wanted.contains(id))
+        .copied()
+        .collect();
 
     let to_add: Vec<(uuid::Uuid, PathBuf, f64)> = candidates
         .iter()
@@ -7663,12 +7933,7 @@ fn scheduler_loop(
                 path,
                 from_seconds,
             };
-            match vance_audio::spawn_source(
-                &sidecar_binary,
-                &source,
-                per_source_capacity,
-                &stats,
-            ) {
+            match vance_audio::spawn_source(&sidecar_binary, &source, per_source_capacity, &stats) {
                 Ok(stream) => {
                     if command_tx
                         .send(vance_audio::SourceCommand::Add(stream))
@@ -7727,9 +7992,7 @@ fn translate_send(send: &vance_timeline::Send) -> vance_audio::SendMix {
 /// thread needs. The translation keeps the audio crate decoupled from
 /// the timeline crate and centralises range-clamping so the fold
 /// thread can trust every value.
-fn translate_audio_effect(
-    spec: &vance_timeline::AudioEffectSpec,
-) -> vance_audio::AudioEffectKind {
+fn translate_audio_effect(spec: &vance_timeline::AudioEffectSpec) -> vance_audio::AudioEffectKind {
     use vance_timeline::AudioEffectSpec as Spec;
     match spec {
         Spec::Eq6 { enabled, eq } => {
@@ -7743,9 +8006,7 @@ fn translate_audio_effect(
             for (dst, src) in out.iter_mut().zip(eq.bands.iter()) {
                 dst.enabled = src.enabled;
                 dst.shape = match src.kind {
-                    vance_timeline::EqBandKind::LowShelf => {
-                        vance_audio::dsp::BiquadShape::LowShelf
-                    }
+                    vance_timeline::EqBandKind::LowShelf => vance_audio::dsp::BiquadShape::LowShelf,
                     vance_timeline::EqBandKind::Peak => vance_audio::dsp::BiquadShape::Peak,
                     vance_timeline::EqBandKind::HighShelf => {
                         vance_audio::dsp::BiquadShape::HighShelf
@@ -8014,20 +8275,18 @@ fn start_audio_mix(
     let initial_audio_sources = collect_audio_sources_at(sequence, project, from_seconds);
     let initial_snapshot = build_mixer_snapshot(sequence);
     let initial_sched_clips = build_sched_clips(sequence, project);
-    let sched_clips =
-        Arc::new(arc_swap::ArcSwap::from_pointee(initial_sched_clips));
+    let sched_clips = Arc::new(arc_swap::ArcSwap::from_pointee(initial_sched_clips));
 
     // Scheduler ↔ fold thread channel. Unbounded (mpsc::channel) because
     // scheduler ticks emit at most ~MAX_CONCURRENT_SOURCES commands per
     // tick; the fold thread drains in a tight try_recv loop.
-    let (command_tx, command_rx) =
-        std::sync::mpsc::channel::<vance_audio::SourceCommand>();
+    let (command_tx, command_rx) = std::sync::mpsc::channel::<vance_audio::SourceCommand>();
     let stats = Arc::new(vance_audio::MixerStats::default());
 
     // Probe the cpal device's sample rate up-front so we can size the
     // per-source rings to match what `AudioMixer::start` will see.
-    let probed_sample_rate = vance_audio::probe_default_sample_rate()
-        .map_err(|e| format!("audio probe: {e}"))?;
+    let probed_sample_rate =
+        vance_audio::probe_default_sample_rate().map_err(|e| format!("audio probe: {e}"))?;
     let per_source_capacity = vance_audio::per_source_ring_capacity(probed_sample_rate);
 
     // Phase 7.4 M4: pre-spawn the initial source set on THIS thread (the
@@ -8098,7 +8357,13 @@ fn start_audio_mix(
             let sample_rate = mixer.device_sample_rate();
             let meter_handle = mixer.meter_handle();
             if ready_tx
-                .send(Ok((sync, snapshot_handle, master_frame, sample_rate, meter_handle)))
+                .send(Ok((
+                    sync,
+                    snapshot_handle,
+                    master_frame,
+                    sample_rate,
+                    meter_handle,
+                )))
                 .is_err()
             {
                 return;
@@ -8593,10 +8858,9 @@ fn playback_loop(
                     // already parked a resume target.)
                     if chain_resume_micros.load(Ordering::Acquire) == i64::MIN {
                         if let Some(ctx) = seq_ctx.as_ref() {
-                            let end_t = ctx.anchor_timeline_in
-                                + (elapsed_sec - ctx.anchor_source_in);
-                            let resume_micros =
-                                (end_t * 1_000_000.0).round() as i64 + 1000;
+                            let end_t =
+                                ctx.anchor_timeline_in + (elapsed_sec - ctx.anchor_source_in);
+                            let resume_micros = (end_t * 1_000_000.0).round() as i64 + 1000;
                             chain_resume_micros.store(resume_micros, Ordering::Release);
                         }
                     }
@@ -8620,10 +8884,9 @@ fn playback_loop(
                     ended_at_eos.store(true, Ordering::Release);
                     if chain_resume_micros.load(Ordering::Acquire) == i64::MIN {
                         if let Some(ctx) = seq_ctx.as_ref() {
-                            let end_t = ctx.anchor_timeline_in
-                                + (elapsed_sec - ctx.anchor_source_in);
-                            let resume_micros =
-                                (end_t * 1_000_000.0).round() as i64 + 1000;
+                            let end_t =
+                                ctx.anchor_timeline_in + (elapsed_sec - ctx.anchor_source_in);
+                            let resume_micros = (end_t * 1_000_000.0).round() as i64 + 1000;
                             chain_resume_micros.store(resume_micros, Ordering::Release);
                         }
                     }
@@ -8658,10 +8921,9 @@ fn playback_loop(
                     ended_at_eos.store(true, Ordering::Release);
                     if chain_resume_micros.load(Ordering::Acquire) == i64::MIN {
                         if let Some(ctx) = seq_ctx.as_ref() {
-                            let end_t = ctx.anchor_timeline_in
-                                + (elapsed_sec - ctx.anchor_source_in);
-                            let resume_micros =
-                                (end_t * 1_000_000.0).round() as i64 + 1000;
+                            let end_t =
+                                ctx.anchor_timeline_in + (elapsed_sec - ctx.anchor_source_in);
+                            let resume_micros = (end_t * 1_000_000.0).round() as i64 + 1000;
                             chain_resume_micros.store(resume_micros, Ordering::Release);
                         }
                     }
@@ -8746,10 +9008,12 @@ fn playback_loop(
             let grades = eval_clip_grades(&clip_effects, clip_t, None);
             let mut rs = render_state.lock();
             rs.renderer.set_opacity(op);
-            rs.renderer.set_transform(xf.translate, xf.scale, xf.rotation_radians);
+            rs.renderer
+                .set_transform(xf.translate, xf.scale, xf.rotation_radians);
             rs.renderer.set_brightness_contrast(br, ct);
             rs.renderer.set_crop(crop[0], crop[1], crop[2], crop[3]);
-            rs.renderer.set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
+            rs.renderer
+                .set_chroma_key(chroma.0, chroma.1, chroma.2, chroma.3);
             rs.renderer.set_luma_key(luma.0, luma.1, luma.2, luma.3);
             rs.renderer.set_grades(&grades);
         }
@@ -8777,8 +9041,7 @@ fn playback_loop(
                             active_b_frame = Some(f);
                             active_mix = at.mix;
                             in_transition = true;
-                            let resume_micros =
-                                (timeline_sec * 1_000_000.0).round() as i64;
+                            let resume_micros = (timeline_sec * 1_000_000.0).round() as i64;
                             chain_resume_micros.store(resume_micros, Ordering::Release);
                         }
                         Err(e) => {
@@ -8792,10 +9055,7 @@ fn playback_loop(
                         match DecoderClient::spawn(&ctx.decoder_bin) {
                             Ok(c) => transition_decoder = Some(c),
                             Err(e) => {
-                                tracing::warn!(
-                                    ?e,
-                                    "transition: failed to spawn secondary decoder",
-                                );
+                                tracing::warn!(?e, "transition: failed to spawn secondary decoder",);
                             }
                         }
                     }
@@ -8823,10 +9083,9 @@ fn playback_loop(
                     // is a seek per frame; for 1–2s dissolve windows
                     // at 24–30fps it stays well under the per-frame
                     // budget on modern hardware.
-                    if let (Some(dec), Some(info_b)) = (
-                        transition_decoder.as_mut(),
-                        transition_stream_info.as_ref(),
-                    ) {
+                    if let (Some(dec), Some(info_b)) =
+                        (transition_decoder.as_mut(), transition_stream_info.as_ref())
+                    {
                         let (b_tb_n, b_tb_d) = info_b.time_base;
                         let b_src_sec = rt_to_seconds(at.to.source_pts);
                         let b_pts = if b_tb_n != 0 {
@@ -8846,17 +9105,11 @@ fn playback_loop(
                                 // EOS on A) chains onto B's media
                                 // rather than skipping to the next
                                 // clip after B.
-                                let resume_micros =
-                                    (timeline_sec * 1_000_000.0).round() as i64;
-                                chain_resume_micros
-                                    .store(resume_micros, Ordering::Release);
+                                let resume_micros = (timeline_sec * 1_000_000.0).round() as i64;
+                                chain_resume_micros.store(resume_micros, Ordering::Release);
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    ?e,
-                                    b_pts,
-                                    "transition: B decode_at failed",
-                                );
+                                tracing::warn!(?e, b_pts, "transition: B decode_at failed",);
                             }
                         }
                     }
@@ -9049,7 +9302,9 @@ fn present_record_only(
             return Err(EngineError::SurfaceAcquire("surface outdated".into()));
         }
         wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-            return Err(EngineError::SurfaceAcquire("surface timeout/occluded".into()));
+            return Err(EngineError::SurfaceAcquire(
+                "surface timeout/occluded".into(),
+            ));
         }
     };
     let view = surface_tex
@@ -9144,8 +9399,8 @@ impl Engine {
                 "render range empty: start={start_s} end={end_s}"
             )));
         }
-        let total_frames = ((end_s - start_s) * frame_rate_num as f64 / frame_rate_den as f64)
-            .ceil() as u64;
+        let total_frames =
+            ((end_s - start_s) * frame_rate_num as f64 / frame_rate_den as f64).ceil() as u64;
         let sample_rate: u32 = 48_000;
 
         // 3. Ensure a headless render state. install_viewport's render
@@ -9260,223 +9515,245 @@ impl Engine {
         // Wrapped in an IIFE so an HDR export's temporary render-state swap +
         // output-space override are ALWAYS restored (below), even if the loop
         // or the encoder finish errors out.
-        let export_result: Result<(u64, u64), EngineError> = (|| -> Result<(u64, u64), EngineError> {
-        for f in 0..total_frames {
-            let timeline_seconds =
-                start_s + (f as f64) * (frame_rate_den as f64) / (frame_rate_num as f64);
-            let timeline_t = seconds_to_rt(timeline_seconds);
+        let export_result: Result<(u64, u64), EngineError> =
+            (|| -> Result<(u64, u64), EngineError> {
+                for f in 0..total_frames {
+                    let timeline_seconds =
+                        start_s + (f as f64) * (frame_rate_den as f64) / (frame_rate_num as f64);
+                    let timeline_t = seconds_to_rt(timeline_seconds);
 
-            // Resolve what's on screen from ONE project borrow. An
-            // active transition (dissolve window) takes priority over a
-            // plain clip, mirroring the live renderer. `transition_plan`
-            // carries (from_media, from_clip, from_src_pts, from_src_in,
-            // to_media, to_src_pts, mix). The clip tuple is the
-            // single-clip fall-through.
-            #[allow(clippy::type_complexity)]
-            let (
-                transition_plan,
-                active_media,
-                active_source_pts_seconds,
-                clip_effects,
-                clip_source_in_seconds,
-                active_clip_id,
-            ): (
-                // (transition, from_src_in, to_src_in)
-                Option<(vance_timeline::ActiveTransition, f64, f64)>,
-                Option<MediaItemId>,
-                f64,
-                Vec<vance_timeline::Effect>,
-                f64,
-                Option<vance_timeline::ClipId>,
-            ) = {
-                let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
-                let seq_id = self.current_sequence_id.ok_or(EngineError::NoCurrentSequence)?;
-                let seq = project.sequence(seq_id).ok_or(EngineError::SequenceNotFound)?;
-                if let Some(tr) = vance_timeline::transition_at(seq, timeline_t) {
-                    let src_in = |clip_id: vance_timeline::ClipId| {
-                        seq.tracks
-                            .iter()
-                            .find_map(|t| {
-                                t.clips
+                    // Resolve what's on screen from ONE project borrow. An
+                    // active transition (dissolve window) takes priority over a
+                    // plain clip, mirroring the live renderer. `transition_plan`
+                    // carries (from_media, from_clip, from_src_pts, from_src_in,
+                    // to_media, to_src_pts, mix). The clip tuple is the
+                    // single-clip fall-through.
+                    #[allow(clippy::type_complexity)]
+                    let (
+                        transition_plan,
+                        active_media,
+                        active_source_pts_seconds,
+                        clip_effects,
+                        clip_source_in_seconds,
+                        active_clip_id,
+                    ): (
+                        // (transition, from_src_in, to_src_in)
+                        Option<(vance_timeline::ActiveTransition, f64, f64)>,
+                        Option<MediaItemId>,
+                        f64,
+                        Vec<vance_timeline::Effect>,
+                        f64,
+                        Option<vance_timeline::ClipId>,
+                    ) = {
+                        let project = self
+                            .current_project
+                            .as_ref()
+                            .ok_or(EngineError::NoProject)?;
+                        let seq_id = self
+                            .current_sequence_id
+                            .ok_or(EngineError::NoCurrentSequence)?;
+                        let seq = project
+                            .sequence(seq_id)
+                            .ok_or(EngineError::SequenceNotFound)?;
+                        if let Some(tr) = vance_timeline::transition_at(seq, timeline_t) {
+                            let src_in = |clip_id: vance_timeline::ClipId| {
+                                seq.tracks
                                     .iter()
-                                    .find(|cl| cl.id == clip_id)
-                                    .map(|cl| rt_to_seconds(cl.source_in))
-                            })
-                            .unwrap_or(0.0)
-                    };
-                    let from_src_in = src_in(tr.from.clip_id);
-                    let to_src_in = src_in(tr.to.clip_id);
-                    (Some((tr, from_src_in, to_src_in)), None, 0.0, Vec::new(), 0.0, None)
-                } else {
-                    match vance_timeline::scene_at(seq, timeline_t) {
-                        vance_timeline::SceneAt::Clip(c) => {
-                            let (effects, source_in) = seq
-                                .tracks
-                                .iter()
-                                .find_map(|t| {
-                                    t.clips.iter().find(|cl| cl.id == c.clip_id).map(|cl| {
-                                        (cl.effects.clone(), rt_to_seconds(cl.source_in))
+                                    .find_map(|t| {
+                                        t.clips
+                                            .iter()
+                                            .find(|cl| cl.id == clip_id)
+                                            .map(|cl| rt_to_seconds(cl.source_in))
                                     })
-                                })
-                                .unwrap_or_default();
-                            (
-                                None,
-                                Some(c.media),
-                                rt_to_seconds(c.source_pts),
-                                effects,
-                                source_in,
-                                Some(c.clip_id),
-                            )
-                        }
-                        vance_timeline::SceneAt::Empty => {
-                            (None, None, 0.0, Vec::new(), 0.0, None)
-                        }
-                    }
-                }
-            };
-
-            let mut rgba: Option<Vec<u8>> = None;
-            if let Some((tr, from_src_in, to_src_in)) = transition_plan {
-                let from_media = tr.from.media;
-                let from_src_pts = rt_to_seconds(tr.from.source_pts);
-                let to_media = tr.to.media;
-                let to_src_pts = rt_to_seconds(tr.to.source_pts);
-                match &tr.kind {
-                    vance_timeline::TransitionKind::Dissolve => {
-                        // Cross-dissolve: decode A → A-side, B → B-side
-                        // (the B decode may swap the primary decoder's open
-                        // file, but A's frame is already on the GPU), apply
-                        // A's native effects, set the mix factor, read back.
-                        if let Some(frame_a) =
-                            self.decode_clip_framedata(from_media, from_src_pts, from_src_in)
-                        {
-                            {
-                                let mut rs = render_state_arc.lock();
-                                let _ = rs.renderer.upload_frame(&frame_a);
-                            }
-                            if let Some(frame_b) =
-                                self.decode_clip_framedata(to_media, to_src_pts, to_src_in)
-                            {
-                                let mut rs = render_state_arc.lock();
-                                let _ = rs.renderer.upload_frame_b(&frame_b);
-                            }
-                            let from_clip_t = from_src_pts - from_src_in;
-                            self.apply_clip_render_params(tr.from.clip_id, from_media, from_clip_t);
-                            let mut rs = render_state_arc.lock();
-                            rs.renderer.set_mix_factor(tr.mix);
-                            rgba = if opts.hdr {
-                                rs.renderer.render_to_rgba64_buffer(width, height).ok()
-                            } else {
-                                rs.renderer.render_to_rgba_buffer(width, height).ok()
+                                    .unwrap_or(0.0)
                             };
-                        }
-                    }
-                    vance_timeline::TransitionKind::Wasm(plugin_id) => {
-                        // Render A and B fully + independently, then let the
-                        // WASM plugin blend B into A on the CPU.
-                        let a = self
-                            .render_clip_to_rgba(
-                                tr.from.clip_id,
-                                from_media,
-                                from_src_pts,
-                                from_src_in,
-                                width,
-                                height,
+                            let from_src_in = src_in(tr.from.clip_id);
+                            let to_src_in = src_in(tr.to.clip_id);
+                            (
+                                Some((tr, from_src_in, to_src_in)),
+                                None,
+                                0.0,
+                                Vec::new(),
+                                0.0,
+                                None,
                             )
-                            .map(|(r, _)| r);
-                        let b = self
-                            .render_clip_to_rgba(
-                                tr.to.clip_id,
-                                to_media,
-                                to_src_pts,
-                                to_src_in,
-                                width,
-                                height,
-                            )
-                            .map(|(r, _)| r);
-                        if let (Some(mut a), Some(b)) = (a, b) {
-                            let to_clip_t = to_src_pts - to_src_in;
-                            self.apply_wasm_transition(
-                                &mut a, &b, width, height, plugin_id, &tr.params, tr.mix, to_clip_t,
-                            );
-                            rgba = Some(a);
+                        } else {
+                            match vance_timeline::scene_at(seq, timeline_t) {
+                                vance_timeline::SceneAt::Clip(c) => {
+                                    let (effects, source_in) = seq
+                                        .tracks
+                                        .iter()
+                                        .find_map(|t| {
+                                            t.clips.iter().find(|cl| cl.id == c.clip_id).map(|cl| {
+                                                (cl.effects.clone(), rt_to_seconds(cl.source_in))
+                                            })
+                                        })
+                                        .unwrap_or_default();
+                                    (
+                                        None,
+                                        Some(c.media),
+                                        rt_to_seconds(c.source_pts),
+                                        effects,
+                                        source_in,
+                                        Some(c.clip_id),
+                                    )
+                                }
+                                vance_timeline::SceneAt::Empty => {
+                                    (None, None, 0.0, Vec::new(), 0.0, None)
+                                }
+                            }
                         }
-                    }
-                }
-            } else if let (Some(media_id), Some(clip_id)) = (active_media, active_clip_id) {
-                // Single clip: decode (File or Title), apply native
-                // effects, read back.
-                let entry_clip_t = active_source_pts_seconds - clip_source_in_seconds;
-                if let Some(frame) = self.decode_clip_framedata(
-                    media_id,
-                    active_source_pts_seconds,
-                    clip_source_in_seconds,
-                ) {
-                    {
-                        let mut rs = render_state_arc.lock();
-                        let _ = rs.renderer.upload_frame(&frame);
-                        rs.renderer.set_mix_factor(0.0);
-                    }
-                    self.apply_clip_render_params(clip_id, media_id, entry_clip_t);
-                    let mut rs = render_state_arc.lock();
-                    let readback = if opts.hdr {
-                        rs.renderer.render_to_rgba64_buffer(width, height)
-                    } else {
-                        rs.renderer.render_to_rgba_buffer(width, height)
                     };
-                    match readback {
-                        Ok(buf) => rgba = Some(buf),
-                        Err(e) => {
-                            tracing::warn!(?e, frame = f, "readback failed; black");
+
+                    let mut rgba: Option<Vec<u8>> = None;
+                    if let Some((tr, from_src_in, to_src_in)) = transition_plan {
+                        let from_media = tr.from.media;
+                        let from_src_pts = rt_to_seconds(tr.from.source_pts);
+                        let to_media = tr.to.media;
+                        let to_src_pts = rt_to_seconds(tr.to.source_pts);
+                        match &tr.kind {
+                            vance_timeline::TransitionKind::Dissolve => {
+                                // Cross-dissolve: decode A → A-side, B → B-side
+                                // (the B decode may swap the primary decoder's open
+                                // file, but A's frame is already on the GPU), apply
+                                // A's native effects, set the mix factor, read back.
+                                if let Some(frame_a) = self.decode_clip_framedata(
+                                    from_media,
+                                    from_src_pts,
+                                    from_src_in,
+                                ) {
+                                    {
+                                        let mut rs = render_state_arc.lock();
+                                        let _ = rs.renderer.upload_frame(&frame_a);
+                                    }
+                                    if let Some(frame_b) =
+                                        self.decode_clip_framedata(to_media, to_src_pts, to_src_in)
+                                    {
+                                        let mut rs = render_state_arc.lock();
+                                        let _ = rs.renderer.upload_frame_b(&frame_b);
+                                    }
+                                    let from_clip_t = from_src_pts - from_src_in;
+                                    self.apply_clip_render_params(
+                                        tr.from.clip_id,
+                                        from_media,
+                                        from_clip_t,
+                                    );
+                                    let mut rs = render_state_arc.lock();
+                                    rs.renderer.set_mix_factor(tr.mix);
+                                    rgba = if opts.hdr {
+                                        rs.renderer.render_to_rgba64_buffer(width, height).ok()
+                                    } else {
+                                        rs.renderer.render_to_rgba_buffer(width, height).ok()
+                                    };
+                                }
+                            }
+                            vance_timeline::TransitionKind::Wasm(plugin_id) => {
+                                // Render A and B fully + independently, then let the
+                                // WASM plugin blend B into A on the CPU.
+                                let a = self
+                                    .render_clip_to_rgba(
+                                        tr.from.clip_id,
+                                        from_media,
+                                        from_src_pts,
+                                        from_src_in,
+                                        width,
+                                        height,
+                                    )
+                                    .map(|(r, _)| r);
+                                let b = self
+                                    .render_clip_to_rgba(
+                                        tr.to.clip_id,
+                                        to_media,
+                                        to_src_pts,
+                                        to_src_in,
+                                        width,
+                                        height,
+                                    )
+                                    .map(|(r, _)| r);
+                                if let (Some(mut a), Some(b)) = (a, b) {
+                                    let to_clip_t = to_src_pts - to_src_in;
+                                    self.apply_wasm_transition(
+                                        &mut a, &b, width, height, plugin_id, &tr.params, tr.mix,
+                                        to_clip_t,
+                                    );
+                                    rgba = Some(a);
+                                }
+                            }
+                        }
+                    } else if let (Some(media_id), Some(clip_id)) = (active_media, active_clip_id) {
+                        // Single clip: decode (File or Title), apply native
+                        // effects, read back.
+                        let entry_clip_t = active_source_pts_seconds - clip_source_in_seconds;
+                        if let Some(frame) = self.decode_clip_framedata(
+                            media_id,
+                            active_source_pts_seconds,
+                            clip_source_in_seconds,
+                        ) {
+                            {
+                                let mut rs = render_state_arc.lock();
+                                let _ = rs.renderer.upload_frame(&frame);
+                                rs.renderer.set_mix_factor(0.0);
+                            }
+                            self.apply_clip_render_params(clip_id, media_id, entry_clip_t);
+                            let mut rs = render_state_arc.lock();
+                            let readback = if opts.hdr {
+                                rs.renderer.render_to_rgba64_buffer(width, height)
+                            } else {
+                                rs.renderer.render_to_rgba_buffer(width, height)
+                            };
+                            match readback {
+                                Ok(buf) => rgba = Some(buf),
+                                Err(e) => {
+                                    tracing::warn!(?e, frame = f, "readback failed; black");
+                                }
+                            }
                         }
                     }
+                    let mut push = rgba.unwrap_or_else(|| black.clone());
+                    // Phase 10.5 — run the clip's WASM plugin effects over the
+                    // composited RGBA before encoding. No-op when the clip has
+                    // no `wasm:` effects. Skipped on the HDR path: those CPU plugins
+                    // operate on 8-bit RGBA and can't interpret the 10-bit rgba64le
+                    // buffer (a documented HDR limitation).
+                    if !clip_effects.is_empty() && !opts.hdr {
+                        let clip_t = active_source_pts_seconds - clip_source_in_seconds;
+                        self.apply_wasm_effects(&mut push, width, height, &clip_effects, clip_t);
+                    }
+                    client
+                        .push_video(f as i64, push)
+                        .map_err(|e| EngineError::Project(format!("encoder push_video: {e}")))?;
                 }
-            }
-            let mut push = rgba.unwrap_or_else(|| black.clone());
-            // Phase 10.5 — run the clip's WASM plugin effects over the
-            // composited RGBA before encoding. No-op when the clip has
-            // no `wasm:` effects. Skipped on the HDR path: those CPU plugins
-            // operate on 8-bit RGBA and can't interpret the 10-bit rgba64le
-            // buffer (a documented HDR limitation).
-            if !clip_effects.is_empty() && !opts.hdr {
-                let clip_t = active_source_pts_seconds - clip_source_in_seconds;
-                self.apply_wasm_effects(&mut push, width, height, &clip_effects, clip_t);
-            }
-            client
-                .push_video(f as i64, push)
-                .map_err(|e| EngineError::Project(format!("encoder push_video: {e}")))?;
-        }
 
-        // 8. Real mixed audio — offline bounce of the export range
-        //    through the full mixer model (per-clip gain/fades/pan,
-        //    per-track DSP, master), then push to the encoder in
-        //    chunks. Falls back to silence only if the bounce fails
-        //    (e.g. no audio sidecar), so the file is always valid.
-        let mixed = match self.offline_audio_bounce(start_s, end_s, sample_rate) {
-            Ok(samples) => samples,
-            Err(e) => {
-                tracing::warn!(?e, "audio bounce failed; exporting silent track");
-                let total = ((end_s - start_s) * sample_rate as f64).round() as usize;
-                vec![0f32; total * 2]
-            }
-        };
-        // Push in ~0.1 s chunks (interleaved stereo).
-        let push_chunk_frames = (sample_rate as usize / 10).max(1);
-        let mut pos = 0usize;
-        while pos < mixed.len() {
-            let end = (pos + push_chunk_frames * 2).min(mixed.len());
-            client
-                .push_audio(0, mixed[pos..end].to_vec())
-                .map_err(|e| EngineError::Project(format!("encoder push_audio: {e}")))?;
-            pos = end;
-        }
+                // 8. Real mixed audio — offline bounce of the export range
+                //    through the full mixer model (per-clip gain/fades/pan,
+                //    per-track DSP, master), then push to the encoder in
+                //    chunks. Falls back to silence only if the bounce fails
+                //    (e.g. no audio sidecar), so the file is always valid.
+                let mixed = match self.offline_audio_bounce(start_s, end_s, sample_rate) {
+                    Ok(samples) => samples,
+                    Err(e) => {
+                        tracing::warn!(?e, "audio bounce failed; exporting silent track");
+                        let total = ((end_s - start_s) * sample_rate as f64).round() as usize;
+                        vec![0f32; total * 2]
+                    }
+                };
+                // Push in ~0.1 s chunks (interleaved stereo).
+                let push_chunk_frames = (sample_rate as usize / 10).max(1);
+                let mut pos = 0usize;
+                while pos < mixed.len() {
+                    let end = (pos + push_chunk_frames * 2).min(mixed.len());
+                    client
+                        .push_audio(0, mixed[pos..end].to_vec())
+                        .map_err(|e| EngineError::Project(format!("encoder push_audio: {e}")))?;
+                    pos = end;
+                }
 
-        let (video_frames, audio_samples) = client
-            .finish()
-            .map_err(|e| EngineError::Project(format!("encoder finish: {e}")))?;
-        let _ = client.shutdown();
-        Ok((video_frames, audio_samples))
-        })(); // end IIFE
+                let (video_frames, audio_samples) = client
+                    .finish()
+                    .map_err(|e| EngineError::Project(format!("encoder finish: {e}")))?;
+                let _ = client.shutdown();
+                Ok((video_frames, audio_samples))
+            })(); // end IIFE
 
         // Restore SDR render state after an HDR export (the HDR renderer is a
         // dedicated Rgba16Float instance; preview needs the original). Always
@@ -9576,7 +9853,10 @@ impl Engine {
         // 3. Build a Clip targeting the full rendered duration, anchored
         //    at the export's start timeline-time.
         let (clip, new_clip_id) = {
-            let project = self.current_project.as_ref().ok_or(EngineError::NoProject)?;
+            let project = self
+                .current_project
+                .as_ref()
+                .ok_or(EngineError::NoProject)?;
             let media = project
                 .media
                 .get(&media_id)
@@ -9640,10 +9920,7 @@ impl Engine {
                 tracing::warn!(?e, "frame cache init failed; caching disabled");
                 // Re-attempt anyway with a fresh process-temp prefix
                 // to avoid permanent disable.
-                let alt = std::env::temp_dir().join(format!(
-                    "vance-cache-{}",
-                    std::process::id()
-                ));
+                let alt = std::env::temp_dir().join(format!("vance-cache-{}", std::process::id()));
                 let c = vance_cache::FrameCache::new(alt, ring_budget, disk_budget)
                     .expect("fallback cache");
                 let arc = Arc::new(c);
@@ -9823,12 +10100,7 @@ impl Engine {
     /// in-place edit, like `ensure_plugin_loaded`). Needs the render device
     /// (available once the viewport is installed).
     fn ensure_shader_loaded(&mut self, id: &str) -> bool {
-        let Some(disc) = self
-            .plugin_registry
-            .by_id(id)
-            .filter(|d| d.shader)
-            .cloned()
-        else {
+        let Some(disc) = self.plugin_registry.by_id(id).filter(|d| d.shader).cloned() else {
             return false;
         };
         let current_mtime = std::fs::metadata(&disc.path)
@@ -9856,7 +10128,8 @@ impl Engine {
         };
         match vance_effects::ShaderEffect::compile_with(device, queue, &body) {
             Ok(fx) => {
-                self.loaded_shaders.insert(id.to_string(), (fx, current_mtime));
+                self.loaded_shaders
+                    .insert(id.to_string(), (fx, current_mtime));
                 true
             }
             Err(err) => {
@@ -9940,7 +10213,12 @@ impl Engine {
         };
         seq.tracks
             .iter()
-            .find_map(|t| t.clips.iter().find(|c| c.id == clip_id).map(|c| c.effects.clone()))
+            .find_map(|t| {
+                t.clips
+                    .iter()
+                    .find(|c| c.id == clip_id)
+                    .map(|c| c.effects.clone())
+            })
             .unwrap_or_default()
     }
 
@@ -10047,7 +10325,9 @@ impl Engine {
             tracing::warn!(plugin = %id, "wasm effect references unknown plugin");
             return false;
         };
-        let current_mtime = std::fs::metadata(&disc.path).and_then(|m| m.modified()).ok();
+        let current_mtime = std::fs::metadata(&disc.path)
+            .and_then(|m| m.modified())
+            .ok();
         // Reuse the cached instance only if its mtime matches.
         if let Some((_, cached_mtime)) = self.loaded_plugins.get(id) {
             if *cached_mtime == current_mtime {
@@ -10074,7 +10354,11 @@ impl Engine {
                     return false;
                 }
             };
-            match self.entitlement_gate.as_ref().and_then(|g| g.decrypt(id, &body)) {
+            match self
+                .entitlement_gate
+                .as_ref()
+                .and_then(|g| g.decrypt(id, &body))
+            {
                 Some(pt) => std::borrow::Cow::Owned(pt),
                 None => {
                     tracing::warn!(plugin = %id, "blocked: paid effect couldn't be decrypted");
@@ -10138,7 +10422,10 @@ impl Engine {
         key: String,
         value: Option<String>,
     ) -> Result<(), EngineError> {
-        let project = self.current_project.as_mut().ok_or(EngineError::NoProject)?;
+        let project = self
+            .current_project
+            .as_mut()
+            .ok_or(EngineError::NoProject)?;
         let media = project
             .media
             .get_mut(&media_id)
@@ -10184,7 +10471,10 @@ impl Engine {
         name: String,
         query: vance_timeline::MediaQuery,
     ) -> Result<String, EngineError> {
-        let project = self.current_project.as_mut().ok_or(EngineError::NoProject)?;
+        let project = self
+            .current_project
+            .as_mut()
+            .ok_or(EngineError::NoProject)?;
         let bin = vance_timeline::SmartBin::new(name, query);
         let id = bin.id.to_string();
         project.smart_bins.push(bin);
@@ -10196,7 +10486,10 @@ impl Engine {
         let uuid = uuid::Uuid::parse_str(id)
             .map_err(|e| EngineError::Project(format!("bad smart-bin id: {e}")))?;
         let target = MediaItemId::from_uuid(uuid);
-        let project = self.current_project.as_mut().ok_or(EngineError::NoProject)?;
+        let project = self
+            .current_project
+            .as_mut()
+            .ok_or(EngineError::NoProject)?;
         let before = project.smart_bins.len();
         project.smart_bins.retain(|b| b.id != target);
         Ok(project.smart_bins.len() != before)
@@ -10411,7 +10704,10 @@ mod tests {
         let mut grain = vec![1.0f32; frames * 2]; // all unity
         apply_grain_window(&mut grain, sr);
         // First frame fully faded to 0.
-        assert!(grain[0].abs() < 1e-6 && grain[1].abs() < 1e-6, "start not faded");
+        assert!(
+            grain[0].abs() < 1e-6 && grain[1].abs() < 1e-6,
+            "start not faded"
+        );
         // Last frame fully faded to 0.
         let last = frames - 1;
         assert!(
@@ -10500,12 +10796,7 @@ mod tests {
     }
 
     fn audio_media(path: &str) -> Arc<MediaItem> {
-        let mut m = MediaItem::new(
-            PathBuf::from(path),
-            "clip.wav",
-            MediaKind::Audio,
-            t(10),
-        );
+        let mut m = MediaItem::new(PathBuf::from(path), "clip.wav", MediaKind::Audio, t(10));
         m.has_audio_track = true;
         Arc::new(m)
     }
@@ -10515,12 +10806,10 @@ mod tests {
         let mut seq = vance_timeline::Sequence::new("S", vance_core::FrameRate::FPS_24);
         let video_t = vance_timeline::Track::new(TrackKind::Video, "V1");
         let audio_t = vance_timeline::Track::new(TrackKind::Audio, "A1");
-        let video_clip = Arc::new(
-            vance_timeline::Clip::new(MediaItemId::new(), "v", t(0), t(0), t(5)).unwrap(),
-        );
-        let audio_clip = Arc::new(
-            vance_timeline::Clip::new(MediaItemId::new(), "a", t(0), t(0), t(5)).unwrap(),
-        );
+        let video_clip =
+            Arc::new(vance_timeline::Clip::new(MediaItemId::new(), "v", t(0), t(0), t(5)).unwrap());
+        let audio_clip =
+            Arc::new(vance_timeline::Clip::new(MediaItemId::new(), "a", t(0), t(0), t(5)).unwrap());
         let mut video_t = video_t;
         video_t.clips.push(video_clip.clone());
         let mut audio_t = audio_t;
@@ -10533,7 +10822,10 @@ mod tests {
         let snap = build_mixer_snapshot(&seq);
         assert_eq!(snap.tracks.len(), 2, "both tracks emit a TrackMix");
         assert_eq!(snap.clips.len(), 1, "only audio tracks emit ClipMixes");
-        let cm = snap.clips.get(&audio_clip_id.as_uuid()).expect("audio clip present");
+        let cm = snap
+            .clips
+            .get(&audio_clip_id.as_uuid())
+            .expect("audio clip present");
         assert_eq!(cm.track_id, audio_track_id.as_uuid());
         assert!(cm.enabled);
         assert!(!snap.solo_anywhere);
@@ -10576,12 +10868,18 @@ mod tests {
         assert!((sc[1] - 1.0).abs() < 1e-5, "full height, no vertical zoom");
         let ar_s = 1920.0f32 / 1080.0;
         let ar_t = 1080.0f32 / 1920.0;
-        assert!((sc[0] - ar_s / ar_t).abs() < 1e-4, "horizontal scale = ar_s/ar_t");
+        assert!(
+            (sc[0] - ar_s / ar_t).abs() < 1e-4,
+            "horizontal scale = ar_s/ar_t"
+        );
         // The subject (clamped) maps to output-center: out = scale*(subj-0.5)+0.5+translate.
         let hx = 0.5 / sc[0];
         let clamped_cx = 0.9f32.clamp(hx, 1.0 - hx);
         let out_x = sc[0] * (clamped_cx - 0.5) + 0.5 + tr[0];
-        assert!((out_x - 0.5).abs() < 1e-4, "subject centered horizontally: {out_x}");
+        assert!(
+            (out_x - 0.5).abs() < 1e-4,
+            "subject centered horizontally: {out_x}"
+        );
 
         // Centered subject at exactly middle → translate ~0.
         let (tr2, _) = reframe_transform((0.5, 0.5), 1920, 1080, 1080, 1920, 1.0);
@@ -10600,7 +10898,8 @@ mod tests {
         let reverb = vance_timeline::BusId::new();
         let mut mbus = vance_timeline::AudioBus::new("Music");
         mbus.id = music;
-        mbus.inserts.push(vance_timeline::AudioEffectSpec::default_compressor());
+        mbus.inserts
+            .push(vance_timeline::AudioEffectSpec::default_compressor());
         // A post-fader send from Music → Reverb at -6 dB.
         mbus.sends.push(vance_timeline::Send {
             target: reverb,
@@ -10613,7 +10912,10 @@ mod tests {
         seq.buses.push(rbus);
 
         let snap = build_mixer_snapshot(&seq);
-        let m = snap.buses.get(&music.as_uuid()).expect("music bus in snapshot");
+        let m = snap
+            .buses
+            .get(&music.as_uuid())
+            .expect("music bus in snapshot");
         assert_eq!(m.audio_effects.len(), 1, "bus insert translated");
         assert_eq!(m.sends.len(), 1, "bus send translated");
         assert_eq!(m.sends[0].target, reverb.as_uuid());
@@ -10627,8 +10929,12 @@ mod tests {
         let mut project = vance_timeline::Project::new("P");
         // Two audio media items: one has audio, one doesn't.
         let mi_with = audio_media("/tmp/with.wav");
-        let mut mi_without_inner =
-            MediaItem::new(PathBuf::from("/tmp/without.mp4"), "x", MediaKind::Video, t(10));
+        let mut mi_without_inner = MediaItem::new(
+            PathBuf::from("/tmp/without.mp4"),
+            "x",
+            MediaKind::Video,
+            t(10),
+        );
         mi_without_inner.has_audio_track = false;
         let mi_without = Arc::new(mi_without_inner);
         let id_with = mi_with.id;
@@ -10686,9 +10992,18 @@ mod tests {
         use vance_timeline::TrackId;
         let tid = TrackId::new();
         let cid = vance_timeline::ClipId::new();
-        assert!(op_touches_mixer(&EditOp::SetTrackMute { track_id: tid, mute: true }));
-        assert!(op_touches_mixer(&EditOp::SetTrackSolo { track_id: tid, solo: true }));
-        assert!(op_touches_mixer(&EditOp::SetTrackGainDb { track_id: tid, gain_db: -3.0 }));
+        assert!(op_touches_mixer(&EditOp::SetTrackMute {
+            track_id: tid,
+            mute: true
+        }));
+        assert!(op_touches_mixer(&EditOp::SetTrackSolo {
+            track_id: tid,
+            solo: true
+        }));
+        assert!(op_touches_mixer(&EditOp::SetTrackGainDb {
+            track_id: tid,
+            gain_db: -3.0
+        }));
         assert!(op_touches_mixer(&EditOp::SetClipMute {
             track_id: tid,
             clip_id: cid,
@@ -10766,14 +11081,7 @@ mod tests {
     fn compute_sched_plan_skips_clip_outside_preload() {
         // Clip starts at t=5.0, playhead at t=0.0, PRELOAD=2.0 — too far.
         let c = sched(5.0, 5.0);
-        let plan = compute_sched_plan(
-            &[c],
-            &std::collections::HashSet::new(),
-            0.0,
-            0.05,
-            2.0,
-            16,
-        );
+        let plan = compute_sched_plan(&[c], &std::collections::HashSet::new(), 0.0, 0.05, 2.0, 16);
         assert!(plan.to_add.is_empty());
     }
 
@@ -10847,8 +11155,7 @@ mod tests {
         );
         assert_eq!(plan.cap_drops, 2);
         assert_eq!(plan.to_add.len(), 2);
-        let kept: std::collections::HashSet<_> =
-            plan.to_add.iter().map(|x| x.0).collect();
+        let kept: std::collections::HashSet<_> = plan.to_add.iter().map(|x| x.0).collect();
         assert!(kept.contains(&c0.clip_id));
         assert!(kept.contains(&c1.clip_id));
         assert!(!kept.contains(&c2.clip_id));
@@ -10954,7 +11261,11 @@ mod tests {
 
         // Within preload (4.0 is 1.0s before clip start).
         let pre = collect_audio_sources_at(&seq, &project, 4.0);
-        assert_eq!(pre.len(), 1, "preload window should include t-1s-ahead clip");
+        assert_eq!(
+            pre.len(),
+            1,
+            "preload window should include t-1s-ahead clip"
+        );
         assert!((pre[0].from_seconds - 0.0).abs() < 1e-9);
 
         // Outside preload (2.0 is 3.0s before clip start; PRELOAD=2.0).
@@ -10968,7 +11279,10 @@ mod tests {
 
         // Past the clip (11.0 > clip end 10.0).
         let past = collect_audio_sources_at(&seq, &project, 11.0);
-        assert!(past.is_empty(), "clips behind the playhead must be excluded");
+        assert!(
+            past.is_empty(),
+            "clips behind the playhead must be excluded"
+        );
     }
 
     #[test]
@@ -10982,7 +11296,10 @@ mod tests {
         let mut live = std::collections::HashSet::new();
         live.insert(c.clip_id);
         let plan = compute_sched_plan(&[c.clone()], &live, 0.0, 0.05, 2.0, 16);
-        assert!(plan.to_add.is_empty(), "seeded live set must suppress respawn");
+        assert!(
+            plan.to_add.is_empty(),
+            "seeded live set must suppress respawn"
+        );
         assert!(plan.to_remove.is_empty());
     }
 }

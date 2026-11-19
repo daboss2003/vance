@@ -24,7 +24,10 @@ fn schema_matches_committed_snapshot() {
     if !path.exists() {
         std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir schema/");
         std::fs::write(&path, &actual).expect("write initial snapshot");
-        eprintln!("(bootstrapped GradingCommand snapshot at {})", path.display());
+        eprintln!(
+            "(bootstrapped GradingCommand snapshot at {})",
+            path.display()
+        );
         return;
     }
     let expected = std::fs::read_to_string(&path).expect("read snapshot");

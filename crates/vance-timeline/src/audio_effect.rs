@@ -354,7 +354,11 @@ impl AudioEffectSpec {
 
     /// Default for "Add Plugin" with a captured descriptor — the UI
     /// passes in the plugin chosen from the enumeration.
-    pub fn plugin(format: impl Into<String>, id: impl Into<String>, name: impl Into<String>) -> Self {
+    pub fn plugin(
+        format: impl Into<String>,
+        id: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
         AudioEffectSpec::Plugin {
             enabled: true,
             descriptor: PluginRefSpec {

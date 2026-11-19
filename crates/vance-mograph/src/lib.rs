@@ -215,7 +215,10 @@ mod tests {
     #[test]
     fn set_rejects_unknown_and_typemismatch() {
         let mut inst = MographInstance::new(builtins::centered_title());
-        assert!(!inst.set("nope", ControlValue::Text("x".into())), "unknown id");
+        assert!(
+            !inst.set("nope", ControlValue::Text("x".into())),
+            "unknown id"
+        );
         assert!(
             !inst.set("headline", ControlValue::Number(3.0)),
             "type mismatch"
@@ -230,10 +233,7 @@ mod tests {
         let img = eng.render(&inst, 1.0, 30.0, 5.0);
         assert_eq!(img.width, inst.template.canvas.width);
         assert_eq!(img.height, inst.template.canvas.height);
-        assert_eq!(
-            img.pixels.len(),
-            (img.width * img.height * 4) as usize
-        );
+        assert_eq!(img.pixels.len(), (img.width * img.height * 4) as usize);
     }
 
     #[test]
@@ -245,9 +245,7 @@ mod tests {
             return; // headless host without fonts — skip
         }
         let inst = MographInstance::new(builtins::centered_title());
-        let energy = |img: &RgbaImage| -> u64 {
-            img.pixels.iter().map(|&b| b as u64).sum()
-        };
+        let energy = |img: &RgbaImage| -> u64 { img.pixels.iter().map(|&b| b as u64).sum() };
         let early = energy(&eng.render(&inst, 0.0, 30.0, 5.0));
         let late = energy(&eng.render(&inst, 1.0, 30.0, 5.0));
         assert!(late > early, "title should fade in: {early} -> {late}");

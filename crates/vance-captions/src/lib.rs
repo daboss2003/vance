@@ -170,18 +170,42 @@ mod tests {
         assert_eq!(parse_timestamp("00:05.5"), Some(5500));
         assert_eq!(parse_timestamp("1:02:03"), Some(3_723_000));
         assert_eq!(parse_timestamp("bad"), None);
-        assert_eq!(parse_timestamp("00:70:00,000"), None, "minutes >= 60 rejected");
+        assert_eq!(
+            parse_timestamp("00:70:00,000"),
+            None,
+            "minutes >= 60 rejected"
+        );
     }
 
     #[test]
     fn parse_is_robust_to_hostile_input() {
         // Review fixes: overflow must NOT panic, BOM is stripped, signed /
         // non-digit fields are rejected.
-        assert_eq!(parse_timestamp("9999999999999999:00:00,000"), None, "no overflow panic");
-        assert_eq!(parse_timestamp("\u{FEFF}00:00:01,000"), Some(1000), "BOM stripped");
-        assert_eq!(parse_timestamp("00:00:01,-50"), None, "signed fraction rejected");
-        assert_eq!(parse_timestamp("00:00:01,+5"), None, "signed fraction rejected");
-        assert_eq!(parse_timestamp("-1:00:00,000"), None, "negative hour rejected");
+        assert_eq!(
+            parse_timestamp("9999999999999999:00:00,000"),
+            None,
+            "no overflow panic"
+        );
+        assert_eq!(
+            parse_timestamp("\u{FEFF}00:00:01,000"),
+            Some(1000),
+            "BOM stripped"
+        );
+        assert_eq!(
+            parse_timestamp("00:00:01,-50"),
+            None,
+            "signed fraction rejected"
+        );
+        assert_eq!(
+            parse_timestamp("00:00:01,+5"),
+            None,
+            "signed fraction rejected"
+        );
+        assert_eq!(
+            parse_timestamp("-1:00:00,000"),
+            None,
+            "negative hour rejected"
+        );
     }
 
     #[test]

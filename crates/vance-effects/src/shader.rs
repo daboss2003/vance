@@ -62,7 +62,8 @@ impl ShaderEffect {
     /// Compile on the shared headless GPU context (created once, then reused —
     /// used by tests + the Effect Studio's live preview).
     pub fn compile(effect_body: &str) -> Result<ShaderEffect, String> {
-        let (device, queue) = shared_device().ok_or_else(|| "no GPU adapter available".to_string())?;
+        let (device, queue) =
+            shared_device().ok_or_else(|| "no GPU adapter available".to_string())?;
         Self::compile_with(device, queue, effect_body)
     }
 

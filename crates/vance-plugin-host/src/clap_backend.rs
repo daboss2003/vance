@@ -124,9 +124,14 @@ impl PluginBackend for ClapBackend {
 
         let host_info = HostInfo::new("Vance", "Vance", "https://vance.app", "1.0")
             .map_err(|e| format!("host info: {e:?}"))?;
-        let mut instance =
-            PluginInstance::<VanceHost>::new(|_| VanceHostShared, |_| (), &entry, &plugin_id, &host_info)
-                .map_err(|e| format!("instantiate `{plugin_id:?}`: {e:?}"))?;
+        let mut instance = PluginInstance::<VanceHost>::new(
+            |_| VanceHostShared,
+            |_| (),
+            &entry,
+            &plugin_id,
+            &host_info,
+        )
+        .map_err(|e| format!("instantiate `{plugin_id:?}`: {e:?}"))?;
 
         // Enumerate parameters on the main thread (before activation).
         let params = enumerate_params(&mut instance);

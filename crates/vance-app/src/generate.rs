@@ -117,8 +117,14 @@ pub fn generate_with_progress(req: &GenRequest, on: &mut GenProgress) -> Result<
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     let mut readers = Vec::new();
     for pipe in [
-        child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
-        child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
     ]
     .into_iter()
     .flatten()
@@ -170,7 +176,13 @@ fn parse_step(line: &str) -> Option<(u32, u32)> {
     let rest = &line[line.rfind("step ")? + 5..];
     let mut parts = rest.split('/');
     let n: u32 = parts.next()?.trim().parse().ok()?;
-    let m: u32 = parts.next()?.trim().split_whitespace().next()?.parse().ok()?;
+    let m: u32 = parts
+        .next()?
+        .trim()
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
     Some((n, m))
 }
 
@@ -274,7 +286,10 @@ fn default_sd_args(model: &Path, req: &GenRequest) -> Vec<String> {
 /// `{...}` names are left verbatim.
 fn substitute(token: &str, req: &GenRequest) -> Option<String> {
     let neg = req.negative.clone().unwrap_or_default();
-    let seed = req.seed.map(|s| s.to_string()).unwrap_or_else(|| "-1".to_string());
+    let seed = req
+        .seed
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "-1".to_string());
     let steps = req.steps.unwrap_or(20).to_string();
     let width = req.width.to_string();
     let height = req.height.to_string();
@@ -388,8 +403,12 @@ mod tests {
 
     #[test]
     fn not_configured_message_is_actionable() {
-        assert!(GenError::NotConfigured.to_string().contains("VANCE_IMAGEGEN_CMD"));
-        assert!(GenError::NotConfigured.to_string().contains("VANCE_SD_MODEL"));
+        assert!(GenError::NotConfigured
+            .to_string()
+            .contains("VANCE_IMAGEGEN_CMD"));
+        assert!(GenError::NotConfigured
+            .to_string()
+            .contains("VANCE_SD_MODEL"));
     }
 
     #[test]
@@ -404,8 +423,14 @@ mod tests {
     fn substitute_fills_placeholders_as_single_args() {
         let r = req();
         // A lone {prompt} becomes ONE arg carrying the whole (spaced) prompt.
-        assert_eq!(substitute("{prompt}", &r).as_deref(), Some("a red fox in snow"));
-        assert_eq!(substitute("--size={width}x{height}", &r).as_deref(), Some("--size=1024x576"));
+        assert_eq!(
+            substitute("{prompt}", &r).as_deref(),
+            Some("a red fox in snow")
+        );
+        assert_eq!(
+            substitute("--size={width}x{height}", &r).as_deref(),
+            Some("--size=1024x576")
+        );
         assert_eq!(substitute("{seed}", &r).as_deref(), Some("42"));
         // Absent negative → the token drops entirely.
         assert_eq!(substitute("{negative}", &r), None);
@@ -435,15 +460,22 @@ mod tests {
         r.prompt = "foo; rm -rf / #".into();
         let toks = tokenize("gen -p {prompt} -o {out}");
         let argv: Vec<String> = toks.iter().filter_map(|t| substitute(t, &r)).collect();
-        assert_eq!(argv, vec!["gen", "-p", "foo; rm -rf / #", "-o", "/tmp/gen.png"]);
+        assert_eq!(
+            argv,
+            vec!["gen", "-p", "foo; rm -rf / #", "-o", "/tmp/gen.png"]
+        );
     }
 
     #[test]
     fn default_sd_args_include_model_prompt_size() {
         let r = req();
         let a = default_sd_args(Path::new("/models/sd.gguf"), &r);
-        assert!(a.windows(2).any(|w| w[0] == "-m" && w[1] == "/models/sd.gguf"));
-        assert!(a.windows(2).any(|w| w[0] == "-p" && w[1] == "a red fox in snow"));
+        assert!(a
+            .windows(2)
+            .any(|w| w[0] == "-m" && w[1] == "/models/sd.gguf"));
+        assert!(a
+            .windows(2)
+            .any(|w| w[0] == "-p" && w[1] == "a red fox in snow"));
         assert!(a.windows(2).any(|w| w[0] == "-W" && w[1] == "1024"));
         assert!(a.windows(2).any(|w| w[0] == "-s" && w[1] == "42"));
     }

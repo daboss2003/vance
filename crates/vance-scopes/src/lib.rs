@@ -127,7 +127,12 @@ pub struct ScopeData {
 pub enum ScopeError {
     /// The RGBA buffer is shorter than `w * h * 4`.
     #[error("buffer too small: got {got} bytes, need {need} for {w}x{h} RGBA")]
-    BufferTooSmall { got: usize, need: usize, w: u32, h: u32 },
+    BufferTooSmall {
+        got: usize,
+        need: usize,
+        w: u32,
+        h: u32,
+    },
     /// A config dimension was zero.
     #[error("scope config dimension was zero")]
     ZeroDimension,
@@ -149,7 +154,12 @@ pub fn vectorscope_targets(size: u32) -> Vec<[f32; 2]> {
 
 /// Accumulate all four scopes from an RGBA8 buffer (`w * h * 4` bytes,
 /// row-major). The buffer is the display image (sRGB code values).
-pub fn compute_all(rgba: &[u8], w: u32, h: u32, cfg: &ScopeConfig) -> Result<ScopeData, ScopeError> {
+pub fn compute_all(
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+    cfg: &ScopeConfig,
+) -> Result<ScopeData, ScopeError> {
     if cfg.waveform_cols == 0 || cfg.levels == 0 || cfg.vector_size == 0 {
         return Err(ScopeError::ZeroDimension);
     }
@@ -200,7 +210,8 @@ pub fn compute_all(rgba: &[u8], w: u32, h: u32, cfg: &ScopeConfig) -> Result<Sco
             parade.b.add(col, lvl(b));
 
             // Vectorscope: full-range Rec.709 Cb/Cr → grid.
-            let (_, cb, cr) = color::ycbcr_fullrange(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+            let (_, cb, cr) =
+                color::ycbcr_fullrange(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
             let (vx, vy) = color::cbcr_to_grid(cb, cr, vsize);
             let vxi = (vx.round().clamp(0.0, (vsize - 1) as f32)) as u32;
             let vyi = (vy.round().clamp(0.0, (vsize - 1) as f32)) as u32;
@@ -272,7 +283,8 @@ impl ScopeData {
 
         // Bulk u32 arrays — native-endian cast is little-endian on every
         // supported target (x86/ARM macOS/Windows/Linux).
-        let push_arr = |buf: &mut Vec<u8>, a: &[u32]| buf.extend_from_slice(bytemuck::cast_slice(a));
+        let push_arr =
+            |buf: &mut Vec<u8>, a: &[u32]| buf.extend_from_slice(bytemuck::cast_slice(a));
         push_arr(&mut out, &self.histogram.r);
         push_arr(&mut out, &self.histogram.g);
         push_arr(&mut out, &self.histogram.b);

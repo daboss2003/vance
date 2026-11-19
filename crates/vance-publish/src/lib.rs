@@ -96,7 +96,10 @@ pub fn pkce_from_bytes(random: &[u8]) -> Pkce {
     let verifier = b64.encode(random);
     let digest = Sha256::digest(verifier.as_bytes());
     let challenge = b64.encode(digest);
-    Pkce { verifier, challenge }
+    Pkce {
+        verifier,
+        challenge,
+    }
 }
 
 /// Percent-encode for an `application/x-www-form-urlencoded` value / query
@@ -116,7 +119,12 @@ pub fn form_encode(s: &str) -> String {
 
 /// Build the browser authorization URL for the Authorization-Code + PKCE
 /// flow. `state` is an opaque CSRF token the caller verifies on callback.
-pub fn authorize_url(platform: Platform, cfg: &OAuthConfig, challenge: &str, state: &str) -> String {
+pub fn authorize_url(
+    platform: Platform,
+    cfg: &OAuthConfig,
+    challenge: &str,
+    state: &str,
+) -> String {
     let mut params = vec![
         ("response_type", "code".to_string()),
         (platform.client_id_param(), cfg.client_id.clone()),
@@ -271,8 +279,12 @@ mod tests {
     fn pkce_is_deterministic_and_urlsafe() {
         let p = pkce_from_bytes(&[0u8; 32]);
         // Verifier is base64url of 32 zero bytes; challenge = SHA256 of that.
-        assert!(!p.verifier.contains('+') && !p.verifier.contains('/') && !p.verifier.contains('='));
-        assert!(!p.challenge.contains('+') && !p.challenge.contains('/') && !p.challenge.contains('='));
+        assert!(
+            !p.verifier.contains('+') && !p.verifier.contains('/') && !p.verifier.contains('=')
+        );
+        assert!(
+            !p.challenge.contains('+') && !p.challenge.contains('/') && !p.challenge.contains('=')
+        );
         // Same input → same output (pure).
         assert_eq!(p, pkce_from_bytes(&[0u8; 32]));
         // Different input → different verifier.

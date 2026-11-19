@@ -14,13 +14,11 @@ fn main() {
 
     // pkg-config emits the cargo:rustc-link-search / -link-lib directives
     // for libOpenColorIO and hands back the include paths the shim needs.
-    let lib = pkg_config::Config::new()
-        .probe("OpenColorIO")
-        .expect(
-            "feature `ocio` is on but pkg-config could not find OpenColorIO. \
+    let lib = pkg_config::Config::new().probe("OpenColorIO").expect(
+        "feature `ocio` is on but pkg-config could not find OpenColorIO. \
              Install it (macOS: `brew install opencolorio`) and ensure \
              pkg-config can see it (PKG_CONFIG_PATH).",
-        );
+    );
 
     let mut build = cc::Build::new();
     build.cpp(true).std("c++17").file("src/shim.cpp");

@@ -1681,7 +1681,10 @@ fn ui_wasm_plugin(d: &vance_plugin_sdk::discovery::DiscoveredPlugin) -> UiWasmPl
 fn list_wasm_plugins(state: tauri::State<'_, EngineHandle>) -> Vec<UiWasmPlugin> {
     let mut eng = state.lock();
     eng.rescan_plugins();
-    eng.discovered_plugins().iter().map(ui_wasm_plugin).collect()
+    eng.discovered_plugins()
+        .iter()
+        .map(ui_wasm_plugin)
+        .collect()
 }
 
 /// Uninstall an add-on effect by id: delete its `.wasm` from the managed
@@ -1726,7 +1729,11 @@ fn add_wasm_plugin(
     source: String,
 ) -> Result<UiWasmPlugin, String> {
     let src = std::path::PathBuf::from(&source);
-    if src.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()) != Some("wasm".into())
+    if src
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        != Some("wasm".into())
     {
         return Err("That file isn't an add-on effect (.wasm).".into());
     }
@@ -4063,7 +4070,11 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tau
 
     let file = SubmenuBuilder::new(app, "File")
         .item(&item("new", "New Project", Some("CmdOrCtrl+N"))?)
-        .item(&item("open_project", "Open Project…", Some("CmdOrCtrl+Shift+O"))?)
+        .item(&item(
+            "open_project",
+            "Open Project…",
+            Some("CmdOrCtrl+Shift+O"),
+        )?)
         .separator()
         .item(&item("open_file", "Import Media…", Some("CmdOrCtrl+I"))?)
         .item(&item("new_title", "New Title…", Some("CmdOrCtrl+T"))?)

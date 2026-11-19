@@ -115,7 +115,11 @@ impl PluginRegistry {
     /// duplicate is logged + dropped so the user's search-root order
     /// (project-local before global, say) is honoured deterministically.
     fn add(&mut self, plugin: DiscoveredPlugin) {
-        if self.plugins.iter().any(|p| p.manifest.id == plugin.manifest.id) {
+        if self
+            .plugins
+            .iter()
+            .any(|p| p.manifest.id == plugin.manifest.id)
+        {
             tracing::info!(
                 id = %plugin.manifest.id,
                 path = ?plugin.path,

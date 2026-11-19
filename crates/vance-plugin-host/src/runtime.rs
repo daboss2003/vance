@@ -243,27 +243,36 @@ impl Router {
     ) -> Result<Uuid, String> {
         match descriptor.format {
             PluginFormat::Builtin => {
-                let id = self.stub.instantiate(descriptor, sample_rate, max_block_frames)?;
+                let id = self
+                    .stub
+                    .instantiate(descriptor, sample_rate, max_block_frames)?;
                 self.owners.insert(id, Owner::Stub);
                 Ok(id)
             }
             PluginFormat::Clap => {
                 #[cfg(feature = "clap")]
                 {
-                    let id = self.clap.instantiate(descriptor, sample_rate, max_block_frames)?;
+                    let id = self
+                        .clap
+                        .instantiate(descriptor, sample_rate, max_block_frames)?;
                     self.owners.insert(id, Owner::Clap);
                     Ok(id)
                 }
                 #[cfg(not(feature = "clap"))]
                 {
                     let _ = (sample_rate, max_block_frames);
-                    Err("CLAP hosting not compiled into this sidecar (build --features clap)".into())
+                    Err(
+                        "CLAP hosting not compiled into this sidecar (build --features clap)"
+                            .into(),
+                    )
                 }
             }
             PluginFormat::Lv2 => {
                 #[cfg(feature = "lv2")]
                 {
-                    let id = self.lv2.instantiate(descriptor, sample_rate, max_block_frames)?;
+                    let id = self
+                        .lv2
+                        .instantiate(descriptor, sample_rate, max_block_frames)?;
                     self.owners.insert(id, Owner::Lv2);
                     Ok(id)
                 }

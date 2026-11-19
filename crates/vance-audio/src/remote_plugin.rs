@@ -208,10 +208,7 @@ impl RemotePluginHost {
         if self.spawn_failed {
             return false;
         }
-        let env = self
-            .spawn_env
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()));
+        let env = self.spawn_env.iter().map(|(k, v)| (k.as_str(), v.as_str()));
         match PluginClient::spawn_with_env(&self.exe, env) {
             Ok(client) => {
                 self.watch
@@ -283,7 +280,9 @@ impl RemotePluginHost {
             return None;
         }
         let (sr, mb, gen) = (self.sample_rate, self.max_block, self.generation);
-        match self.guarded(INSTANTIATE_TIMEOUT_MS, move |c| c.instantiate(descriptor, sr, mb)) {
+        match self.guarded(INSTANTIATE_TIMEOUT_MS, move |c| {
+            c.instantiate(descriptor, sr, mb)
+        }) {
             Some(Ok(id)) => {
                 self.instantiations += 1;
                 Some((id, gen))
@@ -324,9 +323,9 @@ impl RemotePluginHost {
         if gen != self.generation || self.client.is_none() {
             return;
         }
-        if let Some(Err(e)) =
-            self.guarded(CONTROL_TIMEOUT_MS, move |c| c.set_param(instance, param_id, value))
-        {
+        if let Some(Err(e)) = self.guarded(CONTROL_TIMEOUT_MS, move |c| {
+            c.set_param(instance, param_id, value)
+        }) {
             self.note_error(e);
         }
     }
@@ -404,7 +403,9 @@ fn kill_pid(pid: u32) {
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+        };
         unsafe {
             let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
             if !handle.is_null() {

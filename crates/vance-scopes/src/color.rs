@@ -41,12 +41,12 @@ pub fn cbcr_to_grid(cb: f32, cr: f32, size: u32) -> (f32, f32) {
 /// The six 75%-saturation color-bar primaries/secondaries in normalized
 /// `R'G'B'`, in the canonical vectorscope order R, Mg, B, Cy, G, Yl.
 pub const BARS_75: [(f32, f32, f32); 6] = [
-    (0.75, 0.0, 0.0),   // Red
-    (0.75, 0.0, 0.75),  // Magenta
-    (0.0, 0.0, 0.75),   // Blue
-    (0.0, 0.75, 0.75),  // Cyan
-    (0.0, 0.75, 0.0),   // Green
-    (0.75, 0.75, 0.0),  // Yellow
+    (0.75, 0.0, 0.0),  // Red
+    (0.75, 0.0, 0.75), // Magenta
+    (0.0, 0.0, 0.75),  // Blue
+    (0.0, 0.75, 0.75), // Cyan
+    (0.0, 0.75, 0.0),  // Green
+    (0.75, 0.75, 0.0), // Yellow
 ];
 
 /// Skin-tone ("I"/flesh) line angle in degrees, measured CCW from the

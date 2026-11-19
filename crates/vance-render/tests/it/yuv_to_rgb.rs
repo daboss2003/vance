@@ -162,11 +162,13 @@ fn ten_bit_matches_eight_bit_equivalent() {
     let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
 
     // 8-bit reference white.
-    r.upload_frame(&solid_yuv420p(64, 64, 235, 128, 128)).unwrap();
+    r.upload_frame(&solid_yuv420p(64, 64, 235, 128, 128))
+        .unwrap();
     let ref8 = center(&r.render_to_rgba_buffer(64, 64).unwrap(), 64, 64);
 
     // 10-bit white (values ×4 of the 8-bit limited points).
-    r.upload_frame(&solid_yuv420p10le(64, 64, 940, 512, 512)).unwrap();
+    r.upload_frame(&solid_yuv420p10le(64, 64, 940, 512, 512))
+        .unwrap();
     let px10 = center(&r.render_to_rgba_buffer(64, 64).unwrap(), 64, 64);
 
     for ch in 0..3 {
@@ -180,11 +182,16 @@ fn ten_bit_matches_eight_bit_equivalent() {
     assert!(px10[0] > 240, "10-bit white should be bright: {}", px10[0]);
 
     // A 10-bit mid-gray also matches its 8-bit equivalent.
-    r.upload_frame(&solid_yuv420p(64, 64, 128, 128, 128)).unwrap();
+    r.upload_frame(&solid_yuv420p(64, 64, 128, 128, 128))
+        .unwrap();
     let gray8 = center(&r.render_to_rgba_buffer(64, 64).unwrap(), 64, 64);
-    r.upload_frame(&solid_yuv420p10le(64, 64, 512, 512, 512)).unwrap();
+    r.upload_frame(&solid_yuv420p10le(64, 64, 512, 512, 512))
+        .unwrap();
     let gray10 = center(&r.render_to_rgba_buffer(64, 64).unwrap(), 64, 64);
-    assert!((gray10[0] as i32 - gray8[0] as i32).abs() <= 3, "mid-gray 10 vs 8 bit");
+    assert!(
+        (gray10[0] as i32 - gray8[0] as i32).abs() <= 3,
+        "mid-gray 10 vs 8 bit"
+    );
 }
 
 /// FULL 10-bit HDR round-trip: a 10-bit PQ Rec.2020 source decoded and
@@ -225,10 +232,20 @@ fn ten_bit_pq_source_round_trips_including_highlights() {
 
     // Reference-white-ish mid PQ code 0.5 round-trips close to 0.5 (the PQ
     // input EOTF is the inverse of the output OETF).
-    r.upload_frame(&solid_yuv420p10le(64, 64, compositor_pipeline(0.5), 512, 512)).unwrap();
+    r.upload_frame(&solid_yuv420p10le(
+        64,
+        64,
+        compositor_pipeline(0.5),
+        512,
+        512,
+    ))
+    .unwrap();
     let mid = read_center_r(&r);
     let want_mid = (0.5 * 65535.0) as i32;
-    assert!((mid as i32 - want_mid).abs() < 1200, "PQ 0.5 round-trip: {mid} vs ~{want_mid}");
+    assert!(
+        (mid as i32 - want_mid).abs() < 1200,
+        "PQ 0.5 round-trip: {mid} vs ~{want_mid}"
+    );
 
     // A HIGHLIGHT (PQ code 0.75, far above reference white) must SURVIVE, not
     // clip to reference white. If the [0,1] working clamp weren't lifted for
@@ -236,13 +253,23 @@ fn ten_bit_pq_source_round_trips_including_highlights() {
     // ~0.5 (≈ mid). It reads much higher, and round-trips approximately (the
     // residual is the accumulated 10-bit↔8-bit-constant + steep-PQ-curve
     // approximation; exact HDR fidelity is a hardware-verified follow-up).
-    r.upload_frame(&solid_yuv420p10le(64, 64, compositor_pipeline(0.75), 512, 512)).unwrap();
+    r.upload_frame(&solid_yuv420p10le(
+        64,
+        64,
+        compositor_pipeline(0.75),
+        512,
+        512,
+    ))
+    .unwrap();
     let hi = read_center_r(&r);
     assert!(
         hi > mid + 10000,
         "highlight must survive well above reference white (not clipped): hi={hi} mid={mid}"
     );
-    assert!(hi > 42000 && hi < 55000, "highlight round-trips near PQ 0.75: {hi}");
+    assert!(
+        hi > 42000 && hi < 55000,
+        "highlight round-trips near PQ 0.75: {hi}"
+    );
 }
 
 /// HDR → SDR preview tone map: an HDR (PQ) source shown on an SDR output
@@ -264,7 +291,8 @@ fn hdr_source_to_sdr_tonemaps_highlights() {
     r.set_pipeline(params);
 
     let render_pq = |r: &mut Renderer, code: f64| -> u8 {
-        r.upload_frame(&solid_yuv420p10le(64, 64, y_for(code), 512, 512)).unwrap();
+        r.upload_frame(&solid_yuv420p10le(64, 64, y_for(code), 512, 512))
+            .unwrap();
         center(&r.render_to_rgba_buffer(64, 64).unwrap(), 64, 64)[0]
     };
     // PQ 0.4 (~50 nits), 0.6 (~180 nits), 0.85 (bright) — all above SDR
@@ -272,8 +300,14 @@ fn hdr_source_to_sdr_tonemaps_highlights() {
     let a = render_pq(&mut r, 0.4);
     let b = render_pq(&mut r, 0.6);
     let c = render_pq(&mut r, 0.85);
-    assert!(a < b && b < c, "tone map must keep highlight ordering: {a} < {b} < {c}");
-    assert!(c > 240, "the brightest highlight should be near SDR white: {c}");
+    assert!(
+        a < b && b < c,
+        "tone map must keep highlight ordering: {a} < {b} < {c}"
+    );
+    assert!(
+        c > 240,
+        "the brightest highlight should be near SDR white: {c}"
+    );
     // Detail is preserved: the mid-highlight is clearly below white (a hard
     // clamp would have pinned it to 255 along with the brighter ones).
     assert!(b < 250, "mid-highlight must not be fully clipped: {b}");
@@ -326,7 +360,10 @@ fn hdr_white_encodes_to_pq_reference() {
     assert_eq!(a16, 65535, "opaque alpha");
     // Sanity: a PQ-coded 100-nit white is a MID code, not near-max (which is
     // what an SDR white or a mis-tag would produce).
-    assert!(r16 > 25000 && r16 < 42000, "PQ white must be mid-range, got {r16}");
+    assert!(
+        r16 > 25000 && r16 < 42000,
+        "PQ white must be mid-range, got {r16}"
+    );
 }
 
 /// Reference SMPTE ST 2084 (PQ) OETF, `E = L/10000` in [0,1].
@@ -436,7 +473,11 @@ fn primary_grade_gain_brightens() {
 
     let mut base_r = Renderer::new(RendererConfig::default()).expect("renderer");
     base_r.upload_frame(&frame).expect("upload");
-    let base = center(&base_r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64);
+    let base = center(
+        &base_r.render_to_rgba_buffer(64, 64).expect("render"),
+        64,
+        64,
+    );
 
     let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
     r.upload_frame(&frame).expect("upload");
@@ -464,7 +505,11 @@ fn disabled_grade_node_is_noop() {
 
     let mut base_r = Renderer::new(RendererConfig::default()).expect("renderer");
     base_r.upload_frame(&frame).expect("upload");
-    let base = center(&base_r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64);
+    let base = center(
+        &base_r.render_to_rgba_buffer(64, 64).expect("render"),
+        64,
+        64,
+    );
 
     let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
     r.upload_frame(&frame).expect("upload");
@@ -490,7 +535,11 @@ fn curves_master_lift_brightens_midgray() {
 
     let mut base_r = Renderer::new(RendererConfig::default()).expect("renderer");
     base_r.upload_frame(&frame).expect("upload");
-    let base = center(&base_r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64);
+    let base = center(
+        &base_r.render_to_rgba_buffer(64, 64).expect("render"),
+        64,
+        64,
+    );
 
     let ckf = |x: f64, y: f64| Keyframe {
         time_seconds: x,
@@ -527,7 +576,11 @@ fn curves_luma_lift_brightens_midgray() {
 
     let mut base_r = Renderer::new(RendererConfig::default()).expect("renderer");
     base_r.upload_frame(&frame).expect("upload");
-    let base = center(&base_r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64);
+    let base = center(
+        &base_r.render_to_rgba_buffer(64, 64).expect("render"),
+        64,
+        64,
+    );
 
     let ckf = |x: f64, y: f64| Keyframe {
         time_seconds: x,
@@ -564,7 +617,11 @@ fn identity_curves_node_is_noop() {
 
     let mut base_r = Renderer::new(RendererConfig::default()).expect("renderer");
     base_r.upload_frame(&frame).expect("upload");
-    let base = center(&base_r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64);
+    let base = center(
+        &base_r.render_to_rgba_buffer(64, 64).expect("render"),
+        64,
+        64,
+    );
 
     let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
     r.upload_frame(&frame).expect("upload");
@@ -576,7 +633,10 @@ fn identity_curves_node_is_noop() {
     }]);
     let graded = center(&r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64);
 
-    assert_eq!(base, graded, "identity curves node must not change the image");
+    assert_eq!(
+        base, graded,
+        "identity curves node must not change the image"
+    );
 }
 
 // ---- HSL qualifier / secondary key (Phase 6.9) ---------------------------
@@ -630,7 +690,10 @@ fn qualifier_off_is_passthrough() {
         })],
         &gray,
     );
-    assert_eq!(plain, weird_but_off, "disabled qualifier must not change output");
+    assert_eq!(
+        plain, weird_but_off,
+        "disabled qualifier must not change output"
+    );
 }
 
 // Wide-open qualifier (default ranges) -> mask==1 everywhere -> matte white.
@@ -638,7 +701,10 @@ fn qualifier_off_is_passthrough() {
 fn matte_wide_open_is_white() {
     let gray = solid_yuv420p(64, 64, 128, 128, 128);
     let m = render_center(&[matte_node(Qualifier::default())], &gray);
-    assert!(m[0] > 250 && m[1] > 250 && m[2] > 250, "expected white matte, got {m:?}");
+    assert!(
+        m[0] > 250 && m[1] > 250 && m[2] > 250,
+        "expected white matte, got {m:?}"
+    );
 }
 
 // A saturation window that excludes a neutral gray (sat==0) -> mask 0 ->
@@ -653,7 +719,10 @@ fn matte_sat_window_excludes_gray() {
         })],
         &gray,
     );
-    assert!(m[0] < 5 && m[1] < 5 && m[2] < 5, "expected black matte, got {m:?}");
+    assert!(
+        m[0] < 5 && m[1] < 5 && m[2] < 5,
+        "expected black matte, got {m:?}"
+    );
 }
 
 // Invert flips the excluded gray back to fully keyed (white).
@@ -668,7 +737,10 @@ fn matte_invert_flips() {
         })],
         &gray,
     );
-    assert!(m[0] > 250 && m[1] > 250 && m[2] > 250, "inverted matte should be white, got {m:?}");
+    assert!(
+        m[0] > 250 && m[1] > 250 && m[2] > 250,
+        "inverted matte should be white, got {m:?}"
+    );
 }
 
 // Luma window keys a near-white frame only when its band includes ~1.0.
@@ -689,8 +761,14 @@ fn matte_luma_window_selects_by_brightness() {
         })],
         &white,
     );
-    assert!(included[0] > 250, "white in [0.5,1] luma band should key white, got {included:?}");
-    assert!(excluded[0] < 5, "white outside [0,0.4] luma band should be black, got {excluded:?}");
+    assert!(
+        included[0] > 250,
+        "white in [0.5,1] luma band should key white, got {included:?}"
+    );
+    assert!(
+        excluded[0] < 5,
+        "white outside [0,0.4] luma band should be black, got {excluded:?}"
+    );
 }
 
 // Hue keying: a red frame (hue ~= 0) is keyed by a narrow band at hue 0
@@ -713,7 +791,10 @@ fn matte_hue_key_red_in_excluded_at_opposite() {
         &red,
     );
     assert!(keyed[0] > 240, "red should key at hue 0, got {keyed:?}");
-    assert!(not_keyed[0] < 15, "red should be excluded at hue 0.5, got {not_keyed:?}");
+    assert!(
+        not_keyed[0] < 15,
+        "red should be excluded at hue 0.5, got {not_keyed:?}"
+    );
 }
 
 // Out-of-key correction is a bypass: a gain node keyed to a hue the frame
@@ -730,7 +811,10 @@ fn out_of_key_is_bypass() {
         })],
         &red,
     );
-    assert_eq!(base, off_hue, "out-of-key node must be a pixel-exact bypass");
+    assert_eq!(
+        base, off_hue,
+        "out-of-key node must be a pixel-exact bypass"
+    );
     // Sanity: an in-key version DOES change the pixel.
     let in_key = render_center(
         &[gain_node(Qualifier {
@@ -779,14 +863,23 @@ fn sample_at(buf: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
 fn window_matte_node(window: Window) -> GradeNodeParams {
     GradeNodeParams {
         enabled: true,
-        qual: Qualifier { show_mask: true, ..Qualifier::default() },
+        qual: Qualifier {
+            show_mask: true,
+            ..Qualifier::default()
+        },
         window,
         ..GradeNodeParams::default()
     }
 }
 
 fn ellipse(cx: f32, cy: f32, rx: f32, ry: f32) -> Window {
-    Window { shape: 1, center: [cx, cy], size: [rx, ry], feather: 0.01, ..Window::default() }
+    Window {
+        shape: 1,
+        center: [cx, cy],
+        size: [rx, ry],
+        feather: 0.01,
+        ..Window::default()
+    }
 }
 
 // A centered ellipse window keys the center pixel and excludes the corner
@@ -802,8 +895,14 @@ fn window_ellipse_matte_center_white_corner_black() {
     };
     let mid = center(&buf, 64, 64);
     let corner = sample_at(&buf, 64, 2, 2);
-    assert!(mid[0] > 250, "center should be inside the window (white matte): {mid:?}");
-    assert!(corner[0] < 5, "corner should be outside (black matte): {corner:?}");
+    assert!(
+        mid[0] > 250,
+        "center should be inside the window (white matte): {mid:?}"
+    );
+    assert!(
+        corner[0] < 5,
+        "corner should be outside (black matte): {corner:?}"
+    );
 }
 
 // A rectangle window includes a near-corner point that the inscribed
@@ -811,7 +910,13 @@ fn window_ellipse_matte_center_white_corner_black() {
 #[test]
 fn window_rect_matte_fills_box() {
     let gray = solid_yuv420p(64, 64, 128, 128, 128);
-    let rect = Window { shape: 2, center: [0.5, 0.5], size: [0.4, 0.4], feather: 0.01, ..Window::default() };
+    let rect = Window {
+        shape: 2,
+        center: [0.5, 0.5],
+        size: [0.4, 0.4],
+        feather: 0.01,
+        ..Window::default()
+    };
     let buf = {
         let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
         r.upload_frame(&gray).expect("upload");
@@ -821,7 +926,10 @@ fn window_rect_matte_fills_box() {
     // (0.5+0.3, 0.5+0.3) in uv -> pixel ~ (51, 51): inside the 0.4 box,
     // outside the inscribed ellipse.
     let box_corner = sample_at(&buf, 64, 51, 51);
-    assert!(box_corner[0] > 200, "box corner should be keyed by a rect window: {box_corner:?}");
+    assert!(
+        box_corner[0] > 200,
+        "box corner should be keyed by a rect window: {box_corner:?}"
+    );
 }
 
 // Inverting the window flips inside/outside.
@@ -852,12 +960,20 @@ fn window_off_is_bit_identical() {
         &[GradeNodeParams {
             enabled: true,
             gain: [1.0, 1.0, 1.0, 2.0],
-            window: Window { shape: 0, center: [0.2, 0.3], size: [0.1, 0.1], ..Window::default() },
+            window: Window {
+                shape: 0,
+                center: [0.2, 0.3],
+                size: [0.1, 0.1],
+                ..Window::default()
+            },
             ..GradeNodeParams::default()
         }],
         &gray,
     );
-    assert_eq!(plain, with_off_window, "window shape 0 must be an exact passthrough");
+    assert_eq!(
+        plain, with_off_window,
+        "window shape 0 must be an exact passthrough"
+    );
 }
 
 // The node mask is qualifier_mask * window_mask: a red frame with the
@@ -872,7 +988,12 @@ fn window_times_qualifier_intersection() {
         r.upload_frame(&red).expect("upload");
         r.set_grades(&[GradeNodeParams {
             enabled: true,
-            qual: Qualifier { enabled: true, show_mask: true, hue: [0.0, 0.2, 0.02], ..Qualifier::default() },
+            qual: Qualifier {
+                enabled: true,
+                show_mask: true,
+                hue: [0.0, 0.2, 0.02],
+                ..Qualifier::default()
+            },
             window: ellipse(0.5, 0.5, 0.3, 0.3),
             ..GradeNodeParams::default()
         }]);
@@ -884,14 +1005,22 @@ fn window_times_qualifier_intersection() {
         r.upload_frame(&red).expect("upload");
         r.set_grades(&[GradeNodeParams {
             enabled: true,
-            qual: Qualifier { enabled: true, show_mask: true, hue: [0.5, 0.2, 0.02], ..Qualifier::default() },
+            qual: Qualifier {
+                enabled: true,
+                show_mask: true,
+                hue: [0.5, 0.2, 0.02],
+                ..Qualifier::default()
+            },
             window: ellipse(0.5, 0.5, 0.3, 0.3),
             ..GradeNodeParams::default()
         }]);
         center(&r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64)
     };
     assert!(pass[0] > 240, "in-hue + inside window -> keyed: {pass:?}");
-    assert!(excluded[0] < 15, "off-hue zeroes the combined mask: {excluded:?}");
+    assert!(
+        excluded[0] < 15,
+        "off-hue zeroes the combined mask: {excluded:?}"
+    );
 }
 
 // Aspect: on a non-square (96x54, 16:9) frame, an equal-radii ellipse is
@@ -923,7 +1052,11 @@ use vance_render::CurveSet;
 use vance_timeline::{Keyframe, KeyframeInterp};
 
 fn lkf(x: f64, y: f64) -> Keyframe {
-    Keyframe { time_seconds: x, value: y, interp: KeyframeInterp::Linear }
+    Keyframe {
+        time_seconds: x,
+        value: y,
+        interp: KeyframeInterp::Linear,
+    }
 }
 fn const_curve(y: f64) -> Vec<Keyframe> {
     // Same y for x=0 and x=1 -> a constant remap independent of input.
@@ -947,7 +1080,10 @@ fn curves_hsl_hue_rotate_red_to_green() {
         ..GradeNodeParams::default()
     }]);
     let g = center(&r.render_to_rgba_buffer(64, 64).expect("render"), 64, 64);
-    assert!(g[1] > g[0] + 30 && g[1] > g[2] + 30, "expected green-dominant, got {g:?}");
+    assert!(
+        g[1] > g[0] + 30 && g[1] > g[2] + 30,
+        "expected green-dominant, got {g:?}"
+    );
 }
 
 // hs = constant 0 -> hue-driven sat multiplier = 0 -> saturation killed.
@@ -992,5 +1128,8 @@ fn curves_hsl_identity_is_bit_identical() {
         }],
         &frame,
     );
-    assert_eq!(plain, with_empty_hsl, "all-empty curves node must be a passthrough");
+    assert_eq!(
+        plain, with_empty_hsl,
+        "all-empty curves node must be a passthrough"
+    );
 }

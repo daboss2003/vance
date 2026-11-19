@@ -214,8 +214,8 @@ mod tests {
     #[test]
     fn two_tier_get_put_round_trip() {
         let dir = tempdir().unwrap();
-        let cache = FrameCache::new(dir.path().to_path_buf(), 1024 * 1024, 16 * 1024 * 1024)
-            .unwrap();
+        let cache =
+            FrameCache::new(dir.path().to_path_buf(), 1024 * 1024, 16 * 1024 * 1024).unwrap();
         let key = CacheKey::for_source_frame("file:///x.mp4", 100, 0);
         assert!(cache.get(&key).is_none(), "miss before write");
         cache.put(&key, b"hello").unwrap();
@@ -226,8 +226,8 @@ mod tests {
     #[test]
     fn ring_isolation_per_source() {
         let dir = tempdir().unwrap();
-        let cache = FrameCache::new(dir.path().to_path_buf(), 1024 * 1024, 16 * 1024 * 1024)
-            .unwrap();
+        let cache =
+            FrameCache::new(dir.path().to_path_buf(), 1024 * 1024, 16 * 1024 * 1024).unwrap();
         let k_a = CacheKey::for_source_frame("file:///a.mp4", 1, 0);
         let k_b = CacheKey::for_source_frame("file:///b.mp4", 1, 0);
         cache.put(&k_a, b"a-frame").unwrap();
@@ -242,8 +242,8 @@ mod tests {
     #[test]
     fn transform_hash_differentiates_keys() {
         let dir = tempdir().unwrap();
-        let cache = FrameCache::new(dir.path().to_path_buf(), 1024 * 1024, 16 * 1024 * 1024)
-            .unwrap();
+        let cache =
+            FrameCache::new(dir.path().to_path_buf(), 1024 * 1024, 16 * 1024 * 1024).unwrap();
         let raw = CacheKey::for_source_frame("file:///x.mp4", 100, 0);
         let transformed = CacheKey::for_source_frame("file:///x.mp4", 100, 0xdeadbeef);
         cache.put(&raw, b"raw").unwrap();
@@ -255,10 +255,13 @@ mod tests {
     #[test]
     fn stats_reflect_writes() {
         let dir = tempdir().unwrap();
-        let cache = FrameCache::new(dir.path().to_path_buf(), 1024 * 1024, 16 * 1024 * 1024)
-            .unwrap();
+        let cache =
+            FrameCache::new(dir.path().to_path_buf(), 1024 * 1024, 16 * 1024 * 1024).unwrap();
         cache
-            .put(&CacheKey::for_source_frame("file:///x.mp4", 1, 0), &vec![0u8; 100])
+            .put(
+                &CacheKey::for_source_frame("file:///x.mp4", 1, 0),
+                &vec![0u8; 100],
+            )
             .unwrap();
         let s = cache.stats();
         assert_eq!(s.ring_count, 1);
@@ -270,8 +273,8 @@ mod tests {
     #[test]
     fn hit_miss_counters_and_reset() {
         let dir = tempdir().unwrap();
-        let cache = FrameCache::new(dir.path().to_path_buf(), 1024 * 1024, 16 * 1024 * 1024)
-            .unwrap();
+        let cache =
+            FrameCache::new(dir.path().to_path_buf(), 1024 * 1024, 16 * 1024 * 1024).unwrap();
         let key = CacheKey::for_source_frame("file:///x.mp4", 1, 0);
         assert!(cache.get(&key).is_none(), "cold miss");
         cache.put(&key, b"x").unwrap();
@@ -291,8 +294,8 @@ mod tests {
     #[test]
     fn disk_hit_counter_after_ring_drop() {
         let dir = tempdir().unwrap();
-        let cache = FrameCache::new(dir.path().to_path_buf(), 1024 * 1024, 16 * 1024 * 1024)
-            .unwrap();
+        let cache =
+            FrameCache::new(dir.path().to_path_buf(), 1024 * 1024, 16 * 1024 * 1024).unwrap();
         let key = CacheKey::for_source_frame("file:///x.mp4", 1, 0);
         cache.put(&key, b"x").unwrap();
         cache.drop_source("file:///x.mp4"); // ring gone; disk row remains
@@ -309,8 +312,12 @@ mod tests {
     #[test]
     fn scrub_pattern_exceeds_80pct_hit_ratio() {
         let dir = tempdir().unwrap();
-        let cache =
-            FrameCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024, 256 * 1024 * 1024).unwrap();
+        let cache = FrameCache::new(
+            dir.path().to_path_buf(),
+            64 * 1024 * 1024,
+            256 * 1024 * 1024,
+        )
+        .unwrap();
         let uri = "file:///scrub.mp4";
         let frame = vec![7u8; 8 * 1024]; // 8 KiB/frame; 30 frames ≪ ring budget
         let window = 30i64;

@@ -96,7 +96,15 @@ impl ExprEngine {
         // --- Pure helper functions ------------------------------------
         engine.register_fn("clamp", |x: f64, lo: f64, hi: f64| x.max(lo).min(hi));
         engine.register_fn("lerp", |a: f64, b: f64, t: f64| a + (b - a) * t);
-        engine.register_fn("sign", |x: f64| if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 });
+        engine.register_fn("sign", |x: f64| {
+            if x > 0.0 {
+                1.0
+            } else if x < 0.0 {
+                -1.0
+            } else {
+                0.0
+            }
+        });
         // Deterministic value noise in [-1, 1] — reproducible across
         // renders (no global RNG). `wiggle` idiom: `amp * noise(time*freq)`.
         engine.register_fn("noise", value_noise);
@@ -150,7 +158,9 @@ fn dynamic_to_f64(d: &rhai::Dynamic) -> Option<f64> {
     } else if let Some(i) = d.clone().try_cast::<i64>() {
         Some(i as f64)
     } else {
-        d.clone().try_cast::<bool>().map(|b| if b { 1.0 } else { 0.0 })
+        d.clone()
+            .try_cast::<bool>()
+            .map(|b| if b { 1.0 } else { 0.0 })
     }
 }
 
@@ -222,7 +232,10 @@ mod tests {
         let e = ExprEngine::new();
         assert_eq!(e.eval_str("value", &ctx()).unwrap(), 5.0);
         assert_eq!(e.eval_str("time * fps", &ctx()).unwrap(), 48.0);
-        assert_eq!(e.eval_str("width / height", &ctx()).unwrap(), 1920.0 / 1080.0);
+        assert_eq!(
+            e.eval_str("width / height", &ctx()).unwrap(),
+            1920.0 / 1080.0
+        );
     }
 
     #[test]
@@ -266,7 +279,11 @@ mod tests {
     fn conditional_expression() {
         let e = ExprEngine::new();
         // `time > 1` mixes f64 var with int literal in a comparison.
-        assert_eq!(e.eval_str("if time > 1 { 10.0 } else { 0.0 }", &ctx()).unwrap(), 10.0);
+        assert_eq!(
+            e.eval_str("if time > 1 { 10.0 } else { 0.0 }", &ctx())
+                .unwrap(),
+            10.0
+        );
     }
 
     #[test]

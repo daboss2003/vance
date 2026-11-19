@@ -30,21 +30,21 @@
 #![warn(missing_docs)]
 
 pub mod audio_effect;
+pub mod bus;
 pub mod clip;
+pub mod connection;
 pub mod edit_log;
 pub mod effect;
 pub mod error;
 pub mod fade;
 pub mod grade;
 pub mod id;
-pub mod bus;
-pub mod connection;
 pub mod marker;
-pub mod review;
 pub mod media;
 pub mod media_query;
 pub mod ops;
 pub mod project;
+pub mod review;
 pub mod scene_plan;
 pub mod sequence;
 pub mod title;
@@ -55,23 +55,23 @@ pub use audio_effect::{
     AudioEffectSpec, CompressorSpec, DeHumSpec, Eq6Spec, EqBandKind, EqBandSpec, LimiterSpec,
     NoiseGateSpec, PluginParamValue, PluginRefSpec,
 };
+pub use bus::{bus_graph_cycle, routing_cycle, AudioBus, BusOutput, Send};
 pub use clip::Clip;
+pub use connection::{connected_subtree, would_cycle, Connection};
 pub use edit_log::{apply, EditLog, EditOp, HistoryNodeView};
 pub use effect::{
     eval_curve, validate_expr, Effect, EffectParams, EffectValue, Keyframe, KeyframeInterp,
 };
-pub use bus::{bus_graph_cycle, routing_cycle, AudioBus, BusOutput, Send};
-pub use connection::{connected_subtree, would_cycle, Connection};
 pub use error::{Result, TimelineError};
-pub use media_query::{Condition, MediaField, MediaQuery, QueryOp, SmartBin};
 pub use fade::{eval_fade_in, eval_fade_out, Fade, FadeCurve};
 pub use id::{
     BusId, ClipId, EffectId, MarkerId, MediaItemId, ProjectId, SequenceId, TrackId, TransitionId,
 };
 pub use marker::{Marker, MarkerColor, MarkerKind};
-pub use review::{ReviewComment, ReviewReply};
 pub use media::{ContentHash, MediaItem, MediaKind};
+pub use media_query::{Condition, MediaField, MediaQuery, QueryOp, SmartBin};
 pub use project::{OcioView, Project};
+pub use review::{ReviewComment, ReviewReply};
 pub use scene_plan::{scene_at, transition_at, ActiveClip, ActiveTransition, SceneAt};
 pub use sequence::Sequence;
 pub use title::TitleParams;

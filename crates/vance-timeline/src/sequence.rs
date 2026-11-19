@@ -130,10 +130,14 @@ mod tests {
             crate::id::ClipId::new(),
         ));
         // GOAT-7: captions ride the same RON path.
-        s.captions.push(vance_captions::Cue::new(1000, 3000, "hello"));
+        s.captions
+            .push(vance_captions::Cue::new(1000, 3000, "hello"));
         let ron = ron::ser::to_string_pretty(&s, ron::ser::PrettyConfig::default()).unwrap();
         let back: Sequence = ron::from_str(&ron).unwrap();
-        assert_eq!(s, back, "connections + magnetic + captions survive RON round-trip");
+        assert_eq!(
+            s, back,
+            "connections + magnetic + captions survive RON round-trip"
+        );
         assert!(back.magnetic);
         assert_eq!(back.connections.len(), 1);
         assert_eq!(back.captions.len(), 1);

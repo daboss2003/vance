@@ -31,7 +31,8 @@ impl GainShared {
         f32::from_bits(self.gain_bits.load(Ordering::Relaxed))
     }
     fn set_gain(&self, g: f32) {
-        self.gain_bits.store(g.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+        self.gain_bits
+            .store(g.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 }
 impl<'a> PluginShared<'a> for GainShared {}

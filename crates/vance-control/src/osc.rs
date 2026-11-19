@@ -49,7 +49,12 @@ pub fn decode_message(packet: &[u8]) -> Option<OscMessage> {
     // Type-tag string. Absent tags → no args (some senders omit it).
     let tags = match read_osc_string(packet, &mut pos) {
         Some(t) if t.starts_with(',') => t,
-        _ => return Some(OscMessage { address, args: Vec::new() }),
+        _ => {
+            return Some(OscMessage {
+                address,
+                args: Vec::new(),
+            })
+        }
     };
     let mut args = Vec::new();
     for tag in tags[1..].chars() {
@@ -98,7 +103,9 @@ pub fn to_control_event(msg: &OscMessage) -> Option<ControlEvent> {
 fn read_osc_string(buf: &[u8], pos: &mut usize) -> Option<String> {
     let start = *pos;
     let nul = buf[start..].iter().position(|&b| b == 0)?;
-    let s = std::str::from_utf8(&buf[start..start + nul]).ok()?.to_string();
+    let s = std::str::from_utf8(&buf[start..start + nul])
+        .ok()?
+        .to_string();
     // Advance past the string + null, padded to the next 4-byte boundary.
     let len = nul + 1;
     let padded = (len + 3) & !3;
@@ -149,11 +156,26 @@ mod tests {
     #[test]
     fn maps_convention_addresses() {
         let f = decode_message(&osc_float("/vance/fader/2", 0.5)).unwrap();
-        assert_eq!(to_control_event(&f), Some(ControlEvent::Fader { id: 2, value: 0.5 }));
+        assert_eq!(
+            to_control_event(&f),
+            Some(ControlEvent::Fader { id: 2, value: 0.5 })
+        );
         let b = decode_message(&osc_float("/vance/button/1", 1.0)).unwrap();
-        assert_eq!(to_control_event(&b), Some(ControlEvent::Button { id: 1, pressed: true }));
+        assert_eq!(
+            to_control_event(&b),
+            Some(ControlEvent::Button {
+                id: 1,
+                pressed: true
+            })
+        );
         let bp = decode_message(&osc_float("/vance/button/1", 0.0)).unwrap();
-        assert_eq!(to_control_event(&bp), Some(ControlEvent::Button { id: 1, pressed: false }));
+        assert_eq!(
+            to_control_event(&bp),
+            Some(ControlEvent::Button {
+                id: 1,
+                pressed: false
+            })
+        );
         let j = decode_message(&osc_float("/vance/jog", -2.0)).unwrap();
         assert_eq!(to_control_event(&j), Some(ControlEvent::Jog { ticks: -2 }));
         // Unknown address → None.

@@ -131,7 +131,10 @@ impl<'de> Deserialize<'de> for EffectValue {
                         expr: map.next_value()?,
                     },
                     Some(other) => {
-                        return Err(serde::de::Error::unknown_field(other, &["keyframes", "expr"]))
+                        return Err(serde::de::Error::unknown_field(
+                            other,
+                            &["keyframes", "expr"],
+                        ))
                     }
                     None => return Err(serde::de::Error::custom("empty EffectValue map")),
                 };
@@ -422,8 +425,8 @@ mod tests {
         ];
         for v in cases {
             let s = ron::ser::to_string_pretty(&v, cfg.clone()).unwrap();
-            let back: EffectValue =
-                ron::from_str(&s).unwrap_or_else(|e| panic!("RON round-trip failed for {v:?}: {e}\n{s}"));
+            let back: EffectValue = ron::from_str(&s)
+                .unwrap_or_else(|e| panic!("RON round-trip failed for {v:?}: {e}\n{s}"));
             assert_eq!(v, back, "RON round-trip mismatch:\n{s}");
         }
         // A whole effect-params map (as stored on a clip) must also

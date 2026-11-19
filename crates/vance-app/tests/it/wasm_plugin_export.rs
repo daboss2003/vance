@@ -86,8 +86,19 @@ fn render_cache_matches_uncached_and_hits_on_revisit() {
 
 fn sidecars_present() -> bool {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug");
-    dir.join(if cfg!(windows) { "vance-decoder.exe" } else { "vance-decoder" }).exists()
-        && dir.join(if cfg!(windows) { "vance-encoder.exe" } else { "vance-encoder" }).exists()
+    dir.join(if cfg!(windows) {
+        "vance-decoder.exe"
+    } else {
+        "vance-decoder"
+    })
+    .exists()
+        && dir
+            .join(if cfg!(windows) {
+                "vance-encoder.exe"
+            } else {
+                "vance-encoder"
+            })
+            .exists()
 }
 
 fn build_engine_with_clip() -> Option<(Engine, vance_timeline::TrackId, vance_timeline::ClipId)> {

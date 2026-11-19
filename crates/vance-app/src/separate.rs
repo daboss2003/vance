@@ -74,7 +74,10 @@ pub fn isolate(media_path: &Path) -> Result<Stems, SeparateError> {
         .arg(&media);
     let out = cmd.output()?;
     if !out.status.success() {
-        let stderr: String = String::from_utf8_lossy(&out.stderr).chars().take(2000).collect();
+        let stderr: String = String::from_utf8_lossy(&out.stderr)
+            .chars()
+            .take(2000)
+            .collect();
         return Err(SeparateError::Failed {
             code: out.status.code(),
             stderr,
@@ -118,7 +121,9 @@ mod tests {
 
     #[test]
     fn not_installed_message_is_actionable() {
-        assert!(SeparateError::NotInstalled.to_string().contains("pip install"));
+        assert!(SeparateError::NotInstalled
+            .to_string()
+            .contains("pip install"));
     }
 
     #[test]

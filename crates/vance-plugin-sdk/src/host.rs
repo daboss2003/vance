@@ -141,10 +141,7 @@ impl WasmPlugin {
             .get_typed_func::<(i32, i32, i32, i32, i32), i32>(&mut store, abi::EXPORT_PROCESS)
             .is_ok();
         let has_process2 = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32, i32), i32>(
-                &mut store,
-                abi::EXPORT_PROCESS2,
-            )
+            .get_typed_func::<(i32, i32, i32, i32, i32, i32), i32>(&mut store, abi::EXPORT_PROCESS2)
             .is_ok();
 
         // ABI version gate.
@@ -254,7 +251,13 @@ impl WasmPlugin {
             let rc = f
                 .call(
                     &mut self.store,
-                    (buf_ptr, w as i32, h as i32, params_ptr, params_bytes.len() as i32),
+                    (
+                        buf_ptr,
+                        w as i32,
+                        h as i32,
+                        params_ptr,
+                        params_bytes.len() as i32,
+                    ),
                 )
                 .map_err(|e| PluginError::Trap(e.to_string()))?;
             self.mem_read(buf_ptr, rgba)?;

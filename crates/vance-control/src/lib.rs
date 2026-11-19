@@ -131,7 +131,9 @@ impl Mapping {
             ControlEvent::Button { id, pressed: true } => self.buttons.get(id).copied(),
             ControlEvent::Button { .. } => None,
             ControlEvent::Fader { id, value } => self.faders.get(id).map(|t| match t {
-                FaderTarget::MasterGain => ControlAction::SetMasterGainDb(fader_to_master_db(*value)),
+                FaderTarget::MasterGain => {
+                    ControlAction::SetMasterGainDb(fader_to_master_db(*value))
+                }
             }),
             ControlEvent::Jog { ticks } => {
                 Some(ControlAction::JogFrames(*ticks as i64 * self.jog_frames))
@@ -148,13 +150,28 @@ mod tests {
     fn standard_mapping_transport_and_fader() {
         let m = Mapping::standard();
         assert_eq!(
-            m.map(&ControlEvent::Button { id: 0, pressed: true }),
+            m.map(&ControlEvent::Button {
+                id: 0,
+                pressed: true
+            }),
             Some(ControlAction::PlayPause)
         );
         // Release doesn't fire.
-        assert_eq!(m.map(&ControlEvent::Button { id: 0, pressed: false }), None);
+        assert_eq!(
+            m.map(&ControlEvent::Button {
+                id: 0,
+                pressed: false
+            }),
+            None
+        );
         // Unbound button.
-        assert_eq!(m.map(&ControlEvent::Button { id: 99, pressed: true }), None);
+        assert_eq!(
+            m.map(&ControlEvent::Button {
+                id: 99,
+                pressed: true
+            }),
+            None
+        );
         // Fader 0 → master gain, 0.5 → -27 dB.
         match m.map(&ControlEvent::Fader { id: 0, value: 0.5 }) {
             Some(ControlAction::SetMasterGainDb(db)) => assert!((db - (-27.0)).abs() < 1e-4),

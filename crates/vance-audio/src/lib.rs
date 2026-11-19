@@ -22,11 +22,11 @@
 pub mod audio_plugin;
 #[cfg(feature = "clap")]
 pub mod clap_host;
-#[cfg(feature = "lv2")]
-pub mod lv2_host;
 pub mod client;
 pub mod dsp;
 pub mod loudness;
+#[cfg(feature = "lv2")]
+pub mod lv2_host;
 pub mod mixer;
 pub mod player;
 pub mod protocol;

@@ -90,8 +90,16 @@ fn soak_cycle_keeps_cache_within_budget() {
         return;
     }
     let target_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug");
-    let dec_bin = target_dir.join(if cfg!(windows) { "vance-decoder.exe" } else { "vance-decoder" });
-    let enc_bin = target_dir.join(if cfg!(windows) { "vance-encoder.exe" } else { "vance-encoder" });
+    let dec_bin = target_dir.join(if cfg!(windows) {
+        "vance-decoder.exe"
+    } else {
+        "vance-decoder"
+    });
+    let enc_bin = target_dir.join(if cfg!(windows) {
+        "vance-encoder.exe"
+    } else {
+        "vance-encoder"
+    });
     if !dec_bin.exists() || !enc_bin.exists() {
         missing_prereq("sidecars missing");
         return;
@@ -111,20 +119,29 @@ fn soak_cycle_keeps_cache_within_budget() {
     let media = engine
         .import_media_file(&fixture.canonicalize().unwrap().to_string_lossy())
         .expect("import");
-    let media_id =
-        vance_timeline::MediaItemId::from_uuid(media.id.parse::<uuid::Uuid>().unwrap());
+    let media_id = vance_timeline::MediaItemId::from_uuid(media.id.parse::<uuid::Uuid>().unwrap());
     let track_id = {
         let contents = engine.current_sequence_contents().expect("seq");
-        let v1 = contents.tracks.iter().find(|t| t.kind == "video").expect("V1");
+        let v1 = contents
+            .tracks
+            .iter()
+            .find(|t| t.kind == "video")
+            .expect("V1");
         vance_timeline::TrackId::from_uuid(v1.id.parse::<uuid::Uuid>().unwrap())
     };
-    engine.insert_clip_at(track_id, media_id, 0.0).expect("clip");
+    engine
+        .insert_clip_at(track_id, media_id, 0.0)
+        .expect("clip");
 
     // A persistent decoder + cache for the scrub portion, reused every
     // cycle so the cache (and the long-lived sidecar) are what's soaked.
     // The cache dir + render output are RAII-scoped so a panic mid-run
     // doesn't leak them on disk.
-    let uri = fixture.canonicalize().unwrap().to_string_lossy().to_string();
+    let uri = fixture
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
     let mut scrub_dec = DecoderClient::spawn(&dec_bin).expect("spawn scrub decoder");
     let info = scrub_dec.open(uri.clone()).expect("open fixture");
     let dur = info.duration_pts.unwrap_or(0).max(1);
@@ -216,7 +233,9 @@ fn soak_cycle_keeps_cache_within_budget() {
             "[soak] WARNING: RSS sampling unavailable — LEAK GATE SKIPPED (samples={rss_samples:?})"
         );
         if std::env::var_os("VANCE_REQUIRE_SIDECARS").is_some() {
-            panic!("VANCE_REQUIRE_SIDECARS set but RSS could not be sampled — leak gate cannot run");
+            panic!(
+                "VANCE_REQUIRE_SIDECARS set but RSS could not be sampled — leak gate cannot run"
+            );
         }
     } else if rss_samples.len() >= 3 {
         let baseline = rss_samples[1]; // first post-warmup sample

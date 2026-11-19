@@ -14,11 +14,7 @@ pub struct Transform(pub [[f32; 3]; 3]);
 
 impl Transform {
     /// Identity transform.
-    pub const IDENTITY: Self = Self([
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0],
-    ]);
+    pub const IDENTITY: Self = Self([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
 
     /// Multiply two row-major matrices: `self * rhs`.
     pub fn compose(&self, rhs: &Self) -> Self {
@@ -27,8 +23,7 @@ impl Transform {
         let mut out = [[0.0_f32; 3]; 3];
         for i in 0..3 {
             for j in 0..3 {
-                out[i][j] =
-                    a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+                out[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
             }
         }
         Self(out)

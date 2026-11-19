@@ -153,9 +153,7 @@ pub struct LoudnessMeter {
 
 impl LoudnessMeter {
     pub fn new(sample_rate: f32) -> Self {
-        let hop_frames = ((sample_rate * HOP_MS as f32) / 1000.0)
-            .max(1.0)
-            .round() as u32;
+        let hop_frames = ((sample_rate * HOP_MS as f32) / 1000.0).max(1.0).round() as u32;
         let hops_per_block = (BLOCK_MS / HOP_MS).max(1);
         let recent_capacity = SHORT_TERM_BLOCKS.max(hops_per_block as usize);
         Self {
@@ -274,8 +272,7 @@ impl LoudnessMeter {
             return f32::NEG_INFINITY;
         }
         let ungated_mean = sum / count as f64;
-        let ungated_lufs =
-            10.0 * ungated_mean.log10() + LUFS_CALIBRATION as f64;
+        let ungated_lufs = 10.0 * ungated_mean.log10() + LUFS_CALIBRATION as f64;
         let relative_gate = (ungated_lufs + RELATIVE_GATE_OFFSET_LU as f64) as f32;
         // Pass 2: relative-gate. Re-average using the higher of the
         // two gates per BS.1770 §3.2.

@@ -69,7 +69,10 @@ pub fn isolate_subject(media_path: &Path) -> Result<PathBuf, MagicMaskError> {
         .arg(&out_file);
     let out = cmd.output()?;
     if !out.status.success() {
-        let stderr: String = String::from_utf8_lossy(&out.stderr).chars().take(2000).collect();
+        let stderr: String = String::from_utf8_lossy(&out.stderr)
+            .chars()
+            .take(2000)
+            .collect();
         return Err(MagicMaskError::Failed {
             code: out.status.code(),
             stderr,
@@ -93,8 +96,14 @@ fn find_output(dir: &Path) -> Option<PathBuf> {
             }
             continue;
         }
-        let ext = p.extension().and_then(|s| s.to_str()).map(|s| s.to_lowercase());
-        if matches!(ext.as_deref(), Some("mov") | Some("webm") | Some("mp4") | Some("mkv")) {
+        let ext = p
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_lowercase());
+        if matches!(
+            ext.as_deref(),
+            Some("mov") | Some("webm") | Some("mp4") | Some("mkv")
+        ) {
             return Some(p);
         }
     }
@@ -112,7 +121,9 @@ mod tests {
 
     #[test]
     fn not_installed_message_is_actionable() {
-        assert!(MagicMaskError::NotInstalled.to_string().contains("pip install"));
+        assert!(MagicMaskError::NotInstalled
+            .to_string()
+            .contains("pip install"));
     }
 
     #[test]

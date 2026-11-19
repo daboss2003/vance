@@ -209,8 +209,8 @@ fn run_one(
     encoder_binary: &PathBuf,
     status: &Arc<Mutex<Vec<ProxyJobSnapshot>>>,
 ) -> Result<u64, String> {
-    let mut decoder = DecoderClient::spawn(decoder_binary)
-        .map_err(|e| format!("decoder spawn: {e}"))?;
+    let mut decoder =
+        DecoderClient::spawn(decoder_binary).map_err(|e| format!("decoder spawn: {e}"))?;
     let stream = decoder
         .open(job.source_path.clone())
         .map_err(|e| format!("decoder open: {e}"))?;
@@ -231,8 +231,8 @@ fn run_one(
         );
     }
 
-    let mut encoder = EncoderClient::spawn(encoder_binary)
-        .map_err(|e| format!("encoder spawn: {e}"))?;
+    let mut encoder =
+        EncoderClient::spawn(encoder_binary).map_err(|e| format!("encoder spawn: {e}"))?;
     // Proxy is video-only — audio passes through untouched at use
     // time (Phase 9.5 toggle decides which file feeds audio).
     encoder
@@ -283,7 +283,13 @@ fn run_one(
     let mut next_pts: i64 = 0;
     let frames_total = stream
         .duration_pts
-        .map(|d| if step_pts > 0 { (d / step_pts) as u64 } else { 0 })
+        .map(|d| {
+            if step_pts > 0 {
+                (d / step_pts) as u64
+            } else {
+                0
+            }
+        })
         .unwrap_or(0);
     loop {
         // Decode at next_pts. If we ran past the duration_pts, the
@@ -331,11 +337,7 @@ fn run_one(
     Ok(frame_index)
 }
 
-fn set_status(
-    status: &Arc<Mutex<Vec<ProxyJobSnapshot>>>,
-    id: &str,
-    new_status: ProxyJobStatus,
-) {
+fn set_status(status: &Arc<Mutex<Vec<ProxyJobSnapshot>>>, id: &str, new_status: ProxyJobStatus) {
     let mut s = status.lock();
     if let Some(slot) = s.iter_mut().find(|j| j.id == id) {
         slot.status = new_status;
@@ -346,7 +348,10 @@ fn set_status(
 /// matches the engine's default render pipeline. For 4:2:0 sources
 /// the chroma is upsampled nearest-neighbour (cheap; acceptable for
 /// a proxy file that the user will scrub but rarely export from).
-fn yuv_or_nv12_to_rgba(frame: &vance_decoder::protocol::FrameData, pixel_count_rgba: usize) -> Vec<u8> {
+fn yuv_or_nv12_to_rgba(
+    frame: &vance_decoder::protocol::FrameData,
+    pixel_count_rgba: usize,
+) -> Vec<u8> {
     let w = frame.width as usize;
     let h = frame.height as usize;
     let mut out = vec![0u8; pixel_count_rgba];

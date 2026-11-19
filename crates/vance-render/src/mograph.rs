@@ -105,6 +105,9 @@ mod tests {
         // Must not panic; produces a minimal even YUV frame.
         let f = render_mograph_yuv420(&engine, &inst, 0.0, 30.0, 1.0);
         assert!(f.width >= 2 && f.height >= 2);
-        assert_eq!(f.bytes.len(), (f.width * f.height + 2 * (f.width / 2) * (f.height / 2)) as usize);
+        assert_eq!(
+            f.bytes.len(),
+            (f.width * f.height + 2 * (f.width / 2) * (f.height / 2)) as usize
+        );
     }
 }

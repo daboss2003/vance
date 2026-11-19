@@ -74,7 +74,9 @@ fn remote_processes_clap_in_sandbox() {
         return;
     };
     let mut host = RemotePluginHost::new(bin, 48_000.0, 512);
-    let (inst, gen) = host.instantiate(descriptor(id)).expect("instantiate over IPC");
+    let (inst, gen) = host
+        .instantiate(descriptor(id))
+        .expect("instantiate over IPC");
     assert!(host.is_connected());
 
     let block = vec![1.0f32; 64 * 2];
@@ -107,9 +109,14 @@ fn sidecar_crash_degrades_to_bypass_then_respawns() {
         return;
     };
     let mut host = RemotePluginHost::new(bin, 48_000.0, 512);
-    let (inst, gen) = host.instantiate(descriptor(id.clone())).expect("instantiate");
+    let (inst, gen) = host
+        .instantiate(descriptor(id.clone()))
+        .expect("instantiate");
     let block = vec![1.0f32; 64 * 2];
-    assert!(host.process(inst, gen, &block).is_some(), "first process ok");
+    assert!(
+        host.process(inst, gen, &block).is_some(),
+        "first process ok"
+    );
 
     // Simulate a plugin crash by killing the sidecar out from under us.
     let pid = host.sidecar_pid();
@@ -129,9 +136,14 @@ fn sidecar_crash_degrades_to_bypass_then_respawns() {
         .instantiate(descriptor(id))
         .expect("re-instantiate after crash");
     assert_ne!(gen2, gen, "respawn must bump the generation");
-    let out = host.process(inst2, gen2, &block).expect("process after respawn");
+    let out = host
+        .process(inst2, gen2, &block)
+        .expect("process after respawn");
     for &s in &out {
-        assert!((s - 0.5).abs() < 1e-3, "expected ~0.5 after respawn, got {s}");
+        assert!(
+            (s - 0.5).abs() < 1e-3,
+            "expected ~0.5 after respawn, got {s}"
+        );
     }
     // The stale instance from before the crash stays bypassed.
     assert!(host.process(inst, gen, &block).is_none());
@@ -159,8 +171,16 @@ fn mixer_track_dsp_routes_clap_through_sidecar() {
     for _ in 0..512 {
         last = dsp.tick_stereo(&spec, 1.0, 1.0, Some(&mut host));
     }
-    assert!((last.0 - 0.5).abs() < 1e-2, "L expected ~0.5, got {}", last.0);
-    assert!((last.1 - 0.5).abs() < 1e-2, "R expected ~0.5, got {}", last.1);
+    assert!(
+        (last.0 - 0.5).abs() < 1e-2,
+        "L expected ~0.5, got {}",
+        last.0
+    );
+    assert!(
+        (last.1 - 0.5).abs() < 1e-2,
+        "R expected ~0.5, got {}",
+        last.1
+    );
     // Normal fast processing must never trip the hang watchdog.
     assert_eq!(host.kills(), 0, "watchdog killed a healthy sidecar");
 }
@@ -191,7 +211,11 @@ fn mixer_applies_clap_params_via_reconcile() {
     for _ in 0..512 {
         out = dsp.tick_stereo(&mk(1.0), 1.0, 1.0, Some(&mut host));
     }
-    assert!((out.0 - 1.0).abs() < 1e-2, "initial gain 1.0 → unity, got {}", out.0);
+    assert!(
+        (out.0 - 1.0).abs() < 1e-2,
+        "initial gain 1.0 → unity, got {}",
+        out.0
+    );
 
     // Live change to 0.0 → silence.
     dsp.reconcile_with(&mk(0.0), 48_000.0, Some(&mut host));
@@ -246,7 +270,11 @@ fn crash_recovers_through_reconcile_only() {
             break;
         }
     }
-    assert!(recovered, "audio did not recover after crash (got {})", out.0);
+    assert!(
+        recovered,
+        "audio did not recover after crash (got {})",
+        out.0
+    );
     assert!(
         host.instantiations() >= 2,
         "recovery must re-instantiate via reconcile, instantiations={}",
@@ -314,7 +342,11 @@ fn param_change_does_not_reinstantiate_remote_plugin() {
     };
     let mut dsp = vance_audio::TrackDspState::new();
     dsp.reconcile_with(&mk_spec(-6.0), 48_000.0, Some(&mut host));
-    assert_eq!(host.instantiations(), 1, "first reconcile instantiates once");
+    assert_eq!(
+        host.instantiations(),
+        1,
+        "first reconcile instantiates once"
+    );
 
     // Several param changes (a knob drag) — none should re-instantiate.
     for g in [-5.0, -4.0, -3.0, 0.0, 3.0] {

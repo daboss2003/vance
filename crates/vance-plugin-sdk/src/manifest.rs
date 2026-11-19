@@ -111,8 +111,7 @@ pub enum ManifestError {
 impl PluginManifest {
     /// Parse + validate a manifest from a RON string.
     pub fn from_ron(s: &str) -> Result<Self, ManifestError> {
-        let m: PluginManifest =
-            ron::from_str(s).map_err(|e| ManifestError::Ron(e.to_string()))?;
+        let m: PluginManifest = ron::from_str(s).map_err(|e| ManifestError::Ron(e.to_string()))?;
         m.validate()?;
         Ok(m)
     }

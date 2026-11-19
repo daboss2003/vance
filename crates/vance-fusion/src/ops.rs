@@ -32,7 +32,11 @@ pub fn fill_background(img: &mut RgbaImage, top: Rgba, bottom: Option<Rgba>) {
         let color = match bottom {
             None => top,
             Some(bot) => {
-                let f = if h > 1 { y as f64 / (h - 1) as f64 } else { 0.0 };
+                let f = if h > 1 {
+                    y as f64 / (h - 1) as f64
+                } else {
+                    0.0
+                };
                 [
                     top[0] + (bot[0] - top[0]) * f,
                     top[1] + (bot[1] - top[1]) * f,
@@ -163,7 +167,11 @@ pub fn color_correct(
     saturation: f64,
 ) -> RgbaImage {
     let mut out = input.clone();
-    let inv_gamma = if gamma > 1e-6 { 1.0 / gamma as f32 } else { 1.0 };
+    let inv_gamma = if gamma > 1e-6 {
+        1.0 / gamma as f32
+    } else {
+        1.0
+    };
     let sat = saturation as f32;
     let lift = [lift[0] as f32, lift[1] as f32, lift[2] as f32];
     let gain = [gain[0] as f32, gain[1] as f32, gain[2] as f32];
@@ -410,7 +418,10 @@ mod tests {
         let out = blur(&input, 3.0, 3);
         // Center alpha reduced, a neighbor now has some alpha.
         let neighbor = ((10 * 21 + 12) * 4 + 3) as usize;
-        assert!(out.pixels[neighbor] > 0, "blur must spread alpha to neighbors");
+        assert!(
+            out.pixels[neighbor] > 0,
+            "blur must spread alpha to neighbors"
+        );
         assert!(out.pixels[c + 3] < 255, "center energy spread out");
     }
 
@@ -418,7 +429,10 @@ mod tests {
     fn color_correct_gain_brightens() {
         let input = solid(2, 2, [0.25, 0.25, 0.25, 1.0]);
         let out = color_correct(&input, [0.0; 3], [2.0, 2.0, 2.0], 1.0, 1.0);
-        assert!((out.pixels[0] as i32 - 128).abs() <= 3, "gain 2× on 0.25 → 0.5");
+        assert!(
+            (out.pixels[0] as i32 - 128).abs() <= 3,
+            "gain 2× on 0.25 → 0.5"
+        );
     }
 
     #[test]

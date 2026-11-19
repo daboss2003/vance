@@ -123,10 +123,7 @@ impl SmartBin {
 
     /// The ids of every item in `library` that matches this bin's query,
     /// in input order.
-    pub fn filter<'a>(
-        &self,
-        library: impl IntoIterator<Item = &'a MediaItem>,
-    ) -> Vec<MediaItemId> {
+    pub fn filter<'a>(&self, library: impl IntoIterator<Item = &'a MediaItem>) -> Vec<MediaItemId> {
         library
             .into_iter()
             .filter(|m| self.query.matches(m))
@@ -169,7 +166,8 @@ fn eval_condition(c: &Condition, item: &MediaItem) -> bool {
         // because `false` stringifies to the non-empty "false".)
         QueryOp::Exists => field_present(&c.field, item),
         QueryOp::Gt | QueryOp::Lt | QueryOp::Ge | QueryOp::Le => {
-            let (Some(lhs), Ok(rhs)) = (field_number(&c.field, item), c.value.trim().parse::<f64>())
+            let (Some(lhs), Ok(rhs)) =
+                (field_number(&c.field, item), c.value.trim().parse::<f64>())
             else {
                 return false;
             };
@@ -336,7 +334,10 @@ mod tests {
         };
         assert!(!exists(MediaField::HasProxy), "no proxy → Exists false");
         assert!(!exists(MediaField::HasAudio), "no audio → Exists false");
-        assert!(!exists(MediaField::Custom("Scene".into())), "no column → Exists false");
+        assert!(
+            !exists(MediaField::Custom("Scene".into())),
+            "no column → Exists false"
+        );
         assert!(exists(MediaField::Name), "named item → Exists true");
     }
 
@@ -345,7 +346,12 @@ mod tests {
         let mut m = item("clip", MediaKind::Video, 30);
         m.metadata.insert("Rating".into(), "4.0".into());
         let eq = |field, value: &str| {
-            MediaQuery::Cond(Condition { field, op: QueryOp::Eq, value: value.into() }).matches(&m)
+            MediaQuery::Cond(Condition {
+                field,
+                op: QueryOp::Eq,
+                value: value.into(),
+            })
+            .matches(&m)
         };
         // "30" (stringified duration) vs the user's "30.0" must match.
         assert!(eq(MediaField::DurationSeconds, "30.0"));

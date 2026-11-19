@@ -188,7 +188,10 @@ mod tests {
         p.media.insert(b_id, Arc::new(b));
 
         // Custom columns = union of metadata keys, sorted.
-        assert_eq!(p.custom_columns(), vec!["Rating".to_string(), "Scene".into()]);
+        assert_eq!(
+            p.custom_columns(),
+            vec!["Rating".to_string(), "Scene".into()]
+        );
 
         // Deep query: rating >= 4 → only the hero.
         let q = MediaQuery::Cond(Condition {

@@ -23,7 +23,14 @@ fn sidecars_present() -> bool {
 }
 fn probe(path: &PathBuf, field: &str) -> String {
     let out = Command::new("ffprobe")
-        .args(["-hide_banner", "-loglevel", "error", "-select_streams", "v:0", "-show_entries"])
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+        ])
         .arg(format!("stream={field}"))
         .args(["-of", "default=noprint_wrappers=1:nokey=1"])
         .arg(path)
@@ -34,7 +41,11 @@ fn probe(path: &PathBuf, field: &str) -> String {
 
 fn video_track(engine: &Engine) -> vance_timeline::TrackId {
     let contents = engine.current_sequence_contents().expect("contents");
-    let v1 = contents.tracks.iter().find(|t| t.kind == "video").expect("V1");
+    let v1 = contents
+        .tracks
+        .iter()
+        .find(|t| t.kind == "video")
+        .expect("V1");
     vance_timeline::TrackId::from_uuid(v1.id.parse().unwrap())
 }
 
@@ -53,10 +64,22 @@ fn export_and_probe(engine: &mut Engine, label: &str) {
             hdr: false,
         })
         .unwrap_or_else(|e| panic!("{label} export: {e}"));
-    assert!(outcome.video_frames >= 6, "{label}: too few frames {}", outcome.video_frames);
+    assert!(
+        outcome.video_frames >= 6,
+        "{label}: too few frames {}",
+        outcome.video_frames
+    );
     let meta = std::fs::metadata(&out).expect("output exists");
-    assert!(meta.len() > 5_000, "{label} output tiny: {} bytes", meta.len());
-    assert_eq!(probe(&out, "codec_name"), "prores", "{label} must be ProRes");
+    assert!(
+        meta.len() > 5_000,
+        "{label} output tiny: {} bytes",
+        meta.len()
+    );
+    assert_eq!(
+        probe(&out, "codec_name"),
+        "prores",
+        "{label} must be ProRes"
+    );
     assert_eq!(probe(&out, "width"), "320", "{label} width");
     let _ = std::fs::remove_file(&out);
 }
@@ -78,7 +101,9 @@ fn fusion_comp_exports_to_valid_prores() {
         .expect("create fusion media");
     let media_id = vance_timeline::MediaItemId::from_uuid(media.id.parse().unwrap());
     let track = video_track(&engine);
-    engine.insert_clip_at(track, media_id, 0.0).expect("insert fusion clip");
+    engine
+        .insert_clip_at(track, media_id, 0.0)
+        .expect("insert fusion clip");
     export_and_probe(&mut engine, "fusion");
 }
 
@@ -104,6 +129,8 @@ fn mograph_title_exports_to_valid_prores() {
         .expect("create mograph media");
     let media_id = vance_timeline::MediaItemId::from_uuid(media.id.parse().unwrap());
     let track = video_track(&engine);
-    engine.insert_clip_at(track, media_id, 0.0).expect("insert mograph clip");
+    engine
+        .insert_clip_at(track, media_id, 0.0)
+        .expect("insert mograph clip");
     export_and_probe(&mut engine, "mograph");
 }

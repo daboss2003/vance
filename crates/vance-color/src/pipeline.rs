@@ -118,7 +118,9 @@ mod tests {
     #[test]
     fn default_pipeline_resolves_to_params() {
         let p = Pipeline::default();
-        let params = p.to_params().expect("default pipeline is built-in-supported");
+        let params = p
+            .to_params()
+            .expect("default pipeline is built-in-supported");
         // Rec.709 → Linear Rec.709 → sRGB: input transfer Rec.709,
         // output transfer sRGB; both primaries are 709 so the
         // matrices are identity.
@@ -138,7 +140,9 @@ mod tests {
             working: ColorSpace::LinearRec709,
             output: ColorSpace::Rec2020Pq,
         };
-        let params = p.to_params().expect("Rec.2020 PQ output is now built-in-encodable");
+        let params = p
+            .to_params()
+            .expect("Rec.2020 PQ output is now built-in-encodable");
         assert_eq!(params.output_transfer, transfer_id(TransferFunction::Pq));
         // 709 → 2020 primaries is NOT identity.
         assert_ne!(params.working_to_output, Transform::IDENTITY);

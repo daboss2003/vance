@@ -59,15 +59,12 @@ impl JsonSchema for Uuid {
             ..Default::default()
         };
         obj.string = Some(Box::new(schemars::schema::StringValidation {
-            pattern: Some(
-                r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$".into(),
-            ),
+            pattern: Some(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$".into()),
             ..Default::default()
         }));
         obj.metadata = Some(Box::new(schemars::schema::Metadata {
             description: Some(
-                "Hyphenated lowercase UUID, e.g. \"00000000-0000-0000-0000-000000000000\"."
-                    .into(),
+                "Hyphenated lowercase UUID, e.g. \"00000000-0000-0000-0000-000000000000\".".into(),
             ),
             ..Default::default()
         }));
@@ -480,9 +477,18 @@ mod tests {
             sat: None,
             luma: None,
         };
-        let back: GradingCommand = serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+        let back: GradingCommand =
+            serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
         assert_eq!(cmd, back);
-        if let GradingCommand::SetQualifier { hue, sat, luma, invert, enabled, .. } = back {
+        if let GradingCommand::SetQualifier {
+            hue,
+            sat,
+            luma,
+            invert,
+            enabled,
+            ..
+        } = back
+        {
             assert!(hue.is_none() && sat.is_none() && luma.is_none() && invert.is_none());
             assert_eq!(enabled, Some(true));
         } else {

@@ -788,9 +788,10 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
             index,
             effect,
         } => ops::update_audio_effect(seq, *track_id, *index, effect.clone()),
-        EditOp::SetTrackGainKeyframes { track_id, keyframes } => {
-            ops::set_track_gain_keyframes(seq, *track_id, keyframes.clone())
-        }
+        EditOp::SetTrackGainKeyframes {
+            track_id,
+            keyframes,
+        } => ops::set_track_gain_keyframes(seq, *track_id, keyframes.clone()),
         EditOp::SetClipGainKeyframes {
             track_id,
             clip_id,
@@ -840,9 +841,7 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
         EditOp::AddBusInsert { bus_id, effect } => {
             ops::add_bus_insert(seq, *bus_id, effect.clone())
         }
-        EditOp::RemoveBusInsert { bus_id, index } => {
-            ops::remove_bus_insert(seq, *bus_id, *index)
-        }
+        EditOp::RemoveBusInsert { bus_id, index } => ops::remove_bus_insert(seq, *bus_id, *index),
         EditOp::MoveBusInsert {
             bus_id,
             from_index,
@@ -881,20 +880,17 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
             end_ms,
         } => Ok(ops::set_caption_timing(seq, *cue_id, *start_ms, *end_ms)),
         EditOp::SplitCaption { cue_id, at_ms } => Ok(ops::split_caption(seq, *cue_id, *at_ms)),
-        EditOp::MergeCaptionWithNext { cue_id } => {
-            Ok(ops::merge_caption_with_next(seq, *cue_id))
-        }
+        EditOp::MergeCaptionWithNext { cue_id } => Ok(ops::merge_caption_with_next(seq, *cue_id)),
         EditOp::ShiftAllCaptions { delta_ms } => Ok(ops::shift_all_captions(seq, *delta_ms)),
         EditOp::SetCaptions { cues } => Ok(ops::set_captions(seq, cues.clone())),
-        EditOp::AddReviewComment { comment } => {
-            Ok(ops::add_review_comment(seq, comment.clone()))
-        }
+        EditOp::AddReviewComment { comment } => Ok(ops::add_review_comment(seq, comment.clone())),
         EditOp::RemoveReviewComment { comment_id } => {
             Ok(ops::remove_review_comment(seq, *comment_id))
         }
-        EditOp::ResolveReviewComment { comment_id, resolved } => {
-            Ok(ops::resolve_review_comment(seq, *comment_id, *resolved))
-        }
+        EditOp::ResolveReviewComment {
+            comment_id,
+            resolved,
+        } => Ok(ops::resolve_review_comment(seq, *comment_id, *resolved)),
         EditOp::SetReviewCommentText { comment_id, text } => {
             Ok(ops::set_review_comment_text(seq, *comment_id, text.clone()))
         }
@@ -1042,7 +1038,9 @@ impl EditLog {
     /// descended). `None` at a leaf.
     pub fn redo(&mut self) -> Option<&Sequence> {
         let node = &self.nodes[self.current];
-        let child = node.active_child.or_else(|| node.children.last().copied())?;
+        let child = node
+            .active_child
+            .or_else(|| node.children.last().copied())?;
         self.current = child;
         Some(&self.nodes[self.current].snapshot)
     }
@@ -1161,9 +1159,7 @@ fn op_label(op: &EditOp) -> String {
         EditOp::SetEffectEnabled { .. } => "Toggle effect".into(),
         EditOp::SetTrackMute { .. } => "Track mute".into(),
         EditOp::SetTrackSolo { .. } => "Track solo".into(),
-        EditOp::SetTrackGainDb { .. } | EditOp::SetTrackGainKeyframes { .. } => {
-            "Track gain".into()
-        }
+        EditOp::SetTrackGainDb { .. } | EditOp::SetTrackGainKeyframes { .. } => "Track gain".into(),
         EditOp::SetClipMute { .. } => "Clip mute".into(),
         EditOp::SetClipGainDb { .. } | EditOp::SetClipGainKeyframes { .. } => "Clip gain".into(),
         EditOp::SetMasterGainDb { .. } => "Master gain".into(),
@@ -1321,7 +1317,11 @@ mod tests {
     fn fork_preserves_both_branches() {
         let (mut log, tid, media) = seed_log();
         let a = Clip::new(media, "a", t(0), t(0), t(5)).unwrap();
-        log.apply(EditOp::InsertClip { track_id: tid, clip: a }).unwrap();
+        log.apply(EditOp::InsertClip {
+            track_id: tid,
+            clip: a,
+        })
+        .unwrap();
         let a_tip = log.current_id();
         assert_eq!(log.current().tracks[0].clips.len(), 1);
 
@@ -1329,8 +1329,16 @@ mod tests {
         log.undo().unwrap();
         let b1 = Clip::new(media, "b1", t(0), t(0), t(5)).unwrap();
         let b2 = Clip::new(media, "b2", t(10), t(0), t(5)).unwrap();
-        log.apply(EditOp::InsertClip { track_id: tid, clip: b1 }).unwrap();
-        log.apply(EditOp::InsertClip { track_id: tid, clip: b2 }).unwrap();
+        log.apply(EditOp::InsertClip {
+            track_id: tid,
+            clip: b1,
+        })
+        .unwrap();
+        log.apply(EditOp::InsertClip {
+            track_id: tid,
+            clip: b2,
+        })
+        .unwrap();
         let b_tip = log.current_id();
         assert_eq!(log.current().tracks[0].clips.len(), 2);
 
@@ -1351,10 +1359,18 @@ mod tests {
         let (mut log, tid, media) = seed_log();
         let branch_point = log.current_id();
         let a = Clip::new(media, "a", t(0), t(0), t(5)).unwrap();
-        log.apply(EditOp::InsertClip { track_id: tid, clip: a }).unwrap();
+        log.apply(EditOp::InsertClip {
+            track_id: tid,
+            clip: a,
+        })
+        .unwrap();
         log.undo().unwrap();
         let b = Clip::new(media, "b", t(0), t(0), t(5)).unwrap();
-        log.apply(EditOp::InsertClip { track_id: tid, clip: b }).unwrap();
+        log.apply(EditOp::InsertClip {
+            track_id: tid,
+            clip: b,
+        })
+        .unwrap();
         let b_node = log.current_id();
         // From the branch point, linear redo follows the newest child (B).
         log.goto(branch_point).unwrap();
@@ -1371,11 +1387,19 @@ mod tests {
         let (mut log, tid, media) = seed_log();
         let branch_point = log.current_id();
         let a = Clip::new(media, "a", t(0), t(0), t(5)).unwrap();
-        log.apply(EditOp::InsertClip { track_id: tid, clip: a }).unwrap();
+        log.apply(EditOp::InsertClip {
+            track_id: tid,
+            clip: a,
+        })
+        .unwrap();
         let a_node = log.current_id();
         log.undo().unwrap();
         let b = Clip::new(media, "b", t(0), t(0), t(5)).unwrap();
-        log.apply(EditOp::InsertClip { track_id: tid, clip: b }).unwrap();
+        log.apply(EditOp::InsertClip {
+            track_id: tid,
+            clip: b,
+        })
+        .unwrap();
         let b_node = log.current_id();
         assert_ne!(a_node, b_node);
 
@@ -1396,7 +1420,11 @@ mod tests {
     fn checkpoint_names_node_and_is_listed() {
         let (mut log, tid, media) = seed_log();
         let a = Clip::new(media, "a", t(0), t(0), t(5)).unwrap();
-        log.apply(EditOp::InsertClip { track_id: tid, clip: a }).unwrap();
+        log.apply(EditOp::InsertClip {
+            track_id: tid,
+            clip: a,
+        })
+        .unwrap();
         log.checkpoint("rough cut");
         let id = log.current_id();
         assert_eq!(log.checkpoints(), vec![(id, "rough cut".to_string())]);
@@ -1449,7 +1477,11 @@ mod tests {
         let (mut log, tid, media) = seed_log();
         let clip = Clip::new(media, "c", t(0), t(0), t(5)).unwrap();
         let cid = clip.id;
-        log.apply(EditOp::InsertClip { track_id: tid, clip }).unwrap();
+        log.apply(EditOp::InsertClip {
+            track_id: tid,
+            clip,
+        })
+        .unwrap();
         // Two grade nodes with caller-allocated IDs (byte-identical replay).
         let e0 = Effect::new("grade");
         let e1 = Effect::new("grade");
@@ -1529,8 +1561,14 @@ mod tests {
         log.apply(EditOp::Compound {
             label: "ai: insert two clips".into(),
             ops: vec![
-                EditOp::InsertClip { track_id: tid, clip: c0 },
-                EditOp::InsertClip { track_id: tid, clip: c1 },
+                EditOp::InsertClip {
+                    track_id: tid,
+                    clip: c0,
+                },
+                EditOp::InsertClip {
+                    track_id: tid,
+                    clip: c1,
+                },
             ],
         })
         .unwrap();
@@ -1556,22 +1594,38 @@ mod tests {
         let result = log.apply(EditOp::Compound {
             label: "should rollback".into(),
             ops: vec![
-                EditOp::InsertClip { track_id: tid, clip: c0 },
+                EditOp::InsertClip {
+                    track_id: tid,
+                    clip: c0,
+                },
                 // This one fails: track doesn't exist.
-                EditOp::RemoveTrack { track_id: bogus_tid },
+                EditOp::RemoveTrack {
+                    track_id: bogus_tid,
+                },
             ],
         });
         assert!(result.is_err(), "compound with failing child must error");
         assert_eq!(log.len(), before_len, "no entry recorded on failure");
-        assert_eq!(log.current().tracks[0].clips.len(), before_clip_count, "state unchanged");
+        assert_eq!(
+            log.current().tracks[0].clips.len(),
+            before_clip_count,
+            "state unchanged"
+        );
     }
 
     #[test]
     fn empty_compound_is_a_noop() {
         let (mut log, _tid, _media) = seed_log();
         let before = log.current().clone();
-        log.apply(EditOp::Compound { label: "empty".into(), ops: Vec::new() })
-            .unwrap();
-        assert_eq!(log.current(), &before, "empty compound must not change state");
+        log.apply(EditOp::Compound {
+            label: "empty".into(),
+            ops: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            log.current(),
+            &before,
+            "empty compound must not change state"
+        );
     }
 }

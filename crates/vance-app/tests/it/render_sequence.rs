@@ -46,10 +46,17 @@ fn render_sequence_with_one_clip_produces_valid_prores() {
     // Sidecar binaries must be built. cargo's CARGO_BIN_EXE_<name>
     // points to the test crate's own bins; the engine binaries live
     // in target/<profile>/.
-    let target_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/debug");
-    let dec_bin = target_dir.join(if cfg!(windows) { "vance-decoder.exe" } else { "vance-decoder" });
-    let enc_bin = target_dir.join(if cfg!(windows) { "vance-encoder.exe" } else { "vance-encoder" });
+    let target_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug");
+    let dec_bin = target_dir.join(if cfg!(windows) {
+        "vance-decoder.exe"
+    } else {
+        "vance-decoder"
+    });
+    let enc_bin = target_dir.join(if cfg!(windows) {
+        "vance-encoder.exe"
+    } else {
+        "vance-encoder"
+    });
     if !dec_bin.exists() || !enc_bin.exists() {
         eprintln!(
             "decoder/encoder binaries missing under {} — run `cargo build -p vance-decoder -p vance-encoder`",
@@ -69,12 +76,13 @@ fn render_sequence_with_one_clip_produces_valid_prores() {
     let media = engine
         .import_media_file(&fixture.canonicalize().unwrap().to_string_lossy())
         .expect("import media");
-    let media_id =
-        vance_timeline::MediaItemId::from_uuid(media.id.parse::<uuid::Uuid>().unwrap());
+    let media_id = vance_timeline::MediaItemId::from_uuid(media.id.parse::<uuid::Uuid>().unwrap());
 
     // Find V1 via the public SequenceContents projection.
     let track_id = {
-        let contents = engine.current_sequence_contents().expect("sequence contents");
+        let contents = engine
+            .current_sequence_contents()
+            .expect("sequence contents");
         let v1 = contents
             .tracks
             .iter()
@@ -87,10 +95,7 @@ fn render_sequence_with_one_clip_produces_valid_prores() {
         .insert_clip_at(track_id, media_id, 0.0)
         .expect("insert clip at 0");
 
-    let out = std::env::temp_dir().join(format!(
-        "vance-renderseq-{}.mov",
-        std::process::id()
-    ));
+    let out = std::env::temp_dir().join(format!("vance-renderseq-{}.mov", std::process::id()));
     let _ = std::fs::remove_file(&out);
 
     let outcome = engine
@@ -114,7 +119,11 @@ fn render_sequence_with_one_clip_produces_valid_prores() {
         outcome.video_frames
     );
     let meta = std::fs::metadata(&out).expect("output exists");
-    assert!(meta.len() > 10_000, "output suspiciously small: {} bytes", meta.len());
+    assert!(
+        meta.len() > 10_000,
+        "output suspiciously small: {} bytes",
+        meta.len()
+    );
 
     // ffprobe sanity.
     let probe = Command::new("ffprobe")
@@ -156,8 +165,16 @@ fn exit_gate_proxy_multi_clip_prores_export() {
         return;
     }
     let target_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug");
-    let dec_bin = target_dir.join(if cfg!(windows) { "vance-decoder.exe" } else { "vance-decoder" });
-    let enc_bin = target_dir.join(if cfg!(windows) { "vance-encoder.exe" } else { "vance-encoder" });
+    let dec_bin = target_dir.join(if cfg!(windows) {
+        "vance-decoder.exe"
+    } else {
+        "vance-decoder"
+    });
+    let enc_bin = target_dir.join(if cfg!(windows) {
+        "vance-encoder.exe"
+    } else {
+        "vance-encoder"
+    });
     if !dec_bin.exists() || !enc_bin.exists() {
         eprintln!("sidecars missing — skipping");
         return;
@@ -170,16 +187,21 @@ fn exit_gate_proxy_multi_clip_prores_export() {
     let media = engine
         .import_media_file(&fixture.canonicalize().unwrap().to_string_lossy())
         .expect("import");
-    let media_id =
-        vance_timeline::MediaItemId::from_uuid(media.id.parse::<uuid::Uuid>().unwrap());
+    let media_id = vance_timeline::MediaItemId::from_uuid(media.id.parse::<uuid::Uuid>().unwrap());
 
     let contents = engine.current_sequence_contents().expect("seq");
-    let v1 = contents.tracks.iter().find(|t| t.kind == "video").expect("V1");
+    let v1 = contents
+        .tracks
+        .iter()
+        .find(|t| t.kind == "video")
+        .expect("V1");
     let track_id = vance_timeline::TrackId::from_uuid(v1.id.parse::<uuid::Uuid>().unwrap());
 
     // Three clips back-to-back. Fixture is 5 s; we use the first 0.5 s
     // of each so the sequence is 1.5 s long total.
-    engine.insert_clip_at(track_id, media_id, 0.0).expect("clip 0");
+    engine
+        .insert_clip_at(track_id, media_id, 0.0)
+        .expect("clip 0");
     // For the proxy we don't trim — we just place the clips at slots
     // 5 s, 10 s, etc. so scene_at routing exercises multiple boundaries
     // even though the test only renders the first 1.5 s.
@@ -190,10 +212,7 @@ fn exit_gate_proxy_multi_clip_prores_export() {
         .insert_clip_at(track_id, media_id, 11.0)
         .expect("clip 2");
 
-    let out = std::env::temp_dir().join(format!(
-        "vance-exit-gate-{}.mov",
-        std::process::id()
-    ));
+    let out = std::env::temp_dir().join(format!("vance-exit-gate-{}.mov", std::process::id()));
     let _ = std::fs::remove_file(&out);
 
     let outcome = engine
@@ -247,8 +266,16 @@ fn render_and_replace_swaps_clip_for_rendered_media() {
         return;
     }
     let target_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug");
-    let dec_bin = target_dir.join(if cfg!(windows) { "vance-decoder.exe" } else { "vance-decoder" });
-    let enc_bin = target_dir.join(if cfg!(windows) { "vance-encoder.exe" } else { "vance-encoder" });
+    let dec_bin = target_dir.join(if cfg!(windows) {
+        "vance-decoder.exe"
+    } else {
+        "vance-decoder"
+    });
+    let enc_bin = target_dir.join(if cfg!(windows) {
+        "vance-encoder.exe"
+    } else {
+        "vance-encoder"
+    });
     if !dec_bin.exists() || !enc_bin.exists() {
         eprintln!("sidecars missing — skipping");
         return;
@@ -261,8 +288,7 @@ fn render_and_replace_swaps_clip_for_rendered_media() {
     let media = engine
         .import_media_file(&fixture.canonicalize().unwrap().to_string_lossy())
         .expect("import");
-    let media_id =
-        vance_timeline::MediaItemId::from_uuid(media.id.parse::<uuid::Uuid>().unwrap());
+    let media_id = vance_timeline::MediaItemId::from_uuid(media.id.parse::<uuid::Uuid>().unwrap());
 
     let contents = engine.current_sequence_contents().expect("seq");
     let v1 = contents
@@ -291,7 +317,10 @@ fn render_and_replace_swaps_clip_for_rendered_media() {
 
     assert!(out.exists(), "rendered media file should exist on disk");
     // The replacement clip should be a NEW id, not the original.
-    assert_ne!(outcome.new_clip_id, original_clip_id, "clip id should change");
+    assert_ne!(
+        outcome.new_clip_id, original_clip_id,
+        "clip id should change"
+    );
     // The new media item should be registered.
     let contents_after = engine.current_sequence_contents().expect("seq after");
     let v1_after = contents_after

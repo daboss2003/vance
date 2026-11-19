@@ -148,13 +148,11 @@ fn cmd_build(args: &[String]) -> i32 {
 
     // Find the produced .wasm.
     let release = format!("{dir}/target/wasm32-unknown-unknown/release");
-    let wasm = std::fs::read_dir(&release)
-        .ok()
-        .and_then(|rd| {
-            rd.flatten()
-                .map(|e| e.path())
-                .find(|p| p.extension().and_then(|x| x.to_str()) == Some("wasm"))
-        });
+    let wasm = std::fs::read_dir(&release).ok().and_then(|rd| {
+        rd.flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|x| x.to_str()) == Some("wasm"))
+    });
     let Some(wasm_path) = wasm else {
         eprintln!("build produced no .wasm in {release}");
         return 1;

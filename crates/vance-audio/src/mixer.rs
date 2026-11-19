@@ -436,7 +436,8 @@ impl TrackDspState {
             }
         }
         if self.chain.len() != spec.len() {
-            self.chain.resize_with(spec.len(), || EffectUnit::Passthrough);
+            self.chain
+                .resize_with(spec.len(), || EffectUnit::Passthrough);
         }
         // The host's current generation (Copy) — used to detect a sidecar
         // respawn so out-of-process slots re-instantiate.
@@ -468,9 +469,7 @@ impl TrackDspState {
                     let identity_changed = slot.format_str != *format_str || slot.id != *id;
                     let stale = slot.remote_stale(host_gen);
                     match &slot.kind {
-                        SlotKind::Local(_) => {
-                            identity_changed || slot.params != *params || stale
-                        }
+                        SlotKind::Local(_) => identity_changed || slot.params != *params || stale,
                         SlotKind::Remote(_) | SlotKind::Bypass => identity_changed || stale,
                     }
                 }
@@ -522,8 +521,7 @@ impl TrackDspState {
                     // rebuild above; nothing to push.
                     if slot.params != *params {
                         if let SlotKind::Remote(rs) = &slot.kind {
-                            if let (Some(h), Some((inst, gen))) =
-                                (host.as_deref_mut(), rs.instance)
+                            if let (Some(h), Some((inst, gen))) = (host.as_deref_mut(), rs.instance)
                             {
                                 for (pid, val) in params.iter() {
                                     h.set_param(inst, gen, *pid, *val);
@@ -601,7 +599,12 @@ impl TrackDspState {
             }
             match (unit, entry) {
                 (EffectUnit::Passthrough, _) => {}
-                (EffectUnit::Eq6(bands), AudioEffectKind::Eq6 { bands: band_specs, .. }) => {
+                (
+                    EffectUnit::Eq6(bands),
+                    AudioEffectKind::Eq6 {
+                        bands: band_specs, ..
+                    },
+                ) => {
                     for (b, p) in bands.iter_mut().zip(band_specs.iter()) {
                         if p.enabled {
                             let (nl, nr) = b.tick_stereo(l, r);
@@ -908,11 +911,7 @@ fn configure_dehum(notches: &mut Vec<crate::dsp::Biquad>, p: &DeHumParams, sampl
 }
 
 impl EffectUnit {
-    fn new(
-        spec: &AudioEffectKind,
-        sample_rate: f32,
-        host: Option<&mut RemotePluginHost>,
-    ) -> Self {
+    fn new(spec: &AudioEffectKind, sample_rate: f32, host: Option<&mut RemotePluginHost>) -> Self {
         match spec {
             AudioEffectKind::Eq6 { bands, .. } => {
                 let mut units = Box::new([crate::dsp::Biquad::identity(); 6]);
@@ -1320,11 +1319,8 @@ impl MixerSnapshot {
         // never erases automation, and editing the lane never disturbs
         // the fade region. Both eval functions return 1.0 when their
         // duration is 0.0 so unset fades cost a single compare.
-        let fade_in_g = eval_fade_in_audio(
-            clip.fade_in_duration_seconds,
-            clip.fade_in_curve,
-            t_clip,
-        );
+        let fade_in_g =
+            eval_fade_in_audio(clip.fade_in_duration_seconds, clip.fade_in_curve, t_clip);
         let fade_out_g = eval_fade_out_audio(
             clip.fade_out_duration_seconds,
             clip.fade_out_curve,
@@ -1519,7 +1515,10 @@ pub fn fold_bus_graph(
                     bus_in,
                     master,
                     Some(s.target),
-                    [post_insert[0] * s.level_linear, post_insert[1] * s.level_linear],
+                    [
+                        post_insert[0] * s.level_linear,
+                        post_insert[1] * s.level_linear,
+                    ],
                 );
             }
         }
@@ -1692,11 +1691,7 @@ impl AudioMixer {
                             *s = 0.0;
                         }
                         if pulled < out.len() {
-                            tracing::trace!(
-                                requested = out.len(),
-                                got = pulled,
-                                "mixer underrun"
-                            );
+                            tracing::trace!(requested = out.len(), got = pulled, "mixer underrun");
                         }
                     },
                     |err| tracing::error!(?err, "mixer cpal stream error"),
@@ -1943,9 +1938,7 @@ pub fn spawn_source(
     stats
         .last_open_to_first_sample_ms
         .store(open_to_first_sample_ms, Ordering::Release);
-    stats
-        .sources_spawned_total
-        .fetch_add(1, Ordering::Release);
+    stats.sources_spawned_total.fetch_add(1, Ordering::Release);
 
     let rb = HeapRb::<f32>::new(capacity);
     let (prod, cons) = rb.split();
@@ -1976,7 +1969,11 @@ pub fn spawn_source(
 /// Inputs come from the live [`MixerSnapshot`]; pure function so the
 /// boundary cases are unit-testable.
 #[inline]
-pub fn source_audible_at(timeline_in_seconds: f64, clip_duration_seconds: f64, t_frame: f64) -> bool {
+pub fn source_audible_at(
+    timeline_in_seconds: f64,
+    clip_duration_seconds: f64,
+    t_frame: f64,
+) -> bool {
     t_frame >= timeline_in_seconds && t_frame < timeline_in_seconds + clip_duration_seconds
 }
 
@@ -2188,7 +2185,11 @@ fn fold_loop(
     // plugins pay nothing. `None` when no sidecar binary is available —
     // CLAP slots then bypass.
     let mut plugin_host: Option<RemotePluginHost> = plugin_host_bin.map(|bin| {
-        RemotePluginHost::new(bin, sample_rate_f32, crate::audio_plugin::DEFAULT_BLOCK as u32)
+        RemotePluginHost::new(
+            bin,
+            sample_rate_f32,
+            crate::audio_plugin::DEFAULT_BLOCK as u32,
+        )
     });
     // Phase 7.8 — master-bus loudness + true-peak. One meter per
     // fold loop instance; the engine's playback start resets this
@@ -2264,11 +2265,7 @@ fn fold_loop(
                 }
             } else {
                 let state = track_dsp_states.entry(*track_id).or_default();
-                state.reconcile_with(
-                    &track.audio_effects,
-                    sample_rate_f32,
-                    plugin_host.as_mut(),
-                );
+                state.reconcile_with(&track.audio_effects, sample_rate_f32, plugin_host.as_mut());
             }
         }
         // Tracks gone from the snapshot: destroy their remote instances,
@@ -2375,11 +2372,8 @@ fn fold_loop(
                 } else {
                     eval_gain_lane(&clip.gain_lane, t_clip)
                 };
-                let fade_in_g = eval_fade_in_audio(
-                    clip.fade_in_duration_seconds,
-                    clip.fade_in_curve,
-                    t_clip,
-                );
+                let fade_in_g =
+                    eval_fade_in_audio(clip.fade_in_duration_seconds, clip.fade_in_curve, t_clip);
                 let fade_out_g = eval_fade_out_audio(
                     clip.fade_out_duration_seconds,
                     clip.fade_out_curve,
@@ -2548,10 +2542,7 @@ fn fold_loop(
 mod tests {
     use super::*;
 
-    fn snapshot_with(
-        tracks: &[(Uuid, TrackMix)],
-        clips: &[(Uuid, ClipMix)],
-    ) -> MixerSnapshot {
+    fn snapshot_with(tracks: &[(Uuid, TrackMix)], clips: &[(Uuid, ClipMix)]) -> MixerSnapshot {
         let mut s = MixerSnapshot::empty();
         for (id, m) in tracks {
             s.tracks.insert(*id, m.clone());
@@ -2651,7 +2642,11 @@ mod tests {
             },
         );
         let out = fold_frame(&snap, &[(c, [1.0, -1.0])]);
-        assert!((out[0] - db_to_linear(-6.0)).abs() < 1e-4, "bus gain not applied: {}", out[0]);
+        assert!(
+            (out[0] - db_to_linear(-6.0)).abs() < 1e-4,
+            "bus gain not applied: {}",
+            out[0]
+        );
 
         // Muting the bus silences everything routed through it.
         snap.buses.get_mut(&bus).unwrap().mute = true;
@@ -2669,26 +2664,68 @@ mod tests {
         let mut snap = snapshot_with(&[(t, track)], &[(c, unity_clip(t))]);
         snap.buses.insert(
             a,
-            BusMix { gain_linear: db_to_linear(-6.0), pan_linear: [1.0, 1.0], mute: false, audio_effects: Vec::new(), sends: Vec::new(), output_bus: Some(b) },
+            BusMix {
+                gain_linear: db_to_linear(-6.0),
+                pan_linear: [1.0, 1.0],
+                mute: false,
+                audio_effects: Vec::new(),
+                sends: Vec::new(),
+                output_bus: Some(b),
+            },
         );
         snap.buses.insert(
             b,
-            BusMix { gain_linear: db_to_linear(-6.0), pan_linear: [1.0, 1.0], mute: false, audio_effects: Vec::new(), sends: Vec::new(), output_bus: None },
+            BusMix {
+                gain_linear: db_to_linear(-6.0),
+                pan_linear: [1.0, 1.0],
+                mute: false,
+                audio_effects: Vec::new(),
+                sends: Vec::new(),
+                output_bus: None,
+            },
         );
         let expect = db_to_linear(-6.0) * db_to_linear(-6.0);
         let out = fold_frame(&snap, &[(c, [1.0, 0.0])]);
-        assert!((out[0] - expect).abs() < 1e-4, "chained bus gain: {} vs {expect}", out[0]);
+        assert!(
+            (out[0] - expect).abs() < 1e-4,
+            "chained bus gain: {} vs {expect}",
+            out[0]
+        );
     }
 
     #[test]
     fn bus_chain_gain_is_defensive() {
         let mut snap = MixerSnapshot::empty();
         assert_eq!(snap.bus_chain_gain(None), 1.0, "route-to-master is unity");
-        assert_eq!(snap.bus_chain_gain(Some(Uuid::new_v4())), 0.0, "missing bus is silent");
+        assert_eq!(
+            snap.bus_chain_gain(Some(Uuid::new_v4())),
+            0.0,
+            "missing bus is silent"
+        );
         // A→B→A cycle is caught by the depth guard → 0.
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-        snap.buses.insert(a, BusMix { gain_linear: 1.0, pan_linear: [1.0, 1.0], mute: false, audio_effects: Vec::new(), sends: Vec::new(), output_bus: Some(b) });
-        snap.buses.insert(b, BusMix { gain_linear: 1.0, pan_linear: [1.0, 1.0], mute: false, audio_effects: Vec::new(), sends: Vec::new(), output_bus: Some(a) });
+        snap.buses.insert(
+            a,
+            BusMix {
+                gain_linear: 1.0,
+                pan_linear: [1.0, 1.0],
+                mute: false,
+                audio_effects: Vec::new(),
+                sends: Vec::new(),
+                output_bus: Some(b),
+            },
+        );
+        snap.buses.insert(
+            b,
+            BusMix {
+                gain_linear: 1.0,
+                pan_linear: [1.0, 1.0],
+                mute: false,
+                audio_effects: Vec::new(),
+                sends: Vec::new(),
+                output_bus: Some(a),
+            },
+        );
         assert_eq!(snap.bus_chain_gain(Some(a)), 0.0);
     }
 
@@ -2775,7 +2812,11 @@ mod tests {
         let mut snap = MixerSnapshot::empty();
         let (src, rev) = (Uuid::new_v4(), Uuid::new_v4());
         let mut s = bmix(0.5, None);
-        s.sends.push(SendMix { target: rev, level_linear: 1.0, pre_fader: false });
+        s.sends.push(SendMix {
+            target: rev,
+            level_linear: 1.0,
+            pre_fader: false,
+        });
         snap.buses.insert(src, s);
         snap.buses.insert(rev, bmix(1.0, None));
         let order = snap.bus_process_order();
@@ -2795,7 +2836,11 @@ mod tests {
         let (src, cue) = (Uuid::new_v4(), Uuid::new_v4());
         let mut s = bmix(0.0, None); // fader fully down + muted below
         s.mute = true;
-        s.sends.push(SendMix { target: cue, level_linear: 1.0, pre_fader: true });
+        s.sends.push(SendMix {
+            target: cue,
+            level_linear: 1.0,
+            pre_fader: true,
+        });
         snap.buses.insert(src, s);
         snap.buses.insert(cue, bmix(1.0, None));
         let order = snap.bus_process_order();
@@ -2803,7 +2848,11 @@ mod tests {
         let mut master = [0.0f32; 2];
         fold_bus_graph(&snap, &order, &mut bus_in, &mut master, |_, s| s);
         // src main is muted (0), but the pre-fader cue send passes at unity.
-        assert!((master[0] - 1.0).abs() < 1e-6, "pre-fader send lost: {}", master[0]);
+        assert!(
+            (master[0] - 1.0).abs() < 1e-6,
+            "pre-fader send lost: {}",
+            master[0]
+        );
     }
 
     #[test]
@@ -2812,14 +2861,22 @@ mod tests {
         let (src, rev) = (Uuid::new_v4(), Uuid::new_v4());
         let mut s = bmix(1.0, None);
         s.mute = true;
-        s.sends.push(SendMix { target: rev, level_linear: 1.0, pre_fader: false });
+        s.sends.push(SendMix {
+            target: rev,
+            level_linear: 1.0,
+            pre_fader: false,
+        });
         snap.buses.insert(src, s);
         snap.buses.insert(rev, bmix(1.0, None));
         let order = snap.bus_process_order();
         let mut bus_in = HashMap::from([(src, [1.0, 1.0])]);
         let mut master = [0.0f32; 2];
         fold_bus_graph(&snap, &order, &mut bus_in, &mut master, |_, s| s);
-        assert_eq!(master, [0.0, 0.0], "muted bus must drop main + post-fader send");
+        assert_eq!(
+            master,
+            [0.0, 0.0],
+            "muted bus must drop main + post-fader send"
+        );
     }
 
     #[test]
@@ -2871,17 +2928,23 @@ mod tests {
             snap.buses.insert(ids[i], bmix(1.0, out));
         }
         let order = snap.bus_process_order();
-        let pos: HashMap<Uuid, usize> =
-            order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        let pos: HashMap<Uuid, usize> = order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
         for i in 0..69 {
-            assert!(pos[&ids[i]] < pos[&ids[i + 1]], "bus {i} must precede its output");
+            assert!(
+                pos[&ids[i]] < pos[&ids[i + 1]],
+                "bus {i} must precede its output"
+            );
         }
         // bus_chain_gain must also survive the full depth (was capped at 64).
         assert_eq!(snap.bus_chain_gain(Some(ids[0])), 1.0);
         let mut bus_in = HashMap::from([(ids[0], [1.0f32, 0.0])]);
         let mut master = [0.0f32; 2];
         fold_bus_graph(&snap, &order, &mut bus_in, &mut master, |_, s| s);
-        assert!((master[0] - 1.0).abs() < 1e-6, "deep chain lost signal: {}", master[0]);
+        assert!(
+            (master[0] - 1.0).abs() < 1e-6,
+            "deep chain lost signal: {}",
+            master[0]
+        );
     }
 
     #[test]
@@ -3134,7 +3197,10 @@ mod tests {
             kf(1.0, 1.0, GainInterp::Linear),
         ];
         let mid = eval_gain_lane(&lane, 0.5);
-        assert!((mid - 0.5).abs() < 1e-6, "midpoint should be 0.5 by symmetry");
+        assert!(
+            (mid - 0.5).abs() < 1e-6,
+            "midpoint should be 0.5 by symmetry"
+        );
         // At t=0.25 → 3(0.25)² − 2(0.25)³ = 0.1875 − 0.03125 = 0.15625.
         let quarter = eval_gain_lane(&lane, 0.25);
         assert!((quarter - 0.15625).abs() < 1e-6);
@@ -3249,7 +3315,11 @@ mod tests {
     #[test]
     fn fade_in_zero_duration_is_unity() {
         // No fade → 1.0 everywhere, regardless of curve.
-        for c in [FadeCurve::Linear, FadeCurve::EqualPower, FadeCurve::Logarithmic] {
+        for c in [
+            FadeCurve::Linear,
+            FadeCurve::EqualPower,
+            FadeCurve::Logarithmic,
+        ] {
             assert_eq!(eval_fade_in_audio(0.0, c, 0.0), 1.0);
             assert_eq!(eval_fade_in_audio(0.0, c, 5.0), 1.0);
         }
@@ -3282,7 +3352,11 @@ mod tests {
         let mid_log = eval_fade_in_audio(2.0, FadeCurve::Logarithmic, 1.0);
         assert!((mid_log - 0.25).abs() < 1e-6);
         // All curves agree at the endpoints.
-        for c in [FadeCurve::Linear, FadeCurve::EqualPower, FadeCurve::Logarithmic] {
+        for c in [
+            FadeCurve::Linear,
+            FadeCurve::EqualPower,
+            FadeCurve::Logarithmic,
+        ] {
             assert_eq!(eval_fade_in_audio(2.0, c, 0.0), 0.0);
             assert_eq!(eval_fade_in_audio(2.0, c, 2.0), 1.0);
         }
@@ -3576,7 +3650,11 @@ mod tests {
             last = state.tick_stereo(&spec, 0.7, -0.3, None);
         }
         assert!((last.0 - 0.7).abs() < 1e-6, "L not passthrough: {}", last.0);
-        assert!((last.1 - (-0.3)).abs() < 1e-6, "R not passthrough: {}", last.1);
+        assert!(
+            (last.1 - (-0.3)).abs() < 1e-6,
+            "R not passthrough: {}",
+            last.1
+        );
     }
 
     #[test]

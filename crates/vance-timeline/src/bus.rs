@@ -237,8 +237,15 @@ mod tests {
         let mut b = AudioBus::new("B");
         a.output = BusOutput::Bus(b.id);
         b.sends.push(Send::to(a.id));
-        assert_eq!(routing_cycle(&[a.clone(), b.clone()]), None, "no main-path cycle");
-        assert!(bus_graph_cycle(&[a, b]).is_some(), "send feedback must be caught");
+        assert_eq!(
+            routing_cycle(&[a.clone(), b.clone()]),
+            None,
+            "no main-path cycle"
+        );
+        assert!(
+            bus_graph_cycle(&[a, b]).is_some(),
+            "send feedback must be caught"
+        );
     }
 
     #[test]
