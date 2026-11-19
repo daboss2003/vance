@@ -61,9 +61,15 @@ pub use fallback::Viewport;
 /// On macOS this wraps an `NSWindow*`; on Windows an `HWND`; on Linux a GTK
 /// window pointer. Use the `from_*_ptr` constructors at the call site.
 #[derive(Debug, Clone, Copy)]
-pub struct HostWindowHandle(HostWindowHandleInner);
+pub struct HostWindowHandle(
+    // Intentional: only the macOS viewport reads the handle today; the
+    // Linux/Windows fallback stub ignores it until the real viewports land
+    // (Windows/Linux milestone), so it's dead code there for now.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] HostWindowHandleInner,
+);
 
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // see HostWindowHandle
 enum HostWindowHandleInner {
     #[cfg(target_os = "macos")]
     AppKit { ns_window: *mut std::ffi::c_void },

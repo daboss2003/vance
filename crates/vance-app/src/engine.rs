@@ -1574,6 +1574,10 @@ impl Engine {
     /// Install both viewports (Record + Source) + create a renderer
     /// that shares the wgpu instance. Called once from the Tauri
     /// `setup` callback on the main thread.
+    // Intentional: only the macOS setup path calls this until the Linux and
+    // Windows viewports land (Windows/Linux milestone); elsewhere the binary
+    // target would flag it as dead code.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn install_viewport(&mut self, host: HostWindowHandle) -> Result<(), EngineError> {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = wgpu::Backends::PRIMARY;

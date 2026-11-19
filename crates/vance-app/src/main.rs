@@ -42,7 +42,7 @@ use tauri::{Emitter, Manager};
 use vance_decoder::StreamInfo;
 use vance_peaks::{PeakError, PeakFile};
 use vance_timeline::SequenceId;
-use vance_viewport::{HostWindowHandle, ViewportBounds};
+use vance_viewport::ViewportBounds;
 
 /// Tauri-managed handle around the optional `PeaksService` (None until
 /// `setup` has constructed it; `Some` for the rest of the app's life).
@@ -4224,7 +4224,7 @@ fn main() {
             #[cfg(target_os = "macos")]
             {
                 let ns_window_ptr = window.ns_window().map_err(|e| e.to_string())?;
-                let host = HostWindowHandle::from_ns_window(ns_window_ptr);
+                let host = vance_viewport::HostWindowHandle::from_ns_window(ns_window_ptr);
                 engine
                     .lock()
                     .install_viewport(host)
