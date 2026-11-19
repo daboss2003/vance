@@ -163,3 +163,12 @@ opt-level = 2
 # Intentional: no debug info for third-party crates (wgpu, wasmtime, tauri,
 # naga, sqlx …) — it was the bulk of the target dir and nobody steps into them.
 debug = false
+
+# Intentional: the per-frame hot path is optimised even in dev builds. Frame
+# IPC (vance-ipc) and the decoder sidecar move every decoded frame; unoptimised
+# they made debug playback of 4K 10-bit ProRes ~15x slower (0.8 vs ~11 fps on
+# an M1). Both crates are small, so the extra compile time is negligible.
+[profile.dev.package.vance-ipc]
+opt-level = 2
+[profile.dev.package.vance-decoder]
+opt-level = 2
