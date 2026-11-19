@@ -1636,26 +1636,11 @@ export const gotoHistory = (nodeId: number): Promise<boolean> => invoke('goto_hi
 
 /** A media-query field. */
 export type MediaField =
-  | 'Name'
-  | 'Kind'
-  | 'DurationSeconds'
-  | 'HasAudio'
-  | 'HasProxy'
-  | 'Path'
-  | { Custom: string };
+  'Name' | 'Kind' | 'DurationSeconds' | 'HasAudio' | 'HasProxy' | 'Path' | { Custom: string };
 
 /** A comparison operator. */
 export type QueryOp =
-  | 'Eq'
-  | 'Ne'
-  | 'Contains'
-  | 'StartsWith'
-  | 'EndsWith'
-  | 'Gt'
-  | 'Lt'
-  | 'Ge'
-  | 'Le'
-  | 'Exists';
+  'Eq' | 'Ne' | 'Contains' | 'StartsWith' | 'EndsWith' | 'Gt' | 'Lt' | 'Ge' | 'Le' | 'Exists';
 
 /** A media query (boolean filter tree). */
 export type MediaQuery =
