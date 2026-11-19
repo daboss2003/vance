@@ -27,6 +27,7 @@
   import { openStudio } from '$lib/studio.svelte';
   import { pluginsFolder } from '$lib/ipc';
   import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
+  import { dialogFocus } from '$lib/dialog-focus';
 
   let tab = $state<'browse' | 'installed'>('browse');
   let folder = $state('');
@@ -67,6 +68,7 @@
   <div
     class="scrim"
     role="dialog"
+    use:dialogFocus
     aria-modal="true"
     aria-label="Add-on effects"
     tabindex="-1"
@@ -307,6 +309,9 @@
 {/if}
 
 <style>
+  .scrim:focus {
+    outline: none;
+  }
   .scrim {
     position: fixed;
     inset: 0;

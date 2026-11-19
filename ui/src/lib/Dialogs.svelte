@@ -2,12 +2,14 @@
   /** Renders the app's modal dialog stack (see dialog.svelte.ts). Mounted once
    *  at the root so any choice/explainer surfaces as a centered dialog. */
   import { dialogs, closeDialog } from '$lib/dialog.svelte';
+  import { dialogFocus } from '$lib/dialog-focus';
 </script>
 
 {#each dialogs as d (d.id)}
   <div
     class="scrim"
     role="dialog"
+    use:dialogFocus
     aria-modal="true"
     aria-label={d.title}
     tabindex="-1"
@@ -43,6 +45,9 @@
 {/each}
 
 <style>
+  .scrim:focus {
+    outline: none;
+  }
   .scrim {
     position: fixed;
     inset: 0;

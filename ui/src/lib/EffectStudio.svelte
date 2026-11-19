@@ -13,6 +13,7 @@
     save
   } from '$lib/studio.svelte';
   import NodeGraphEditor from '$lib/NodeGraphEditor.svelte';
+  import { dialogFocus } from '$lib/dialog-focus';
 
   let canvasEl = $state<HTMLCanvasElement | null>(null);
   let mode = $state<'code' | 'nodes'>('code');
@@ -34,6 +35,7 @@
   <div
     class="scrim"
     role="dialog"
+    use:dialogFocus
     aria-modal="true"
     aria-label="Effect Studio"
     tabindex="-1"
@@ -149,6 +151,9 @@
 {/if}
 
 <style>
+  .scrim:focus {
+    outline: none;
+  }
   .scrim {
     position: fixed;
     inset: 0;

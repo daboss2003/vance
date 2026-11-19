@@ -21,6 +21,7 @@
     connectPayouts
   } from '$lib/account.svelte';
   import type { DeviceInfo } from '$lib/ipc';
+  import { dialogFocus } from '$lib/dialog-focus';
 
   const PROVIDERS = [
     { id: 'google', label: 'Continue with Google' },
@@ -103,6 +104,7 @@
   <div
     class="scrim"
     role="dialog"
+    use:dialogFocus
     aria-modal="true"
     aria-label="Settings"
     tabindex="-1"
@@ -403,6 +405,9 @@
 {/if}
 
 <style>
+  .scrim:focus {
+    outline: none;
+  }
   .scrim {
     position: fixed;
     inset: 0;
