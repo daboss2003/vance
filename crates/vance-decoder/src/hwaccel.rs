@@ -54,6 +54,8 @@ impl HwDeviceCtx {
         Some(Self { raw })
     }
 
+    /// VideoToolbox is macOS-only: always `None` here, so callers fall back
+    /// to software decode.
     #[cfg(not(target_os = "macos"))]
     pub fn try_videotoolbox() -> Option<Self> {
         None

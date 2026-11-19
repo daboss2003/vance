@@ -73,6 +73,9 @@ fn main() {
                 "clippy",
                 "--workspace",
                 "--all-targets",
+                // Report every crate's lints in one run instead of stopping
+                // at the first crate that fails (CI then shows them all).
+                "--keep-going",
                 "--",
                 "-D",
                 "warnings",

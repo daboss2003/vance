@@ -396,9 +396,10 @@ fn preset_to_ffmpeg_args(preset: &EncoderPreset) -> Vec<String> {
             }
         }
         EncoderPreset::Hevc { crf } => {
-            let q = (100 - (*crf as i32) * 2).clamp(1, 100);
             #[cfg(target_os = "macos")]
             {
+                // VideoToolbox takes a 1..=100 quality, not a CRF.
+                let q = (100 - (*crf as i32) * 2).clamp(1, 100);
                 vec![
                     v("-c:v"),
                     v("hevc_videotoolbox"),
