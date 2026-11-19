@@ -3,10 +3,15 @@
 //! arrive converted to a wire format: `Yuv420P10Le` for a >8-bit source,
 //! `Yuv420P` otherwise. Fixtures are generated with the `ffmpeg` CLI at test
 //! time (built-in encoders only); the tests skip when it isn't on PATH.
+//!
+//! Every test uses the default spawn, so on macOS the VideoToolbox codec
+//! allowlist is in play: codecs VT can't decode must stay on the software
+//! path and report `Yuv420P`, not `Nv12`.
 
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 use vance_decoder::{DecoderClient, FrameData, PixelFormat};
 
 fn sidecar_binary_path() -> PathBuf {
@@ -69,13 +74,6 @@ fn spawn_default() -> DecoderClient {
     let bin = sidecar_binary_path();
     assert!(bin.exists(), "decoder binary missing at {}", bin.display());
     DecoderClient::spawn(&bin).expect("spawn decoder")
-}
-
-/// Software decode on every platform — the path Linux/Windows always take.
-fn spawn_software() -> DecoderClient {
-    let bin = sidecar_binary_path();
-    assert!(bin.exists(), "decoder binary missing at {}", bin.display());
-    DecoderClient::spawn_with_env(&bin, [("VANCE_FORCE_SW", "1")]).expect("spawn SW decoder")
 }
 
 /// Asserts the frame's 4:2:0 wire layout (chroma = ceil(w/2) x ceil(h/2))
@@ -227,7 +225,8 @@ fn prores_4444_12bit_is_carried_as_10bit() {
 #[test]
 fn ffv1_444_8bit_decodes_as_yuv420p_in_software() {
     // Odd size: 4:2:0 chroma must be ceil(w/2) x ceil(h/2). FFV1 is
-    // lossless, so the code values survive exactly.
+    // lossless, so the code values survive exactly. VideoToolbox can't decode
+    // FFV1, so on macOS too it must not be attached (and reported as Nv12).
     let Some(fx) = make_fixture(
         "mkv",
         "color=c=gray:s=161x91:r=25:d=0.2,format=yuv444p,lutyuv=y=180:u=90:v=200",
@@ -235,7 +234,7 @@ fn ffv1_444_8bit_decodes_as_yuv420p_in_software() {
     ) else {
         return;
     };
-    let mut client = spawn_software();
+    let mut client = spawn_default();
     let info = client.open(fx.path()).expect("open FFV1 yuv444p");
     assert_eq!(info.codec_name, "ffv1");
     assert_eq!(info.pixel_format, PixelFormat::Yuv420P);
@@ -259,7 +258,8 @@ fn png_rgb24_converts_with_bt709_limited_range() {
     ) else {
         return;
     };
-    let mut client = spawn_software();
+    // Not a VideoToolbox codec: Yuv420P on macOS too.
+    let mut client = spawn_default();
     let info = client.open(fx.path()).expect("open PNG rgb24");
     assert_eq!(info.pixel_format, PixelFormat::Yuv420P);
 
@@ -282,42 +282,99 @@ fn mjpeg_full_range_422_keeps_its_range() {
     ) else {
         return;
     };
-    let mut client = spawn_software();
+    // Not a VideoToolbox codec: Yuv420P on macOS too.
+    let mut client = spawn_default();
     let info = client.open(fx.path()).expect("open MJPEG yuvj422p");
     assert_eq!(info.pixel_format, PixelFormat::Yuv420P);
 
     let f = client.decode_at(0).expect("decode frame 0");
     assert_eq!(f.pixel_format, PixelFormat::Yuv420P);
     assert_flat_yuv(&f, (250, 90, 200), 3);
+
+    assert_stream_flat(&mut client, PixelFormat::Yuv420P, (250, 90, 200), 3, 5);
     client.shutdown().expect("shutdown");
 }
 
 #[test]
-fn hw_attached_decoder_converts_non_hw_frames_to_reported_format() {
-    // Default spawn. On macOS the VideoToolbox device attaches (StreamInfo
-    // says Nv12) but FFV1 has no VT hwaccel, so frames arrive as software
-    // yuv444p and must be converted to the reported Nv12. Elsewhere this is
-    // the plain software path (Yuv420P). Even size: the NV12 packer emits
-    // `width` bytes per UV row.
+fn videotoolbox_codec_decoded_in_software_is_converted_to_nv12() {
+    // MPEG-4 Part 2 is on the VideoToolbox allowlist, so on macOS the device
+    // attaches and StreamInfo says Nv12. Apple Silicon's VideoToolbox has no
+    // MPEG-4 Part 2 decoder, so FFmpeg falls back to software and the frames
+    // arrive as yuv420p; they must be converted to the reported Nv12 (where
+    // VT does decode it they arrive as NV12 already). Elsewhere this is the
+    // plain software path. Odd size: NV12 rows carry 2 * ceil(w/2) UV bytes.
     let Some(fx) = make_fixture(
         "mkv",
-        "color=c=gray:s=162x92:r=25:d=0.2,format=yuv444p,lutyuv=y=180:u=90:v=200",
-        &["-c:v", "ffv1", "-pix_fmt", "yuv444p"],
+        "color=c=gray:s=161x91:r=25:d=0.2,format=yuv420p,lutyuv=y=180:u=90:v=200",
+        &["-c:v", "mpeg4", "-pix_fmt", "yuv420p", "-q:v", "2"],
+    ) else {
+        return;
+    };
+    let expected = if cfg!(target_os = "macos") {
+        PixelFormat::Nv12
+    } else {
+        PixelFormat::Yuv420P
+    };
+    let mut client = spawn_default();
+    let info = client.open(fx.path()).expect("open MPEG-4 Part 2");
+    assert_eq!(info.codec_name, "mpeg4");
+    assert_eq!(info.pixel_format, expected);
+
+    let f = client.decode_at(0).expect("decode frame 0");
+    assert_eq!(f.pixel_format, expected);
+    assert_flat_yuv(&f, (180, 90, 200), 2);
+
+    assert_stream_flat(&mut client, expected, (180, 90, 200), 2, 5);
+    client.shutdown().expect("shutdown");
+}
+
+/// Playback-path throughput for 4K 10-bit ProRes 422 HQ: software decode,
+/// swscale 4:2:2 -> 4:2:0, payload packing and the IPC hop, streamed with
+/// the engine's playback buffer depth. Real-time 24-30 fps needs < ~33 ms
+/// per frame. A manual benchmark, not a CI check:
+///   cargo test -p vance-decoder --test it -- --ignored --nocapture prores_4k
+/// The dev profile builds this crate and vance-ipc at opt-level 2 (see the
+/// workspace Cargo.toml), so a plain debug build gives representative numbers.
+/// On an M1 (Nov 2026): ~88 ms/frame, 11 fps. The inline IPC hop (~77 ms for a
+/// 25 MB frame) is the bottleneck; shared-memory frames are planned.
+#[test]
+#[ignore = "manual benchmark: run with --ignored --nocapture"]
+fn prores_4k_decode_throughput() {
+    let Some(fx) = make_fixture(
+        "mov",
+        "testsrc2=s=3840x2160:r=24:d=3",
+        &[
+            "-c:v",
+            "prores_ks",
+            "-profile:v",
+            "3",
+            "-pix_fmt",
+            "yuv422p10le",
+        ],
     ) else {
         return;
     };
     let mut client = spawn_default();
-    let info = client.open(fx.path()).expect("open FFV1 yuv444p");
-    assert!(
-        matches!(info.pixel_format, PixelFormat::Nv12 | PixelFormat::Yuv420P),
-        "8-bit source should be reported as an 8-bit 4:2:0 format, got {:?}",
-        info.pixel_format
-    );
+    let info = client.open(fx.path()).expect("open 4K ProRes");
+    assert_eq!((info.width, info.height), (3840, 2160));
+    assert_eq!(info.pixel_format, PixelFormat::Yuv420P10Le);
 
-    let f = client.decode_at(0).expect("decode frame 0");
-    assert_eq!(f.pixel_format, info.pixel_format);
-    assert_flat_yuv(&f, (180, 90, 200), 1);
-
-    assert_stream_flat(&mut client, info.pixel_format, (180, 90, 200), 1, 5);
+    let start = Instant::now();
+    client.start_stream(0, 8).expect("start_stream");
+    let mut frames = 0u32;
+    while let Some(f) = client.next_frame().expect("next_frame") {
+        assert_eq!(f.pixel_format, PixelFormat::Yuv420P10Le, "frame {frames}");
+        frames += 1;
+    }
+    let elapsed = start.elapsed();
     client.shutdown().expect("shutdown");
+    assert_eq!(frames, 72, "3 s at 24 fps");
+
+    let ms_per_frame = elapsed.as_secs_f64() * 1000.0 / f64::from(frames);
+    eprintln!(
+        "prores_4k_decode_throughput: {frames} frames in {:.0} ms = {ms_per_frame:.1} ms/frame, \
+         {:.1} fps",
+        elapsed.as_secs_f64() * 1000.0,
+        1000.0 / ms_per_frame
+    );
 }

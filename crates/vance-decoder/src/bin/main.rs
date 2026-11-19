@@ -64,7 +64,7 @@ struct OpenContext {
 /// 4:4:4, RGB, 12-bit, ...) to the wire format chosen at open. Rebuilt only
 /// when the source format or size changes.
 struct FrameConverter {
-    sws: ffmpeg::software::scaling::Context,
+    sws: SwsContext,
     /// (format, width, height) of the source frames `sws` was built for.
     src: (ffmpeg::format::Pixel, u32, u32),
     /// Reused destination frame, allocated once in the wire format.
@@ -74,20 +74,85 @@ struct FrameConverter {
 // SAFETY: the SwsContext is owned exclusively by this converter, which lives
 // in an `OpenContext` and is only used by the one thread that currently owns
 // that context (the main thread, or the decode thread during a stream).
+// swscale's own slice-worker threads only run inside `sws_scale_frame`.
 unsafe impl Send for FrameConverter {}
+
+/// An initialised `SwsContext`, freed on drop. Not ffmpeg-the-third's
+/// `scaling::Context`: that one can't set the `threads` option before init,
+/// and its `run()` calls the legacy `sws_scale()`, which ignores slice
+/// threads (only `sws_scale_frame()` uses them).
+struct SwsContext(*mut ffmpeg::sys::SwsContext);
+
+impl Drop for SwsContext {
+    fn drop(&mut self) {
+        // SAFETY: we own the context; sws_freeContext accepts NULL too.
+        unsafe { ffmpeg::sys::sws_freeContext(self.0) }
+    }
+}
+
+/// swscale slice threads per converter: one per core, capped at 8 (each
+/// converter keeps its own worker pool). Single-threaded, a 4K 10-bit
+/// 4:2:2 -> 4:2:0 pass took ~30 ms on an M1, a whole real-time frame budget;
+/// 8 threads brought it to ~9 ms.
+fn conversion_threads() -> usize {
+    thread::available_parallelism().map_or(1, |n| n.get().min(8))
+}
 
 impl FrameConverter {
     fn new(src: (ffmpeg::format::Pixel, u32, u32), target: PixelFormat) -> Result<Self, String> {
-        use ffmpeg::software::scaling::{Context, Flags};
+        Self::with_threads(src, target, conversion_threads())
+    }
+
+    fn with_threads(
+        src: (ffmpeg::format::Pixel, u32, u32),
+        target: PixelFormat,
+        threads: usize,
+    ) -> Result<Self, String> {
+        use ffmpeg::software::scaling::Flags;
         let (format, width, height) = src;
         let dst = wire_to_ffmpeg(target);
+        let fail = |what: &str, code: i32| {
+            format!(
+                "swscale {format:?} -> {dst:?}: {what}: {}",
+                ffmpeg::Error::from(code)
+            )
+        };
         // FULL_CHR_H_INP: without it, swscale's RGB input path pairs pixels
         // for chroma and, on odd widths, averages the last column with one
         // pixel past the edge (a tinted right-hand column). It has no effect
         // on YUV input.
         let flags = Flags::BILINEAR | Flags::FULL_CHR_H_INP;
-        let mut sws = Context::get(format, width, height, dst, width, height, flags)
-            .map_err(|e| format!("swscale {format:?} -> {dst:?}: {e}"))?;
+        let pix = |p: ffmpeg::format::Pixel| ffmpeg::sys::AVPixelFormat::from(p) as i64;
+        // SAFETY: a NULL return is checked below; dropping SwsContext frees it.
+        let sws = SwsContext(unsafe { ffmpeg::sys::sws_alloc_context() });
+        if sws.0.is_null() {
+            return Err(format!("swscale {format:?} -> {dst:?}: out of memory"));
+        }
+        let options: [(&std::ffi::CStr, i64); 8] = [
+            (c"srcw", i64::from(width)),
+            (c"srch", i64::from(height)),
+            (c"src_format", pix(format)),
+            (c"dstw", i64::from(width)),
+            (c"dsth", i64::from(height)),
+            (c"dst_format", pix(dst)),
+            (c"sws_flags", i64::from(flags.bits())),
+            (c"threads", threads as i64),
+        ];
+        for (name, value) in options {
+            // SAFETY: `sws.0` is a live, not yet initialised SwsContext (an
+            // AVClass-enabled struct) and `name` is NUL-terminated.
+            let ret = unsafe { ffmpeg::sys::av_opt_set_int(sws.0.cast(), name.as_ptr(), value, 0) };
+            if ret < 0 {
+                return Err(fail(&format!("set {name:?}"), ret));
+            }
+        }
+        // SAFETY: as above; NULL filters mean "no extra filtering".
+        let ret = unsafe {
+            ffmpeg::sys::sws_init_context(sws.0, std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        if ret < 0 {
+            return Err(fail("init", ret));
+        }
         // Intentional: the same table and the same range flag on both sides,
         // whatever the source's tags say. Between YUV formats swscale then
         // changes only chroma subsampling and bit depth: the source's matrix
@@ -96,21 +161,15 @@ impl FrameConverter {
         // ...) the destination side makes it a standard Rec.709 limited-range
         // conversion, which is what the renderer assumes for YUV input. The
         // return value is ignored: swscale returns -1 for a YUV->YUV context
-        // even after it has applied the settings.
+        // even after it has applied the settings. (With slice threads it
+        // forwards the settings to every slice context.)
         unsafe {
             let bt709 = ffmpeg::sys::sws_getCoefficients(ffmpeg::sys::SWS_CS_ITU709);
-            ffmpeg::sys::sws_setColorspaceDetails(
-                sws.as_mut_ptr(),
-                bt709,
-                0,
-                bt709,
-                0,
-                0,
-                1 << 16,
-                1 << 16,
-            );
+            ffmpeg::sys::sws_setColorspaceDetails(sws.0, bt709, 0, bt709, 0, 0, 1 << 16, 1 << 16);
         }
-        eprintln!("[decoder] converting {format:?} {width}x{height} -> {dst:?} (swscale)");
+        eprintln!(
+            "[decoder] converting {format:?} {width}x{height} -> {dst:?} (swscale, {threads} threads)"
+        );
         Ok(Self {
             sws,
             src,
@@ -229,11 +288,12 @@ impl State {
         let color_trc: i32 = unsafe { (*stream.parameters().as_ptr()).color_trc as i32 };
         let color_transfer = color_transfer_hint(color_trc);
 
-        // Try VideoToolbox before opening the decoder (8-bit only). On
-        // success, attach hw_device_ctx so FFmpeg's get_format chooses
-        // AV_PIX_FMT_VIDEOTOOLBOX and decoded frames come back as opaque GPU
-        // surfaces (which we then transfer to NV12 system memory).
-        let hw_device = if high_bit_source {
+        // Try VideoToolbox before opening the decoder (8-bit sources of codecs
+        // VT decodes only). On success, attach hw_device_ctx so FFmpeg's
+        // get_format chooses AV_PIX_FMT_VIDEOTOOLBOX and decoded frames come
+        // back as opaque GPU surfaces (which we then transfer to NV12 system
+        // memory).
+        let hw_device = if high_bit_source || !videotoolbox_decodes(codec_id) {
             None
         } else {
             HwDeviceCtx::try_videotoolbox()
@@ -504,9 +564,13 @@ fn convert_frame<'c>(
         Some(c) if c.src == src => slot.insert(c),
         _ => slot.insert(FrameConverter::new(src, target)?),
     };
-    conv.sws
-        .run(frame, &mut conv.out)
-        .map_err(|e| format!("swscale: {e}"))?;
+    // SAFETY: `frame` matches the context's source (format, size), checked
+    // above, and `conv.out` was allocated in its destination format and size.
+    let ret =
+        unsafe { ffmpeg::sys::sws_scale_frame(conv.sws.0, conv.out.as_mut_ptr(), frame.as_ptr()) };
+    if ret < 0 {
+        return Err(format!("swscale: {}", ffmpeg::Error::from(ret)));
+    }
     conv.out.set_pts(frame.pts());
     Ok(&conv.out)
 }
@@ -685,6 +749,19 @@ fn color_transfer_hint(trc: i32) -> vance_decoder::protocol::ColorTransferHint {
     }
 }
 
+/// Codecs we attach VideoToolbox to. Attaching it to anything else (PNG,
+/// FFV1, MJPEG, ...) still decodes, because FFmpeg silently falls back to
+/// software, but `open()` has then reported `Nv12` and every frame pays a
+/// pointless swscale pass to NV12. VP9 / AV1 are left off on purpose: VT
+/// decodes them only on some Macs, so they stay on the software path.
+fn videotoolbox_decodes(codec: ffmpeg::codec::Id) -> bool {
+    use ffmpeg::codec::Id;
+    matches!(
+        codec,
+        Id::H264 | Id::HEVC | Id::MPEG1VIDEO | Id::MPEG2VIDEO | Id::MPEG4 | Id::PRORES
+    )
+}
+
 /// Whether a source pixel format has more than 8 bits per component (10-bit
 /// HEVC, 10-bit 4:2:2 ProRes / DNxHR, 12-bit 4:4:4, P010, 16-bit RGB, ...).
 /// We force SOFTWARE decode for these: VideoToolbox returns a >8-bit surface
@@ -775,6 +852,85 @@ mod tests {
         }
         for pf in [P::YUV420P, P::NV12, P::YUV444P, P::RGB24, P::None] {
             assert!(!is_high_bit_source(pf), "{pf:?} should be 8-bit");
+        }
+    }
+
+    #[test]
+    fn videotoolbox_is_attached_only_to_allowlisted_codecs() {
+        use ffmpeg::codec::Id;
+        for id in [
+            Id::H264,
+            Id::HEVC,
+            Id::MPEG1VIDEO,
+            Id::MPEG2VIDEO,
+            Id::MPEG4,
+            Id::PRORES,
+        ] {
+            assert!(videotoolbox_decodes(id), "{id:?} should use VideoToolbox");
+        }
+        for id in [
+            Id::FFV1,
+            Id::PNG,
+            Id::MJPEG,
+            Id::VP9,
+            Id::AV1,
+            Id::DNXHD,
+            Id::RAWVIDEO,
+            Id::None,
+        ] {
+            assert!(
+                !videotoolbox_decodes(id),
+                "{id:?} should decode in software"
+            );
+        }
+    }
+
+    /// Slice threading must not change a single output sample. Odd size and
+    /// pseudo-random content, tall enough for every thread to get a slice.
+    #[test]
+    fn threaded_conversion_matches_single_threaded() {
+        let (w, h) = (641, 361);
+        let cases = [
+            (P::YUV422P10LE, PixelFormat::Yuv420P10Le),
+            (P::YUV444P12LE, PixelFormat::Yuv420P10Le),
+            (P::RGB24, PixelFormat::Yuv420P),
+            (P::YUVJ422P, PixelFormat::Yuv420P),
+            (P::YUV420P, PixelFormat::Nv12),
+        ];
+        for (format, target) in cases {
+            let mut src = ffmpeg::frame::Video::new(format, w, h);
+            let mut seed = 0x9e37_79b9_u32;
+            let mut next = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed
+            };
+            // SAFETY: as in `is_high_bit_source`.
+            let depth = format
+                .descriptor()
+                .map_or(8, |d| unsafe { (*d.as_ptr()).comp[0].depth });
+            for plane in 0..src.planes() {
+                let data = src.data_mut(plane);
+                if depth > 8 {
+                    for s in data.chunks_exact_mut(2) {
+                        let v = (next() % (1 << depth)) as u16;
+                        s.copy_from_slice(&v.to_le_bytes());
+                    }
+                } else {
+                    data.iter_mut().for_each(|b| *b = next() as u8);
+                }
+            }
+            let run = |threads| {
+                let conv = FrameConverter::with_threads((format, w, h), target, threads).unwrap();
+                let mut slot = Some(conv);
+                let out = convert_frame(&mut slot, &src, target).unwrap();
+                frame_to_payload(out, target).unwrap().bytes
+            };
+            assert!(
+                run(1) == run(8),
+                "{format:?} -> {target:?} differs when threaded"
+            );
         }
     }
 
