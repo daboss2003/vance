@@ -41,7 +41,10 @@ fn fallback_install_returns_unimplemented() {
 
     #[cfg(any(target_os = "windows", all(unix, not(target_os = "macos"))))]
     {
-        let err = Viewport::install(host, &instance).unwrap_err();
+        // `unwrap_err` would need `Viewport: Debug`, which the stub isn't.
+        let Err(err) = Viewport::install(host, &instance) else {
+            panic!("the fallback viewport must refuse to install");
+        };
         assert!(matches!(err, ViewportError::Unimplemented));
     }
 }
