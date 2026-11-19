@@ -143,6 +143,11 @@ lv2-sys = { path = "vendor/lv2-sys" }
 
 [profile.dev]
 incremental = true
+# Intentional: line tables only (not full debug info) — panics and
+# backtraces keep file:line, but the target dir no longer balloons to
+# 100+ GB. Full debug info for a local debugger session:
+#   CARGO_PROFILE_DEV_DEBUG=true cargo build -p <crate>
+debug = "line-tables-only"
 
 [profile.release]
 panic = "abort"
@@ -155,3 +160,6 @@ strip = true
 # Speeds up wgpu/ffmpeg/etc. without making our own iteration loop slow.
 [profile.dev.package."*"]
 opt-level = 2
+# Intentional: no debug info for third-party crates (wgpu, wasmtime, tauri,
+# naga, sqlx …) — it was the bulk of the target dir and nobody steps into them.
+debug = false

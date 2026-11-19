@@ -68,6 +68,22 @@ cargo xtask app-run    # app-build, then launch the app
 
 CI runs `fmt`, `clippy`, `test`, `ui-lint`, `ui-build` on Windows / macOS / Linux. PRs must pass CI.
 
+### Building and testing without filling your disk
+
+The dependency tree is very large: Tauri, wgpu, wasmtime, FFmpeg and sqlx. A careless build setup grows `target/` past 100 GB. These rules keep it small:
+
+- **Everyday loop: check, then test only what you touched.**
+  ```sh
+  cargo xtask check                    # type-check everything; no codegen, small on disk
+  cargo xtask test -p vance-timeline   # tests for the crate you changed
+  cargo test -p vance-app --test it export_video::   # one test module
+  ```
+  Run the full `cargo xtask test` once per milestone or before a PR, not after every edit.
+- **Debug info is minimal on purpose.** Our crates get line tables only, so panics and backtraces still show `file:line`. Dependencies get none. If you need full debug info for a debugger session, turn it on for one build: `CARGO_PROFILE_DEV_DEBUG=true cargo build -p <crate>`.
+- **One integration-test binary per heavy crate.** Every `tests/*.rs` file is otherwise its own executable that links the crate's whole dependency tree. Crates that already have a `tests/it/main.rs` take new tests there as modules. Don't add new top-level `tests/*.rs` files to those crates.
+- **Avoid release builds unless you need them.** `--release` (LTO) is a second full copy of everything. Use it only for performance checks and installers. The same goes for flipping feature flags (`--features clap`, `lv2`, `ocio`) back and forth: each feature set compiles its own copy of the affected crates.
+- **Disk guard.** `cargo xtask check|build|test|clippy|bench` refuse to start, or stop the build, when free space drops below 5 GB. Change the threshold with `VANCE_MIN_FREE_GB`. When `target/` gets too big, `cargo clean` is always safe.
+
 ## Architectural decisions
 
 Land an ADR in `docs/adr/` (template at `docs/adr/0000-template.md`) for any cross-crate decision. ADRs are short, monotonically numbered, and never deleted (mark superseded ones explicitly).

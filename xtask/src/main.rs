@@ -13,8 +13,15 @@ USAGE:
     cargo xtask <SUBCOMMAND>
 
 SUBCOMMANDS:
+    check       Type-check all Rust crates (no codegen — fast, small on disk).
     build       Build all Rust crates (workspace, all targets).
-    test        Run all Rust tests.
+    test        Run all Rust tests. `cargo xtask test -p <crate>` tests just
+                that crate (the everyday loop; run the full suite per milestone).
+
+    check / build / test / clippy / bench are disk-guarded: they refuse to
+    start, or stop cargo, when free disk space drops below 5 GB
+    (override with VANCE_MIN_FREE_GB).
+
     fmt         Format all Rust code.
     fmt-check   Check Rust formatting without modifying files.
     clippy      Lint all Rust code (warnings = errors).
@@ -56,8 +63,9 @@ fn main() {
     let rest: Vec<String> = args.collect();
 
     let result = match cmd.as_str() {
+        "check" => cargo(&["check", "--workspace", "--all-targets"], &rest),
         "build" => cargo(&["build", "--workspace", "--all-targets"], &rest),
-        "test" => cargo(&["test", "--workspace", "--all-targets"], &rest),
+        "test" => test(&rest),
         "fmt" => cargo(&["fmt", "--all"], &rest),
         "fmt-check" => cargo(&["fmt", "--all", "--check"], &rest),
         "clippy" => cargo(
@@ -129,8 +137,120 @@ fn workspace_root() -> PathBuf {
 
 fn cargo(args: &[&str], extra: &[String]) -> Result<(), String> {
     let mut c = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()));
-    c.current_dir(workspace_root()).args(args).args(extra);
-    run(c)
+    c.current_dir(workspace_root())
+        .args(scope_to_packages(args, extra))
+        .args(extra);
+    run_disk_guarded(c)
+}
+
+/// Tests spawn real binaries from `target/debug` — the decoder/encoder/audio
+/// sidecars and `vance-ipc`'s `echo-sidecar` example — and `cargo test` does
+/// not put them there. Without this step those tests fail or silently skip.
+/// Intentional: always the workspace's bins, even for `-p <crate>`, because a
+/// crate's tests need sidecars from OTHER crates (vance-app needs
+/// vance-decoder). Cargo no-ops when they're already up to date.
+fn test(rest: &[String]) -> Result<(), String> {
+    cargo(&["build", "--workspace", "--bins", "--examples"], &[])?;
+    // Intentional: --no-fail-fast — one failing crate must not hide the
+    // results of every crate after it.
+    cargo(
+        &["test", "--workspace", "--all-targets", "--no-fail-fast"],
+        rest,
+    )
+}
+
+/// `cargo xtask test -p foo` must test only `foo`: drop the default
+/// `--workspace` when the caller names packages (before any `--`).
+fn scope_to_packages<'a>(args: &[&'a str], extra: &[String]) -> Vec<&'a str> {
+    let names_package = extra
+        .iter()
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| a == "-p" || a == "--package" || a.starts_with("--package="));
+    args.iter()
+        .copied()
+        .filter(|a| !(names_package && *a == "--workspace"))
+        .collect()
+}
+
+const DEFAULT_MIN_FREE_GB: u64 = 5;
+
+fn min_free_gb() -> u64 {
+    env::var("VANCE_MIN_FREE_GB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MIN_FREE_GB)
+}
+
+/// Free space (KiB) on the volume holding `path`, via POSIX `df -Pk`.
+#[cfg(unix)]
+fn free_kib(path: &std::path::Path) -> Option<u64> {
+    let out = Command::new("df").arg("-Pk").arg(path).output().ok()?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    // Line 2, column 4 = "Available" in POSIX (-P) output.
+    text.lines().nth(1)?.split_whitespace().nth(3)?.parse().ok()
+}
+
+/// Run cargo, but refuse to start — or stop it mid-build — when the disk
+/// is nearly full. A full disk mid-build corrupts the target dir and can
+/// destabilise the whole machine, so failing early is the safer default.
+#[cfg(unix)]
+fn run_disk_guarded(mut cmd: Command) -> Result<(), String> {
+    use std::time::Duration;
+    let root = workspace_root();
+    let min_gb = min_free_gb();
+    let min_kib = min_gb * 1024 * 1024;
+    let too_low = |free: u64| {
+        format!(
+            "only {:.1} GB free on the build volume (minimum {min_gb} GB). \
+             Free some space (e.g. `cargo clean`) or set VANCE_MIN_FREE_GB.",
+            free as f64 / (1024.0 * 1024.0)
+        )
+    };
+    if let Some(free) = free_kib(&root) {
+        if free < min_kib {
+            return Err(format!("refusing to start: {}", too_low(free)));
+        }
+    }
+    eprintln!("xtask: running {cmd:?}");
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn {cmd:?}: {e}"))?;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            return exit_ok(status, &cmd);
+        }
+        std::thread::sleep(Duration::from_secs(2));
+        let Some(free) = free_kib(&root) else {
+            continue;
+        };
+        if free < min_kib {
+            // Intentional: TERM cargo's direct children (rustc) first, then
+            // cargo itself. Cargo stays in our process group so Ctrl+C still
+            // reaches the whole build; a separate group would break that.
+            let pid = child.id().to_string();
+            let _ = Command::new("pkill").args(["-TERM", "-P", &pid]).status();
+            let _ = Command::new("kill").args(["-TERM", &pid]).status();
+            let _ = child.wait();
+            return Err(format!("stopped the build: {}", too_low(free)));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn run_disk_guarded(cmd: Command) -> Result<(), String> {
+    // No portable free-space query without a new dependency; the guard
+    // is a dev-machine convenience, so Windows just runs unguarded.
+    run(cmd)
+}
+
+fn exit_ok(status: ExitStatus, cmd: &Command) -> Result<(), String> {
+    if !status.success() {
+        return Err(format!(
+            "command failed (exit {}): {cmd:?}",
+            status.code().unwrap_or(-1)
+        ));
+    }
+    Ok(())
 }
 
 /// Build every sample WASM plugin under `plugins/` for
@@ -168,14 +288,19 @@ fn build_plugins() -> Result<(), String> {
     // co-located `<exe-dir>/plugins` scan root (see Engine::rescan_plugins)
     // discovers the default pack with no manual install. Cover both host
     // profiles so `cargo run`/`build` (debug) and packaged (release) find them.
-    let stage_dirs = [root.join("target/debug/plugins"), root.join("target/release/plugins")];
+    let stage_dirs = [
+        root.join("target/debug/plugins"),
+        root.join("target/release/plugins"),
+    ];
     for d in &stage_dirs {
         let _ = std::fs::create_dir_all(d);
     }
     let mut staged = 0usize;
     for dir in &dirs {
         let rel = dir.join("target/wasm32-unknown-unknown/release");
-        let Ok(rd) = std::fs::read_dir(&rel) else { continue };
+        let Ok(rd) = std::fs::read_dir(&rel) else {
+            continue;
+        };
         for entry in rd.flatten() {
             let p = entry.path();
             if p.extension().and_then(|x| x.to_str()) != Some("wasm") {
@@ -225,7 +350,10 @@ fn host_triple() -> Result<String, String> {
 fn explicit_target(rest: &[String]) -> Option<String> {
     let mut it = rest.iter();
     while let Some(a) = it.next() {
-        if let Some(t) = a.strip_prefix("--target=").or_else(|| a.strip_prefix("-t=")) {
+        if let Some(t) = a
+            .strip_prefix("--target=")
+            .or_else(|| a.strip_prefix("-t="))
+        {
             return Some(t.to_string());
         }
         if a == "--target" || a == "-t" {
@@ -255,7 +383,11 @@ fn stage_sidecars(rest: &[String]) -> Result<(), String> {
         return stage_universal(&root, &dest_dir);
     }
 
-    let ext = if triple.contains("windows") { ".exe" } else { "" };
+    let ext = if triple.contains("windows") {
+        ".exe"
+    } else {
+        ""
+    };
     // Build every sidecar in one release invocation (add --target only when the
     // caller asked to cross-compile, so a host build stays in target/release).
     let mut args: Vec<String> = vec!["build".into(), "--release".into()];
@@ -406,13 +538,7 @@ fn run(mut cmd: Command) -> Result<(), String> {
     let status: ExitStatus = cmd
         .status()
         .map_err(|e| format!("failed to spawn {cmd:?}: {e}"))?;
-    if !status.success() {
-        return Err(format!(
-            "command failed (exit {}): {cmd:?}",
-            status.code().unwrap_or(-1)
-        ));
-    }
-    Ok(())
+    exit_ok(status, &cmd)
 }
 
 /// Build the frontend AND rebuild vance-app. The Tauri binary embeds the
@@ -462,5 +588,37 @@ mod tests {
             root.join("Cargo.toml").is_file(),
             "workspace Cargo.toml missing"
         );
+    }
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn naming_a_package_drops_workspace() {
+        let base = ["test", "--workspace", "--all-targets"];
+        assert_eq!(
+            scope_to_packages(&base, &s(&["-p", "vance-timeline"])),
+            ["test", "--all-targets"]
+        );
+        assert_eq!(
+            scope_to_packages(&base, &s(&["--package=vance-timeline"])),
+            ["test", "--all-targets"]
+        );
+    }
+
+    #[test]
+    fn workspace_kept_without_package_or_after_double_dash() {
+        let base = ["test", "--workspace", "--all-targets"];
+        assert_eq!(scope_to_packages(&base, &[]), base);
+        // `-p` after `--` is a test-binary arg, not a cargo package filter.
+        assert_eq!(scope_to_packages(&base, &s(&["--", "-p"])), base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn free_space_is_readable() {
+        let free = free_kib(&workspace_root()).expect("df -Pk should parse");
+        assert!(free > 0);
     }
 }

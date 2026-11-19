@@ -25,7 +25,7 @@ target/release/vance-audio-decoder
 Run it from a terminal the first time so you can see logs:
 
 ```
-cd "/Users/mac/Desktop/video editor/vance"
+cd vance            # the repository root
 ./target/release/vance-app
 ```
 
