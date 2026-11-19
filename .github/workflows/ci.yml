@@ -40,7 +40,11 @@ jobs:
             libayatana-appindicator3-dev libxdo-dev pkg-config \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
             libswresample-dev libavfilter-dev libavdevice-dev \
-            libasound2-dev ffmpeg
+            libasound2-dev ffmpeg \
+            mesa-vulkan-drivers libvulkan1
+          # ^ Mesa's software Vulkan driver (lavapipe): GitHub's Linux runners
+          # have no GPU, so without it wgpu finds no adapter and every
+          # render/export test fails with NoAdapter.
 
       # ffmpeg-sys-the-third supports FFmpeg <= 7.1; brew's default `ffmpeg` is
       # 8.x, so use the keg-only ffmpeg@7 and point FFMPEG_DIR at it (its build
@@ -183,7 +187,11 @@ jobs:
             libayatana-appindicator3-dev libxdo-dev pkg-config \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
             libswresample-dev libavfilter-dev libavdevice-dev \
-            libasound2-dev ffmpeg
+            libasound2-dev ffmpeg \
+            mesa-vulkan-drivers libvulkan1
+          # ^ Mesa's software Vulkan driver (lavapipe): GitHub's Linux runners
+          # have no GPU, so without it wgpu finds no adapter and every
+          # render/export test fails with NoAdapter.
 
       # ffmpeg-sys-the-third supports FFmpeg <= 7.1; brew's default `ffmpeg` is
       # 8.x, so use the keg-only ffmpeg@7 and point FFMPEG_DIR at it (its build
