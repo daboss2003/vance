@@ -24,7 +24,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Intentional: ubuntu-24.04, not -latest. ubuntu-latest (26.04) ships
+        # FFmpeg 8, but ffmpeg-the-third 3.x supports <= 7.1. Unpin when the
+        # bindings move to ffmpeg-the-third 6.x (media/export milestone).
+        os: [ubuntu-24.04, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -60,6 +63,15 @@ jobs:
 
       - name: Format check
         run: cargo xtask fmt-check
+
+      # tauri::generate_context!() embeds `frontendDist` (ui/build) at compile
+      # time and fails if it's missing. This job checks Rust only, so a stub
+      # page is enough; the tauri-smoke job builds and embeds the real UI.
+      - name: Stub the UI bundle
+        shell: bash
+        run: |
+          mkdir -p ui/build
+          [ -f ui/build/index.html ] || echo '<!doctype html><title>Vance</title>' > ui/build/index.html
 
       - name: Clippy
         run: cargo xtask clippy
@@ -155,7 +167,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Intentional: ubuntu-24.04, not -latest. ubuntu-latest (26.04) ships
+        # FFmpeg 8, but ffmpeg-the-third 3.x supports <= 7.1. Unpin when the
+        # bindings move to ffmpeg-the-third 6.x (media/export milestone).
+        os: [ubuntu-24.04, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
