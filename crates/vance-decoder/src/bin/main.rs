@@ -12,8 +12,10 @@
 //! ## Threading
 //!
 //! - The main thread runs `vance_ipc::serve_with_blobs()` and processes one
-//!   request at a time. A `Frame` reply's pixels are in a shared-memory
-//!   slot, or follow the reply as a raw blob.
+//!   request at a time. Each arrives in a `DecoderEnvelope` whose released
+//!   slots go back to the pool before the request is handled. A `Frame`
+//!   reply's pixels are in a shared-memory slot, or follow the reply as a
+//!   raw blob.
 //! - During streaming, a background **decode thread** owns the FFmpeg
 //!   `Input` / `Video` decoder and pushes decoded frames into a bounded
 //!   channel. The main thread `recv()`s from that channel when a
@@ -28,8 +30,8 @@
 //! region. A slot stays unpublished while it waits in the stream channel and
 //! is published only when the main thread builds the `Frame` reply, so the
 //! channel's drain on stop hands unsent slots back to the pool. The main
-//! thread never waits for a slot (it is also the thread that handles
-//! `Release`): with none free, its frame goes inline. The decode thread
+//! thread never waits for a slot (it is also the thread that takes released
+//! slots back): with none free, its frame goes inline. The decode thread
 //! waits for one until its stream is stopped.
 
 mod alloc;
@@ -39,19 +41,59 @@ mod pack;
 use alloc::Allocator;
 use media::{DecodedItem, OpenContext, Stream};
 use pack::PackedFrame;
+use std::io::Write;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 use vance_decoder::protocol::{
-    DecoderRequest, DecoderResponse, OpenError, StreamInfo, PROTOCOL_VERSION,
+    DecoderEnvelope, DecoderRequest, DecoderResponse, OpenError, StreamInfo, PROTOCOL_VERSION,
 };
 use vance_ipc::Reply;
 
 fn main() -> vance_ipc::Result<()> {
     vance_ffmpeg_sys::init_once();
     let mut state = State::default();
-    vance_ipc::serve_with_blobs::<DecoderRequest, DecoderResponse, _>(|req, _blobs| {
-        state.handle(req)
-    })
+    let mut served_any = false;
+    let served =
+        vance_ipc::serve_with_blobs::<DecoderEnvelope, DecoderResponse, _>(|envelope, _blobs| {
+            served_any = true;
+            state.handle(envelope)
+        });
+    if let Err(vance_ipc::Error::Decode(e)) = &served {
+        eprintln!(
+            "[decoder] unreadable request (this sidecar speaks protocol v{PROTOCOL_VERSION}): {e}"
+        );
+        if !served_any {
+            answer_unreadable_handshake();
+        }
+    }
+    served
+}
+
+/// Reply to an unreadable first request with this sidecar's `Hello`.
+///
+/// Intentional: answering a request that was never understood. It is all
+/// but certainly the `Hello` of a client on another protocol version, which
+/// waits for a `Hello` back (every version keeps it as the first response
+/// variant, with the same fields). Its handshake then fails as a version
+/// mismatch instead of a dead sidecar. The sidecar exits right after.
+fn answer_unreadable_handshake() {
+    let hello = DecoderResponse::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        ffmpeg_version: ffmpeg_version_string(),
+    };
+    let mut out = std::io::stdout().lock();
+    if vance_ipc::write_frame(&mut out, &hello).is_ok() {
+        let _ = out.flush();
+    }
+}
+
+/// Log that `stale` released slots were ignored: another region's epoch,
+/// already released, or an older generation. The decoder's tests parse
+/// this line to count stale releases.
+fn log_stale_releases(stale: u32) {
+    let line = format!("[decoder] ignored {stale} stale shared-memory slot releases\n");
+    // One write, so the line stays whole next to FFmpeg's own stderr output.
+    let _ = std::io::stderr().write_all(line.as_bytes());
 }
 
 #[derive(Default)]
@@ -80,15 +122,33 @@ fn frame_reply(frame: PackedFrame) -> Reply<DecoderResponse> {
 }
 
 impl State {
-    fn handle(&mut self, req: DecoderRequest) -> Reply<DecoderResponse> {
-        match req {
-            DecoderRequest::Hello {
-                protocol_version: _,
-            } => DecoderResponse::Hello {
-                protocol_version: PROTOCOL_VERSION,
-                ffmpeg_version: ffmpeg_version_string(),
+    /// Take the envelope's released slots back, then handle its request.
+    fn handle(&mut self, envelope: DecoderEnvelope) -> Reply<DecoderResponse> {
+        let DecoderEnvelope { releases, request } = envelope;
+        if !releases.is_empty() {
+            let stale = self.alloc.release(&releases);
+            if stale > 0 {
+                log_stale_releases(stale);
             }
-            .into(),
+        }
+        self.handle_request(request)
+    }
+
+    fn handle_request(&mut self, req: DecoderRequest) -> Reply<DecoderResponse> {
+        match req {
+            DecoderRequest::Hello { protocol_version } => {
+                // The client compares the versions and gives up on a mismatch.
+                if protocol_version != PROTOCOL_VERSION {
+                    eprintln!(
+                        "[decoder] protocol mismatch: client v{protocol_version}, sidecar v{PROTOCOL_VERSION}"
+                    );
+                }
+                DecoderResponse::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    ffmpeg_version: ffmpeg_version_string(),
+                }
+                .into()
+            }
             DecoderRequest::Open { path } => {
                 self.stop_stream_if_any();
                 match self.open(&path) {
@@ -159,10 +219,6 @@ impl State {
                 }
                 .into()
             }
-            DecoderRequest::Release { slots } => DecoderResponse::Released {
-                stale: self.alloc.release(&slots),
-            }
-            .into(),
         }
     }
 

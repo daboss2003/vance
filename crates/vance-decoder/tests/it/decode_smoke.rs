@@ -101,38 +101,145 @@ fn handshake_open_decode_close() {
     client.shutdown().expect("shutdown");
 }
 
-/// The raw v3 protocol: a region that doesn't exist can't be attached, a
-/// release for a region the sidecar never attached is all stale, and
-/// neither disturbs decoding. The `Frame` reply's pixels follow it as
-/// exactly one blob of the announced length.
+/// A sidecar driven in the raw protocol, stderr captured. No reply says how
+/// many released slots were stale, so the sidecar logs it there and
+/// [`RawSidecar::finish`] reads the counts back.
+struct RawSidecar {
+    child: std::process::Child,
+    /// `None` once closed, which ends the sidecar's request loop.
+    stdin: Option<std::process::ChildStdin>,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    /// Collects all of stderr until the sidecar exits.
+    stderr: Option<std::thread::JoinHandle<String>>,
+}
+
+impl RawSidecar {
+    /// Start the sidecar without a handshake.
+    fn start() -> Self {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        let bin = sidecar_binary_path();
+        assert!(bin.exists(), "decoder binary missing at {}", bin.display());
+        let mut cmd = Command::new(bin);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = vance_ipc::process::spawn(&mut cmd).expect("spawn decoder");
+        let stdin = child.stdin.take();
+        let stdout = std::io::BufReader::new(child.stdout.take().expect("stdout piped"));
+        let mut err = child.stderr.take().expect("stderr piped");
+        let stderr = std::thread::spawn(move || {
+            let mut log = String::new();
+            let _ = err.read_to_string(&mut log);
+            log
+        });
+        Self {
+            child,
+            stdin,
+            stdout,
+            stderr: Some(stderr),
+        }
+    }
+
+    /// Start the sidecar, shake hands and open the H.264 fixture.
+    fn open_fixture() -> (Self, vance_decoder::StreamInfo) {
+        use vance_decoder::protocol::{DecoderRequest as Req, DecoderResponse as Resp};
+        let mut sc = Self::start();
+        let hello = sc.request(
+            vec![],
+            Req::Hello {
+                protocol_version: vance_decoder::protocol::PROTOCOL_VERSION,
+            },
+        );
+        assert!(
+            matches!(hello, Resp::Hello { protocol_version, .. }
+                if protocol_version == vance_decoder::protocol::PROTOCOL_VERSION),
+            "{hello:?}"
+        );
+        let open = Req::Open {
+            path: fixture_path().to_string_lossy().into_owned(),
+        };
+        match sc.request(vec![], open) {
+            Resp::Opened(info) => (sc, info),
+            other => panic!("open: {other:?}"),
+        }
+    }
+
+    fn send(&mut self, msg: &impl serde::Serialize) {
+        use std::io::Write;
+        let stdin = self.stdin.as_mut().expect("stdin open");
+        vance_ipc::write_frame(stdin, msg).expect("send");
+        stdin.flush().expect("flush");
+    }
+
+    fn recv(&mut self) -> vance_decoder::DecoderResponse {
+        vance_ipc::read_frame(&mut self.stdout).expect("reply")
+    }
+
+    /// Send `request` with `releases` riding along, and wait for the reply.
+    fn request(
+        &mut self,
+        releases: Vec<vance_decoder::protocol::SlotRef>,
+        request: vance_decoder::DecoderRequest,
+    ) -> vance_decoder::DecoderResponse {
+        self.send(&vance_decoder::DecoderEnvelope { releases, request });
+        self.recv()
+    }
+
+    fn recv_blob(&mut self, len: u64) -> Vec<u8> {
+        vance_ipc::read_blob(&mut self.stdout, len).expect("blob")
+    }
+
+    /// Close stdin and wait for the sidecar to exit: its exit status and
+    /// everything it wrote to stderr.
+    fn exit(mut self) -> (std::process::ExitStatus, String) {
+        drop(self.stdin.take());
+        let status = self.child.wait().expect("wait for the sidecar");
+        let log = self.stderr.take().expect("not yet joined").join().unwrap();
+        eprint!("{log}");
+        (status, log)
+    }
+
+    /// Shut down cleanly, with `releases` riding on the `Shutdown`. Returns
+    /// the stale-release counts the sidecar logged, in order (it logs only
+    /// non-zero counts).
+    fn finish(mut self, releases: Vec<vance_decoder::protocol::SlotRef>) -> Vec<u32> {
+        use vance_decoder::protocol::{DecoderRequest as Req, DecoderResponse as Resp};
+        let bye = self.request(releases, Req::Shutdown);
+        assert!(matches!(bye, Resp::Goodbye), "{bye:?}");
+        let (status, log) = self.exit();
+        assert!(status.success(), "sidecar exited with {status}");
+        // The line `log_stale_releases` in src/bin/main.rs writes.
+        log.lines()
+            .filter_map(|line| {
+                line.strip_prefix("[decoder] ignored ")?
+                    .strip_suffix(" stale shared-memory slot releases")?
+                    .parse()
+                    .ok()
+            })
+            .collect()
+    }
+}
+
+impl Drop for RawSidecar {
+    fn drop(&mut self) {
+        // A failed test must not leave the sidecar running.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The raw protocol: a region that doesn't exist can't be attached,
+/// releases for a region the sidecar never attached are all stale, and
+/// neither disturbs decoding (the releases ride on a `DecodeAt`). The
+/// `Frame` reply's pixels follow it as exactly one blob of the announced
+/// length.
 #[test]
 fn shm_requests_without_a_region_leave_frames_inline() {
     use vance_decoder::protocol::{
         DecoderRequest as Req, DecoderResponse as Resp, FramePayload, ShmRegionDesc, SlotRef,
-        PROTOCOL_VERSION,
     };
-    let bin = sidecar_binary_path();
-    assert!(bin.exists(), "decoder binary missing at {}", bin.display());
-    let mut sc: vance_ipc::Sidecar<Req, Resp> =
-        vance_ipc::Sidecar::spawn(&bin, std::iter::empty::<&str>()).expect("spawn");
-    let hello = sc
-        .request(&Req::Hello {
-            protocol_version: PROTOCOL_VERSION,
-        })
-        .unwrap();
-    assert!(
-        matches!(hello, Resp::Hello { protocol_version, .. } if protocol_version == PROTOCOL_VERSION),
-        "{hello:?}"
-    );
-    let info = match sc
-        .request(&Req::Open {
-            path: fixture_path().to_string_lossy().into_owned(),
-        })
-        .unwrap()
-    {
-        Resp::Opened(info) => info,
-        other => panic!("open: {other:?}"),
-    };
+    let (mut sc, info) = RawSidecar::open_fixture();
 
     let missing = ShmRegionDesc {
         epoch: 1,
@@ -140,7 +247,7 @@ fn shm_requests_without_a_region_leave_frames_inline() {
         slot_count: 3,
         slot_size: vance_ipc::shm::SLOT_ALIGN,
     };
-    let reply = sc.request(&Req::AttachShm(missing)).unwrap();
+    let reply = sc.request(vec![], Req::AttachShm(missing));
     assert!(matches!(reply, Resp::ShmUnavailable { .. }), "{reply:?}");
 
     let slot = SlotRef {
@@ -149,15 +256,10 @@ fn shm_requests_without_a_region_leave_frames_inline() {
         generation: 1,
         len: 10,
     };
-    let reply = sc
-        .request(&Req::Release {
-            slots: vec![slot, SlotRef { slot: 1, ..slot }],
-        })
-        .unwrap();
-    assert!(matches!(reply, Resp::Released { stale: 2 }), "{reply:?}");
-
+    let mut releases = vec![slot, SlotRef { slot: 1, ..slot }];
     for _ in 0..2 {
-        let (meta, len) = match sc.request(&Req::DecodeAt { target_pts: 0 }).unwrap() {
+        let decode = Req::DecodeAt { target_pts: 0 };
+        let (meta, len) = match sc.request(std::mem::take(&mut releases), decode) {
             Resp::Frame {
                 meta,
                 payload: FramePayload::Inline { len },
@@ -167,67 +269,46 @@ fn shm_requests_without_a_region_leave_frames_inline() {
         assert_eq!((meta.width, meta.height), (info.width, info.height));
         let expected = meta.pixel_format.frame_size(meta.width, meta.height) as u64;
         assert_eq!(len, expected);
-        assert_eq!(sc.recv_blob(len).unwrap().len() as u64, expected);
+        assert_eq!(sc.recv_blob(len).len() as u64, expected);
     }
-    assert!(matches!(sc.request(&Req::Shutdown).unwrap(), Resp::Goodbye));
+    assert_eq!(sc.finish(vec![]), [2], "stale releases logged");
 }
 
-/// The raw v3 protocol with a real region: once attached, frames arrive as
+/// The raw protocol with a real region: once attached, frames arrive as
 /// `Shared` slot references with no blob, byte-identical to the inline
-/// frames of a sidecar without a region. Released slots are reused with a
-/// new generation; stale releases are counted; stopping a stream hands its
-/// unsent slots back; with no slot free the main thread goes inline; and a
-/// newer region replaces the old one.
+/// frames of a sidecar without a region. A release riding on a request is
+/// taken back before that request is served, so its slot is reused at once
+/// under a new generation; stale releases are ignored and logged; stopping
+/// a stream hands its unsent slots back; with no slot free the main thread
+/// goes inline; and a newer region replaces the old one.
 #[test]
 fn shm_frames_match_inline_frames_and_slots_come_back() {
     use std::sync::Arc;
     use vance_decoder::protocol::{
         DecoderRequest as Req, DecoderResponse as Resp, FrameMeta, FramePayload, SlotRef,
-        StreamInfo, PROTOCOL_VERSION,
     };
     use vance_ipc::shm::{Access, Adopted, LeaseTable, ReleaseQueue, ShmRegion, SLOT_ALIGN};
-    type Sc = vance_ipc::Sidecar<Req, Resp>;
 
-    let bin = sidecar_binary_path();
-    assert!(bin.exists(), "decoder binary missing at {}", bin.display());
-    let spawn_open = || -> (Sc, StreamInfo) {
-        let mut sc: Sc = vance_ipc::Sidecar::spawn(&bin, std::iter::empty::<&str>()).unwrap();
-        let hello = sc
-            .request(&Req::Hello {
-                protocol_version: PROTOCOL_VERSION,
-            })
-            .unwrap();
-        assert!(matches!(hello, Resp::Hello { .. }), "{hello:?}");
-        let open = Req::Open {
-            path: fixture_path().to_string_lossy().into_owned(),
-        };
-        match sc.request(&open).unwrap() {
-            Resp::Opened(info) => (sc, info),
-            other => panic!("open: {other:?}"),
-        }
-    };
-    let decode = |sc: &mut Sc, target_pts| match sc.request(&Req::DecodeAt { target_pts }) {
-        Ok(Resp::Frame { meta, payload }) => (meta, payload),
+    let decode = |sc: &mut RawSidecar, releases: Vec<SlotRef>, target_pts| match sc
+        .request(releases, Req::DecodeAt { target_pts })
+    {
+        Resp::Frame { meta, payload } => (meta, payload),
         other => panic!("decode_at {target_pts}: {other:?}"),
-    };
-    let release = |sc: &mut Sc, slots: Vec<SlotRef>| match sc.request(&Req::Release { slots }) {
-        Ok(Resp::Released { stale }) => stale,
-        other => panic!("release: {other:?}"),
     };
 
     // The reference: an inline frame from a sidecar that never gets a region.
-    let (mut inline_sc, _) = spawn_open();
-    let (meta0, bytes0) = match decode(&mut inline_sc, 0) {
-        (meta, FramePayload::Inline { len }) => (meta, inline_sc.recv_blob(len).unwrap()),
+    let (mut inline_sc, _) = RawSidecar::open_fixture();
+    let (meta0, bytes0) = match decode(&mut inline_sc, vec![], 0) {
+        (meta, FramePayload::Inline { len }) => (meta, inline_sc.recv_blob(len)),
         other => panic!("expected an inline frame, got {other:?}"),
     };
 
-    let (mut sc, info) = spawn_open();
+    let (mut sc, info) = RawSidecar::open_fixture();
     let frame_size = info.pixel_format.frame_size(info.width, info.height) as u64;
     let slot_size = frame_size.div_ceil(SLOT_ALIGN) * SLOT_ALIGN;
     // The parent's mapping is read-only, as in the real client.
     let mut region = ShmRegion::create(1, 3, slot_size, Access::ReadOnly).expect("create region");
-    let reply = sc.request(&Req::AttachShm(region.desc().clone())).unwrap();
+    let reply = sc.request(vec![], Req::AttachShm(region.desc().clone()));
     assert!(matches!(reply, Resp::ShmAttached { epoch: 1 }), "{reply:?}");
     // The parent owns the name: the child must not have unlinked it.
     region
@@ -246,77 +327,112 @@ fn shm_frames_match_inline_frames_and_slots_come_back() {
         other => panic!("expected a shared frame, got {other:?}"),
     };
 
-    let (meta, r) = shared(decode(&mut sc, 0));
+    let (meta, r) = shared(decode(&mut sc, vec![], 0));
     assert_eq!(meta, meta0);
     assert_eq!((r.epoch, r.len), (1, frame_size));
     let lease = read(r);
     assert!(lease[..] == bytes0[..], "shared frame differs from inline");
     drop(lease);
-    // No blob followed the shared frame, or this reply would be garbage.
-    assert_eq!(release(&mut sc, queue.drain()), 0);
+    let released = queue.drain();
+    assert_eq!(released, [r]);
 
-    // The released slot is the next one used, under a new generation.
-    let (_, r2) = shared(decode(&mut sc, 0));
+    // The release rides on the next decode and is taken back first, so that
+    // decode reuses the slot, under a new generation. (No blob followed the
+    // shared frame, or this reply would be garbage.)
+    let (_, r2) = shared(decode(&mut sc, released, 0));
     assert_eq!((r2.slot, r2.generation), (r.slot, r.generation + 1));
     let lease2 = read(r2);
     assert!(
         lease2[..] == bytes0[..],
         "reused slot holds the wrong frame"
     );
-    // A second release of the first use is stale.
-    assert_eq!(release(&mut sc, vec![r]), 1);
 
-    // Stopping a stream returns every slot its decode thread had filled
-    // but not sent. The parent keeps holding `r2`.
-    let started = sc.request(&Req::StartStream {
-        from_pts: 0,
-        buffer_frames: 8,
-    });
-    assert!(matches!(started, Ok(Resp::Streaming { .. })), "{started:?}");
-    let (_, streamed) = match sc.request(&Req::NextFrame) {
-        Ok(Resp::Frame { meta, payload }) => shared((meta, payload)),
+    // A second release of the first use is stale (logged: 1). It rides on
+    // the stream start, which it doesn't disturb.
+    let started = sc.request(
+        vec![r],
+        Req::StartStream {
+            from_pts: 0,
+            buffer_frames: 8,
+        },
+    );
+    assert!(matches!(started, Resp::Streaming { .. }), "{started:?}");
+    let (_, streamed) = match sc.request(vec![], Req::NextFrame) {
+        Resp::Frame { meta, payload } => shared((meta, payload)),
         other => panic!("next_frame: {other:?}"),
     };
-    assert_eq!(release(&mut sc, vec![streamed]), 0);
-    // Let the decode thread fill both free slots and wait for a third.
+    // Let the decode thread fill the free slot and wait for another.
     std::thread::sleep(std::time::Duration::from_millis(300));
-    assert!(matches!(sc.request(&Req::StopStream), Ok(Resp::Stopped)));
+    // Stopping a stream returns every slot its decode thread had filled but
+    // not sent; `streamed` rides on the stop. The parent keeps `r2`.
+    let stopped = sc.request(vec![streamed], Req::StopStream);
+    assert!(matches!(stopped, Resp::Stopped), "{stopped:?}");
     // Two slots are free again (one is still leased): two shared frames,
     // then the main thread, which never waits, sends the next one inline.
-    let (_, a) = shared(decode(&mut sc, 0));
-    let (_, b) = shared(decode(&mut sc, 0));
+    let (_, a) = shared(decode(&mut sc, vec![], 0));
+    let (_, b) = shared(decode(&mut sc, vec![], 0));
     let lease_a = read(a);
     assert!(lease_a[..] == bytes0[..]);
-    match decode(&mut sc, 0) {
+    match decode(&mut sc, vec![], 0) {
         (meta, FramePayload::Inline { len }) => {
             assert_eq!(meta, meta0);
-            assert!(
-                sc.recv_blob(len).unwrap() == bytes0,
-                "inline fallback differs"
-            );
+            assert!(sc.recv_blob(len) == bytes0, "inline fallback differs");
         }
         other => panic!("expected an inline frame with every slot out, got {other:?}"),
     }
 
     // A bigger region (new epoch) replaces this one while its slots are
-    // still out; releases for the old epoch are then stale.
+    // still out; releases for the old epoch are then stale (logged: 3), and
+    // the decode they ride on is served from the new region.
     let new_region =
         ShmRegion::create(2, 3, 2 * slot_size, Access::ReadOnly).expect("create region 2");
-    let reply = sc
-        .request(&Req::AttachShm(new_region.desc().clone()))
-        .unwrap();
+    let reply = sc.request(vec![], Req::AttachShm(new_region.desc().clone()));
     assert!(matches!(reply, Resp::ShmAttached { epoch: 2 }), "{reply:?}");
-    let (_, r3) = shared(decode(&mut sc, 0));
+    let (_, r3) = shared(decode(&mut sc, vec![], 0));
     assert_eq!(r3.epoch, 2);
     drop((lease2, lease_a));
     let mut old = queue.drain();
     old.push(b);
-    assert_eq!(release(&mut sc, old), 3);
-    assert_eq!(release(&mut sc, vec![r3]), 0);
+    let (_, r4) = shared(decode(&mut sc, old, 0));
+    assert_eq!(r4.epoch, 2);
 
-    assert!(matches!(sc.request(&Req::Shutdown), Ok(Resp::Goodbye)));
-    assert!(matches!(
-        inline_sc.request(&Req::Shutdown),
-        Ok(Resp::Goodbye)
-    ));
+    // Releases of the new region's slots, riding on the shutdown, are not.
+    assert_eq!(sc.finish(vec![r3, r4]), [1, 3], "stale releases logged");
+    assert_eq!(inline_sc.finish(vec![]), [] as [u32; 0]);
+}
+
+/// A client on protocol v3 sends a bare `Hello` (no envelope), which this
+/// sidecar can't read. It still gets this sidecar's `Hello` back, so its
+/// handshake fails as a version mismatch instead of on a dead pipe.
+#[test]
+fn a_v3_client_hears_this_sidecars_version() {
+    use vance_decoder::protocol::{DecoderResponse as Resp, PROTOCOL_VERSION};
+    // Variant 0 of v3's `DecoderRequest`.
+    #[derive(serde::Serialize)]
+    enum V3Request {
+        Hello { protocol_version: u32 },
+    }
+    let mut sc = RawSidecar::start();
+    sc.send(&V3Request::Hello {
+        protocol_version: 3,
+    });
+    let reply = sc.recv();
+    assert!(
+        matches!(
+            reply,
+            Resp::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                ..
+            }
+        ),
+        "{reply:?}"
+    );
+    let (status, log) = sc.exit();
+    assert!(!status.success(), "an unreadable request ends the sidecar");
+    assert!(
+        log.contains(&format!(
+            "unreadable request (this sidecar speaks protocol v{PROTOCOL_VERSION})"
+        )),
+        "{log}"
+    );
 }

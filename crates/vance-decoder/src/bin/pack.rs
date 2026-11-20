@@ -3,7 +3,7 @@
 //! from the [`Allocator`].
 
 use crate::alloc::{Allocator, FrameBuf, Wait};
-use std::thread;
+use crate::media;
 use vance_decoder::hwaccel;
 use vance_decoder::protocol::{FrameMeta, PixelFormat};
 use vance_ffmpeg_sys::ffmpeg;
@@ -44,12 +44,12 @@ impl Drop for SwsContext {
     }
 }
 
-/// swscale slice threads per converter: one per core, capped at 8 (each
-/// converter keeps its own worker pool). Single-threaded, a 4K 10-bit
-/// 4:2:2 -> 4:2:0 pass took ~30 ms on an M1, a whole real-time frame budget;
-/// 8 threads brought it to ~9 ms.
+/// swscale slice threads per converter: `VANCE_CONVERT_THREADS` if set, else
+/// one per core, capped at 8 (each converter keeps its own worker pool).
+/// Single-threaded, a 4K 10-bit 4:2:2 -> 4:2:0 pass took ~30 ms on an M1, a
+/// whole real-time frame budget; 8 threads brought it to ~9 ms.
 fn conversion_threads() -> usize {
-    thread::available_parallelism().map_or(1, |n| n.get().min(8))
+    media::env_threads("VANCE_CONVERT_THREADS")
 }
 
 impl FrameConverter {

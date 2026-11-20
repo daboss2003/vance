@@ -48,7 +48,8 @@ raw blob after the message as the fallback everywhere.**
    the OS name as soon as the child has attached (or failed to). The child maps read-write. No
    control data lives in shared memory: every ownership transfer is a pipe message, so the pipe
    orders them. `Frame { meta, payload: Shared(SlotRef) }` hands a slot to the parent;
-   `Release { slots }` hands slots back (drained from a `ReleaseQueue` before each request).
+   slots go back in the `releases` field of the next request's `DecoderEnvelope` (drained from
+   a `ReleaseQueue`), so returning them costs no round trip of its own (protocol v4).
    `SlotRef`s carry an epoch and a per-slot generation, so late or duplicate releases are
    rejected.
 5. **Epochs.** Regions only grow. A bigger frame size means a new region with a higher epoch;
@@ -58,7 +59,7 @@ raw blob after the message as the fallback everywhere.**
    consumer can never deadlock the producer. `FrameBytes::clone()` always makes an owned copy: a
    clone never extends a lease.
 7. **Sidecar threading.** The sidecar main thread only `try_acquire`s slots, because it is also
-   the thread that receives `Release`; blocking there would deadlock. The decode thread uses
+   the thread that applies the releases riding on each request; blocking there would deadlock. The decode thread uses
    `acquire_timeout(50 ms)` in a loop that also checks its stop flag. Unpublished slots travel
    through the stream channel and are published only when the main thread replies, so draining
    the channel on stop returns them to the pool.
@@ -68,9 +69,10 @@ raw blob after the message as the fallback everywhere.**
 9. **Naming.** Every OS object name comes from one function, `shm::object_name(pid, epoch,
    nonce)`: `/vance` plus three fixed-width hex fields, 30 bytes, within macOS's 31-byte POSIX
    limit. A random nonce keeps a recycled pid from colliding with a crashed process's leftover.
-10. **Protocol.** The decoder protocol moves to v3: `Frame { meta: FrameMeta, payload:
+10. **Protocol.** The decoder protocol moved to v3 here, then v4 (releases ride on every request
+    in a `DecoderEnvelope`) and v5 (`OpenError::NeedsContainer`): `Frame { meta: FrameMeta, payload:
     FramePayload }` with `Inline { len }` (exactly one blob follows) or `Shared(SlotRef)`, plus
-    `AttachShm` / `ShmAttached` / `ShmUnavailable` and `Release` / `Released { stale }`.
+    `AttachShm` / `ShmAttached` / `ShmUnavailable`; stale releases are logged by the sidecar.
     `FrameData` is no longer a wire type; its `bytes` is a `FrameBytes` (owned or leased, read
     through `Deref<Target = [u8]>`).
 11. **Frame-threaded decode** ships in the same milestone. The thread count is
@@ -116,7 +118,8 @@ raw blob after the message as the fallback everywhere.**
   raising `MAX_FRAME_BYTES`.
 
 **Harder:**
-- The decoder protocol is v3: app and sidecar must ship together (they already do).
+- The decoder protocol is v5: app and sidecar must ship together (they already do); the `Hello`
+  handshake reports a mismatch clearly in both directions.
 - Slot ownership is a protocol invariant both sides must keep. The pool and lease bookkeeping
   is generation-checked and covered by tests, but a bug there corrupts frames rather than
   failing loudly.

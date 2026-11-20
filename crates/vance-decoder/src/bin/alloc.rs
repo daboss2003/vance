@@ -26,8 +26,8 @@ const SLOT_WAIT: Duration = Duration::from_millis(50);
 /// How long [`Allocator::alloc`] may wait for a free buffer.
 pub enum Wait<'a> {
     /// Never block. For the sidecar main thread: it is also the thread that
-    /// receives `Release`, so waiting there for a buffer to come back would
-    /// deadlock.
+    /// applies the releases riding on each request envelope, so waiting there
+    /// for a buffer to come back would deadlock.
     Never,
     /// For the stream decode thread: may wait for a buffer, but gives up
     /// (returns `None`) once `stop` is set.
@@ -74,8 +74,8 @@ impl Allocator {
             (None, _) => None,
             (Some(pool), Wait::Never) => pool.try_acquire(),
             // Every slot is with the parent or queued in the stream channel;
-            // one comes back with the parent's next `Release`, or the
-            // channel's drain on stop.
+            // one comes back with the releases on the parent's next request,
+            // or the channel's drain on stop.
             (Some(pool), Wait::UntilStopped(stop)) => loop {
                 if let Some(slot) = pool.acquire_timeout(SLOT_WAIT) {
                     break Some(slot);

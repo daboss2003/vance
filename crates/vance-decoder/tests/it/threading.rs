@@ -9,6 +9,9 @@
 //! stream. Both run with `VANCE_FORCE_SW=1`: VideoToolbox leaves threading
 //! at 1, so only the software path has anything to compare.
 //!
+//! `VANCE_CONVERT_THREADS` (swscale threads) is checked the same way: 1 vs 8
+//! must give the same frames, and the sidecar logs the count it used.
+//!
 //! Fixtures other than the committed H.264 one are generated with the
 //! `ffmpeg` CLI at test time; a case is skipped when ffmpeg or the encoder
 //! it needs isn't available.
@@ -383,6 +386,137 @@ fn hevc_main10_is_identical_threaded() {
         return;
     };
     assert_threading_is_invisible("hevc main10", &fx.0, 50);
+}
+
+/// 10-bit 4:2:2 ProRes, which the sidecar converts to 4:2:0 with swscale.
+fn make_converted_fixture(name: &str) -> Option<Fixture> {
+    make_fixture(
+        name,
+        "prores_ks",
+        "testsrc2=s=640x360:r=25:d=1",
+        &[
+            "-c:v",
+            "prores_ks",
+            "-profile:v",
+            "3",
+            "-pix_fmt",
+            "yuv422p10le",
+        ],
+    )
+}
+
+/// A sidecar with `VANCE_CONVERT_THREADS=convert_threads`.
+fn spawn_converting(convert_threads: &str) -> DecoderClient {
+    let bin = sidecar_binary_path();
+    assert!(bin.exists(), "decoder binary missing at {}", bin.display());
+    DecoderClient::spawn_with_env(
+        &bin,
+        [
+            ("VANCE_CONVERT_THREADS", convert_threads),
+            ("VANCE_DECODE_THREADS", "8"),
+            ("VANCE_FORCE_SW", "1"),
+        ],
+    )
+    .expect("spawn decoder")
+}
+
+/// `VANCE_CONVERT_THREADS` changes how many threads swscale uses, never a
+/// sample: 1 vs 8 conversion threads, streamed and one-shot.
+#[test]
+fn convert_threads_override_is_invisible() {
+    let Some(fx) = make_converted_fixture("prores-convert.mov") else {
+        return;
+    };
+    let path = fx.0.to_string_lossy().into_owned();
+    let mut one = spawn_converting("1");
+    let mut many = spawn_converting("8");
+    let info = one.open(path.clone()).expect("open, 1 thread");
+    many.open(path).expect("open, 8 threads");
+    assert_eq!(
+        info.pixel_format,
+        vance_decoder::protocol::PixelFormat::Yuv420P10Le,
+        "converted to 10-bit 4:2:0"
+    );
+
+    start_both(&mut one, &mut many, 0);
+    let mut frames = Vec::new();
+    while let Some((a, b)) = next_pair("convert threads stream", &mut one, &mut many) {
+        assert_same(&format!("convert threads frame {}", frames.len()), &a, &b);
+        frames.push(a.clone());
+    }
+    assert_eq!(frames.len(), 25, "streamed frame count");
+    for i in [0, 13, 24] {
+        let what = format!("convert threads decode_at frame {i}");
+        assert_decode_at(&what, &mut one, &mut many, &frames[i]);
+    }
+    one.shutdown().expect("shutdown, 1 thread");
+    many.shutdown().expect("shutdown, 8 threads");
+}
+
+const CONVERT_PROBE_ENV: &str = "VANCE_TEST_CONVERT_THREADS_PROBE";
+
+/// The sidecar logs the swscale thread count it converts with: the
+/// override's value, or the default (one per core, at most 8) after logging
+/// that it ignored an invalid one.
+///
+/// Intentional: each case re-runs this test binary with only
+/// `convert_threads_log_probe`. The sidecar inherits its parent's stderr
+/// (vance-ipc), so only a sidecar spawned by a child process of ours writes
+/// to a stderr this test can read.
+#[test]
+fn convert_threads_override_is_logged() {
+    let Some(fx) = make_converted_fixture("prores-convert-log.mov") else {
+        return;
+    };
+    let default = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
+    for (value, threads) in [("1", 1), ("3", 3), ("lots", default), ("0", default)] {
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "threading::convert_threads_log_probe",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CONVERT_PROBE_ENV, &fx.0)
+            .env("VANCE_CONVERT_THREADS", value)
+            .output()
+            .expect("re-run the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "VANCE_CONVERT_THREADS={value}: probe failed:\n{stdout}\n{stderr}"
+        );
+        let used = format!("-> YUV420P10LE (swscale, {threads} threads)");
+        assert!(
+            stderr.contains(&used),
+            "VANCE_CONVERT_THREADS={value}: no {used:?} in the sidecar's log:\n{stderr}"
+        );
+        let ignored = format!("ignoring VANCE_CONVERT_THREADS={value:?}");
+        let invalid = !value.parse::<usize>().is_ok_and(|n| n > 0);
+        assert_eq!(
+            stderr.contains(&ignored),
+            invalid,
+            "VANCE_CONVERT_THREADS={value}: {ignored:?} logged iff invalid:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "run in a process of its own by convert_threads_override_is_logged"]
+fn convert_threads_log_probe() {
+    let Some(path) = std::env::var_os(CONVERT_PROBE_ENV) else {
+        return;
+    };
+    let value = std::env::var("VANCE_CONVERT_THREADS").expect("VANCE_CONVERT_THREADS");
+    let mut client = spawn_converting(&value);
+    client
+        .open(path.to_string_lossy().into_owned())
+        .expect("open");
+    // The first converted frame builds the converter, which logs.
+    client.decode_at(0).expect("decode_at");
+    client.shutdown().expect("shutdown");
 }
 
 /// The one `vance-decoder` child of this process.

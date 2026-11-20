@@ -1,8 +1,9 @@
 //! Decoder wire protocol.
 //!
-//! `DecoderRequest` flows parent → sidecar; `DecoderResponse` flows back.
-//! Versioned by the `PROTOCOL_VERSION` constant. Bump on any breaking
-//! change; older sidecars must reject newer requests cleanly.
+//! `DecoderRequest`s flow parent → sidecar, each wrapped in a
+//! [`DecoderEnvelope`]; `DecoderResponse` flows back. Versioned by the
+//! `PROTOCOL_VERSION` constant. Bump on any breaking change; older sidecars
+//! must reject newer requests cleanly.
 
 use serde::{Deserialize, Serialize};
 
@@ -15,13 +16,37 @@ use serde::{Deserialize, Serialize};
 /// - v3: frames arrive as `Frame { meta, payload }`; inline pixels follow the
 ///   reply as one raw blob instead of a bincode byte array. Adds
 ///   `AttachShm` / `Release` for shared-memory frames (ADR 0006).
-pub const PROTOCOL_VERSION: u32 = 3;
+/// - v4: every request travels in a [`DecoderEnvelope`] that also carries
+///   the slots being released, so returning slots costs no round trip of
+///   its own. `Release` / `Released` are gone.
+/// - v5: `OpenError::NeedsContainer` for raw elementary streams that can't
+///   be seeked (no timestamps).
+///
+/// Every version keeps `Hello` as the first variant of both enums, with the
+/// same fields, so mismatched builds still complete a handshake and report
+/// [`crate::client::ClientError::ProtocolMismatch`]: a v3 sidecar reads a v4
+/// `Hello` envelope (no releases) as a v3 `Hello`, and a v4 sidecar answers
+/// a first request it can't read with its own `Hello`.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 pub use crate::frame::FrameData;
 pub use vance_ipc::shm::{ShmRegionDesc, SlotRef};
 
-/// One request from parent to sidecar.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Every request the client sends is wrapped with the slots it is returning.
+///
+/// The sidecar takes `releases` back first, then handles `request`, so a
+/// frame request can reuse a slot released in the same message.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecoderEnvelope {
+    /// Shared-memory slots the parent is done with. Slots of a region the
+    /// sidecar no longer has, or already returned, are stale and ignored.
+    pub releases: Vec<SlotRef>,
+    /// The request itself.
+    pub request: DecoderRequest,
+}
+
+/// One request from parent to sidecar, sent inside a [`DecoderEnvelope`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DecoderRequest {
     /// Handshake. Sidecar replies with [`DecoderResponse::Hello`].
     Hello {
@@ -91,13 +116,6 @@ pub enum DecoderRequest {
     /// arrive as [`FramePayload::Shared`]) or [`DecoderResponse::ShmUnavailable`]
     /// (they stay inline).
     AttachShm(ShmRegionDesc),
-
-    /// Hand shared-memory slots back to the sidecar once the parent is done
-    /// with them. Reply: [`DecoderResponse::Released`].
-    Release {
-        /// Slots to return. References to another region epoch are stale.
-        slots: Vec<SlotRef>,
-    },
 }
 
 /// One response from sidecar to parent. Always sent in reply to a request,
@@ -172,13 +190,6 @@ pub enum DecoderResponse {
     ShmUnavailable {
         /// Why, for the log.
         reason: String,
-    },
-
-    /// `Release` processed.
-    Released {
-        /// How many of the slots were stale (unknown epoch, already
-        /// released, or an older generation) and were ignored.
-        stale: u32,
     },
 }
 
@@ -302,6 +313,13 @@ pub enum OpenError {
     UnsupportedPixelFormat(String),
     /// FFmpeg returned an error during open / probe.
     FfmpegError(String),
+    /// A raw elementary stream (e.g. a bare `.h264` / `.hevc` file) with no
+    /// container: it has no timestamps, so it can't be seeked or played.
+    /// `format` is FFmpeg's demuxer name. The user should remux it to MP4/MKV.
+    NeedsContainer {
+        /// FFmpeg's demuxer name (e.g. `h264`, `hevc`).
+        format: String,
+    },
 }
 
 #[cfg(test)]
@@ -373,17 +391,45 @@ mod tests {
                 slot_count: 7,
                 slot_size: 25 * 1024 * 1024,
             }),
-            DecoderRequest::Release {
-                slots: vec![SLOT, SlotRef { slot: 4, ..SLOT }],
-            },
         ];
-        for c in cases {
+        let releases = [vec![], vec![SLOT, SlotRef { slot: 4, ..SLOT }]];
+        for (request, releases) in cases.into_iter().zip(releases.iter().cycle()) {
+            let c = DecoderEnvelope {
+                releases: releases.clone(),
+                request,
+            };
             let cfg = bincode::config::standard();
             let bytes = bincode::serde::encode_to_vec(&c, cfg).unwrap();
-            let (back, _): (DecoderRequest, _) =
+            let (back, _): (DecoderEnvelope, _) =
                 bincode::serde::decode_from_slice(&bytes, cfg).unwrap();
-            assert_eq!(format!("{c:?}"), format!("{back:?}"));
+            assert_eq!(c, back);
         }
+    }
+
+    /// A v4 client against a stale v3 sidecar binary: the sidecar (which
+    /// ignores trailing bytes, like `vance_ipc::read_frame`) must read the
+    /// `Hello` envelope as its own `Hello`, so it answers with its version
+    /// and the client reports a mismatch instead of a broken pipe.
+    #[test]
+    fn a_v3_sidecar_reads_the_hello_envelope_as_hello() {
+        // Variant 0 of v3's `DecoderRequest`, as an old sidecar decodes it.
+        #[derive(Debug, Deserialize)]
+        enum V3Request {
+            Hello {
+                #[allow(dead_code)]
+                protocol_version: u32,
+            },
+        }
+        let hello = DecoderEnvelope {
+            releases: Vec::new(),
+            request: DecoderRequest::Hello {
+                protocol_version: PROTOCOL_VERSION,
+            },
+        };
+        let cfg = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&hello, cfg).unwrap();
+        let read: Result<(V3Request, _), _> = bincode::serde::decode_from_slice(&bytes, cfg);
+        assert!(matches!(read, Ok((V3Request::Hello { .. }, _))), "{read:?}");
     }
 
     const SLOT: SlotRef = SlotRef {
@@ -425,7 +471,6 @@ mod tests {
             DecoderResponse::Goodbye,
             DecoderResponse::ShmAttached { epoch: 2 },
             DecoderResponse::ShmUnavailable { reason: "y".into() },
-            DecoderResponse::Released { stale: 1 },
         ];
         for c in cases {
             let cfg = bincode::config::standard();

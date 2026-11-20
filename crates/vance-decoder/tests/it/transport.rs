@@ -4,8 +4,8 @@
 //! inline one (`VANCE_IPC_SHM=0`) must give byte-identical frames, streamed
 //! and one-shot. Also: the lease budget spills instead of stalling the
 //! sidecar, stopped streams hand their slots back, regions only grow, the
-//! test-only slot-size cap sends bigger frames inline, and no region outlives
-//! its client.
+//! test-only slot-size cap sends bigger frames inline, no region outlives
+//! its client, and a `ClientOptions::threads` budget changes no frame.
 //!
 //! Fixtures other than the committed ones are generated with the `ffmpeg`
 //! CLI at test time; a case is skipped when ffmpeg or the encoder it needs
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use vance_decoder::{
-    ClientOptions, DecoderClient, FrameData, PixelFormat, StreamInfo, TransportStats,
+    ClientOptions, DecoderClient, FrameData, PixelFormat, StreamInfo, ThreadBudget, TransportStats,
 };
 use vance_ipc::shm::{live_region_count, SLOT_ALIGN};
 
@@ -513,6 +513,78 @@ fn a_bigger_open_regrows_the_region() {
     assert!(got.bytes.is_shared());
     assert_same("small frames in the grown region", &got, &want);
     assert_eq!(client.transport_stats().inline, 0);
+}
+
+/// A client spawned with the smallest thread budget (one decode and one
+/// conversion thread) gets the same frames as a default client, streamed and
+/// one-shot. ProRes 4:2:2 10-bit takes the frame-threaded decode and the
+/// swscale conversion; software H.264 the frame-threaded decode alone.
+/// (Whether the sidecar honours the counts is `threading`'s to test.)
+#[test]
+fn a_thread_budget_changes_no_frame() {
+    let budget = ClientOptions {
+        threads: Some(ThreadBudget {
+            decode: 1,
+            convert: 1,
+        }),
+        ..ClientOptions::default()
+    };
+    let prores = make_fixture(
+        "mov",
+        "prores_ks",
+        "testsrc2=s=320x180:r=25:d=0.4",
+        &[
+            "-c:v",
+            "prores_ks",
+            "-profile:v",
+            "3",
+            "-pix_fmt",
+            "yuv422p10le",
+        ],
+    );
+    let mut cases = vec![(committed(H264), vec![("VANCE_FORCE_SW", "1")])];
+    if let Some(fx) = &prores {
+        cases.push((fx.path(), vec![]));
+    }
+    for (path, env) in cases {
+        let mut budgeted = DecoderClient::spawn_with_options(
+            sidecar_binary_path(),
+            env.iter().copied(),
+            budget.clone(),
+        )
+        .expect("spawn decoder with a thread budget");
+        let mut default = spawn(&env);
+        let info = budgeted.open(path.as_str()).expect("open, budgeted client");
+        let info_default = default.open(path.as_str()).expect("open, default client");
+        assert_eq!(
+            format!("{info:?}"),
+            format!("{info_default:?}"),
+            "{path}: stream info"
+        );
+
+        budgeted.start_stream(0, 4).expect("start_stream, budgeted");
+        default.start_stream(0, 4).expect("start_stream, default");
+        let mut pts = Vec::new();
+        while let Some((got, want)) = next_pair(&path, &mut budgeted, &mut default) {
+            assert_same(&format!("{path} stream frame {}", pts.len()), &got, &want);
+            pts.push(got.pts);
+        }
+        assert!(pts.len() >= 2, "{path}: only {} frames", pts.len());
+
+        let mid = pts[pts.len() / 2];
+        for target in [pts[0], mid, mid + 1, pts[pts.len() - 1]] {
+            let what = format!("{path} decode_at({target})");
+            let got = budgeted
+                .decode_at(target)
+                .unwrap_or_else(|e| panic!("{what}: budgeted client: {e}"));
+            let want = default
+                .decode_at(target)
+                .unwrap_or_else(|e| panic!("{what}: default client: {e}"));
+            assert_same(&what, &got, &want);
+        }
+        budgeted.shutdown().expect("shutdown, budgeted client");
+        default.shutdown().expect("shutdown, default client");
+    }
 }
 
 const PROBE_ENV: &str = "VANCE_TEST_REGION_LEAK_PROBE";
