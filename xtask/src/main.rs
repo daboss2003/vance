@@ -20,7 +20,10 @@ SUBCOMMANDS:
 
     check / build / test / clippy / bench are disk-guarded: they refuse to
     start, or stop cargo, when free disk space drops below 5 GB
-    (override with VANCE_MIN_FREE_GB).
+    (override with VANCE_MIN_FREE_GB). Before starting they also trim
+    cargo's incremental caches (oldest first) once those pass 4 GB.
+    prune       Delete ALL incremental caches under target/ (safe; the next
+                build recompiles each crate once). Run it with no build active.
 
     fmt         Format all Rust code.
     fmt-check   Check Rust formatting without modifying files.
@@ -64,6 +67,14 @@ fn main() {
 
     let result = match cmd.as_str() {
         "check" => cargo(&["check", "--workspace", "--all-targets"], &rest),
+        "prune" => {
+            let freed = prune_incremental(&target_dir(), 0);
+            eprintln!(
+                "xtask: removed incremental caches, freed {:.1} GB",
+                freed as f64 / GIB as f64
+            );
+            Ok(())
+        }
         "build" => cargo(&["build", "--workspace", "--all-targets"], &rest),
         "test" => test(&rest),
         "fmt" => cargo(&["fmt", "--all"], &rest),
@@ -176,6 +187,117 @@ fn scope_to_packages<'a>(args: &[&'a str], extra: &[String]) -> Vec<&'a str> {
 }
 
 const DEFAULT_MIN_FREE_GB: u64 = 5;
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// Above this, the guarded commands trim incremental caches back to half.
+/// Cargo keeps one ~300 MB cache per crate per build variant (lib, bin,
+/// test, clippy, each feature set) and never deletes stale ones; across a
+/// few variants of vance-app they reached 8.6 GB.
+const INCREMENTAL_LIMIT: u64 = 4 * GIB;
+
+fn target_dir() -> PathBuf {
+    env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join("target"))
+}
+
+/// One incremental cache: `target/<…>/incremental/<crate>-<hash>`.
+struct CacheDir {
+    path: PathBuf,
+    bytes: u64,
+    modified: std::time::SystemTime,
+}
+
+/// Which caches to delete so the total drops to at most `limit / 2`,
+/// oldest-modified first. Nothing is deleted while the total is within
+/// `limit`; `limit == 0` deletes everything.
+fn caches_to_prune(caches: &[CacheDir], limit: u64) -> Vec<usize> {
+    let total: u64 = caches.iter().map(|c| c.bytes).sum();
+    if limit > 0 && total <= limit {
+        return Vec::new();
+    }
+    let target = limit / 2;
+    let mut order: Vec<usize> = (0..caches.len()).collect();
+    order.sort_by_key(|&i| caches[i].modified);
+    let mut remaining = total;
+    let mut doomed = Vec::new();
+    for i in order {
+        if limit > 0 && remaining <= target {
+            break;
+        }
+        remaining -= caches[i].bytes;
+        doomed.push(i);
+    }
+    doomed
+}
+
+/// Trim incremental caches under `target` (see [`caches_to_prune`]); returns
+/// the bytes freed. Intentional: deleting the OLDEST first means a build
+/// running in another terminal, which keeps touching its own cache, is the
+/// last thing to lose it, and losing it only costs that crate a recompile.
+fn prune_incremental(target: &std::path::Path, limit: u64) -> u64 {
+    let mut caches = Vec::new();
+    for dir in incremental_dirs(target) {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let modified = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            caches.push(CacheDir {
+                bytes: dir_bytes(&path),
+                path,
+                modified,
+            });
+        }
+    }
+    let mut freed = 0;
+    for i in caches_to_prune(&caches, limit) {
+        if std::fs::remove_dir_all(&caches[i].path).is_ok() {
+            freed += caches[i].bytes;
+        }
+    }
+    freed
+}
+
+/// `target/<profile>/incremental` and `target/<triple>/<profile>/incremental`.
+fn incremental_dirs(target: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(level1) = std::fs::read_dir(target) else {
+        return out;
+    };
+    for a in level1.flatten() {
+        let a = a.path();
+        if a.join("incremental").is_dir() {
+            out.push(a.join("incremental"));
+        }
+        if let Ok(level2) = std::fs::read_dir(&a) {
+            for b in level2.flatten() {
+                let inc = b.path().join("incremental");
+                if inc.is_dir() {
+                    out.push(inc);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn dir_bytes(path: &std::path::Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    std::fs::read_dir(path)
+        .map(|entries| entries.flatten().map(|e| dir_bytes(&e.path())).sum())
+        .unwrap_or(0)
+}
 
 fn min_free_gb() -> u64 {
     env::var("VANCE_MIN_FREE_GB")
@@ -290,10 +412,18 @@ fn run_disk_guarded(mut cmd: Command) -> Result<(), String> {
     let too_low = |free: u64| {
         format!(
             "only {:.1} GB free on the build volume (minimum {min_gb} GB). \
-             Free some space (e.g. `cargo clean`) or set VANCE_MIN_FREE_GB.",
+             Free some space (`cargo xtask prune` first, `cargo clean` if \
+             that isn't enough) or set VANCE_MIN_FREE_GB.",
             free as f64 / (1024.0 * 1024.0)
         )
     };
+    let freed = prune_incremental(&target_dir(), INCREMENTAL_LIMIT);
+    if freed > 0 {
+        eprintln!(
+            "xtask: trimmed stale incremental caches, freed {:.1} GB",
+            freed as f64 / GIB as f64
+        );
+    }
     match free_kib(&root) {
         Some(free) if free < min_kib => {
             return Err(format!("refusing to start: {}", too_low(free)));
@@ -738,5 +868,59 @@ mod tests {
         }
         let survivors: Vec<_> = kids.iter().filter(|&&p| alive(p)).collect();
         assert!(survivors.is_empty(), "descendants survived: {survivors:?}");
+    }
+
+    fn cache(bytes: u64, age_secs: u64) -> CacheDir {
+        CacheDir {
+            path: PathBuf::new(),
+            bytes,
+            modified: std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs),
+        }
+    }
+
+    #[test]
+    fn caches_within_the_limit_are_kept() {
+        let caches = [cache(3 * GIB, 30), cache(GIB, 10)];
+        assert!(caches_to_prune(&caches, 4 * GIB).is_empty());
+    }
+
+    #[test]
+    fn over_the_limit_trims_oldest_first_down_to_half() {
+        // 6 GiB total, limit 4 GiB → trim to ≤ 2 GiB: drop the two oldest.
+        let caches = [
+            cache(GIB, 5),
+            cache(2 * GIB, 50),
+            cache(GIB, 1),
+            cache(2 * GIB, 40),
+        ];
+        let mut doomed = caches_to_prune(&caches, 4 * GIB);
+        doomed.sort();
+        assert_eq!(doomed, vec![1, 3]);
+    }
+
+    #[test]
+    fn limit_zero_prunes_everything() {
+        let caches = [cache(1, 5), cache(2, 1)];
+        assert_eq!(caches_to_prune(&caches, 0).len(), 2);
+    }
+
+    #[test]
+    fn prune_removes_incremental_dirs_and_reports_bytes() {
+        let target = std::env::temp_dir().join(format!("xtask-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&target);
+        let host = target.join("debug/incremental/vance_app-abc");
+        let cross = target.join("x86_64-unknown-linux-gnu/debug/incremental/vance_ipc-def");
+        let keep = target.join("debug/deps");
+        for d in [&host, &cross, &keep] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(host.join("a.o"), vec![0u8; 1000]).unwrap();
+        std::fs::write(cross.join("b.o"), vec![0u8; 500]).unwrap();
+        std::fs::write(keep.join("lib.rlib"), vec![0u8; 10]).unwrap();
+
+        assert_eq!(prune_incremental(&target, 0), 1500);
+        assert!(!host.exists() && !cross.exists());
+        assert!(keep.join("lib.rlib").exists(), "only incremental caches go");
+        std::fs::remove_dir_all(&target).unwrap();
     }
 }
