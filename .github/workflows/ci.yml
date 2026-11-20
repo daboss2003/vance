@@ -134,6 +134,30 @@ jobs:
           cargo test -p vance-plugin-host --features lv2
           cargo test -p vance-audio --features lv2
 
+  # Windows can't build the whole workspace yet (no FFmpeg dev libraries there
+  # until the Windows/Linux milestone), but vance-ipc has no FFmpeg dependency.
+  # Run its tests on Windows for real so the shared-memory transport (ADR 0006,
+  # on by default on Windows) isn't only type-checked. Blocking on purpose.
+  ipc-windows:
+    name: IPC (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ipc-windows
+
+      - name: Clippy (vance-ipc)
+        run: cargo clippy -p vance-ipc --all-targets -- -D warnings
+
+      - name: Test (vance-ipc)
+        run: cargo test -p vance-ipc
+
   ui:
     name: UI
     runs-on: ubuntu-latest

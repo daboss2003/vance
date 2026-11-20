@@ -43,7 +43,9 @@ pub fn status(cmd: &mut Command) -> io::Result<ExitStatus> {
     spawn(cmd)?.wait()
 }
 
-#[cfg(test)]
+// Unix-only: they drive `sh` / `cat`, which Windows runners don't reliably
+// have on PATH. The race this module closes is macOS-specific anyway.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
