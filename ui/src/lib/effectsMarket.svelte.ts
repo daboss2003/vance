@@ -51,7 +51,7 @@ export async function importEffectPaths(paths: string[]): Promise<void> {
   market.busy = true;
   try {
     for (const path of wasm) {
-      const name = path.split('/').pop() ?? path;
+      const name = path.split(/[\\/]/).pop() ?? path; // both separators: Windows paths
       try {
         const p = await addWasmPlugin(path);
         toast.success(`Added the “${p.name}” effect.`);

@@ -92,6 +92,7 @@ import {
   peaksBackfillVideoAudio
 } from './ipc';
 import { peaksCache } from './peaks-cache.svelte';
+import type { ImportOutcome } from './import-feedback';
 
 class ProjectState {
   /** Current project as the engine sees it; `null` until something is loaded. */
@@ -487,9 +488,11 @@ class ProjectState {
     }
   }
 
-  /** Import a media file by path and append it to the library. */
-  async importMedia(path: string) {
-    this.error = null;
+  /** Import a media file by path and append it to the library. Never throws.
+   *  Intentional: unlike the other mutators it neither sets nor clears
+   *  `error` — the caller reports the outcome as a toast, so writing the
+   *  banner too would show the same failure twice. */
+  async importMedia(path: string): Promise<ImportOutcome> {
     try {
       const item = await importMediaFile(path);
       this.media = [...this.media, item];
@@ -508,8 +511,9 @@ class ProjectState {
           console.warn('peaksEnqueue failed for', item.id, e);
         });
       }
+      return { ok: true, item };
     } catch (e) {
-      this.error = String(e);
+      return { ok: false, error: String(e) };
     }
   }
 
@@ -576,16 +580,19 @@ class ProjectState {
     }
   }
 
-  /** Set or clear the project's display LUT (Phase 6.5). */
-  async setViewLut(path: string | null) {
+  /** Set or clear the project's display LUT (Phase 6.5). Returns whether it
+   *  applied; on failure the reason is in `error`. */
+  async setViewLut(path: string | null): Promise<boolean> {
     this.error = null;
     try {
       await setProjectViewLut(path);
       if (this.info) {
         this.info = { ...this.info, view_lut_path: path };
       }
+      return true;
     } catch (e) {
       this.error = String(e);
+      return false;
     }
   }
 

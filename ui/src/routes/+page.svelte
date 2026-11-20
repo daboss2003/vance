@@ -52,6 +52,7 @@
   import { listen } from '@tauri-apps/api/event';
   import Toasts from '$lib/Toasts.svelte';
   import { toast, pushToast } from '$lib/toast.svelte';
+  import { importToast } from '$lib/import-feedback';
   import Dialogs from '$lib/Dialogs.svelte';
   import { openDialog, dialogs } from '$lib/dialog.svelte';
   import { addWasmPlugin } from '$lib/ipc';
@@ -312,25 +313,22 @@
       toast.error('Create or open a project first, then add media.');
       return;
     }
-    try {
-      await projectState.importMedia(path);
-      toast.success(`Added “${name}” to the media pool.`);
-    } catch (e) {
-      toast.error(`Couldn’t import “${name}”.\n${String(e)}`);
-    }
+    const t = importToast(name, await projectState.importMedia(path));
+    toast[t.kind](t.message);
   }
 
   async function handleFileDrop(paths: string[]) {
     for (const path of paths) {
-      const name = path.split('/').pop() ?? path;
+      // Split on both separators so Windows paths yield the file name too.
+      const name = path.split(/[\\/]/).pop() ?? path;
       const ext = (name.split('.').pop() ?? '').toLowerCase();
       if (ext === 'wasm') {
         await addEffectFromFile(path, name);
       } else if (MEDIA_EXT.has(ext)) {
         await importMediaPath(path, name);
       } else if (ext === 'cube' || ext === '3dl') {
-        await projectState.setViewLut(path);
-        toast.success(`Preview look set from “${name}”.`);
+        // On failure the reason is already in the error banner.
+        if (await projectState.setViewLut(path)) toast.success(`Preview look set from “${name}”.`);
       } else {
         // Ambiguous / unknown — ask instead of guessing.
         const choice = await openDialog({
@@ -1494,7 +1492,7 @@
       ]
     });
     if (typeof selected !== 'string') return;
-    await projectState.importMedia(selected);
+    await importMediaPath(selected, selected.split(/[\\/]/).pop() ?? selected);
   }
 
   function formatDuration(seconds: number): string {
@@ -1748,7 +1746,7 @@
             onclick={pickViewLut}
             title={projectState.info.view_lut_path}
           >
-            {projectState.info.view_lut_path.split('/').pop() ?? '(unnamed)'}
+            {projectState.info.view_lut_path.split(/[\\/]/).pop() ?? '(unnamed)'}
           </button>
           <button
             class="text-vance-muted hover:text-red-400 text-[10px]"
