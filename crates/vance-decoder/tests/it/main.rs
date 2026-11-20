@@ -7,6 +7,7 @@
 //! a new top-level `tests/*.rs` file. Run one module with:
 //!   cargo test -p vance-decoder --test it <module>::
 
+mod annexb;
 mod crash_isolation;
 mod decode_smoke;
 mod hw_decode;

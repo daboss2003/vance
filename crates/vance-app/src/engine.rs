@@ -52,7 +52,7 @@ pub enum EngineError {
     #[error("render: {0}")]
     Render(#[from] vance_render::RenderError),
 
-    #[error("decoder: {0}")]
+    #[error("{}", decoder_error_message(.0))]
     DecoderClient(#[from] vance_decoder::client::ClientError),
 
     #[error("decoder spawn: {0}")]
@@ -109,6 +109,31 @@ impl EngineError {
     fn from_core(e: vance_core::Error) -> Self {
         EngineError::Project(e.to_string())
     }
+}
+
+/// How a decoder error reads in the UI: "decoder: " and the client's
+/// wording, except a bare elementary stream (`.h264`, `.hevc`), which says
+/// what is wrong and how to fix it.
+fn decoder_error_message(e: &vance_decoder::client::ClientError) -> String {
+    use vance_decoder::{client::ClientError, OpenError};
+    let ClientError::Open(OpenError::NeedsContainer { format }) = e else {
+        return format!("decoder: {e}");
+    };
+    let (codec, ext) = match format.as_str() {
+        "h264" => ("H.264".to_string(), "h264"),
+        "hevc" => ("HEVC (H.265)".to_string(), "hevc"),
+        "mpegvideo" => ("MPEG-1/2 video".to_string(), "m2v"),
+        other => (other.to_uppercase(), other),
+    };
+    // Intentional: the command re-encodes. `-c copy` from a bare stream with
+    // B-frames drops the first frames and leaves the rest out of order in
+    // MP4, and fails for MKV and MPEG-TS (FFmpeg 7.1 and 8.1).
+    format!(
+        "This is a raw {codec} stream with no container (no timestamps), so Vance can't \
+         seek or play it. Convert it to MP4 first, e.g. \
+         `ffmpeg -i in.{ext} -c:v libx264 -crf 17 out.mp4`. A lossless `-c copy` remux \
+         only keeps the timing right for streams without B-frames."
+    )
 }
 
 /// Lightweight summary of the loaded project for the UI. Kept small so
@@ -10675,6 +10700,38 @@ pub(crate) fn sidecar_presence() -> (bool, bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bare_stream_import_error_says_how_to_fix_it() {
+        use vance_decoder::{client::ClientError, OpenError};
+        let message = |format: &str| {
+            EngineError::from(ClientError::Open(OpenError::NeedsContainer {
+                format: format.into(),
+            }))
+            .to_string()
+        };
+        assert_eq!(
+            message("h264"),
+            "This is a raw H.264 stream with no container (no timestamps), so Vance can't \
+             seek or play it. Convert it to MP4 first, e.g. \
+             `ffmpeg -i in.h264 -c:v libx264 -crf 17 out.mp4`. A lossless `-c copy` remux \
+             only keeps the timing right for streams without B-frames."
+        );
+        let hevc = message("hevc");
+        assert!(
+            hevc.starts_with("This is a raw HEVC (H.265) stream"),
+            "{hevc}"
+        );
+        assert!(hevc.contains("`ffmpeg -i in.hevc -c:v libx264"), "{hevc}");
+        let vvc = message("vvc");
+        assert!(vvc.starts_with("This is a raw VVC stream"), "{vvc}");
+        assert!(vvc.contains("`ffmpeg -i in.vvc "), "{vvc}");
+        // Every other decoder error keeps its wording.
+        assert_eq!(
+            EngineError::from(ClientError::Open(OpenError::NoVideoStream)).to_string(),
+            "decoder: decoder open failed: NoVideoStream"
+        );
+    }
 
     #[test]
     fn grain_window_fades_edges_keeps_middle() {

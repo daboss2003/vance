@@ -44,6 +44,12 @@ pub struct OpenContext {
     sw_dest_frame: Option<ffmpeg::frame::Video>,
     /// Built on the first decoded frame whose format isn't `info.pixel_format`.
     converter: Option<FrameConverter>,
+    /// The keyframe packet [`seek`] stopped on, read but not decoded yet:
+    /// the next decode sends it before reading on.
+    pending: Option<ffmpeg::Packet>,
+    /// The video stream's first pts in microseconds (0 when unknown): where
+    /// [`seek`]'s search for an earlier keyframe ends.
+    start_us: i64,
 }
 
 pub fn open(path: &str) -> Result<OpenContext, OpenError> {
@@ -52,16 +58,21 @@ pub fn open(path: &str) -> Result<OpenContext, OpenError> {
         return Err(OpenError::NotFound(path.to_string()));
     }
 
-    let input = ffmpeg::format::input(p).map_err(|e| OpenError::FfmpegError(e.to_string()))?;
+    let mut input = ffmpeg::format::input(p).map_err(|e| OpenError::FfmpegError(e.to_string()))?;
 
-    let stream = input
+    let stream_index = input
         .streams()
         .best(ffmpeg::media::Type::Video)
-        .ok_or(OpenError::NoVideoStream)?;
-    let stream_index = stream.index();
+        .ok_or(OpenError::NoVideoStream)?
+        .index();
+    if let Some(format) = raw_stream_without_timestamps(&mut input, stream_index) {
+        return Err(OpenError::NeedsContainer { format });
+    }
+    let stream = input.stream(stream_index).ok_or(OpenError::NoVideoStream)?;
     let time_base = stream.time_base();
     let avg_rate = stream.avg_frame_rate();
     let duration = stream.duration();
+    let start_time = stream.start_time();
     let codec_id = stream.parameters().id();
     let codec_name = format!("{codec_id:?}").to_lowercase();
 
@@ -134,12 +145,17 @@ pub fn open(path: &str) -> Result<OpenContext, OpenError> {
         }
     );
 
+    let time_base = (time_base.numerator() as i64, time_base.denominator() as i64);
+    let start_us = match start_time {
+        ffmpeg::sys::AV_NOPTS_VALUE => 0,
+        pts => pts_to_us(pts, time_base),
+    };
     let info = StreamInfo {
         width: decoder.width(),
         height: decoder.height(),
         pixel_format,
         frame_rate: (avg_rate.numerator() as i64, avg_rate.denominator() as i64),
-        time_base: (time_base.numerator() as i64, time_base.denominator() as i64),
+        time_base,
         duration_pts: if duration > 0 { Some(duration) } else { None },
         codec_name,
         stream_index: stream_index as u32,
@@ -155,19 +171,87 @@ pub fn open(path: &str) -> Result<OpenContext, OpenError> {
         _hw_device: hw_device,
         sw_dest_frame,
         converter: None,
+        pending: None,
+        start_us,
     })
 }
 
-pub fn seek(ctx: &mut OpenContext, target_pts: i64) -> Result<(), String> {
-    let (tb_num, tb_den) = ctx.info.time_base;
-    let target_us = if tb_den != 0 {
-        target_pts.saturating_mul(tb_num).saturating_mul(1_000_000) / tb_den
+/// FFmpeg's demuxers for bare video elementary streams: the codec's own
+/// bitstream with no container around it.
+const RAW_VIDEO_DEMUXERS: &[&str] = &[
+    "av1",
+    "avs2",
+    "avs3",
+    "cavsvideo",
+    "dirac",
+    "dnxhd",
+    "evc",
+    "h261",
+    "h263",
+    "h264",
+    "hevc",
+    "ingenient",
+    "ipu",
+    "m4v",
+    "mjpeg",
+    "mjpeg_2000",
+    "mpegvideo",
+    "obu",
+    "vc1",
+    "vvc",
+];
+
+/// The demuxer's name if `input` is a raw elementary stream (one of
+/// [`RAW_VIDEO_DEMUXERS`]) whose first video packet has no pts. Such a
+/// stream has nothing to seek by or to place frames in time with: bare
+/// H.264 / HEVC carry no timestamps at all (every seek fails with EPERM),
+/// and raw MPEG-1/2 video only gets dts made up from the frame rate, so its
+/// frames come out without a pts. Raw streams whose parser does supply a pts
+/// (MPEG-4 Part 2, H.263, DNxHD) seek and decode, so they still open. Only
+/// these demuxers are checked: a container with dts but no pts (AVI) opens
+/// as before, and so do image pipes (a PNG opens as `png_pipe`).
+fn raw_stream_without_timestamps(
+    input: &mut ffmpeg::format::context::Input,
+    stream_index: usize,
+) -> Option<String> {
+    let name = input.format().name();
+    if !RAW_VIDEO_DEMUXERS.contains(&name) {
+        return None;
+    }
+    // Comes from the packets stream probing buffered; every later decode
+    // seeks before it reads, so taking one here costs nothing.
+    match read_video_packet(input, stream_index) {
+        Ok(Some(packet)) if packet.pts().is_some() => None,
+        _ => Some(name.to_string()),
+    }
+}
+
+/// A pts in `time_base` as microseconds (`AV_TIME_BASE`), what `seek` takes.
+fn pts_to_us(pts: i64, (tb_num, tb_den): (i64, i64)) -> i64 {
+    if tb_den != 0 {
+        pts.saturating_mul(tb_num).saturating_mul(1_000_000) / tb_den
     } else {
-        target_pts
-    };
-    ctx.input
-        .seek(target_us, i64::MIN..=target_us)
-        .map_err(|e| format!("seek: {e}"))?;
+        pts
+    }
+}
+
+/// The furthest [`seek_to_keyframe`] steps back from a target before it
+/// tries the stream start.
+const MAX_SEEK_BACK_US: i64 = 64_000_000;
+
+/// How far before the stream start [`seek_to_start`] aims.
+const START_MARGIN_US: i64 = 10_000_000;
+
+/// Video packets one seek attempt reads while looking for a keyframe. Bounds
+/// the search in a file whose packets carry no keyframe flags.
+const KEYFRAME_SCAN_LIMIT: usize = 2048;
+
+/// Seek so the next decode starts at a keyframe at or before `target_pts`
+/// (or at the stream start), and flush the one-shot decoder.
+pub fn seek(ctx: &mut OpenContext, target_pts: i64) -> Result<(), String> {
+    // Cleared first so a failed seek leaves no packet from the last one.
+    ctx.pending = None;
+    ctx.pending = seek_to_keyframe(ctx, target_pts)?;
     ctx.decoder.flush();
     // Intentional: frames are pulled and dropped right after the flush.
     // FFmpeg 7.1's HEVC decoder keeps its output queue across
@@ -178,6 +262,125 @@ pub fn seek(ctx: &mut OpenContext, target_pts: i64) -> Result<(), String> {
     let mut stale = ffmpeg::frame::Video::empty();
     while ctx.decoder.receive_frame(&mut stale).is_ok() {}
     Ok(())
+}
+
+/// Position `ctx.input` on a keyframe at or before `target_pts` and return
+/// that keyframe's packet, already read. `None`: no keyframe was found even
+/// from the stream start (packets without keyframe flags), and decoding
+/// starts at the stream's first packet.
+///
+/// An indexed container (MP4, MOV, MKV) seeks straight to such a keyframe,
+/// so this reads only the packet the decode would read first anyway. MPEG-TS
+/// has no keyframe index: FFmpeg seeks it by timestamp and can stop on any
+/// frame, and decoding from there gave H.264's next GOP instead of the
+/// target and HEVC frames without their references.
+///
+/// Intentional: when the seek lands past the keyframe the target needs, it
+/// seeks again 1 s, 2 s, 4 s ... (doubling, at most 64 s) before the target,
+/// then from the stream start. The step is a guess at the GOP length; the
+/// doubling bounds the attempts for any length, and the cap bounds how much
+/// a file without keyframe flags is read before decoding from the start.
+fn seek_to_keyframe(
+    ctx: &mut OpenContext,
+    target_pts: i64,
+) -> Result<Option<ffmpeg::Packet>, String> {
+    let target_us = pts_to_us(target_pts, ctx.info.time_base);
+    let mut back_us = 0;
+    while back_us <= MAX_SEEK_BACK_US {
+        let from_us = target_us.saturating_sub(back_us);
+        if from_us <= ctx.start_us {
+            break;
+        }
+        if let Err(e) = seek_input(&mut ctx.input, from_us) {
+            if back_us == 0 {
+                return Err(e);
+            }
+            break;
+        }
+        if let Some(key) = scan_for_keyframe(ctx, target_pts, false)? {
+            return Ok(Some(key));
+        }
+        back_us = if back_us == 0 { 1_000_000 } else { back_us * 2 };
+    }
+    seek_to_start(ctx)?;
+    if let Some(key) = scan_for_keyframe(ctx, target_pts, true)? {
+        return Ok(Some(key));
+    }
+    seek_to_start(ctx)?;
+    Ok(None)
+}
+
+/// Read video packets up to the first keyframe and return it if decoding
+/// can start there: it is at or before `target_pts`, or `from_start` (the
+/// stream's first keyframe is the earliest start there is). `None` if it is
+/// past the target, or a packet before it already is (a later keyframe is
+/// later still), or at end of file, or after [`KEYFRAME_SCAN_LIMIT`]
+/// packets. The packets before the keyframe are dropped: they belong to the
+/// GOP before it.
+fn scan_for_keyframe(
+    ctx: &mut OpenContext,
+    target_pts: i64,
+    from_start: bool,
+) -> Result<Option<ffmpeg::Packet>, String> {
+    for _ in 0..KEYFRAME_SCAN_LIMIT {
+        let Some(packet) = read_video_packet(&mut ctx.input, ctx.stream_index)? else {
+            return Ok(None);
+        };
+        // dts where there is no pts (AVI).
+        let past_target = packet
+            .pts()
+            .or(packet.dts())
+            .is_some_and(|ts| ts > target_pts);
+        if packet.is_key() {
+            return Ok((from_start || !past_target).then_some(packet));
+        }
+        if past_target && !from_start {
+            return Ok(None);
+        }
+    }
+    Ok(None)
+}
+
+/// Seek the demuxer to `ts_us` or the nearest point before it.
+fn seek_input(input: &mut ffmpeg::format::context::Input, ts_us: i64) -> Result<(), String> {
+    input
+        .seek(ts_us, i64::MIN..=ts_us)
+        .map_err(|e| format!("seek: {e}"))
+}
+
+/// Seek to the video stream's first packet.
+fn seek_to_start(ctx: &mut OpenContext) -> Result<(), String> {
+    // Intentional: aimed well before the start pts. MPEG-TS seeks by dts and
+    // a B-frame stream's first dts precedes its first pts, so aiming at the
+    // start itself stops a packet or two in. Some demuxers (AVI, image and
+    // raw streams) refuse a time before their first entry; then the start
+    // itself.
+    seek_input(&mut ctx.input, ctx.start_us.saturating_sub(START_MARGIN_US))
+        .or_else(|_| seek_input(&mut ctx.input, ctx.start_us))
+}
+
+/// The next packet of the video stream, or `None` at end of file.
+fn read_video_packet(
+    input: &mut ffmpeg::format::context::Input,
+    stream_index: usize,
+) -> Result<Option<ffmpeg::Packet>, String> {
+    loop {
+        let mut packet = ffmpeg::Packet::empty();
+        match packet.read(input) {
+            Ok(()) if packet.stream() == stream_index => return Ok(Some(packet)),
+            Ok(()) => {}
+            Err(ffmpeg::Error::Eof) => return Ok(None),
+            Err(e) => return Err(format!("read packet: {e}")),
+        }
+    }
+}
+
+/// The packet [`seek`] left pending, else the next one from the file.
+fn next_video_packet(ctx: &mut OpenContext) -> Result<Option<ffmpeg::Packet>, String> {
+    match ctx.pending.take() {
+        Some(packet) => Ok(Some(packet)),
+        None => read_video_packet(&mut ctx.input, ctx.stream_index),
+    }
 }
 
 /// Seek, then decode the first frame at or after `target_pts`.
@@ -199,48 +402,31 @@ fn decode_one_at_or_after(
     alloc: &Allocator,
 ) -> Result<PackedFrame, String> {
     let mut decoded = ffmpeg::frame::Video::empty();
-    let stream_index = ctx.stream_index;
     loop {
-        let mut got_packet = false;
-        for item in ctx.input.packets() {
-            let (stream, packet) = item.map_err(|e| format!("read packet: {e}"))?;
-            if stream.index() != stream_index {
-                continue;
-            }
-            got_packet = true;
-            ctx.decoder
-                .send_packet(&packet)
-                .map_err(|e| format!("send_packet: {e}"))?;
-            while ctx.decoder.receive_frame(&mut decoded).is_ok() {
-                let pts = decoded.pts().unwrap_or(0);
-                if pts >= target_pts {
-                    return pack_one_shot(
-                        &decoded,
-                        ctx.sw_dest_frame.as_mut(),
-                        &mut ctx.converter,
-                        ctx.info.pixel_format,
-                        alloc,
-                    );
-                }
-            }
-            break;
-        }
-        if !got_packet {
-            ctx.decoder
+        let packet = next_video_packet(ctx)?;
+        match &packet {
+            Some(packet) => ctx
+                .decoder
+                .send_packet(packet)
+                .map_err(|e| format!("send_packet: {e}"))?,
+            None => ctx
+                .decoder
                 .send_eof()
-                .map_err(|e| format!("send_eof: {e}"))?;
-            while ctx.decoder.receive_frame(&mut decoded).is_ok() {
-                let pts = decoded.pts().unwrap_or(0);
-                if pts >= target_pts {
-                    return pack_one_shot(
-                        &decoded,
-                        ctx.sw_dest_frame.as_mut(),
-                        &mut ctx.converter,
-                        ctx.info.pixel_format,
-                        alloc,
-                    );
-                }
+                .map_err(|e| format!("send_eof: {e}"))?,
+        }
+        while ctx.decoder.receive_frame(&mut decoded).is_ok() {
+            let pts = decoded.pts().unwrap_or(0);
+            if pts >= target_pts {
+                return pack_one_shot(
+                    &decoded,
+                    ctx.sw_dest_frame.as_mut(),
+                    &mut ctx.converter,
+                    ctx.info.pixel_format,
+                    alloc,
+                );
             }
+        }
+        if packet.is_none() {
             return Err(format!("no frame at or after pts {target_pts}"));
         }
     }
@@ -362,7 +548,14 @@ fn decode_stream_loop(
                 from_pts,
             };
             let decoder = own.as_mut().unwrap_or(&mut ctx.decoder);
-            let end = feed_stream(&mut ctx.input, ctx.stream_index, decoder, &mut sink);
+            let pending = ctx.pending.take();
+            let end = feed_stream(
+                &mut ctx.input,
+                ctx.stream_index,
+                pending,
+                decoder,
+                &mut sink,
+            );
             drop(sink);
             // Joins the frame threads (each finishes the frame it is on) and
             // frees their frames before the sentinel below waits for room.
@@ -438,8 +631,8 @@ enum StreamEnd {
 }
 
 /// What the stream needs to turn decoded frames into sent ones. Borrows
-/// fields of the `OpenContext` apart from `input`, which the packet
-/// iterator holds at the same time.
+/// fields of the `OpenContext` apart from `input`, which `feed_stream`
+/// reads at the same time.
 struct FrameSink<'a> {
     /// Reused for every `receive_frame`.
     decoded: ffmpeg::frame::Video,
@@ -452,24 +645,29 @@ struct FrameSink<'a> {
     from_pts: i64,
 }
 
-/// Feed the rest of the video stream's packets to `decoder`, sending every
-/// frame it produces, then drain it to the end.
+/// Feed `pending` (the keyframe `seek` stopped on), then the rest of the
+/// video stream's packets to `decoder`, sending every frame it produces,
+/// then drain it to the end.
 fn feed_stream(
     input: &mut ffmpeg::format::context::Input,
     stream_index: usize,
+    mut pending: Option<ffmpeg::Packet>,
     decoder: &mut ffmpeg::decoder::Video,
     sink: &mut FrameSink<'_>,
 ) -> StreamEnd {
-    for item in input.packets() {
+    loop {
+        let packet = match pending.take() {
+            Some(packet) => packet,
+            None => match read_video_packet(input, stream_index) {
+                Ok(Some(packet)) => packet,
+                Ok(None) => break,
+                Err(e) => return StreamEnd::Failed(e),
+            },
+        };
+        // Checked after the read, as late as it can be: `send_packet` may
+        // decode the whole frame, which nothing interrupts.
         if sink.stopped() {
             return StreamEnd::Stopped;
-        }
-        let (stream, packet) = match item {
-            Ok(v) => v,
-            Err(e) => return StreamEnd::Failed(format!("read packet: {e}")),
-        };
-        if stream.index() != stream_index {
-            continue;
         }
         let mut retried = false;
         loop {
@@ -557,17 +755,24 @@ impl FrameSink<'_> {
     }
 }
 
-/// Software decode threads: `VANCE_DECODE_THREADS` (a positive integer) if
-/// set, else one per core, capped at 8.
+/// Software decode threads: `VANCE_DECODE_THREADS` if set, else the default
+/// (see [`env_threads`]).
 fn decode_threads() -> usize {
-    threads_from_env(std::env::var("VANCE_DECODE_THREADS").ok().as_deref())
+    env_threads("VANCE_DECODE_THREADS")
 }
 
-fn threads_from_env(var: Option<&str>) -> usize {
-    if let Some(v) = var {
+/// A thread count from the environment variable `name`: its value when that
+/// is a positive integer, else one per core, capped at 8. Any other value is
+/// logged and ignored. The client's thread budget sets these at spawn.
+pub fn env_threads(name: &str) -> usize {
+    threads_from_env(name, std::env::var(name).ok().as_deref())
+}
+
+fn threads_from_env(name: &str, value: Option<&str>) -> usize {
+    if let Some(v) = value {
         match v.trim().parse::<usize>() {
             Ok(n) if n > 0 => return n,
-            _ => eprintln!("[decoder] ignoring VANCE_DECODE_THREADS={v:?}: not a positive integer"),
+            _ => eprintln!("[decoder] ignoring {name}={v:?}: not a positive integer"),
         }
     }
     thread::available_parallelism().map_or(1, |n| n.get().min(8))
@@ -730,13 +935,15 @@ mod tests {
     }
 
     #[test]
-    fn decode_threads_override_must_be_a_positive_integer() {
+    fn thread_overrides_must_be_positive_integers() {
         let default = thread::available_parallelism().map_or(1, |n| n.get().min(8));
-        assert_eq!(threads_from_env(None), default);
-        assert_eq!(threads_from_env(Some("1")), 1);
-        assert_eq!(threads_from_env(Some(" 12 ")), 12);
-        for bad in ["0", "-2", "eight", ""] {
-            assert_eq!(threads_from_env(Some(bad)), default, "{bad:?}");
+        for name in ["VANCE_DECODE_THREADS", "VANCE_CONVERT_THREADS"] {
+            assert_eq!(threads_from_env(name, None), default, "{name} unset");
+            assert_eq!(threads_from_env(name, Some("1")), 1, "{name}");
+            assert_eq!(threads_from_env(name, Some(" 12 ")), 12, "{name}");
+            for bad in ["0", "-2", "eight", "", "2.5"] {
+                assert_eq!(threads_from_env(name, Some(bad)), default, "{name}={bad:?}");
+            }
         }
     }
 
