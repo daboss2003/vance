@@ -330,14 +330,16 @@ fn videotoolbox_codec_decoded_in_software_is_converted_to_nv12() {
 
 /// Playback-path throughput for 4K 10-bit ProRes 422 HQ: software decode,
 /// swscale 4:2:2 -> 4:2:0, payload packing and the IPC hop, streamed with
-/// the engine's playback buffer depth. Real-time 24-30 fps needs < ~33 ms
-/// per frame. A manual benchmark, not a CI check:
+/// the engine's playback buffer depth, once per frame transport. The
+/// consumer copies each frame into a reused buffer, standing in for the
+/// renderer's texture upload. Real-time 24-30 fps needs < ~33 ms per frame.
+/// A manual benchmark, not a CI check:
 ///   cargo test -p vance-decoder --test it -- --ignored --nocapture prores_4k
 /// The dev profile builds this crate and vance-ipc at opt-level 2 (see the
 /// workspace Cargo.toml), so a plain debug build gives representative numbers.
-/// On an M1 (Nov 2026): ~42 ms/frame, 24 fps, with frames sent as raw blobs
-/// after the reply (it was ~88-98 ms with the bytes inside bincode).
-/// Shared-memory frames and threaded decode are next (ADR 0006).
+/// On an M1 (Nov 2026), with frame-threaded decode: ~18 ms/frame (~55 fps)
+/// with shared memory, ~21-26 ms/frame inline. Before ADR 0006 it was
+/// ~42 ms/frame with raw blobs, and ~88-98 ms with the bytes inside bincode.
 #[test]
 #[ignore = "manual benchmark: run with --ignored --nocapture"]
 fn prores_4k_decode_throughput() {
@@ -355,27 +357,46 @@ fn prores_4k_decode_throughput() {
     ) else {
         return;
     };
-    let mut client = spawn_default();
-    let info = client.open(fx.path()).expect("open 4K ProRes");
-    assert_eq!((info.width, info.height), (3840, 2160));
-    assert_eq!(info.pixel_format, PixelFormat::Yuv420P10Le);
+    let bin = sidecar_binary_path();
+    for (transport, env) in [
+        ("shared memory", &[][..]),
+        ("inline (VANCE_IPC_SHM=0)", &[("VANCE_IPC_SHM", "0")][..]),
+    ] {
+        let mut client =
+            DecoderClient::spawn_with_env(&bin, env.iter().copied()).expect("spawn decoder");
+        let info = client.open(fx.path()).expect("open 4K ProRes");
+        assert_eq!((info.width, info.height), (3840, 2160));
+        assert_eq!(info.pixel_format, PixelFormat::Yuv420P10Le);
+        // The consumer copies every frame once, as the renderer's texture
+        // upload does; without that a lease would cost nothing to "use".
+        let mut scratch = vec![0u8; info.pixel_format.frame_size(info.width, info.height)];
 
-    let start = Instant::now();
-    client.start_stream(0, 8).expect("start_stream");
-    let mut frames = 0u32;
-    while let Some(f) = client.next_frame().expect("next_frame") {
-        assert_eq!(f.pixel_format, PixelFormat::Yuv420P10Le, "frame {frames}");
-        frames += 1;
+        let start = Instant::now();
+        client.start_stream(0, 8).expect("start_stream");
+        let mut frames = 0u32;
+        while let Some(f) = client.next_frame().expect("next_frame") {
+            assert_eq!(f.pixel_format, PixelFormat::Yuv420P10Le, "frame {frames}");
+            scratch.copy_from_slice(&f.bytes);
+            std::hint::black_box(&scratch);
+            frames += 1;
+        }
+        let elapsed = start.elapsed();
+        let stats = client.transport_stats();
+        client.shutdown().expect("shutdown");
+        assert_eq!(frames, 72, "3 s at 24 fps");
+        let sent_shared = stats.shared + stats.spilled;
+        if env.is_empty() {
+            assert_eq!((sent_shared, stats.inline), (72, 0), "{stats:?}");
+        } else {
+            assert_eq!((sent_shared, stats.inline), (0, 72), "{stats:?}");
+        }
+
+        let ms_per_frame = elapsed.as_secs_f64() * 1000.0 / f64::from(frames);
+        eprintln!(
+            "prores_4k_decode_throughput, {transport}: {frames} frames in {:.0} ms = \
+             {ms_per_frame:.1} ms/frame, {:.1} fps ({stats:?})",
+            elapsed.as_secs_f64() * 1000.0,
+            1000.0 / ms_per_frame
+        );
     }
-    let elapsed = start.elapsed();
-    client.shutdown().expect("shutdown");
-    assert_eq!(frames, 72, "3 s at 24 fps");
-
-    let ms_per_frame = elapsed.as_secs_f64() * 1000.0 / f64::from(frames);
-    eprintln!(
-        "prores_4k_decode_throughput: {frames} frames in {:.0} ms = {ms_per_frame:.1} ms/frame, \
-         {:.1} fps",
-        elapsed.as_secs_f64() * 1000.0,
-        1000.0 / ms_per_frame
-    );
 }

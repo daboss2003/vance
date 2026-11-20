@@ -129,4 +129,45 @@ mod tests {
             r#"FrameBytes { kind: "owned", len: 1000 }"#
         );
     }
+
+    /// Over a real region: a clone of leased bytes is an owned copy, and the
+    /// lease ends (its slot is queued for release) when the original goes,
+    /// however long the clone lives. `into_vec` copies and ends the lease.
+    #[test]
+    fn leased_bytes_clone_to_owned_and_release_on_drop() {
+        use std::sync::Arc;
+        use vance_ipc::shm::{Access, Adopted, LeaseTable, ReleaseQueue, ShmRegion, SlotPool};
+
+        let mut region =
+            ShmRegion::create(1, 2, vance_ipc::shm::SLOT_ALIGN, Access::ReadWrite).unwrap();
+        region.unlink_name().unwrap();
+        let region = Arc::new(region);
+        let pool = SlotPool::new(Arc::clone(&region));
+        let queue = Arc::new(ReleaseQueue::default());
+        let table = LeaseTable::new(region, Arc::clone(&queue), 2);
+        let lease = |fill: u8| {
+            let mut w = pool.try_acquire().unwrap();
+            w.as_mut_slice()[..8].fill(fill);
+            let r = w.publish(8);
+            match table.adopt(r).unwrap() {
+                Adopted::Leased(l) => (FrameBytes::from(l), r),
+                Adopted::Spilled(_) => panic!("under budget, expected a lease"),
+            }
+        };
+
+        let (b, r) = lease(7);
+        assert!(b.is_shared());
+        assert_eq!(&b[..], [7; 8]);
+        assert_eq!(format!("{b:?}"), r#"FrameBytes { kind: "leased", len: 8 }"#);
+        let c = b.clone();
+        assert!(!c.is_shared());
+        assert_eq!(b, c);
+        drop(b);
+        assert_eq!(queue.drain(), [r], "the clone must not keep the lease");
+        assert_eq!(&c[..], [7; 8]);
+
+        let (b, r) = lease(9);
+        assert_eq!(b.into_vec(), [9; 8]);
+        assert_eq!(queue.drain(), [r]);
+    }
 }

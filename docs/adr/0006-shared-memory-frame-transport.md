@@ -1,6 +1,6 @@
 # ADR 0006 — Shared-Memory Frame Transport
 
-- **Status:** Proposed
+- **Status:** Accepted (implemented 2026-11-20)
 - **Date:** 2026-11-20
 - **Deciders:** Vance core team
 - **Supersedes:** — (amends ADR 0004 rule 5; implements its rule 3)
@@ -36,7 +36,8 @@ raw blob after the message as the fallback everywhere.**
    ~42 ms/frame on the M1.
 2. **Shared memory.** POSIX `shm_open` + `mmap` on macOS and Linux; a named, pagefile-backed
    section (`CreateFileMappingW` / `MapViewOfFile`) on Windows. Both through the existing `libc`
-   and `windows-sys` 0.59 (features `Win32_System_Memory`, `Win32_Foundation`). No new crates.
+   and `windows-sys` 0.59 (features `Win32_System_Memory`, `Win32_Foundation`, and
+   `Win32_Security`, which 0.59 requires for `CreateFileMappingW`). No new crates.
    The API is `vance_ipc::shm`.
 3. **Region layout.** One region per decoder client: `slot_count` slots of `slot_size` bytes,
    where `slot_size` is the frame size rounded up to `SLOT_ALIGN` (64 KiB: at least the 16 KiB
@@ -165,6 +166,11 @@ raw blob after the message as the fallback everywhere.**
 
 - Code: `crates/vance-ipc/src/{frame.rs, sidecar.rs, shm.rs}`, `crates/vance-decoder/src/{protocol.rs, frame.rs, client.rs}`,
   the sidecar in `crates/vance-decoder/src/bin/` (`alloc.rs` is where slots replace heap buffers).
-- Benchmark: `cargo test -p vance-decoder --test it -- --ignored --nocapture prores_4k`.
-  Target: ≥ 24 fps (≤ 41.7 ms/frame) on an M1 dev build with shared memory and threaded decode.
+- Benchmark: `cargo test -p vance-decoder --test it -- --ignored --nocapture --exact
+  pixel_format_convert::prores_4k_decode_throughput` (the consumer copies each frame into a
+  reused buffer, standing in for the GPU upload).
+  Target: ≥ 24 fps (≤ 41.7 ms/frame) on an M1 dev build. **Result:** ~18 ms/frame (~55 fps)
+  with shared memory, ~21–26 ms/frame over raw blobs, from 88–98 ms/frame before (M1, Nov 2026,
+  with frame-threaded decode).
+- Linux and Windows code paths are verified in CI only.
 - Related: ADR 0004 (process model).

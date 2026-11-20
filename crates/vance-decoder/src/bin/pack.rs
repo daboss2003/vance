@@ -218,6 +218,10 @@ fn wire_to_ffmpeg(pf: PixelFormat) -> ffmpeg::format::Pixel {
 
 /// Pack `frame`'s planes back to back (padding stripped) into a buffer of
 /// exactly the frame's size. `Ok(None)` when `wait` gave up on a buffer.
+///
+/// Rows are copied straight into the buffer, which is a shared-memory slot
+/// whenever one is available: this is the frame's only copy on its way to
+/// the parent.
 fn frame_to_payload(
     frame: &ffmpeg::frame::Video,
     expected_pf: PixelFormat,
@@ -369,6 +373,55 @@ mod tests {
             assert_eq!((packed.meta.width, packed.meta.height), (w, h));
             let (_, blob) = packed.buf.into_payload();
             assert_eq!(blob.unwrap().len(), wire.frame_size(w, h), "{format:?}");
+        }
+    }
+
+    /// Packing into a shared-memory slot writes exactly the bytes the heap
+    /// path sends inline, padding stripped.
+    #[test]
+    fn packing_into_a_slot_matches_packing_on_the_heap() {
+        use std::sync::Arc;
+        use vance_decoder::protocol::FramePayload;
+        use vance_ipc::shm::{Access, Adopted, LeaseTable, ShmRegion, SLOT_ALIGN};
+
+        let (w, h) = (161, 91);
+        let largest = PixelFormat::Yuv420P10Le.frame_size(w, h) as u64;
+        let slot_size = largest.div_ceil(SLOT_ALIGN) * SLOT_ALIGN;
+        let region = Arc::new(ShmRegion::create(1, 1, slot_size, Access::ReadWrite).unwrap());
+        let mut alloc = Allocator::default();
+        alloc.attach(region.desc()).unwrap();
+        let table = LeaseTable::new(Arc::clone(&region), Arc::default(), 1);
+
+        for (format, wire) in [
+            (P::YUV420P, PixelFormat::Yuv420P),
+            (P::NV12, PixelFormat::Nv12),
+            (P::YUV420P10LE, PixelFormat::Yuv420P10Le),
+        ] {
+            let mut frame = ffmpeg::frame::Video::new(format, w, h);
+            for plane in 0..frame.planes() {
+                let data = frame.data_mut(plane);
+                for (i, b) in data.iter_mut().enumerate() {
+                    *b = (i * 7 + plane * 31) as u8;
+                }
+            }
+            let packed = frame_to_payload(&frame, wire, &alloc, Wait::Never)
+                .unwrap()
+                .unwrap();
+            let r = match packed.buf.into_payload() {
+                (FramePayload::Shared(r), None) => r,
+                (other, _) => panic!("{format:?}: expected a slot, got {other:?}"),
+            };
+            assert_eq!(r.len as usize, wire.frame_size(w, h), "{format:?}");
+            let lease = match table.adopt(r).unwrap() {
+                Adopted::Leased(lease) => lease,
+                other => panic!("{other:?}"),
+            };
+            assert!(
+                lease[..] == packed_bytes(&frame, wire)[..],
+                "{format:?}: slot bytes differ from the inline bytes"
+            );
+            drop(lease);
+            assert_eq!(alloc.release(&[r]), 0);
         }
     }
 

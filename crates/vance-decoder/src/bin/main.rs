@@ -12,7 +12,8 @@
 //! ## Threading
 //!
 //! - The main thread runs `vance_ipc::serve_with_blobs()` and processes one
-//!   request at a time. A `Frame` reply's pixels follow it as a raw blob.
+//!   request at a time. A `Frame` reply's pixels are in a shared-memory
+//!   slot, or follow the reply as a raw blob.
 //! - During streaming, a background **decode thread** owns the FFmpeg
 //!   `Input` / `Video` decoder and pushes decoded frames into a bounded
 //!   channel. The main thread `recv()`s from that channel when a
@@ -20,6 +21,16 @@
 //! - `StopStream` (or `Close` / `Shutdown` during a stream) signals the
 //!   decode thread, joins it, and reclaims the `OpenContext` for further
 //!   single-shot `Seek` / `DecodeAt` operations.
+//!
+//! ## Shared-memory frames (ADR 0006)
+//!
+//! After `AttachShm`, frames are packed straight into slots of the parent's
+//! region. A slot stays unpublished while it waits in the stream channel and
+//! is published only when the main thread builds the `Frame` reply, so the
+//! channel's drain on stop hands unsent slots back to the pool. The main
+//! thread never waits for a slot (it is also the thread that handles
+//! `Release`): with none free, its frame goes inline. The decode thread
+//! waits for one until its stream is stopped.
 
 mod alloc;
 mod media;
@@ -55,7 +66,8 @@ struct State {
     alloc: Allocator,
 }
 
-/// A `Frame` reply, with the pixels as its blob when they go inline.
+/// A `Frame` reply, with the pixels as its blob when they go inline. A
+/// slot is published here, and belongs to the parent from now on.
 fn frame_reply(frame: PackedFrame) -> Reply<DecoderResponse> {
     let (payload, blob) = frame.buf.into_payload();
     Reply {
@@ -127,12 +139,23 @@ impl State {
                 DecoderResponse::Goodbye.into()
             }
             DecoderRequest::AttachShm(desc) => {
+                // Returns every slot still queued for the old stream first.
                 self.stop_stream_if_any();
                 match self.alloc.attach(&desc) {
-                    Ok(()) => DecoderResponse::ShmAttached { epoch: desc.epoch },
-                    Err(e) => DecoderResponse::ShmUnavailable {
-                        reason: e.to_string(),
-                    },
+                    Ok(()) => {
+                        eprintln!(
+                            "[decoder] shared memory attached: epoch {}, {} slots of {} bytes",
+                            desc.epoch, desc.slot_count, desc.slot_size
+                        );
+                        DecoderResponse::ShmAttached { epoch: desc.epoch }
+                    }
+                    Err(e) => {
+                        let reason = e.to_string();
+                        eprintln!(
+                            "[decoder] shared memory unavailable, frames go inline: {reason}"
+                        );
+                        DecoderResponse::ShmUnavailable { reason }
+                    }
                 }
                 .into()
             }

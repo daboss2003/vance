@@ -2345,7 +2345,7 @@ impl Engine {
                 };
                 (
                     PlaybackPrimary::Decoder {
-                        client: decoder,
+                        client: Box::new(decoder),
                         info,
                         from_pts,
                     },
@@ -8592,7 +8592,8 @@ pub enum PlaybackPrimary {
     /// A real video clip — frames stream from the FFmpeg sidecar.
     Decoder {
         /// The sidecar client. The loop calls `next_frame()` each iteration.
-        client: DecoderClient,
+        /// Boxed: with its shared-memory state it dwarfs the other variants.
+        client: Box<DecoderClient>,
         /// Stream info captured at open time, drives PTS→seconds math.
         info: StreamInfo,
         /// First PTS the stream was started at (logged + used by the
@@ -8680,7 +8681,7 @@ impl PlaybackPrimary {
     /// it was before playback.
     fn into_decoder(self) -> Option<DecoderClient> {
         match self {
-            PlaybackPrimary::Decoder { client, .. } => Some(client),
+            PlaybackPrimary::Decoder { client, .. } => Some(*client),
             PlaybackPrimary::Title { .. }
             | PlaybackPrimary::MoGraph { .. }
             | PlaybackPrimary::Fusion { .. } => None,
