@@ -158,6 +158,85 @@ fn hdr10_source_decodes_autotags_and_exports_hdr10() {
     let _ = std::fs::remove_file(&out);
 }
 
+/// 4K HDR10 export. One rgba64le 3840×2160 frame is 66 MB, more than an IPC
+/// message may carry (`vance_ipc::MAX_FRAME_BYTES`), so this catches a push
+/// path that puts pixels inside the message. Three frames keep it quick.
+#[test]
+fn hdr10_export_at_4k() {
+    if !tool("ffmpeg") || !tool("ffprobe") || !sidecars_present() {
+        eprintln!("ffmpeg/ffprobe/sidecars absent — skipping 4K HDR export");
+        return;
+    }
+    let fixture = hdr_fixture();
+    if !fixture.exists() {
+        eprintln!("HDR fixture missing: {} — skipping", fixture.display());
+        return;
+    }
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    std::env::set_current_dir(&workspace_root).expect("chdir workspace root");
+
+    let mut engine = Engine::default();
+    engine.new_project("hdr-4k".into()).expect("new project");
+    let media = engine
+        .import_media_file(&fixture.canonicalize().unwrap().to_string_lossy())
+        .expect("HDR source must import");
+    let media_id = vance_timeline::MediaItemId::from_uuid(media.id.parse().unwrap());
+    let track_id = {
+        let contents = engine.current_sequence_contents().expect("contents");
+        let v1 = contents
+            .tracks
+            .iter()
+            .find(|t| t.kind == "video")
+            .expect("V1");
+        vance_timeline::TrackId::from_uuid(v1.id.parse().unwrap())
+    };
+    engine
+        .insert_clip_at(track_id, media_id, 0.0)
+        .expect("insert clip");
+
+    let out = std::env::temp_dir().join(format!("vance-hdr-4k-{}.mov", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    let outcome = engine.render_sequence(RenderOptions {
+        output_path: out.to_string_lossy().to_string(),
+        preset: EncoderPreset::Hevc { crf: 28 },
+        width: Some(3840),
+        height: Some(2160),
+        render_and_replace_track: None,
+        start_seconds: Some(0.0),
+        // 3 frames at the new sequence's 24 fps (0.125 s is exact in binary).
+        end_seconds: Some(0.125),
+        hdr: true,
+    });
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = std::fs::remove_file(&out);
+            panic!("4K HDR render_sequence: {e}");
+        }
+    };
+    assert_eq!(outcome.video_frames, 3);
+
+    let streams = [
+        ("codec_name", "hevc"),
+        ("width", "3840"),
+        ("height", "2160"),
+        ("pix_fmt", "yuv420p10le"),
+        ("color_transfer", "smpte2084"),
+        ("color_primaries", "bt2020"),
+        ("nb_frames", "3"),
+    ]
+    .map(|(field, want)| (field, want, probe(&out, field)));
+    let profile = probe(&out, "profile");
+    let _ = std::fs::remove_file(&out);
+    for (field, want, got) in streams {
+        assert_eq!(got, want, "4K HDR export {field}");
+    }
+    assert!(
+        profile.contains("Main 10"),
+        "must be Main 10, got {profile}"
+    );
+}
+
 #[test]
 fn hlg_source_decodes_and_autotags() {
     if !tool("ffmpeg") || !tool("ffprobe") || !sidecars_present() {

@@ -9,9 +9,10 @@
 use std::path::PathBuf;
 use std::process::Command;
 use vance_encoder::protocol::{
-    AudioCodec, AudioConfig, AudioSampleFormat, EncoderPreset, VideoConfig, VideoPixelFormat,
+    AudioCodec, AudioConfig, AudioSampleFormat, EncoderPreset, EncoderRequest, EncoderResponse,
+    VideoConfig, VideoPixelFormat, PROTOCOL_VERSION,
 };
-use vance_encoder::EncoderClient;
+use vance_encoder::{EncoderClient, EncoderClientError};
 
 fn ffmpeg_present() -> bool {
     Command::new("ffmpeg").arg("-version").output().is_ok()
@@ -269,6 +270,199 @@ fn h264_export_succeeds_via_runtime_encoder_selection() {
         assert_eq!(codec, "h264", "expected an H.264 stream, got `{codec}`");
     }
     let _ = std::fs::remove_file(&out);
+}
+
+/// A 4K `rgba64le` frame (66 MB) is bigger than an IPC message may be, so it
+/// only gets through if pixels travel as a blob outside the message.
+#[test]
+fn frames_bigger_than_an_ipc_message_encode() {
+    if !ffmpeg_present() || !ffprobe_present() {
+        eprintln!("ffmpeg / ffprobe not on PATH — skipping 4K rgba64le test");
+        return;
+    }
+    let Some(binary) = sidecar_binary() else {
+        eprintln!("vance-encoder binary not built — skipping 4K rgba64le test");
+        return;
+    };
+    let (w, h) = (3840u32, 2160u32);
+    let frame_len = w as usize * h as usize * VideoPixelFormat::Rgba64Le.bytes_per_pixel();
+    assert!(frame_len as u64 > u64::from(vance_ipc::MAX_FRAME_BYTES));
+
+    let out = std::env::temp_dir().join(format!("vance-4k-rgba64-{}.mov", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    let mut client = EncoderClient::spawn(&binary).expect("spawn");
+    client
+        .open(
+            out.to_string_lossy().to_string(),
+            Some(VideoConfig {
+                width: w,
+                height: h,
+                frame_rate_num: 24,
+                frame_rate_den: 1,
+                pixel_format: VideoPixelFormat::Rgba64Le,
+                // prores_ks is built into every ffmpeg, unlike libx265.
+                preset: EncoderPreset::ProRes422HQ,
+                time_base_num: 1,
+                time_base_den: 24,
+                hdr: None,
+            }),
+            None,
+        )
+        .expect("open 4K rgba64le");
+    for f in 0..2u8 {
+        let mut pixels = vec![0u8; frame_len];
+        for (i, band) in pixels.chunks_mut(8192).enumerate() {
+            band.fill((i as u8) ^ f.wrapping_mul(91));
+        }
+        client
+            .push_video(i64::from(f), pixels)
+            .unwrap_or_else(|e| panic!("push 4K rgba64le frame {f}: {e}"));
+    }
+    let (frames, _) = client.finish().expect("finish 4K rgba64le");
+    let _ = client.shutdown();
+
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0"])
+        .args([
+            "-show_entries",
+            "stream=codec_name,width,height",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(&out)
+        .output()
+        .expect("ffprobe");
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(frames, 2);
+    let probe = String::from_utf8_lossy(&probe.stdout);
+    assert_eq!(
+        probe.lines().collect::<Vec<_>>(),
+        ["prores", "3840", "2160"],
+        "ffprobe of the 4K export"
+    );
+}
+
+/// Every refused push still consumes its blob, so the pushes after it land
+/// where they should and the counts at Finish only include accepted ones.
+#[test]
+fn refused_pushes_leave_the_session_usable() {
+    if !ffmpeg_present() {
+        eprintln!("ffmpeg not on PATH — skipping refused-push test");
+        return;
+    }
+    let Some(binary) = sidecar_binary() else {
+        eprintln!("vance-encoder binary not built — skipping refused-push test");
+        return;
+    };
+    let out = std::env::temp_dir().join(format!("vance-refused-{}.mov", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    let (w, h) = (64u32, 64u32);
+    let frame_len = (w * h * 4) as usize;
+    let encoder_message = |r: Result<(), EncoderClientError>| match r {
+        Err(EncoderClientError::Encoder(e)) => e.message,
+        other => panic!("expected a refused push, got {other:?}"),
+    };
+
+    let mut client = EncoderClient::spawn(&binary).expect("spawn");
+    let msg = encoder_message(client.push_video(0, vec![0u8; frame_len]));
+    assert!(msg.contains("encoder not open"), "{msg}");
+
+    client
+        .open(
+            out.to_string_lossy().to_string(),
+            Some(VideoConfig {
+                width: w,
+                height: h,
+                frame_rate_num: 24,
+                frame_rate_den: 1,
+                pixel_format: VideoPixelFormat::Rgba8,
+                preset: EncoderPreset::ProRes422HQ,
+                time_base_num: 1,
+                time_base_den: 24,
+                hdr: None,
+            }),
+            Some(AudioConfig {
+                sample_rate: 48_000,
+                channels: 2,
+                sample_format: AudioSampleFormat::F32Interleaved,
+                codec: AudioCodec::PcmS24,
+                time_base_num: 1,
+                time_base_den: 48_000,
+            }),
+        )
+        .expect("open");
+
+    // An rgba64le-sized frame for an Rgba8 config.
+    let msg = encoder_message(client.push_video(0, vec![7u8; frame_len * 2]));
+    assert!(
+        msg.contains("video frame size mismatch: got 32768 bytes, expected 16384"),
+        "{msg}"
+    );
+    // Three samples can't be stereo frames.
+    let msg = encoder_message(client.push_audio(0, vec![0.25; 3]));
+    assert!(msg.contains("not a whole number of 2-channel"), "{msg}");
+    // Refused before anything is written: sending the request first would
+    // leave the sidecar waiting for a blob that never comes.
+    let too_big = vec![0u8; vance_ipc::MAX_BLOB_BYTES as usize + 1];
+    assert!(matches!(
+        client.push_video(0, too_big),
+        Err(EncoderClientError::Ipc(vance_ipc::Error::BlobTooLarge))
+    ));
+
+    for f in 0..5u8 {
+        client
+            .push_video(i64::from(f), vec![f.wrapping_mul(40); frame_len])
+            .unwrap_or_else(|e| panic!("push frame {f}: {e}"));
+    }
+    client
+        .push_audio(0, vec![0.1; 4800 * 2])
+        .expect("push 0.1 s of stereo");
+    let (frames, samples) = client.finish().expect("finish");
+    let _ = client.shutdown();
+    let len = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    let _ = std::fs::remove_file(&out);
+    assert_eq!((frames, samples), (5, 4800));
+    assert!(len > 1_000, "output too small: {len} bytes");
+}
+
+/// A blob that disagrees with its message leaves the request stream out of
+/// sync. Whatever follows must be refused, even bytes that decode as a valid
+/// request.
+#[test]
+fn a_push_whose_blob_disagrees_with_its_message_refuses_everything_after() {
+    let Some(binary) = sidecar_binary() else {
+        eprintln!("vance-encoder binary not built — skipping out-of-sync test");
+        return;
+    };
+    let mut sidecar: vance_ipc::Sidecar<EncoderRequest, EncoderResponse> =
+        vance_ipc::Sidecar::spawn(&binary, std::iter::empty::<&str>()).expect("spawn");
+    // The blob's bytes are a whole framed Hello: once the sidecar has lost
+    // sync, they are what it reads as its next request.
+    let mut smuggled = Vec::new();
+    vance_ipc::write_frame(
+        &mut smuggled,
+        &EncoderRequest::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        },
+    )
+    .unwrap();
+    sidecar
+        .send(&EncoderRequest::PushVideoFrame {
+            pts: 0,
+            len: smuggled.len() as u64 + 1,
+        })
+        .unwrap();
+    sidecar.send_blob(&smuggled).unwrap();
+
+    let failed = |resp| match resp {
+        EncoderResponse::EncodeFailed(e) => e.message,
+        other => panic!("expected EncodeFailed, got {other:?}"),
+    };
+    let msg = failed(sidecar.recv().expect("reply to the bad push"));
+    assert!(msg.contains("differs from the length"), "{msg}");
+    let msg = failed(sidecar.recv().expect("reply to the smuggled Hello"));
+    assert!(msg.contains("out of sync"), "{msg}");
+    let _ = sidecar.shutdown();
 }
 
 fn preset_slug(p: &EncoderPreset) -> &'static str {

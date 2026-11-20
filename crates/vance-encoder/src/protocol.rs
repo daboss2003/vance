@@ -3,6 +3,11 @@
 //! Parent → sidecar: [`EncoderRequest`]. Sidecar → parent:
 //! [`EncoderResponse`]. Versioned via [`PROTOCOL_VERSION`].
 //!
+//! Pixels and samples never go inside a message: a push request carries only
+//! a length and is followed by one raw blob ([`vance_ipc::write_blob`]). A 4K
+//! `rgba64le` frame (66 MB) is bigger than any bincode message may be
+//! ([`vance_ipc::MAX_FRAME_BYTES`]).
+//!
 //! Architecture mirrors `vance-decoder`: ONE encoder sidecar process
 //! handles ONE in-progress encode at a time, sequential frames pushed
 //! by the parent. The parent can spawn multiple sidecars to run the
@@ -11,7 +16,8 @@
 use serde::{Deserialize, Serialize};
 
 /// Wire protocol version. Bump on breaking changes.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// v2: push requests announce a raw blob instead of carrying the bytes.
+pub const PROTOCOL_VERSION: u32 = 2;
 // Compile-time guard: protocol versions start at 1.
 const _: () = assert!(PROTOCOL_VERSION >= 1);
 
@@ -142,20 +148,28 @@ pub enum EncoderRequest {
     /// Push one decoded video frame, in display order. The sidecar
     /// owns timing — the parent supplies frames at the sequence's
     /// nominal rate.
+    ///
+    /// Followed by exactly one blob of `len` bytes: the packed pixel buffer,
+    /// `width * height * bytes_per_pixel` of the opened [`VideoConfig`]. The
+    /// sidecar reads the blob even when it refuses the push.
     PushVideoFrame {
         /// Frame PTS in `(time_base_num, time_base_den)` units (set
         /// at [`EncoderRequest::Open`] time).
         pts: i64,
-        /// Pixel buffer. Length must equal `width * height * 4`.
-        pixels: Vec<u8>,
+        /// Byte length of the pixel blob that follows.
+        len: u64,
     },
-    /// Push one audio chunk in display order. Interleaved stereo f32.
+    /// Push one audio chunk in display order.
+    ///
+    /// Followed by exactly one blob of `len` bytes: interleaved
+    /// `(L, R, L, R, …)` f32 samples, little-endian, a whole number of sample
+    /// frames (`4 * channels` bytes each).
     PushAudioFrame {
         /// First sample's PTS in `(audio_time_base_num,
         /// audio_time_base_den)` units (usually `(1, sample_rate)`).
         pts: i64,
-        /// Interleaved samples `(L, R, L, R, …)`.
-        samples: Vec<f32>,
+        /// Byte length of the sample blob that follows.
+        len: u64,
     },
     /// Signal end-of-stream and flush all encoders. Sidecar replies
     /// with [`EncoderResponse::Finished`] when the file is fully
@@ -623,6 +637,20 @@ mod tests {
         };
         let s = serde_json::to_string(&req).unwrap();
         let _back: EncoderRequest = serde_json::from_str(&s).unwrap();
+    }
+
+    #[test]
+    fn push_messages_stay_small_whatever_the_frame_size() {
+        // An 8K rgba64le frame (265 MB) still announces itself in a few bytes.
+        let len = 7680 * 4320 * 8;
+        for req in [
+            EncoderRequest::PushVideoFrame { pts: i64::MAX, len },
+            EncoderRequest::PushAudioFrame { pts: i64::MAX, len },
+        ] {
+            let mut wire = Vec::new();
+            vance_ipc::write_frame(&mut wire, &req).unwrap();
+            assert!(wire.len() < 32, "{req:?} takes {} bytes", wire.len());
+        }
     }
 
     #[test]

@@ -22,6 +22,7 @@ use vance_encoder::protocol::{
     AudioCodec, AudioConfig, EncoderError, EncoderPreset, EncoderRequest, EncoderResponse,
     HdrMetadata, VideoConfig, PROTOCOL_VERSION,
 };
+use vance_ipc::BlobReader;
 
 fn main() -> vance_ipc::Result<()> {
     tracing_subscriber::fmt()
@@ -30,12 +31,17 @@ fn main() -> vance_ipc::Result<()> {
     tracing::info!("encoder sidecar starting");
 
     let mut state: State = State::default();
-    vance_ipc::serve::<EncoderRequest, EncoderResponse, _>(|req| state.handle(req))
+    vance_ipc::serve_with_blobs::<EncoderRequest, EncoderResponse, _>(|req, blobs| {
+        state.handle(req, blobs).into()
+    })
 }
 
 #[derive(Default)]
 struct State {
     open: Option<OpenSession>,
+    /// Set when a pushed blob couldn't be read. The request stream is then out
+    /// of sync, so nothing that follows can be trusted to be a real request.
+    stream_error: Option<String>,
 }
 
 struct OpenSession {
@@ -69,7 +75,15 @@ struct AudioPipe {
 }
 
 impl State {
-    fn handle(&mut self, req: EncoderRequest) -> EncoderResponse {
+    fn handle(&mut self, req: EncoderRequest, blobs: &mut BlobReader<'_>) -> EncoderResponse {
+        if let Some(reason) = &self.stream_error {
+            // Intentional: refuse every request, even Hello or Shutdown. After
+            // a failed blob read, "requests" may be leftover pixel bytes that
+            // happen to decode, e.g. as an Open with a garbage path.
+            return EncoderResponse::EncodeFailed(EncoderError::new(format!(
+                "encoder request stream is out of sync after an earlier error: {reason}"
+            )));
+        }
         match req {
             EncoderRequest::Hello { .. } => EncoderResponse::Hello {
                 protocol_version: PROTOCOL_VERSION,
@@ -80,14 +94,12 @@ impl State {
                 Ok(()) => EncoderResponse::Opened,
                 Err(e) => EncoderResponse::OpenFailed(EncoderError::new(e)),
             },
-            EncoderRequest::PushVideoFrame { pts: _, pixels } => match self.push_video(&pixels) {
-                Ok(()) => EncoderResponse::FramePushed,
-                Err(e) => EncoderResponse::EncodeFailed(EncoderError::new(e)),
-            },
-            EncoderRequest::PushAudioFrame { pts: _, samples } => match self.push_audio(&samples) {
-                Ok(()) => EncoderResponse::FramePushed,
-                Err(e) => EncoderResponse::EncodeFailed(EncoderError::new(e)),
-            },
+            EncoderRequest::PushVideoFrame { pts: _, len } => {
+                self.push_blob(blobs, len, Self::push_video)
+            }
+            EncoderRequest::PushAudioFrame { pts: _, len } => {
+                self.push_blob(blobs, len, Self::push_audio)
+            }
             EncoderRequest::Finish => match self.finish() {
                 Ok((v, a)) => EncoderResponse::Finished {
                     video_frames: v,
@@ -113,6 +125,9 @@ impl State {
         }
         if video.is_none() && audio.is_none() {
             return Err("Open requires at least one of video or audio config".into());
+        }
+        if audio.as_ref().is_some_and(|a| a.channels == 0) {
+            return Err("audio config has no channels".into());
         }
 
         let temp_dir = std::env::temp_dir();
@@ -147,15 +162,45 @@ impl State {
         Ok(())
     }
 
+    /// Reads the `len`-byte blob a push request announced and hands it to
+    /// `push`, which checks its length against the open session.
+    fn push_blob(
+        &mut self,
+        blobs: &mut BlobReader<'_>,
+        len: u64,
+        push: fn(&mut Self, &[u8]) -> Result<(), String>,
+    ) -> EncoderResponse {
+        // Intentional: the blob is read before anything is validated, even
+        // when the push will be refused (wrong size, nothing open), so the
+        // next request starts where the parent wrote it. `read_blob` bounds
+        // the allocation at `MAX_BLOB_BYTES`.
+        let bytes = match blobs.read_blob(len) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let reason = format!("reading a {len}-byte push: {e}");
+                tracing::error!("{reason}");
+                self.stream_error = Some(reason.clone());
+                return EncoderResponse::EncodeFailed(EncoderError::new(reason));
+            }
+        };
+        match push(self, &bytes) {
+            Ok(()) => EncoderResponse::FramePushed,
+            Err(e) => EncoderResponse::EncodeFailed(EncoderError::new(e)),
+        }
+    }
+
     fn push_video(&mut self, pixels: &[u8]) -> Result<(), String> {
         let s = self.open.as_mut().ok_or("encoder not open")?;
         let v = s.video.as_mut().ok_or("no video stream configured")?;
         let expected = (v.width as usize) * (v.height as usize) * v.bytes_per_pixel;
         if pixels.len() != expected {
             return Err(format!(
-                "video frame size mismatch: got {} bytes, expected {}",
+                "video frame size mismatch: got {} bytes, expected {} ({}x{} at {} bytes per pixel)",
                 pixels.len(),
-                expected
+                expected,
+                v.width,
+                v.height,
+                v.bytes_per_pixel
             ));
         }
         v.stdin
@@ -165,19 +210,30 @@ impl State {
         Ok(())
     }
 
-    fn push_audio(&mut self, samples: &[f32]) -> Result<(), String> {
+    /// `bytes`: interleaved little-endian f32 samples.
+    fn push_audio(&mut self, bytes: &[u8]) -> Result<(), String> {
         let s = self.open.as_mut().ok_or("encoder not open")?;
         let a = s.audio.as_mut().ok_or("no audio stream configured")?;
-        for &sample in samples {
+        let frame_bytes = 4 * usize::from(a.channels);
+        if !bytes.len().is_multiple_of(frame_bytes) {
+            return Err(format!(
+                "audio push of {} bytes is not a whole number of {}-channel f32 sample frames",
+                bytes.len(),
+                a.channels
+            ));
+        }
+        let mut pcm = Vec::with_capacity(bytes.len() / 4 * 3);
+        for chunk in bytes.chunks_exact(4) {
+            let sample = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             let clamped = sample.clamp(-1.0, 1.0);
             let v = (clamped * 8_388_607.0) as i32; // 2^23 - 1
-            let bytes = v.to_le_bytes();
-            a.file
-                .write_all(&bytes[0..3])
-                .map_err(|e| format!("wav write: {e}"))?;
-            a.bytes_written += 3;
+            pcm.extend_from_slice(&v.to_le_bytes()[0..3]);
         }
-        a.samples_written += (samples.len() / a.channels as usize) as u64;
+        a.file
+            .write_all(&pcm)
+            .map_err(|e| format!("wav write: {e}"))?;
+        a.bytes_written += pcm.len() as u64;
+        a.samples_written += (bytes.len() / frame_bytes) as u64;
         Ok(())
     }
 

@@ -112,27 +112,35 @@ impl EncoderClient {
     }
 
     /// Push one decoded video frame. `pixels` length must equal
-    /// `width * height * 4` (RGBA/BGRA).
+    /// `width * height * bytes_per_pixel` of the opened config's pixel
+    /// format (4 for RGBA/BGRA, 8 for `rgba64le`).
     pub fn push_video(&mut self, pts: i64, pixels: Vec<u8>) -> Result<(), EncoderClientError> {
-        match self
-            .sidecar
-            .request(&EncoderRequest::PushVideoFrame { pts, pixels })?
-        {
-            EncoderResponse::FramePushed => Ok(()),
-            EncoderResponse::EncodeFailed(e) => Err(EncoderClientError::Encoder(e)),
-            other => Err(EncoderClientError::UnexpectedResponse {
-                expected: "FramePushed",
-                got: other,
-            }),
-        }
+        let len = pixels.len() as u64;
+        self.push(&EncoderRequest::PushVideoFrame { pts, len }, &pixels)
     }
 
-    /// Push one chunk of interleaved stereo f32 audio.
+    /// Push one chunk of interleaved f32 audio (`channels` of the opened
+    /// config per sample frame).
     pub fn push_audio(&mut self, pts: i64, samples: Vec<f32>) -> Result<(), EncoderClientError> {
-        match self
-            .sidecar
-            .request(&EncoderRequest::PushAudioFrame { pts, samples })?
-        {
+        let mut bytes = Vec::with_capacity(samples.len() * 4);
+        for s in &samples {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        let len = bytes.len() as u64;
+        self.push(&EncoderRequest::PushAudioFrame { pts, len }, &bytes)
+    }
+
+    /// Send a push request, then the blob it announced, and wait for the ack.
+    fn push(&mut self, req: &EncoderRequest, blob: &[u8]) -> Result<(), EncoderClientError> {
+        // Checked before anything is written: `send_blob` would refuse this
+        // blob only after the request went out, leaving the sidecar waiting
+        // for bytes that never come.
+        if blob.len() as u64 > vance_ipc::MAX_BLOB_BYTES {
+            return Err(vance_ipc::Error::BlobTooLarge.into());
+        }
+        self.sidecar.send(req)?;
+        self.sidecar.send_blob(blob)?;
+        match self.sidecar.recv()? {
             EncoderResponse::FramePushed => Ok(()),
             EncoderResponse::EncodeFailed(e) => Err(EncoderClientError::Encoder(e)),
             other => Err(EncoderClientError::UnexpectedResponse {

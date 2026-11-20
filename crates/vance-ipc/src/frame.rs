@@ -27,11 +27,10 @@ use std::io::{Read, Write};
 /// Hard cap on a single frame's payload size. Protects against corrupt
 /// length headers driving multi-GB allocations.
 ///
-/// Decoded video frames travel as raw blobs ([`MAX_BLOB_BYTES`]), but the
-/// encoder's push path still inlines frames in bincode, so the cap must
-/// cover the largest frame sent that way: 4K 10-bit 4:2:0 is 3840·2160·3 ≈
-/// 23.7 MiB. 48 MiB leaves headroom for DCI-4K 10-bit while still bounding
-/// a corrupt-header allocation.
+/// Pixel data never travels inside a bincode message any more: decoded frames
+/// and encoder pushes both go as raw blobs after a small message
+/// ([`MAX_BLOB_BYTES`]). Messages are now only metadata, so 48 MiB is pure
+/// headroom; it stays as the bound on a corrupt-header allocation.
 pub const MAX_FRAME_BYTES: u32 = 48 * 1024 * 1024;
 
 /// Hard cap on a single raw blob. Covers an 8K 16-bit RGBA frame (~265 MB)
