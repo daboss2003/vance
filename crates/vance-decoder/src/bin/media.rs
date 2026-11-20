@@ -13,9 +13,13 @@
 //! decoder with frame threads as well (several frames at once), which is
 //! where most of the speed comes from but costs up to n − 1 frames of
 //! output delay and n frames in flight.
+//!
+//! Both decode paths time frames with a [`FrameClock`], which also gives a
+//! timestamp to frames of a container that stores none (AVI).
 
 use crate::alloc::{Allocator, Wait};
 use crate::pack::{self, FrameConverter, PackedFrame};
+use std::collections::VecDeque;
 use std::ffi::c_int;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,6 +54,11 @@ pub struct OpenContext {
     /// The video stream's first pts in microseconds (0 when unknown): where
     /// [`seek`]'s search for an earlier keyframe ends.
     start_us: i64,
+    /// The container stores dts only (AVI): see [`FrameClock`].
+    dts_only: bool,
+    /// `dts_only`, and the codec reorders frames: decodes check the
+    /// keyframe `seek` stops on (see [`SeekStart`]).
+    check_seek_start: bool,
 }
 
 pub fn open(path: &str) -> Result<OpenContext, OpenError> {
@@ -68,6 +77,8 @@ pub fn open(path: &str) -> Result<OpenContext, OpenError> {
     if let Some(format) = raw_stream_without_timestamps(&mut input, stream_index) {
         return Err(OpenError::NeedsContainer { format });
     }
+    // FFmpeg's one AVI demuxer, OpenDML (> 1 GB) files included.
+    let dts_only = input.format().name() == "avi";
     let stream = input.stream(stream_index).ok_or(OpenError::NoVideoStream)?;
     let time_base = stream.time_base();
     let avg_rate = stream.avg_frame_rate();
@@ -145,6 +156,13 @@ pub fn open(path: &str) -> Result<OpenContext, OpenError> {
         }
     );
 
+    // Only a codec that reorders frames (B-frames) can show a frame before a
+    // keyframe that is decoded after it.
+    let check_seek_start = dts_only
+        && decoder
+            .codec()
+            .and_then(|codec| codec.descriptor())
+            .is_some_and(|d| d.props().contains(ffmpeg::codec::CodecProperties::REORDER));
     let time_base = (time_base.numerator() as i64, time_base.denominator() as i64);
     let start_us = match start_time {
         ffmpeg::sys::AV_NOPTS_VALUE => 0,
@@ -173,6 +191,8 @@ pub fn open(path: &str) -> Result<OpenContext, OpenError> {
         converter: None,
         pending: None,
         start_us,
+        dts_only,
+        check_seek_start,
     })
 }
 
@@ -326,7 +346,9 @@ fn scan_for_keyframe(
         let Some(packet) = read_video_packet(&mut ctx.input, ctx.stream_index)? else {
             return Ok(None);
         };
-        // dts where there is no pts (AVI).
+        // dts where there is no pts (AVI). A keyframe's dts there is the
+        // timestamp `FrameClock` gives its frame: in a closed GOP every frame
+        // shown before the keyframe is decoded before it.
         let past_target = packet
             .pts()
             .or(packet.dts())
@@ -389,47 +411,232 @@ pub fn decode_at(
     target_pts: i64,
     alloc: &Allocator,
 ) -> Result<PackedFrame, String> {
-    seek(ctx, target_pts)?;
-    decode_one_at_or_after(ctx, target_pts, alloc)
+    let mut decoded = ffmpeg::frame::Video::empty();
+    let mut start = SeekStart::new(target_pts);
+    loop {
+        let check = start.seek(ctx)?;
+        if decode_to(ctx, &mut decoded, target_pts, check)? {
+            break;
+        }
+        start.step_back();
+    }
+    pack_one_shot(
+        &decoded,
+        ctx.sw_dest_frame.as_mut(),
+        &mut ctx.converter,
+        ctx.info.pixel_format,
+        alloc,
+    )
 }
 
-/// Drain packets + decoder until we get a frame at or after `target_pts`.
-/// Used by one-shot `decode_at` (NOT by the streaming loop, which decodes
-/// every frame it produces).
-fn decode_one_at_or_after(
+/// Where a decode for a target starts: [`seek`] for the target, then, in AVI
+/// with a codec that reorders frames, a keyframe earlier each time the
+/// decode's first frame is past the target.
+///
+/// AVI's index seeks by dts, and a keyframe's timestamp there is only known
+/// once it is decoded ([`FrameClock`]). An open GOP's keyframe is decoded
+/// before the B-frames shown just ahead of it, so its dts is earlier than
+/// its frame, and a target among those B-frames seeks to a keyframe whose
+/// frame comes after the target (and whose B-frames can't be decoded
+/// without the GOP before): `DecodeAt` frame 11 of an MPEG-4 Part 2 file
+/// with 12-frame open GOPs gave frame 12. Other containers seek by the
+/// keyframe's own pts, which `seek` checks against the target before.
+struct SeekStart {
+    /// What to `seek` for: the target, then just before the last keyframe.
+    from: i64,
+    /// The keyframe the last `seek` stopped on, when its decode checks it.
+    keyframe: Option<i64>,
+}
+
+impl SeekStart {
+    fn new(target_pts: i64) -> Self {
+        Self {
+            from: target_pts,
+            keyframe: None,
+        }
+    }
+
+    /// Seek. `true`: the decode from here has to check that its first frame
+    /// is not past the target (with [`decode_to`]).
+    fn seek(&mut self, ctx: &mut OpenContext) -> Result<bool, String> {
+        seek(ctx, self.from)?;
+        let keyframe = ctx
+            .pending
+            .as_ref()
+            .and_then(ffmpeg::Packet::dts)
+            .filter(|_| ctx.check_seek_start);
+        // Only a keyframe before the last one can start earlier.
+        let check = match (keyframe, self.keyframe) {
+            (Some(k), Some(last)) => k < last,
+            (k, _) => k.is_some(),
+        };
+        self.keyframe = keyframe;
+        Ok(check)
+    }
+
+    /// Start before the keyframe the last `seek` stopped on.
+    fn step_back(&mut self) {
+        if let Some(k) = self.keyframe {
+            self.from = k.saturating_sub(1);
+        }
+    }
+}
+
+/// Decode on the one-shot decoder from where [`seek`] left it to the first
+/// frame at or after `target_pts`, which is left in `decoded`. `Ok(false)`:
+/// `check_first`, and the first frame decoded was already past the target.
+/// Not used by streams, which send every frame they decode.
+fn decode_to(
     ctx: &mut OpenContext,
+    decoded: &mut ffmpeg::frame::Video,
     target_pts: i64,
-    alloc: &Allocator,
-) -> Result<PackedFrame, String> {
-    let mut decoded = ffmpeg::frame::Video::empty();
+    check_first: bool,
+) -> Result<bool, String> {
+    // `seek` flushed the decoder just before.
+    let mut clock = FrameClock::new(ctx.dts_only);
+    let mut first = true;
     loop {
         let packet = next_video_packet(ctx)?;
         match &packet {
-            Some(packet) => ctx
-                .decoder
-                .send_packet(packet)
-                .map_err(|e| format!("send_packet: {e}"))?,
+            Some(packet) => {
+                ctx.decoder
+                    .send_packet(packet)
+                    .map_err(|e| format!("send_packet: {e}"))?;
+                clock.sent(packet);
+            }
             None => ctx
                 .decoder
                 .send_eof()
                 .map_err(|e| format!("send_eof: {e}"))?,
         }
-        while ctx.decoder.receive_frame(&mut decoded).is_ok() {
-            let pts = decoded.pts().unwrap_or(0);
+        while ctx.decoder.receive_frame(decoded).is_ok() {
+            let pts = clock.stamp(decoded, reorder_delay(&ctx.decoder));
             if pts >= target_pts {
-                return pack_one_shot(
-                    &decoded,
-                    ctx.sw_dest_frame.as_mut(),
-                    &mut ctx.converter,
-                    ctx.info.pixel_format,
-                    alloc,
-                );
+                return Ok(!(first && check_first && pts > target_pts));
             }
+            first = false;
         }
         if packet.is_none() {
             return Err(format!("no frame at or after pts {target_pts}"));
         }
     }
+}
+
+/// [`seek`] for a stream from `from_pts`, the keyframe checked as for
+/// [`decode_at`], by decoding up to its first frame on the one-shot decoder.
+fn seek_for_stream(ctx: &mut OpenContext, from_pts: i64) -> Result<(), String> {
+    let mut start = SeekStart::new(from_pts);
+    let mut decoded = ffmpeg::frame::Video::empty();
+    while start.seek(ctx)? {
+        // A decode error here is left for the stream to report.
+        let past = matches!(decode_to(ctx, &mut decoded, i64::MIN, false), Ok(true))
+            && decoded.pts().is_some_and(|pts| pts > from_pts);
+        if !past {
+            // Back to the keyframe the check decoded from.
+            start.seek(ctx)?;
+            break;
+        }
+        start.step_back();
+    }
+    Ok(())
+}
+
+/// Times the frames of one decoder from a flush (or its opening) on: told
+/// of every packet the decoder accepts ([`FrameClock::sent`]), it gives each
+/// frame the decoder returns its presentation timestamp
+/// ([`FrameClock::stamp`]).
+///
+/// A container with pts (MP4, MOV, MKV, MPEG-TS, ...): a frame's own pts,
+/// else FFmpeg's best-effort timestamp. AVI stores no pts. Its index gives
+/// each chunk a dts, in decode order, and FFmpeg's best-effort timestamp
+/// for a frame there is the dts of the packet whose sending released it
+/// (the pts it guesses for some packets is a dts too). Without B-frames
+/// that is the frame's own packet. With them the decoder holds frames back
+/// by its reorder delay, so the timestamp comes that many frames late (the
+/// same content in MOV shows frame `k` at `k / fps`, and the AVI's audio
+/// starts at 0), and the last frames, released by the end-of-stream drain,
+/// have none.
+///
+/// Intentional: so in AVI a frame takes the dts of the packet `delay`
+/// packets before the one that released it, and a frame the drain releases
+/// the next dts left. Frames come out in display order, so the n-th frame
+/// takes the n-th dts: its own slot. Looked up by value, not counted, so a
+/// packet the decoder returns nothing for (an MPEG-4 N-VOP placeholder for
+/// a dropped frame) costs one frame a late timestamp instead of shifting
+/// every later one, and dts that step by more than 1 (a `-c copy` remux
+/// pads with empty chunks, which the demuxer skips) are kept as they are.
+struct FrameClock {
+    dts_only: bool,
+    /// AVI: dts of the packets sent that no frame has taken, in send order.
+    unclaimed: VecDeque<i64>,
+    /// AVI: the last timestamp given and the step to it from the one before.
+    last: Option<(i64, i64)>,
+}
+
+impl FrameClock {
+    fn new(dts_only: bool) -> Self {
+        Self {
+            dts_only,
+            unclaimed: VecDeque::new(),
+            last: None,
+        }
+    }
+
+    /// Note `packet`, which the decoder has just accepted.
+    fn sent(&mut self, packet: &ffmpeg::Packet) {
+        if let (true, Some(dts)) = (self.dts_only, packet.dts()) {
+            self.unclaimed.push_back(dts);
+        }
+    }
+
+    /// `frame`'s presentation timestamp, also set as its pts (what is sent
+    /// to the client). `delay`: the decoder's [`reorder_delay`].
+    fn stamp(&mut self, frame: &mut ffmpeg::frame::Video, delay: usize) -> i64 {
+        let ts = if self.dts_only {
+            self.claim(frame.timestamp(), delay)
+        } else if let Some(pts) = frame.pts() {
+            return pts;
+        } else {
+            frame.timestamp().unwrap_or(0)
+        };
+        frame.set_pts(Some(ts));
+        ts
+    }
+
+    /// AVI: the dts `delay` packets before the one with the frame's
+    /// best-effort timestamp, else the oldest unclaimed one.
+    fn claim(&mut self, best_effort: Option<i64>, delay: usize) -> i64 {
+        let released_by =
+            best_effort.and_then(|ts| self.unclaimed.iter().position(|&dts| dts == ts));
+        let slot = released_by.map_or(0, |i| i.saturating_sub(delay));
+        let ts = match self.unclaimed.get(slot) {
+            Some(&dts) => {
+                // Older ones belong to packets that gave no frame.
+                self.unclaimed.drain(..=slot);
+                dts
+            }
+            // More frames than packets: one step on.
+            None => match self.last {
+                Some((last, step)) => last + step,
+                None => best_effort.unwrap_or(0),
+            },
+        };
+        let step = match self.last {
+            Some((last, _)) if ts > last => ts - last,
+            Some((_, step)) => step,
+            None => 1,
+        };
+        self.last = Some((ts, step));
+        ts
+    }
+}
+
+/// How many packets `decoder` holds a frame back to reorder frames
+/// (`has_b_frames`): 0 without B-frames.
+fn reorder_delay(decoder: &ffmpeg::decoder::Video) -> usize {
+    // SAFETY: an open decoder's context. With frame threads FFmpeg copies
+    // the field from the worker before it returns that worker's frame.
+    usize::try_from(unsafe { (*decoder.as_ptr()).has_b_frames }).unwrap_or(0)
 }
 
 /// `materialize_frame` on the main thread, which never waits for a buffer.
@@ -482,7 +689,7 @@ pub fn start_stream(
 ) -> Result<Stream, String> {
     // Also flushes the one-shot decoder, so it holds no reference frames
     // while the stream's own decoder runs.
-    seek(&mut ctx, from_pts)?;
+    seek_for_stream(&mut ctx, from_pts)?;
 
     let cap = (buffer_frames.max(1) as usize).min(64);
     let (tx, rx) = sync_channel::<Option<DecodedItem>>(cap);
@@ -546,6 +753,8 @@ fn decode_stream_loop(
                 tx: &tx,
                 stop: &stop,
                 from_pts,
+                // Either decoder is fresh: its own, or the one `seek` flushed.
+                clock: FrameClock::new(ctx.dts_only),
             };
             let decoder = own.as_mut().unwrap_or(&mut ctx.decoder);
             let pending = ctx.pending.take();
@@ -643,6 +852,7 @@ struct FrameSink<'a> {
     tx: &'a SyncSender<Option<DecodedItem>>,
     stop: &'a AtomicBool,
     from_pts: i64,
+    clock: FrameClock,
 }
 
 /// Feed `pending` (the keyframe `seek` stopped on), then the rest of the
@@ -685,6 +895,7 @@ fn feed_stream(
                 Err(e) => return StreamEnd::Failed(format!("send_packet: {e}")),
             }
         }
+        sink.clock.sent(&packet);
         // Frame threads return nothing for the first n − 1 packets.
         if let Some(end) = sink.drain(decoder) {
             return end;
@@ -713,7 +924,7 @@ impl FrameSink<'_> {
             }
             match decoder.receive_frame(&mut self.decoded) {
                 Ok(()) => {
-                    if let Err(end) = self.send_decoded() {
+                    if let Err(end) = self.send_decoded(reorder_delay(decoder)) {
                         return Some(end);
                     }
                 }
@@ -730,9 +941,10 @@ impl FrameSink<'_> {
     }
 
     /// Pack and send the frame just received, unless it is before `from_pts`.
-    fn send_decoded(&mut self) -> Result<(), StreamEnd> {
+    /// `delay`: the decoder's [`reorder_delay`].
+    fn send_decoded(&mut self, delay: usize) -> Result<(), StreamEnd> {
         // Typical when the seek snapped to an earlier keyframe.
-        if self.decoded.pts().unwrap_or(0) < self.from_pts {
+        if self.clock.stamp(&mut self.decoded, delay) < self.from_pts {
             return Ok(());
         }
         let frame = match pack::materialize_frame(
@@ -945,6 +1157,106 @@ mod tests {
                 assert_eq!(threads_from_env(name, Some(bad)), default, "{name}={bad:?}");
             }
         }
+    }
+
+    /// An AVI clock told of packets with `dts`, in send order.
+    fn avi_clock(dts: &[i64]) -> FrameClock {
+        let mut clock = FrameClock::new(true);
+        for &d in dts {
+            let mut packet = ffmpeg::Packet::empty();
+            packet.set_dts(Some(d));
+            clock.sent(&packet);
+        }
+        clock
+    }
+
+    /// A decoded frame as FFmpeg returns it: its pts and best-effort
+    /// timestamp.
+    fn frame(pts: Option<i64>, best_effort: Option<i64>) -> ffmpeg::frame::Video {
+        let mut f = ffmpeg::frame::Video::empty();
+        f.set_pts(pts);
+        // SAFETY: a live frame we own.
+        unsafe {
+            (*f.as_mut_ptr()).best_effort_timestamp =
+                best_effort.unwrap_or(ffmpeg::sys::AV_NOPTS_VALUE);
+        }
+        f
+    }
+
+    /// A container with pts keeps every frame's pts untouched; a frame
+    /// without one gets FFmpeg's best-effort timestamp, else 0 as before.
+    #[test]
+    fn frames_with_pts_keep_them() {
+        let mut clock = FrameClock::new(false);
+        for (pts, best_effort, want) in [
+            (Some(7), Some(9), 7),
+            (Some(-3), None, -3),
+            (None, Some(11), 11),
+            (None, None, 0),
+        ] {
+            let mut f = frame(pts, best_effort);
+            assert_eq!(clock.stamp(&mut f, 2), want, "{pts:?} {best_effort:?}");
+            assert_eq!(f.pts(), Some(want), "{pts:?} {best_effort:?}: frame's pts");
+        }
+    }
+
+    /// The decoder releases frame k with packet k + delay; the frames left
+    /// at the end come out with no timestamp. Each takes its own slot, with
+    /// dts as they step (24 a frame here, as in a `-c copy` remux).
+    #[test]
+    fn avi_frames_take_their_slot_back_through_the_reorder_delay() {
+        let dts: Vec<i64> = (0..8).map(|k| k * 24).collect();
+        for delay in 0..3 {
+            let mut clock = avi_clock(&dts);
+            let got: Vec<i64> = (0..8)
+                .map(|k| {
+                    let released_by = dts.get(k + delay).copied();
+                    let mut f = frame(None, released_by);
+                    let ts = clock.stamp(&mut f, delay);
+                    assert_eq!(f.pts(), Some(ts), "delay {delay}: frame {k}'s pts");
+                    ts
+                })
+                .collect();
+            assert_eq!(got, dts, "delay {delay}");
+        }
+    }
+
+    /// FFmpeg's guessed pts on some AVI frames (MPEG-4 Part 2 B-frames) is a
+    /// dts like the best-effort timestamp; only the latter is used.
+    #[test]
+    fn avi_frames_ignore_the_guessed_pts() {
+        let mut clock = avi_clock(&[0, 1, 2, 3]);
+        let mut got = Vec::new();
+        for (pts, best_effort) in [(None, Some(1)), (Some(2), Some(2)), (Some(3), Some(3))] {
+            got.push(clock.stamp(&mut frame(pts, best_effort), 1));
+        }
+        got.push(clock.stamp(&mut frame(None, None), 1));
+        assert_eq!(got, [0, 1, 2, 3]);
+    }
+
+    /// A packet the decoder returns no frame for (an N-VOP placeholder,
+    /// packet 3 here) costs the frame released next one late timestamp; the
+    /// frames after are on time again.
+    #[test]
+    fn a_packet_without_a_frame_does_not_shift_later_frames() {
+        let mut clock = avi_clock(&[0, 1, 2, 3, 4, 5, 6]);
+        let got: Vec<i64> = [Some(1), Some(2), Some(4), Some(5), Some(6), None]
+            .into_iter()
+            .map(|best_effort| clock.stamp(&mut frame(None, best_effort), 1))
+            .collect();
+        assert_eq!(got, [0, 1, 3, 4, 5, 6]);
+    }
+
+    /// More frames than packets, or a best-effort timestamp that is no
+    /// packet's dts: still strictly increasing.
+    #[test]
+    fn avi_timestamps_go_on_increasing_past_the_packets() {
+        let mut clock = avi_clock(&[0, 24, 48]);
+        let got: Vec<i64> = [None, Some(999), None, None, None]
+            .into_iter()
+            .map(|best_effort| clock.stamp(&mut frame(None, best_effort), 0))
+            .collect();
+        assert_eq!(got, [0, 24, 48, 72, 96]);
     }
 
     /// `is_eagain` must recognise the EAGAIN FFmpeg really returns: a

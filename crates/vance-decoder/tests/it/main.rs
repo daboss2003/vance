@@ -8,6 +8,7 @@
 //!   cargo test -p vance-decoder --test it <module>::
 
 mod annexb;
+mod avi;
 mod crash_isolation;
 mod decode_smoke;
 mod hw_decode;
