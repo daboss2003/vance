@@ -6539,6 +6539,7 @@ dependencies = [
  "vance-encoder",
  "vance-fusion",
  "vance-grading-cmd",
+ "vance-ipc",
  "vance-mograph",
  "vance-ocio",
  "vance-ofx",
@@ -6756,12 +6757,14 @@ name = "vance-ipc"
 version = "0.0.0"
 dependencies = [
  "bincode",
+ "libc",
  "parking_lot 0.12.5",
  "serde",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
  "vance-core",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

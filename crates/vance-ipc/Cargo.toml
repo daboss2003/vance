@@ -16,9 +16,25 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
 
+# Shared-memory frame regions (ADR 0006): POSIX shm_open + mmap on Unix, a
+# named pagefile-backed section on Windows.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Memory",
+] }
+
 [dev-dependencies]
 tempfile = "3"
 
 [[example]]
 name = "echo-sidecar"
 path = "examples/echo_sidecar.rs"
+
+[[example]]
+name = "shm-peer"
+path = "examples/shm_peer.rs"

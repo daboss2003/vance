@@ -13,18 +13,58 @@
 //! Regions only grow: a bigger frame size means a new region with a higher
 //! `epoch`, and references to an older epoch are stale.
 //!
-//! This build has no OS layer yet: [`ShmRegion::create`] and
-//! [`ShmRegion::open`] return [`Error::ShmUnsupported`], so every caller
-//! takes the inline-blob fallback. The slot bookkeeping below is complete.
+//! The OS layer is POSIX `shm_open` + `mmap` on macOS and Linux
+//! (`shm/unix.rs`) and a named pagefile-backed section on Windows
+//! (`shm/windows.rs`). Any error from it is an [`Error::Shm`], and callers
+//! fall back to inline blobs.
 
 use crate::{Error, Result};
 use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::io;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+use unix as os;
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows as os;
+
+/// No shared memory on other targets: every caller takes the blob fallback.
+#[cfg(not(any(unix, windows)))]
+mod os {
+    use super::Access;
+    use std::io;
+
+    pub(super) enum Mapping {}
+
+    impl Mapping {
+        pub(super) fn create(_: &str, _: usize, _: Access) -> io::Result<Self> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+        pub(super) fn open(_: &str, _: usize, _: Access) -> io::Result<Self> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+        pub(super) fn as_ptr(&self) -> *mut u8 {
+            match *self {}
+        }
+    }
+
+    pub(super) fn unlink(_: &str) -> io::Result<()> {
+        Ok(())
+    }
+
+    pub(super) fn space_available(_: u64) -> bool {
+        false
+    }
+}
 
 /// Everything a child needs to attach to a parent's region. Sent over the
 /// pipe.
@@ -96,41 +136,106 @@ pub fn live_region_count() -> usize {
     LIVE_REGIONS.load(Ordering::SeqCst)
 }
 
+/// Whether the OS has room for a new region of `bytes` right now; check
+/// before [`ShmRegion::create`] and use inline blobs when it says no.
+///
+/// Only Linux can say no: its shm objects are files in the `/dev/shm`
+/// tmpfs, where sizing one past the free space succeeds and the writer gets
+/// `SIGBUS` later. macOS backs regions with ordinary memory, and Windows
+/// commits a section's memory up front, so an oversized region fails at
+/// creation there.
+pub fn shm_space_available(bytes: u64) -> bool {
+    os::space_available(bytes)
+}
+
 /// One mapped shared-memory region: `slot_count` slots of `slot_size` bytes.
 pub struct ShmRegion {
     ptr: *mut u8,
     len: u64,
     desc: ShmRegionDesc,
+    access: Access,
+    backing: Backing,
+}
+
+enum Backing {
+    Os {
+        /// Only here to be released (unmapped, handle closed) on drop.
+        _mapping: os::Mapping,
+        /// This process created the OS object (and so owns its name).
+        owner: bool,
+        unlinked: bool,
+    },
     /// Test-only regions are plain heap memory, freed on drop.
-    heap: bool,
+    #[cfg(test)]
+    Heap,
 }
 
 // SAFETY: the mapping is plain memory that stays valid until drop, and the
 // region itself never reads or writes it. Access goes through `WriteSlot`
 // (exclusive ownership of one slot, handed out by `SlotPool`) or `Lease`
 // (a published slot the producer won't touch again until it's released).
+// The OS handle (Windows) is only used to release the mapping in drop,
+// which needs `&mut self`.
 unsafe impl Send for ShmRegion {}
 // SAFETY: as above; shared references only hand out disjoint slot views.
 unsafe impl Sync for ShmRegion {}
 
 impl ShmRegion {
     /// Parent side: create and map a new region named by [`object_name`].
+    ///
+    /// `slot_size` must be a nonzero multiple of [`SLOT_ALIGN`] and
+    /// `slot_count` nonzero. Dropping the region before
+    /// [`ShmRegion::unlink_name`] also removes the name.
     pub fn create(epoch: u32, slot_count: u32, slot_size: u64, access: Access) -> Result<Self> {
-        let _ = (epoch, slot_count, slot_size, access);
-        Err(Error::ShmUnsupported)
+        let len = region_len(slot_count, slot_size)?;
+        let pid = std::process::id();
+        let mut collisions = 0;
+        loop {
+            let os_name = object_name(pid, epoch, random_nonce());
+            match os::Mapping::create(&os_name, len, access) {
+                Ok(map) => {
+                    let desc = ShmRegionDesc {
+                        epoch,
+                        os_name,
+                        slot_count,
+                        slot_size,
+                    };
+                    return Ok(Self::mapped(map, desc, access, true));
+                }
+                // A leftover from a crashed process with a recycled pid, or
+                // another region here that drew the same nonce: draw again.
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && collisions < 8 => {
+                    collisions += 1;
+                }
+                Err(e) => return Err(os_error("create", &os_name, e)),
+            }
+        }
     }
 
-    /// Child side: map the region `desc` describes. Validates that the OS
-    /// object is at least `slot_count * slot_size` bytes.
+    /// Child side: map the region `desc` describes. Fails unless the OS
+    /// object is exactly `slot_count * slot_size` bytes.
     pub fn open(desc: &ShmRegionDesc, access: Access) -> Result<Self> {
-        let _ = (desc, access);
-        Err(Error::ShmUnsupported)
+        let len = region_len(desc.slot_count, desc.slot_size)?;
+        let map = os::Mapping::open(&desc.os_name, len, access)
+            .map_err(|e| os_error("open", &desc.os_name, e))?;
+        Ok(Self::mapped(map, desc.clone(), access, false))
     }
 
     /// Remove the OS name so nothing else can attach and the object is freed
     /// once both mappings are gone. Idempotent; a no-op on Windows, where
     /// the section dies with its last handle.
     pub fn unlink_name(&mut self) -> Result<()> {
+        match &mut self.backing {
+            Backing::Os { unlinked, .. } => {
+                if !*unlinked {
+                    os::unlink(&self.desc.os_name)
+                        .map_err(|e| os_error("unlink", &self.desc.os_name, e))?;
+                    *unlinked = true;
+                }
+            }
+            #[cfg(test)]
+            Backing::Heap => {}
+        }
         Ok(())
     }
 
@@ -151,6 +256,22 @@ impl ShmRegion {
             .wrapping_add((u64::from(slot) * self.desc.slot_size) as usize)
     }
 
+    /// The one place a mapped region is built, so the live count matches.
+    fn mapped(map: os::Mapping, desc: ShmRegionDesc, access: Access, owner: bool) -> Self {
+        LIVE_REGIONS.fetch_add(1, Ordering::SeqCst);
+        Self {
+            ptr: map.as_ptr(),
+            len: u64::from(desc.slot_count) * desc.slot_size,
+            desc,
+            access,
+            backing: Backing::Os {
+                _mapping: map,
+                owner,
+                unlinked: false,
+            },
+        }
+    }
+
     /// Heap-backed stand-in for a mapping, so the bookkeeping is testable
     /// without an OS layer.
     #[cfg(test)]
@@ -167,21 +288,75 @@ impl ShmRegion {
                 slot_count,
                 slot_size,
             },
-            heap: true,
+            access: Access::ReadWrite,
+            backing: Backing::Heap,
         }
     }
 }
 
 impl Drop for ShmRegion {
     fn drop(&mut self) {
-        if self.heap {
-            let mem = std::ptr::slice_from_raw_parts_mut(self.ptr, self.len as usize);
-            // SAFETY: `ptr`/`len` came from `Box::into_raw` of exactly this
-            // slice in `heap_for_tests`, and nothing borrows the region any
-            // more (we are its last owner).
-            drop(unsafe { Box::from_raw(mem) });
+        match &self.backing {
+            Backing::Os {
+                owner: true,
+                unlinked: false,
+                ..
+            } => {
+                // Intentional: best effort, errors ignored. The creator
+                // normally unlinks right after the child attaches; this
+                // covers the error paths in between, so they don't leave a
+                // stale name behind.
+                let _ = os::unlink(&self.desc.os_name);
+            }
+            Backing::Os { .. } => {}
+            #[cfg(test)]
+            Backing::Heap => {
+                let mem = std::ptr::slice_from_raw_parts_mut(self.ptr, self.len as usize);
+                // SAFETY: `ptr`/`len` came from `Box::into_raw` of exactly
+                // this slice in `heap_for_tests`, and nothing borrows the
+                // region any more (we are its last owner).
+                drop(unsafe { Box::from_raw(mem) });
+            }
         }
+        // The OS mapping itself is released when `backing` drops, right
+        // after this.
         LIVE_REGIONS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Mapping length for `slot_count` slots of `slot_size` bytes, rejecting
+/// layouts no region may have.
+fn region_len(slot_count: u32, slot_size: u64) -> Result<usize> {
+    let valid = slot_count > 0 && slot_size > 0 && slot_size.is_multiple_of(SLOT_ALIGN);
+    valid
+        .then(|| u64::from(slot_count).checked_mul(slot_size))
+        .flatten()
+        // The OS sizes objects with a signed 64-bit offset.
+        .filter(|&n| i64::try_from(n).is_ok())
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| {
+            Error::Shm(format!(
+                "invalid region layout: {slot_count} slots of {slot_size} bytes \
+                 (slot size must be a nonzero multiple of {SLOT_ALIGN})"
+            ))
+        })
+}
+
+/// A fresh random value for [`object_name`]'s nonce. std's `RandomState` is
+/// keyed from the OS's random source, so hashing a per-process counter with
+/// it gives unpredictable, distinct values without a `rand` dependency.
+fn random_nonce() -> u32 {
+    use std::hash::BuildHasher;
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    std::collections::hash_map::RandomState::new().hash_one(n) as u32
+}
+
+fn os_error(op: &str, name: &str, e: io::Error) -> Error {
+    if e.kind() == io::ErrorKind::Unsupported {
+        Error::ShmUnsupported
+    } else {
+        Error::Shm(format!("{op} {name}: {e}"))
     }
 }
 
@@ -219,7 +394,17 @@ struct PoolState {
 
 impl SlotPool {
     /// A pool with every slot of `region` free.
+    ///
+    /// # Panics
+    ///
+    /// If `region` is mapped read-only: its slots are written through
+    /// [`WriteSlot::as_mut_slice`], and a write there would fault.
     pub fn new(region: Arc<ShmRegion>) -> Arc<Self> {
+        assert_eq!(
+            region.access,
+            Access::ReadWrite,
+            "SlotPool needs a read-write mapping"
+        );
         let n = region.desc.slot_count as usize;
         Arc::new(Self {
             region,
@@ -306,8 +491,8 @@ impl WriteSlot {
         let region = &self.pool.region;
         // SAFETY: the pool hands each free slot to exactly one WriteSlot, the
         // slot lies inside the mapping (index from the pool's own range), and
-        // nobody reads it until it is published. Only producers (read-write
-        // mappings) create pools.
+        // nobody reads it until it is published. `SlotPool::new` only accepts
+        // read-write mappings.
         unsafe {
             std::slice::from_raw_parts_mut(
                 region.slot_ptr(self.slot),
@@ -493,17 +678,27 @@ mod tests {
     }
 
     #[test]
-    fn os_layer_is_unsupported_for_now() {
-        let r = ShmRegion::create(1, 4, SLOT, Access::ReadWrite);
-        assert!(matches!(r, Err(Error::ShmUnsupported)), "{r:?}");
-        let desc = ShmRegionDesc {
-            epoch: 1,
-            os_name: object_name(1, 1, 1),
-            slot_count: 4,
-            slot_size: SLOT,
-        };
-        let r = ShmRegion::open(&desc, Access::ReadOnly);
-        assert!(matches!(r, Err(Error::ShmUnsupported)), "{r:?}");
+    fn region_layouts_are_validated() {
+        assert_eq!(region_len(3, SLOT).unwrap(), 3 * SLOT as usize);
+        for (count, size) in [
+            (0, SLOT),
+            (1, 0),
+            (1, SLOT + 1),
+            (1, SLOT / 2),
+            (u32::MAX, u64::MAX - u64::MAX % SLOT),
+            (2, 1 << 63),
+        ] {
+            assert!(
+                matches!(region_len(count, size), Err(Error::Shm(_))),
+                "{count} x {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn nonces_differ() {
+        let nonces: std::collections::HashSet<u32> = (0..16).map(|_| random_nonce()).collect();
+        assert_eq!(nonces.len(), 16);
     }
 
     #[test]
