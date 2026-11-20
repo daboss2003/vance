@@ -37,7 +37,7 @@ pub fn render_fusion_yuv420(
         height: eh,
         pixel_format: PixelFormat::Yuv420P,
         strides: vec![ew, cw, cw],
-        bytes: yuv,
+        bytes: yuv.into(),
     }
 }
 

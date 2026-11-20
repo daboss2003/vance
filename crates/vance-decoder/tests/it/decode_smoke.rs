@@ -100,3 +100,74 @@ fn handshake_open_decode_close() {
     client.close().expect("close");
     client.shutdown().expect("shutdown");
 }
+
+/// The raw v3 protocol: a region that doesn't exist can't be attached, a
+/// release for a region the sidecar never attached is all stale, and
+/// neither disturbs decoding. The `Frame` reply's pixels follow it as
+/// exactly one blob of the announced length.
+#[test]
+fn shm_requests_without_a_region_leave_frames_inline() {
+    use vance_decoder::protocol::{
+        DecoderRequest as Req, DecoderResponse as Resp, FramePayload, ShmRegionDesc, SlotRef,
+        PROTOCOL_VERSION,
+    };
+    let bin = sidecar_binary_path();
+    assert!(bin.exists(), "decoder binary missing at {}", bin.display());
+    let mut sc: vance_ipc::Sidecar<Req, Resp> =
+        vance_ipc::Sidecar::spawn(&bin, std::iter::empty::<&str>()).expect("spawn");
+    let hello = sc
+        .request(&Req::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        })
+        .unwrap();
+    assert!(
+        matches!(hello, Resp::Hello { protocol_version, .. } if protocol_version == PROTOCOL_VERSION),
+        "{hello:?}"
+    );
+    let info = match sc
+        .request(&Req::Open {
+            path: fixture_path().to_string_lossy().into_owned(),
+        })
+        .unwrap()
+    {
+        Resp::Opened(info) => info,
+        other => panic!("open: {other:?}"),
+    };
+
+    let missing = ShmRegionDesc {
+        epoch: 1,
+        os_name: vance_ipc::shm::object_name(std::process::id(), 1, 0x5eed_0000),
+        slot_count: 3,
+        slot_size: vance_ipc::shm::SLOT_ALIGN,
+    };
+    let reply = sc.request(&Req::AttachShm(missing)).unwrap();
+    assert!(matches!(reply, Resp::ShmUnavailable { .. }), "{reply:?}");
+
+    let slot = SlotRef {
+        epoch: 1,
+        slot: 0,
+        generation: 1,
+        len: 10,
+    };
+    let reply = sc
+        .request(&Req::Release {
+            slots: vec![slot, SlotRef { slot: 1, ..slot }],
+        })
+        .unwrap();
+    assert!(matches!(reply, Resp::Released { stale: 2 }), "{reply:?}");
+
+    for _ in 0..2 {
+        let (meta, len) = match sc.request(&Req::DecodeAt { target_pts: 0 }).unwrap() {
+            Resp::Frame {
+                meta,
+                payload: FramePayload::Inline { len },
+            } => (meta, len),
+            other => panic!("decode_at: {other:?}"),
+        };
+        assert_eq!((meta.width, meta.height), (info.width, info.height));
+        let expected = meta.pixel_format.frame_size(meta.width, meta.height) as u64;
+        assert_eq!(len, expected);
+        assert_eq!(sc.recv_blob(len).unwrap().len() as u64, expected);
+    }
+    assert!(matches!(sc.request(&Req::Shutdown).unwrap(), Resp::Goodbye));
+}

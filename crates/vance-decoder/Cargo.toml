@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
+# Intentional: src/bin/ holds the sidecar's modules (media.rs, pack.rs, ...),
+# not separate binaries; without this Cargo would build each file as one.
+autobins = false
 
 [lib]
 path = "src/lib.rs"

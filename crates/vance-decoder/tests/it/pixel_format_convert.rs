@@ -335,8 +335,9 @@ fn videotoolbox_codec_decoded_in_software_is_converted_to_nv12() {
 ///   cargo test -p vance-decoder --test it -- --ignored --nocapture prores_4k
 /// The dev profile builds this crate and vance-ipc at opt-level 2 (see the
 /// workspace Cargo.toml), so a plain debug build gives representative numbers.
-/// On an M1 (Nov 2026): ~88 ms/frame, 11 fps. The inline IPC hop (~77 ms for a
-/// 25 MB frame) is the bottleneck; shared-memory frames are planned.
+/// On an M1 (Nov 2026): ~42 ms/frame, 24 fps, with frames sent as raw blobs
+/// after the reply (it was ~88-98 ms with the bytes inside bincode).
+/// Shared-memory frames and threaded decode are next (ADR 0006).
 #[test]
 #[ignore = "manual benchmark: run with --ignored --nocapture"]
 fn prores_4k_decode_throughput() {

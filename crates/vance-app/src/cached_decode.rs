@@ -81,7 +81,7 @@ pub fn unpack_frame(buf: &[u8]) -> Option<FrameData> {
         let off = 19 + i * 4;
         strides.push(u32::from_le_bytes(buf[off..off + 4].try_into().ok()?));
     }
-    let bytes = buf[stride_table_end..].to_vec();
+    let bytes = buf[stride_table_end..].to_vec().into();
     Some(FrameData {
         pts,
         width,
@@ -125,7 +125,11 @@ mod tests {
             height: 16,
             pixel_format: PixelFormat::Yuv420P,
             strides: vec![16, 8, 8],
-            bytes: (0u8..=255).cycle().take(16 * 16 * 3 / 2).collect(),
+            bytes: (0u8..=255)
+                .cycle()
+                .take(16 * 16 * 3 / 2)
+                .collect::<Vec<u8>>()
+                .into(),
         }
     }
 

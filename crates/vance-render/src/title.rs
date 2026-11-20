@@ -123,7 +123,7 @@ pub fn render_title_yuv420(params: &TitleParams) -> Result<FrameData, TitleError
         pixel_format: PixelFormat::Yuv420P,
         // YUV420P stride per plane equals each plane's row width.
         strides: vec![w, cw, cw],
-        bytes: yuv,
+        bytes: yuv.into(),
     })
 }
 

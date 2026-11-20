@@ -25,7 +25,7 @@ fn solid_yuv420p(width: u32, height: u32, y: u8, u: u8, v: u8) -> FrameData {
         height,
         pixel_format: PixelFormat::Yuv420P,
         strides: vec![width, chroma_w, chroma_w],
-        bytes,
+        bytes: bytes.into(),
     }
 }
 
@@ -45,7 +45,7 @@ fn solid_nv12(width: u32, height: u32, y: u8, u: u8, v: u8) -> FrameData {
         height,
         pixel_format: PixelFormat::Nv12,
         strides: vec![width, chroma_w * 2],
-        bytes,
+        bytes: bytes.into(),
     }
 }
 
@@ -150,7 +150,7 @@ fn solid_yuv420p10le(width: u32, height: u32, y: u16, u: u16, v: u16) -> FrameDa
         height,
         pixel_format: PixelFormat::Yuv420P10Le,
         strides: vec![width, cw, cw],
-        bytes,
+        bytes: bytes.into(),
     }
 }
 
@@ -425,7 +425,8 @@ fn odd_dimension_frames_upload_and_render() {
     .into_iter()
     .chain([(w.div_ceil(2) * h.div_ceil(2), 240 << 2)])
     .flat_map(|(n, code)| std::iter::repeat_n(code.to_le_bytes(), n as usize).flatten())
-    .collect();
+    .collect::<Vec<u8>>()
+    .into();
     for (label, frame) in [
         ("yuv420p", solid_yuv420p(w, h, 63, 102, 240)),
         ("nv12", solid_nv12(w, h, 63, 102, 240)),
@@ -474,7 +475,7 @@ fn malformed_frame_rejected() {
         height: 64,
         pixel_format: PixelFormat::Yuv420P,
         strides: vec![64, 32, 32],
-        bytes: vec![0; 100], // way too small
+        bytes: vec![0; 100].into(), // way too small
     };
     let err = r.upload_frame(&bad).unwrap_err();
     let s = format!("{err}");

@@ -512,7 +512,7 @@ mod tests {
             height: h,
             pixel_format: PixelFormat::Yuv420P,
             strides: vec![w, w / 2, w / 2],
-            bytes: vec![128u8; (w * h + 2 * (w / 2) * (h / 2)) as usize],
+            bytes: vec![128u8; (w * h + 2 * (w / 2) * (h / 2)) as usize].into(),
         };
         let out = yuv_or_nv12_to_rgba(&frame, (w * h * 4) as usize);
         assert_eq!(out.len(), (w * h * 4) as usize);
@@ -564,7 +564,7 @@ mod tests {
                 height: h,
                 pixel_format,
                 strides,
-                bytes,
+                bytes: bytes.into(),
             };
             let out = yuv_or_nv12_to_rgba(&frame, (w * h * 4) as usize);
             assert!(

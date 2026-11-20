@@ -13,3 +13,5 @@ mod hw_decode;
 mod memory_budget;
 mod pixel_format_convert;
 mod streaming;
+mod threading;
+mod transport;

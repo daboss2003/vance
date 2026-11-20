@@ -8,17 +8,19 @@
 //! - The sidecar binary (`src/bin/main.rs`), which embeds FFmpeg and serves
 //!   the protocol over stdin/stdout.
 //!
-//! Milestone 1.2 scope: open / info / seek / decode-at-PTS / close. Frames
-//! are returned inline in the IPC response for now; shared memory lands
-//! when 4K performance becomes a measurable problem (Milestone 1.5+).
+//! Scope: open / info / seek / decode-at-PTS / streaming / close. Pixels
+//! cross the process boundary as a raw blob after each `Frame` reply, or in
+//! a shared-memory slot once one is attached (ADR 0006).
 
 #![warn(missing_docs)]
 
 pub mod client;
+pub mod frame;
 pub mod hwaccel;
 pub mod protocol;
 
-pub use client::DecoderClient;
+pub use client::{ClientOptions, DecoderClient, TransportStats};
+pub use frame::{FrameBytes, FrameData};
 pub use protocol::{
-    DecoderRequest, DecoderResponse, FrameData, OpenError, PixelFormat, StreamInfo,
+    DecoderRequest, DecoderResponse, FrameMeta, FramePayload, OpenError, PixelFormat, StreamInfo,
 };

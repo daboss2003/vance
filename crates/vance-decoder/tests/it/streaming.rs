@@ -111,3 +111,47 @@ fn stop_stream_mid_stream_recovers_for_decode_at() {
 
     client.shutdown().expect("shutdown");
 }
+
+/// With shared memory off, every frame (one-shot and streamed) arrives
+/// inline, owned, and fully sized; the counters say so.
+#[test]
+fn inline_transport_is_counted() {
+    use vance_decoder::{ClientOptions, TransportStats};
+    let bin = sidecar_binary_path();
+    let options = ClientOptions {
+        shm: false,
+        ..ClientOptions::default()
+    };
+    let mut client =
+        DecoderClient::spawn_with_options(&bin, std::iter::empty::<(&str, &str)>(), options)
+            .expect("spawn");
+    assert_eq!(client.transport_stats(), TransportStats::default());
+    let info = client
+        .open(fixture_path().to_string_lossy().to_string())
+        .expect("open");
+    let frame_size = info.pixel_format.frame_size(info.width, info.height);
+
+    let f = client.decode_at(0).expect("decode_at");
+    assert!(!f.bytes.is_shared());
+    assert_eq!(f.bytes.len(), frame_size);
+
+    client.start_stream(0, 4).expect("start_stream");
+    let mut streamed = 0u64;
+    for _ in 0..10 {
+        let f = client.next_frame().expect("next_frame").expect("not eos");
+        assert!(!f.bytes.is_shared());
+        assert_eq!(f.bytes.len(), frame_size);
+        streamed += 1;
+    }
+    client.stop_stream().expect("stop_stream");
+
+    let stats = client.transport_stats();
+    assert_eq!(
+        stats,
+        TransportStats {
+            inline: 1 + streamed,
+            ..TransportStats::default()
+        }
+    );
+    client.shutdown().expect("shutdown");
+}

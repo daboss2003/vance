@@ -12,7 +12,13 @@ use serde::{Deserialize, Serialize};
 /// - v1: Phase 1 — Hello/Open/Seek/DecodeAt/Close/Shutdown.
 /// - v2: Phase 2.1 — adds streaming (StartStream/NextFrame/StopStream)
 ///   and the `EndOfStream` response.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// - v3: frames arrive as `Frame { meta, payload }`; inline pixels follow the
+///   reply as one raw blob instead of a bincode byte array. Adds
+///   `AttachShm` / `Release` for shared-memory frames (ADR 0006).
+pub const PROTOCOL_VERSION: u32 = 3;
+
+pub use crate::frame::FrameData;
+pub use vance_ipc::shm::{ShmRegionDesc, SlotRef};
 
 /// One request from parent to sidecar.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,9 +43,9 @@ pub enum DecoderRequest {
         target_pts: i64,
     },
 
-    /// Decode the frame whose PTS is closest to (and at most) `target_pts`,
-    /// in the stream's time base. The sidecar may seek + decode forward as
-    /// needed; the response returns the actual PTS of the frame delivered.
+    /// Decode the first frame whose PTS is at or after `target_pts`, in the
+    /// stream's time base. The sidecar seeks to the keyframe before it and
+    /// decodes forward; the response carries the actual PTS delivered.
     DecodeAt {
         /// Target PTS in the stream's time base.
         target_pts: i64,
@@ -79,6 +85,19 @@ pub enum DecoderRequest {
     /// from the sidecar's point of view, but lets the parent get a clean
     /// `Goodbye` response before EOF.
     Shutdown,
+
+    /// Offer a shared-memory region for frame payloads. Implies
+    /// `StopStream`. Reply: [`DecoderResponse::ShmAttached`] (frames may now
+    /// arrive as [`FramePayload::Shared`]) or [`DecoderResponse::ShmUnavailable`]
+    /// (they stay inline).
+    AttachShm(ShmRegionDesc),
+
+    /// Hand shared-memory slots back to the sidecar once the parent is done
+    /// with them. Reply: [`DecoderResponse::Released`].
+    Release {
+        /// Slots to return. References to another region epoch are stale.
+        slots: Vec<SlotRef>,
+    },
 }
 
 /// One response from sidecar to parent. Always sent in reply to a request,
@@ -105,8 +124,14 @@ pub enum DecoderResponse {
         pts: i64,
     },
 
-    /// A decoded frame.
-    Frame(FrameData),
+    /// A decoded frame. With an `Inline` payload exactly one raw blob of
+    /// `len` bytes follows this reply on the stream.
+    Frame {
+        /// Everything about the frame except its pixels.
+        meta: FrameMeta,
+        /// Where the pixels are.
+        payload: FramePayload,
+    },
 
     /// `DecodeAt` failed (no frame at or near the requested PTS, decoder
     /// error, etc.).
@@ -136,6 +161,25 @@ pub enum DecoderResponse {
 
     /// Graceful shutdown acknowledged; sidecar will exit immediately.
     Goodbye,
+
+    /// `AttachShm` succeeded: the sidecar mapped the region of this epoch.
+    ShmAttached {
+        /// Epoch of the attached region.
+        epoch: u32,
+    },
+
+    /// `AttachShm` failed; frames stay inline.
+    ShmUnavailable {
+        /// Why, for the log.
+        reason: String,
+    },
+
+    /// `Release` processed.
+    Released {
+        /// How many of the slots were stale (unknown epoch, already
+        /// released, or an older generation) and were ignored.
+        stale: u32,
+    },
 }
 
 /// Information about the chosen video stream after open. Returned in
@@ -218,13 +262,9 @@ impl PixelFormat {
     }
 }
 
-/// One decoded frame returned in [`DecoderResponse::Frame`].
-///
-/// Pixel data is inline for Milestone 1.2 (works up to ~1080p within the
-/// IPC frame cap). Will be replaced by a shared-memory handle when 4K
-/// performance demands it (Milestone 1.5+).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FrameData {
+/// A decoded frame's description, sent with [`DecoderResponse::Frame`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameMeta {
     /// PTS in the stream's time base.
     pub pts: i64,
     /// Width in pixels.
@@ -233,10 +273,20 @@ pub struct FrameData {
     pub height: u32,
     /// Pixel format (matches the open's `StreamInfo.pixel_format`).
     pub pixel_format: PixelFormat,
-    /// Per-plane line strides in bytes (NV12: [Y, UV]; YUV420P: [Y, U, V]).
+    /// Per-plane row lengths in samples (NV12: [Y, UV]; YUV420P: [Y, U, V]).
     pub strides: Vec<u32>,
-    /// Raw pixel bytes, planes packed back to back (Y first).
-    pub bytes: Vec<u8>,
+}
+
+/// Where a frame's pixel bytes (planes packed back to back, Y first) are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FramePayload {
+    /// Exactly one raw blob of `len` bytes follows the reply.
+    Inline {
+        /// Byte count of the blob.
+        len: u64,
+    },
+    /// In a shared-memory slot, owned by the parent until it releases it.
+    Shared(SlotRef),
 }
 
 /// Reasons an `Open` can fail.
@@ -317,11 +367,70 @@ mod tests {
             DecoderRequest::StopStream,
             DecoderRequest::Close,
             DecoderRequest::Shutdown,
+            DecoderRequest::AttachShm(ShmRegionDesc {
+                epoch: 2,
+                os_name: vance_ipc::shm::object_name(1, 2, 3),
+                slot_count: 7,
+                slot_size: 25 * 1024 * 1024,
+            }),
+            DecoderRequest::Release {
+                slots: vec![SLOT, SlotRef { slot: 4, ..SLOT }],
+            },
         ];
         for c in cases {
             let cfg = bincode::config::standard();
             let bytes = bincode::serde::encode_to_vec(&c, cfg).unwrap();
             let (back, _): (DecoderRequest, _) =
+                bincode::serde::decode_from_slice(&bytes, cfg).unwrap();
+            assert_eq!(format!("{c:?}"), format!("{back:?}"));
+        }
+    }
+
+    const SLOT: SlotRef = SlotRef {
+        epoch: 2,
+        slot: 3,
+        generation: 9,
+        len: 1234,
+    };
+
+    #[test]
+    fn response_round_trips() {
+        let meta = FrameMeta {
+            pts: -5,
+            width: 161,
+            height: 91,
+            pixel_format: PixelFormat::Yuv420P10Le,
+            strides: vec![161, 81, 81],
+        };
+        let cases = vec![
+            DecoderResponse::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                ffmpeg_version: "7.1".into(),
+            },
+            DecoderResponse::OpenFailed(OpenError::NoVideoStream),
+            DecoderResponse::Seeked { pts: 7 },
+            DecoderResponse::Frame {
+                meta: meta.clone(),
+                payload: FramePayload::Inline { len: 40_000 },
+            },
+            DecoderResponse::Frame {
+                meta,
+                payload: FramePayload::Shared(SLOT),
+            },
+            DecoderResponse::DecodeFailed { reason: "x".into() },
+            DecoderResponse::Streaming { first_pts: 3 },
+            DecoderResponse::EndOfStream,
+            DecoderResponse::Stopped,
+            DecoderResponse::Closed,
+            DecoderResponse::Goodbye,
+            DecoderResponse::ShmAttached { epoch: 2 },
+            DecoderResponse::ShmUnavailable { reason: "y".into() },
+            DecoderResponse::Released { stale: 1 },
+        ];
+        for c in cases {
+            let cfg = bincode::config::standard();
+            let bytes = bincode::serde::encode_to_vec(&c, cfg).unwrap();
+            let (back, _): (DecoderResponse, _) =
                 bincode::serde::decode_from_slice(&bytes, cfg).unwrap();
             assert_eq!(format!("{c:?}"), format!("{back:?}"));
         }

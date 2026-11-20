@@ -9,9 +9,11 @@
 //! - A `Sidecar<Req, Resp>` supervisor that spawns a child binary and
 //!   exchanges typed request/response messages over its stdin/stdout.
 //! - A child-side `serve` helper that runs a request handler loop.
-//!
-//! Shared-memory frame transport lands in Milestone 1.2 when `vance-decoder`
-//! actually has frames to ship.
+//! - Raw blobs after a message for bulk bytes such as video frames
+//!   (`write_blob` / `read_blob`, `serve_with_blobs`), so pixels never go
+//!   through bincode.
+//! - Shared-memory frame regions ([`shm`], ADR 0006); until its OS layer
+//!   lands every frame takes the blob fallback.
 //!
 //! ## Why stdin/stdout, not Unix sockets?
 //!
@@ -20,15 +22,16 @@
 //! by the child. The cost is half-duplex per stream — but with two streams
 //! (parent's stdout = child's stdin for commands; child's stdout = parent's
 //! stdin for responses) we get a clean full-duplex channel. Good enough
-//! for command/response; Milestone 1.2 adds shared memory for bulk frame
-//! data so the IPC channel never carries pixel buffers.
+//! for command/response; shared memory (ADR 0006) takes bulk frame data off
+//! the channel entirely.
 
 #![warn(missing_docs)]
 
 mod error;
 mod frame;
+pub mod shm;
 mod sidecar;
 
 pub use error::{Error, Result};
-pub use frame::{read_frame, write_frame, MAX_FRAME_BYTES};
-pub use sidecar::{serve, Sidecar};
+pub use frame::{read_blob, read_frame, write_blob, write_frame, MAX_BLOB_BYTES, MAX_FRAME_BYTES};
+pub use sidecar::{serve, serve_with_blobs, BlobReader, Reply, Sidecar};
