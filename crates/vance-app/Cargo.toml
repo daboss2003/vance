@@ -86,6 +86,8 @@ vance-plugin-host = { workspace = true }
 vance-timeline = { workspace = true }
 vance-project = { workspace = true }
 vance-peaks = { workspace = true }
+# Every child process the app starts goes through `vance_ipc::process`.
+vance-ipc = { workspace = true }
 uuid = { workspace = true }
 arc-swap = "1"
 # M1 — accounts client: OS keychain for tokens (spec §4.3), with an

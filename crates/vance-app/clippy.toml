@@ -1,0 +1,1 @@
+disallowed-methods = [{ path = "std::process::Command::spawn", reason = "use vance_ipc::process::spawn (pipe-inheritance race, see vance-ipc/src/process.rs)" }, { path = "std::process::Command::output", reason = "use vance_ipc::process::output" }, { path = "std::process::Command::status", reason = "use vance_ipc::process::status" }]

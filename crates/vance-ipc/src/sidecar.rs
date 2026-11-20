@@ -82,7 +82,7 @@ impl<Req: Serialize, Resp: DeserializeOwned> Sidecar<Req, Resp> {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        let mut child = cmd.spawn().map_err(|e| Error::SpawnFailed {
+        let mut child = crate::process::spawn(&mut cmd).map_err(|e| Error::SpawnFailed {
             program: program_str.clone(),
             source: e,
         })?;
@@ -379,15 +379,7 @@ mod tests {
     /// Spawn the echo sidecar. The example binary is built on demand
     /// (`cargo xtask test` builds examples first; a bare `cargo test -p
     /// vance-ipc` may not have), hence the hint.
-    ///
-    /// Intentional: spawns in this module are serialized. On macOS std
-    /// creates a child's pipes with `pipe()` and sets CLOEXEC afterwards, so
-    /// a sidecar spawned by a concurrent test in between inherits the pipe
-    /// and keeps it open; a write to a killed child then still succeeds
-    /// (seen ~2 in 1000 runs).
     fn spawn_echo(args: &[&str]) -> Sidecar<EchoReq, EchoResp> {
-        static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _serialized = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
         let path = echo_sidecar_path();
         assert!(
             path.exists(),

@@ -7,6 +7,10 @@
 //! a new top-level `tests/*.rs` file. Run one module with:
 //!   cargo test -p vance-app --test it <module>::
 
+// Tests run ffmpeg/ffprobe directly to build fixtures and check output; the
+// spawn lock (vance_ipc::process, enforced by ../../clippy.toml) is for app code.
+#![allow(clippy::disallowed_methods)]
+
 mod edge_cases;
 mod encrypted_effect;
 mod export_audio;

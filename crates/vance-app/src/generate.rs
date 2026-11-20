@@ -103,12 +103,13 @@ pub fn generate_with_progress(req: &GenRequest, on: &mut GenProgress) -> Result<
     // Pipe stdin and don't take it: the diffusers wrapper (run with
     // `--watch-parent`) exits the instant Vance dies, so a heavy generation
     // can't keep pegging the machine after the app quits.
-    let mut child = Command::new(&program)
-        .args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut child = vance_ipc::process::spawn(
+        Command::new(&program)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )?;
 
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     let mut readers = Vec::new();

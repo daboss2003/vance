@@ -12,8 +12,10 @@
 //! - Raw blobs after a message for bulk bytes such as video frames
 //!   (`write_blob` / `read_blob`, `serve_with_blobs`), so pixels never go
 //!   through bincode.
-//! - Shared-memory frame regions ([`shm`], ADR 0006); until its OS layer
-//!   lands every frame takes the blob fallback.
+//! - Shared-memory frame regions ([`shm`], ADR 0006), with the raw blob as
+//!   the fallback whenever a region isn't available.
+//! - [`process`]: every child-process start goes through one lock, so pipes
+//!   can't leak into a concurrently started child (macOS).
 //!
 //! ## Why stdin/stdout, not Unix sockets?
 //!
@@ -29,6 +31,7 @@
 
 mod error;
 mod frame;
+pub mod process;
 pub mod shm;
 mod sidecar;
 

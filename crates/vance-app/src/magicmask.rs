@@ -67,7 +67,7 @@ pub fn isolate_subject(media_path: &Path) -> Result<PathBuf, MagicMaskError> {
         .arg("-tv")
         .arg("-o")
         .arg(&out_file);
-    let out = cmd.output()?;
+    let out = vance_ipc::process::output(&mut cmd)?;
     if !out.status.success() {
         let stderr: String = String::from_utf8_lossy(&out.stderr)
             .chars()

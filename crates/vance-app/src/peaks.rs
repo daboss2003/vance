@@ -722,11 +722,12 @@ fn signal_terminate(pid: u32) {
         // windows crate, and writing FFI for one syscall isn't worth
         // the cargo footprint. taskkill is in System32 on every
         // supported Windows release.
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        let _ = vance_ipc::process::status(
+            std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        );
     }
 }
 

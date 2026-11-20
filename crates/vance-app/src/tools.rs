@@ -447,11 +447,7 @@ fn ensure_venv(on: &mut Progress) -> Result<PathBuf, InstallError> {
     let python = ensure_python(on)?;
     on("setup", "Creating a private Python environment…", None);
     let venv = venv_dir()?;
-    let out = Command::new(&python)
-        .arg("-m")
-        .arg("venv")
-        .arg(&venv)
-        .output()?;
+    let out = vance_ipc::process::output(Command::new(&python).arg("-m").arg("venv").arg(&venv))?;
     if !out.status.success() {
         return Err(pip_err("creating venv", &out));
     }
@@ -533,12 +529,13 @@ fn provision_python(on: &mut Progress) -> Result<PathBuf, InstallError> {
     on("setup", "Unpacking Python…", None);
     // `tar` handles .tar.gz on macOS/Linux and Windows 10+ (bsdtar). The archive
     // extracts to a top-level `python/` dir.
-    let out = Command::new("tar")
-        .arg("-xzf")
-        .arg(&tgz)
-        .arg("-C")
-        .arg(&tools)
-        .output()?;
+    let out = vance_ipc::process::output(
+        Command::new("tar")
+            .arg("-xzf")
+            .arg(&tgz)
+            .arg("-C")
+            .arg(&tools),
+    )?;
     let _ = std::fs::remove_file(&tgz);
     if !out.status.success() {
         return Err(InstallError::Pip {
@@ -715,7 +712,7 @@ fn run_streaming(
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn()?;
+    let mut child = vance_ipc::process::spawn(&mut cmd)?;
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     let mut readers = Vec::new();
     if let Some(out) = child.stdout.take() {

@@ -176,7 +176,7 @@ fn run_cpp(
 }
 
 fn run_and_collect(mut cmd: Command) -> Result<(), TranscribeError> {
-    let out = cmd.output()?;
+    let out = vance_ipc::process::output(&mut cmd)?;
     if !out.status.success() {
         let stderr: String = String::from_utf8_lossy(&out.stderr)
             .chars()

@@ -260,8 +260,7 @@ fn device_name() -> String {
         .ok()
         .or_else(|| std::env::var("HOSTNAME").ok())
         .or_else(|| {
-            std::process::Command::new("hostname")
-                .output()
+            vance_ipc::process::output(&mut std::process::Command::new("hostname"))
                 .ok()
                 .and_then(|o| String::from_utf8(o.stdout).ok())
                 .map(|s| s.trim().to_string())
@@ -1033,14 +1032,13 @@ impl AccountsState {
 // ===========================================================================
 
 fn open_browser(url: &str) {
+    use std::process::Command;
     let _ = if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(url).spawn()
+        vance_ipc::process::spawn(Command::new("open").arg(url))
     } else if cfg!(target_os = "windows") {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .spawn()
+        vance_ipc::process::spawn(Command::new("cmd").args(["/C", "start", "", url]))
     } else {
-        std::process::Command::new("xdg-open").arg(url).spawn()
+        vance_ipc::process::spawn(Command::new("xdg-open").arg(url))
     };
 }
 

@@ -75,7 +75,7 @@ pub fn isolate(media_path: &Path) -> Result<Stems, SeparateError> {
         .arg(&out_dir)
         .arg("--")
         .arg(&media);
-    let out = cmd.output()?;
+    let out = vance_ipc::process::output(&mut cmd)?;
     if !out.status.success() {
         let stderr: String = String::from_utf8_lossy(&out.stderr)
             .chars()

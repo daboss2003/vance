@@ -567,14 +567,13 @@ fn url_decode(s: &str) -> String {
 
 /// Open a URL in the OS default browser (best-effort).
 fn open_browser(url: &str) {
+    use std::process::Command;
     let _ = if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(url).spawn()
+        vance_ipc::process::spawn(Command::new("open").arg(url))
     } else if cfg!(target_os = "windows") {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .spawn()
+        vance_ipc::process::spawn(Command::new("cmd").args(["/C", "start", "", url]))
     } else {
-        std::process::Command::new("xdg-open").arg(url).spawn()
+        vance_ipc::process::spawn(Command::new("xdg-open").arg(url))
     };
 }
 
