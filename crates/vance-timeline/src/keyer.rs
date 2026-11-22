@@ -19,7 +19,7 @@ pub const KEY_BALANCE: &str = "balance";
 pub const KEY_STRENGTH: &str = "strength";
 /// Matte values at or below this become fully transparent. Default 0.0.
 pub const KEY_CLIP_BLACK: &str = "clip_black";
-/// Matte values at or above this become fully opaque. Default 1.0.
+/// Matte values at or above this become fully opaque. Default 0.9.
 pub const KEY_CLIP_WHITE: &str = "clip_white";
 /// Shrink (+, erode) or grow (−, dilate) the matte, in source pixels. Default 0.
 pub const KEY_CHOKE_PX: &str = "choke_px";

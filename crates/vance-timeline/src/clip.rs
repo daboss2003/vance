@@ -152,4 +152,26 @@ mod tests {
         assert_eq!(c.duration(), t(5));
         assert_eq!(c.timeline_out(), t(15));
     }
+
+    #[test]
+    fn blend_mode_json_defaults_and_unknown_names() {
+        use crate::blend::BlendMode;
+        let mut clip = Clip::new(MediaItemId::new(), "x", t(0), t(0), t(5)).unwrap();
+        clip.blend_mode = BlendMode::Overlay;
+        let mut json = serde_json::to_value(&clip).unwrap();
+        assert_eq!(json["blend_mode"], "overlay");
+        assert_eq!(serde_json::from_value::<Clip>(json.clone()).unwrap(), clip);
+
+        let with = |json: &mut serde_json::Value, v: serde_json::Value| {
+            json["blend_mode"] = v;
+            serde_json::from_value::<Clip>(json.clone())
+                .unwrap()
+                .blend_mode
+        };
+        assert_eq!(with(&mut json, "vivid_light".into()), BlendMode::Normal);
+        assert_eq!(with(&mut json, serde_json::Value::Null), BlendMode::Normal);
+        json.as_object_mut().unwrap().remove("blend_mode");
+        let old: Clip = serde_json::from_value(json).unwrap();
+        assert_eq!(old.blend_mode, BlendMode::Normal, "pre-M1 clip");
+    }
 }

@@ -8,11 +8,10 @@
 //! deliberate Phase-1 shortcut documented in PLAN.md §7 Phase 1; full color
 //! management lands in Phase 6.
 //!
-//! Both [`PixelFormat::Yuv420P`] (planar) and [`PixelFormat::Nv12`]
-//! (semi-planar) inputs are accepted. For NV12 inputs the UV plane is
-//! split CPU-side at upload so the GPU sees the same three R8 textures
-//! either way. Zero-copy NV12 (R8 + Rg8) is a Milestone 1.6 optimization
-//! once VideoToolbox hardware decode lands.
+//! [`PixelFormat::Yuv420P`] (planar), [`PixelFormat::Nv12`] (semi-planar),
+//! [`PixelFormat::Yuv420P10Le`] and straight-alpha [`PixelFormat::Rgba8`]
+//! inputs are accepted. Planes upload as they are: NV12's interleaved UV
+//! plane is one two-channel texture the shader reads as `.rg`.
 
 #![warn(missing_docs)]
 

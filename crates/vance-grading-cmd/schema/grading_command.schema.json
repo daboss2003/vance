@@ -1084,7 +1084,7 @@
           ]
         },
         {
-          "description": "Ellipse / circle (when half_x == half_y).",
+          "description": "Ellipse. The half sizes are fractions of the clip's width and height, so it is a circle on screen when `half_x == half_y × height / display_width` (display width = stored width × pixel aspect).",
           "type": "string",
           "enum": [
             "ellipse"

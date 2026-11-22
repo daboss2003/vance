@@ -88,3 +88,56 @@ fn streams_aac_to_eos() {
     client.stop_stream().expect("stop_stream");
     client.shutdown().expect("shutdown");
 }
+
+/// Once a request has failed because the sidecar died, the client may have
+/// reaped it (vance-ipc checks its exit status), so its pid could be
+/// anyone's: a kill handle then sends no signal. Likewise after a shutdown
+/// or a drop.
+#[cfg(unix)]
+#[test]
+fn a_kill_handle_sends_nothing_once_the_sidecar_may_be_reaped() {
+    use std::time::{Duration, Instant};
+    let bin = sidecar_binary_path();
+    let mut client = AudioClient::spawn(&bin).expect("spawn");
+    client
+        .open(fixture_path().to_string_lossy().to_string())
+        .expect("open");
+    let handle = client.kill_handle();
+    let pid = client.pid().expect("pid");
+    // Dies on its own (not through the handle).
+    let killed = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(killed, "SIGKILL {pid}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let failed = loop {
+        match client.start_stream(0, 1024) {
+            Err(e) => break e,
+            Ok(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = client.stop_stream();
+            }
+            Ok(_) => panic!("the dead sidecar kept answering"),
+        }
+    };
+    assert!(
+        matches!(failed, vance_audio::AudioClientError::Ipc(_)),
+        "{failed:?}"
+    );
+    handle.kill();
+    assert!(!handle.signalled(), "no signal after a failed request");
+    drop(client);
+
+    let client = AudioClient::spawn(&bin).expect("spawn");
+    let handle = client.kill_handle();
+    client.shutdown().expect("shutdown");
+    handle.kill();
+    assert!(!handle.signalled(), "no signal after a shutdown");
+
+    let client = AudioClient::spawn(&bin).expect("spawn");
+    let handle = client.kill_handle();
+    drop(client);
+    handle.kill();
+    assert!(!handle.signalled(), "no signal after a drop");
+}

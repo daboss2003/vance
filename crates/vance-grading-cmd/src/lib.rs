@@ -148,7 +148,9 @@ pub enum HslCurve {
 pub enum WindowShape {
     /// Window disabled (mask = 1, exact passthrough).
     Off,
-    /// Ellipse / circle (when half_x == half_y).
+    /// Ellipse. The half sizes are fractions of the clip's width and height,
+    /// so it is a circle on screen when `half_x == half_y × height /
+    /// display_width` (display width = stored width × pixel aspect).
     Ellipse,
     /// Axis-aligned rectangle.
     Rectangle,

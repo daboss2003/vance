@@ -267,3 +267,118 @@ fn hlg_source_decodes_and_autotags() {
         "HLG source must auto-tag Rec.2020 HLG"
     );
 }
+
+/// The HDR10 fixture's black (limited-range Y' 64, chroma 512) exports as
+/// black. Read as full range it was 64 / 1023 of the PQ signal (≈ 0.1 nit),
+/// which comes back out near Y' 119 instead of 64.
+#[test]
+fn hdr10_black_exports_as_black() {
+    if !tool("ffmpeg") || !tool("ffprobe") || !sidecars_present() {
+        eprintln!("ffmpeg/ffprobe/sidecars absent — skipping HDR black");
+        return;
+    }
+    let fixture = hdr_fixture();
+    if !fixture.exists() {
+        eprintln!("HDR fixture missing: {} — skipping", fixture.display());
+        return;
+    }
+    let (w, h) = (320usize, 240usize);
+    // The fixture's top-left 12×12 is Y' 64 / chroma 512 in every frame.
+    const PATCH: std::ops::Range<usize> = 2..10;
+    let decode = |path: &PathBuf| -> Vec<(Vec<u16>, Vec<u16>, Vec<u16>)> {
+        let out = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-i"])
+            .arg(path)
+            .args([
+                "-map",
+                "0:v:0",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-",
+            ])
+            .output()
+            .expect("run ffmpeg");
+        assert!(out.status.success(), "decode {}", path.display());
+        let words: Vec<u16> = out
+            .stdout
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        let (luma, chroma) = (w * h, w * h / 4);
+        words
+            .chunks_exact(luma + 2 * chroma)
+            .map(|f| {
+                (
+                    f[..luma].to_vec(),
+                    f[luma..luma + chroma].to_vec(),
+                    f[luma + chroma..].to_vec(),
+                )
+            })
+            .collect()
+    };
+    for (y, u, v) in decode(&fixture).iter().take(6) {
+        for r in PATCH {
+            for c in PATCH {
+                assert_eq!(y[r * w + c], 64, "fixture black at ({c},{r})");
+                assert_eq!(u[(r / 2) * (w / 2) + c / 2], 512);
+                assert_eq!(v[(r / 2) * (w / 2) + c / 2], 512);
+            }
+        }
+    }
+
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    std::env::set_current_dir(&workspace_root).expect("chdir workspace root");
+    let mut engine = Engine::default();
+    engine.new_project("hdr-black".into()).expect("new project");
+    let media = engine
+        .import_media_file(&fixture.canonicalize().unwrap().to_string_lossy())
+        .expect("import");
+    let media_id = vance_timeline::MediaItemId::from_uuid(media.id.parse().unwrap());
+    let track_id = {
+        let contents = engine.current_sequence_contents().expect("contents");
+        let v1 = contents
+            .tracks
+            .iter()
+            .find(|t| t.kind == "video")
+            .expect("V1");
+        vance_timeline::TrackId::from_uuid(v1.id.parse().unwrap())
+    };
+    engine
+        .insert_clip_at(track_id, media_id, 0.0)
+        .expect("insert clip");
+    let out = std::env::temp_dir().join(format!("vance-hdr-black-{}.mov", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    let outcome = engine.render_sequence(RenderOptions {
+        output_path: out.to_string_lossy().to_string(),
+        preset: EncoderPreset::Hevc { crf: 0 },
+        width: Some(w as u32),
+        height: Some(h as u32),
+        render_and_replace_track: None,
+        start_seconds: Some(0.0),
+        end_seconds: Some(0.25),
+        hdr: true,
+    });
+    let frames = outcome.map(|_| decode(&out));
+    let full_range = probe(&out, "color_range") == "pc";
+    let _ = std::fs::remove_file(&out);
+    let frames = frames.expect("HDR render_sequence");
+    assert_eq!(frames.len(), 6);
+    let black = if full_range { 0 } else { 64 };
+    for (n, (y, u, v)) in frames.iter().enumerate() {
+        for r in PATCH {
+            for c in PATCH {
+                let (luma, cb, cr) = (
+                    y[r * w + c],
+                    u[(r / 2) * (w / 2) + c / 2],
+                    v[(r / 2) * (w / 2) + c / 2],
+                );
+                assert!(
+                    luma.abs_diff(black) <= 2 && cb.abs_diff(512) <= 2 && cr.abs_diff(512) <= 2,
+                    "frame {n} ({c},{r}): Y'CbCr ({luma},{cb},{cr}), want black ({black},512,512)"
+                );
+            }
+        }
+    }
+}

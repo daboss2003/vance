@@ -306,7 +306,6 @@ fn render_and_replace_swaps_clip_for_rendered_media() {
     let outcome = engine
         .render_and_replace(RenderAndReplaceOptions {
             output_path: out.to_string_lossy().to_string(),
-            preset: EncoderPreset::ProRes422HQ,
             width: Some(320),
             height: Some(240),
             track_id,

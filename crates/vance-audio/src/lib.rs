@@ -33,7 +33,7 @@ pub mod protocol;
 pub mod remote_plugin;
 pub mod scrub_output;
 
-pub use client::{AudioClient, AudioClientError};
+pub use client::{AudioClient, AudioClientError, AudioKill};
 pub use mixer::{
     bus_balance, db_to_linear, eval_fade_in_audio, eval_fade_out_audio, eval_gain_lane,
     fold_bus_graph, fold_frame, fold_frame_at, pan_to_equal_power, per_source_ring_capacity,

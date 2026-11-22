@@ -30,7 +30,7 @@ fn parse_blend_mode(name: &str) -> Result<BlendMode, String> {
 }
 
 /// Add a track; `kind` is "video" or "audio". Returns the new track's id.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn add_track(
     state: tauri::State<'_, EngineHandle>,
     kind: String,
@@ -43,19 +43,33 @@ pub fn add_track(
         other => return Err(format!("unknown track kind: {other}")),
     };
     state
-        .lock()
+        .engine()?
         .add_track(kind, name, position)
         .map(|id| id.to_string())
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn remove_track(state: tauri::State<'_, EngineHandle>, track_id: String) -> Result<(), String> {
     let id = parse_track_id(&track_id)?;
-    state.lock().remove_track(id).map_err(|e| e.to_string())
+    state.engine()?.remove_track(id).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+/// Rename a track; an empty name reverts it to its positional name.
+#[tauri::command(async)]
+pub fn rename_track(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    name: String,
+) -> Result<(), String> {
+    let id = parse_track_id(&track_id)?;
+    state
+        .engine()?
+        .rename_track(id, name)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
 pub fn move_track(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -63,12 +77,12 @@ pub fn move_track(
 ) -> Result<(), String> {
     let id = parse_track_id(&track_id)?;
     state
-        .lock()
+        .engine()?
         .move_track(id, to_position)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_track_enabled(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -76,12 +90,26 @@ pub fn set_track_enabled(
 ) -> Result<(), String> {
     let id = parse_track_id(&track_id)?;
     state
-        .lock()
+        .engine()?
         .set_track_enabled(id, enabled)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+/// Lock or unlock a track (a locked track can't be deleted until unlocked).
+#[tauri::command(async)]
+pub fn set_track_locked(
+    state: tauri::State<'_, EngineHandle>,
+    track_id: String,
+    locked: bool,
+) -> Result<(), String> {
+    let id = parse_track_id(&track_id)?;
+    state
+        .engine()?
+        .set_track_locked(id, locked)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
 pub fn set_clip_blend_mode(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -92,13 +120,13 @@ pub fn set_clip_blend_mode(
     let clip = parse_clip_id(&clip_id)?;
     let mode = parse_blend_mode(&blend_mode)?;
     state
-        .lock()
+        .engine()?
         .set_clip_blend_mode(track, clip, mode)
         .map_err(|e| e.to_string())
 }
 
 /// Set the sequence canvas size; both `null` clears it to the default.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_frame_size(
     state: tauri::State<'_, EngineHandle>,
     width: Option<u32>,
@@ -109,17 +137,23 @@ pub fn set_frame_size(
         (None, None) => None,
         _ => return Err("width and height must both be set or both be null".into()),
     };
-    state.lock().set_frame_size(size).map_err(|e| e.to_string())
+    state
+        .engine()?
+        .set_frame_size(size)
+        .map_err(|e| e.to_string())
 }
 
 /// Solo a clip's keyer matte in the viewer; `null` clears it.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_matte_view(
     state: tauri::State<'_, EngineHandle>,
     clip_id: Option<String>,
 ) -> Result<(), String> {
     let clip = clip_id.as_deref().map(parse_clip_id).transpose()?;
-    state.lock().set_matte_view(clip).map_err(|e| e.to_string())
+    state
+        .engine()?
+        .set_matte_view(clip)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

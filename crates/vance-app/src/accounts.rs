@@ -1252,6 +1252,16 @@ pub async fn entitlements_list(state: St<'_>) -> Result<Value, String> {
         .map_err(|e| e.to_string())?
 }
 
+/// Rescan add-ons after an install/uninstall that already happened: waits an
+/// export out (on a blocking thread, not the async runtime's) rather than
+/// failing, so the engine sees the change. Returns how many it found.
+pub(crate) async fn rescan_after_export(engine: &EngineHandle) -> Result<usize, String> {
+    let engine = engine.clone();
+    tokio::task::spawn_blocking(move || engine.engine_after_export().rescan_plugins())
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn entitlement_install(
     state: St<'_>,
@@ -1266,7 +1276,7 @@ pub async fn entitlement_install(
     })
     .await
     .map_err(|e| e.to_string())??;
-    engine.lock().rescan_plugins();
+    rescan_after_export(&engine).await?;
     Ok(())
 }
 
@@ -1283,7 +1293,7 @@ pub async fn entitlement_uninstall(
     })
     .await
     .map_err(|e| e.to_string())?;
-    engine.lock().rescan_plugins();
+    rescan_after_export(&engine).await?;
     Ok(())
 }
 
@@ -1299,7 +1309,7 @@ pub async fn entitlements_reconcile(
     let report = tokio::task::spawn_blocking(move || st.reconcile(auto))
         .await
         .map_err(|e| e.to_string())?;
-    engine.lock().rescan_plugins();
+    rescan_after_export(&engine).await?;
     Ok(report)
 }
 
@@ -1357,7 +1367,7 @@ pub async fn catalog_install(
     tokio::task::spawn_blocking(move || st.catalog_install(&sku))
         .await
         .map_err(|e| e.to_string())??;
-    engine.lock().rescan_plugins();
+    rescan_after_export(&engine).await?;
     Ok(())
 }
 

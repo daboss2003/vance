@@ -30,7 +30,9 @@ pub struct Track {
     pub id: TrackId,
     /// What kind of clips this track accepts.
     pub kind: TrackKind,
-    /// Display name. Convention: V1, V2, ... and A1, A2, ...
+    /// Display name. `V<n>` on a video track / `A<n>` on an audio track is
+    /// an automatic name that follows the track's position (renumbered by
+    /// the track ops); anything else is a custom name, kept as-is.
     pub name: String,
     /// When `false`, the track contributes nothing to the render but
     /// stays in the project. Cheap on/off.

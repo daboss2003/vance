@@ -11,7 +11,14 @@
 //! - "ripple" variants close the gap left behind by shifting later
 //!   clips on the same track left by the removed/changed range.
 //!   Non-ripple variants leave a gap.
-//! - Operations refuse to modify a locked track (`TimelineError::Locked`).
+//! - A locked track's contents (clips, transitions, effects, stored clip
+//!   and mixer parameters, routing and sends) can't change and the track
+//!   can't be removed: those operations fail with
+//!   `TimelineError::InvalidArgument`. Mute,
+//!   solo, visibility, stacking order and the name stay available
+//!   (lock-policy comment above [`add_track`]).
+//! - Automatic track names (`V1`, `A2`, …) follow the track's position and
+//!   are renumbered by every structural track edit; custom names are kept.
 //! - Operations validate their geometry: zero-or-negative durations,
 //!   timeline overlap, negative source positions all reject up-front.
 //! - Slip changes the source range, leaving the timeline alone.
@@ -27,9 +34,11 @@ use crate::connection::{connected_subtree, would_cycle, Connection};
 use crate::effect::{Effect, EffectValue};
 use crate::error::{Result, TimelineError};
 use crate::id::{BusId, ClipId, EffectId, TrackId, TransitionId};
+use crate::scene_plan::{capped_duration, transition_sides, transition_window};
 use crate::sequence::Sequence;
 use crate::track::{Track, TrackKind};
 use crate::transition::{Transition, TransitionKind};
+use crate::unicode_tables::{in_table, COMBINING_MARKS, EXTENDED_PICTOGRAPHIC, FORMAT_CHARS};
 
 // ---- time helpers -----------------------------------------------------------
 
@@ -66,11 +75,13 @@ fn find_clip(track: &Track, clip_id: ClipId) -> Result<(usize, Arc<Clip>)> {
         .ok_or_else(|| TimelineError::invalid(format!("clip {clip_id} not found on track")))
 }
 
+/// The lock-policy refusal (policy above [`add_track`]). The message names
+/// the track the way the user sees it, by its name.
 fn ensure_unlocked(track: &Track) -> Result<()> {
     if track.locked {
         Err(TimelineError::invalid(format!(
-            "track {} is locked",
-            track.id
+            "track \"{}\" is locked; unlock it first",
+            track.name
         )))
     } else {
         Ok(())
@@ -139,12 +150,216 @@ fn insertion_index(clips: &[Arc<Clip>], at: RationalTime) -> usize {
 
 // ---- track-level operations -------------------------------------------------
 
-/// Append a new track to the sequence with a freshly allocated ID.
+// Locked tracks (`Track.locked`): a lock freezes what is ON the track — its
+// clips, transitions, effects and stored parameters (clip blend mode, gain,
+// pan, fades, automation, audio inserts, output routing and sends) — so
+// every op that rewrites those calls `ensure_unlocked`, `remove_track`
+// refuses a locked track (it would delete those contents) and `remove_bus`
+// refuses a bus a locked track uses (it would reroute it). Ripple edits
+// across tracks skip locked ones. Non-destructive toggles that only change
+// whether or where the track is seen or heard stay available, so the user
+// can audition a locked track without unlocking it: mute / solo / clip mute,
+// and for M1 visibility (`set_track_enabled`, the video analogue of mute)
+// and stacking order (`move_track`, also when it shifts other locked
+// tracks). The name is a label, not content: `rename_track` works on a
+// locked track, and so does the automatic renumbering below, which has to,
+// because moving or inserting another track changes a locked track's
+// position. Adding a track never touches an existing one's contents, so
+// locks don't affect it.
+//
+// Track names: an automatic name (`V<n>` on a video track, `A<n>` on an
+// audio track, ASCII digits) states the track's position in its kind's
+// group: V1 is the bottom video layer, A1 the first audio track. Every
+// structural edit (add / insert / move / remove) renumbers them. Custom
+// names are never changed, but their tracks still hold a number, so
+// [BG, V1] becomes [BG, V2]. The schema has no flag for this; the form of
+// the name is the flag.
+
+/// Longest accepted user-entered track name, in characters (after trimming).
+pub const MAX_TRACK_NAME_CHARS: usize = 64;
+
+fn automatic_prefix(kind: TrackKind) -> char {
+    match kind {
+        TrackKind::Video => 'V',
+        TrackKind::Audio => 'A',
+    }
+}
+
+/// `true` iff `name` is an automatic name for a `kind` track: `V` (video) /
+/// `A` (audio) followed by one or more ASCII digits.
+fn is_automatic_track_name(kind: TrackKind, name: &str) -> bool {
+    name.strip_prefix(automatic_prefix(kind))
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Automatic name of the track at zero-based `position` in its kind's group.
+fn automatic_track_name(kind: TrackKind, position: usize) -> String {
+    format!("{}{}", automatic_prefix(kind), position + 1)
+}
+
+/// Rewrite every automatic name to its track's current position in its
+/// kind's group. Tracks whose name doesn't change stay shared.
+fn renumber_automatic_names(mut seq: Sequence) -> Sequence {
+    let (mut video, mut audio) = (0, 0);
+    for slot in &mut seq.tracks {
+        let next = match slot.kind {
+            TrackKind::Video => &mut video,
+            TrackKind::Audio => &mut audio,
+        };
+        let position = *next;
+        *next += 1;
+        if is_automatic_track_name(slot.kind, &slot.name) {
+            let want = automatic_track_name(slot.kind, position);
+            if slot.name != want {
+                Arc::make_mut(slot).name = want;
+            }
+        }
+    }
+    seq
+}
+
+fn is_emoji(c: char) -> bool {
+    in_table(&EXTENDED_PICTOGRAPHIC, c)
+}
+
+/// Why a track name can't hold `c`, or `None` if it can: the Unicode
+/// categories that break a one-line label or make two names look alike —
+/// controls (Cc), line / paragraph separators (Zl, Zp) and format
+/// characters (Cf). Right-to-left letters are ordinary letters and pass.
+fn refused_name_char(c: char) -> Option<&'static str> {
+    match c {
+        '\u{2028}' | '\u{2029}' => Some("line or paragraph separators"),
+        c if c.is_control() => Some("control characters such as tabs or line breaks"),
+        // Two Cf groups people actually meet get their own names.
+        '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}' => Some("zero-width characters"),
+        '\u{200E}'
+        | '\u{200F}'
+        | '\u{061C}'
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2066}'..='\u{2069}' => Some("text-direction controls"),
+        c if in_table(&FORMAT_CHARS, c) => Some("invisible formatting characters"),
+        _ => None,
+    }
+}
+
+/// Trim and validate a user-entered track name. `None` means it was empty:
+/// use the automatic name.
+fn clean_track_name(name: &str) -> Result<Option<&str>> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let chars = name.chars().count();
+    if chars > MAX_TRACK_NAME_CHARS {
+        return Err(TimelineError::invalid(format!(
+            "track name is {chars} characters long; the limit is {MAX_TRACK_NAME_CHARS}"
+        )));
+    }
+    if let Some((c, what)) = refused_in_name(name) {
+        return Err(TimelineError::invalid(format!(
+            "track name can't contain {what} (found U+{:04X})",
+            c as u32
+        )));
+    }
+    Ok(Some(name))
+}
+
+const ZWJ: char = '\u{200D}';
+const ZWNJ: char = '\u{200C}';
+const BLACK_FLAG: char = '\u{1F3F4}';
+const CANCEL_TAG: char = '\u{E007F}';
+
+/// The first character `name` can't hold and why ([`refused_name_char`]).
+/// Intentional: three uses of format characters are ordinary text and pass
+/// (decisions 2026-11-22) — a ZWJ joining two emoji (🧑‍💻, 🏳️‍🌈, 👩🏽‍🔬),
+/// the tags of a subdivision flag (🏴 + U+E0020–E007E + cancel tag, e.g.
+/// Scotland) and a ZWNJ between two letters (Persian, Kurdish and Indic
+/// orthography: می‌خواهم). Anywhere else they are refused as before.
+fn refused_in_name(name: &str) -> Option<(char, &'static str)> {
+    let chars: Vec<char> = name.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == BLACK_FLAG {
+            if let Some(end) = flag_tags_end(&chars, i + 1) {
+                i = end + 1;
+                continue;
+            }
+        }
+        if c == ZWJ && joins_emoji(&chars, i) {
+            i += 1;
+            continue;
+        }
+        if c == ZWNJ && joins_letters(&chars, i) {
+            i += 1;
+            continue;
+        }
+        if let Some(why) = refused_name_char(c) {
+            return Some((c, why));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Index of the cancel tag closing a flag's tag sequence that starts at
+/// `start`: one or more tag characters (U+E0020–E007E), then U+E007F.
+fn flag_tags_end(chars: &[char], start: usize) -> Option<usize> {
+    let tags = chars[start..]
+        .iter()
+        .take_while(|c| ('\u{E0020}'..='\u{E007E}').contains(*c))
+        .count();
+    let end = start + tags;
+    (tags > 0 && chars.get(end) == Some(&CANCEL_TAG)).then_some(end)
+}
+
+/// Whether the ZWJ at `at` sits between two emoji: the scalar before it,
+/// looking past variation selectors and skin-tone modifiers (🏳️, 👩🏽), and
+/// the one right after it.
+fn joins_emoji(chars: &[char], at: usize) -> bool {
+    let decoration = |c: &&char| matches!(**c, '\u{FE0E}' | '\u{FE0F}' | '\u{1F3FB}'..='\u{1F3FF}');
+    let before = chars[..at].iter().rev().find(|c| !decoration(c));
+    before.is_some_and(|&c| is_emoji(c)) && chars.get(at + 1).is_some_and(|&c| is_emoji(c))
+}
+
+/// Whether the ZWNJ at `at` sits between two letters (`char::is_alphabetic`):
+/// the scalar before it, looking past combining marks (Mn / Mc: a virama, a
+/// vowel sign, a diacritic), and the one right after it. This is RFC 5892's
+/// CONTEXTJ intent for ZWNJ (after a virama, or between joining letters)
+/// without Unicode joining types, which std doesn't expose, so any two
+/// letters qualify.
+fn joins_letters(chars: &[char], at: usize) -> bool {
+    let before = chars[..at]
+        .iter()
+        .rev()
+        .find(|&&c| !in_table(&COMBINING_MARKS, c));
+    before.is_some_and(|c| c.is_alphabetic())
+        && chars.get(at + 1).is_some_and(|c| c.is_alphabetic())
+}
+
+/// The name a track gets from a user-entered `name` (see [`rename_track`]):
+/// empty or automatic-form names become the automatic name for `position`.
+fn chosen_track_name(kind: TrackKind, name: &str, position: usize) -> Result<String> {
+    Ok(match clean_track_name(name)? {
+        Some(custom) if !is_automatic_track_name(kind, custom) => custom.to_owned(),
+        // Intentional: a typed "V7" makes the track automatic again and is
+        // stored as its position ("V2"); there is no schema flag, the name's
+        // form decides (follow-up decision 2026-11-22).
+        _ => automatic_track_name(kind, position),
+    })
+}
+
+/// Add a new empty track with a freshly allocated ID at the end of its
+/// kind's group (see [`add_track_with_id`]).
 pub fn add_track(seq: &Sequence, kind: TrackKind, name: impl Into<String>) -> Sequence {
     add_track_with_id(seq, TrackId::new(), kind, name)
 }
 
-/// Append a new track using the supplied ID. The `EditLog` calls this
+/// Add a new empty track using the supplied ID, after the last track of its
+/// kind: a video track becomes the new top layer and stays ahead of the
+/// audio tracks, an audio track goes last. The name is taken verbatim (an
+/// automatic one is renumbered); user-entered names go through
+/// [`insert_track_with_id`], which validates them. The `EditLog` calls this
 /// when re-applying a logged `AddTrack` so undo/redo round-trips are
 /// faithful.
 pub fn add_track_with_id(
@@ -153,60 +368,22 @@ pub fn add_track_with_id(
     kind: TrackKind,
     name: impl Into<String>,
 ) -> Sequence {
-    let new_track = Track {
-        id: track_id,
-        kind,
-        name: name.into(),
-        enabled: true,
-        locked: false,
-        clips: Vec::new(),
-        transitions: Vec::new(),
-        mute: false,
-        solo: false,
-        gain_db: 0.0,
-        gain_keyframes: Vec::new(),
-        pan: 0.0,
-        audio_effects: Vec::new(),
-        output: crate::bus::BusOutput::Master,
-        sends: Vec::new(),
-    };
-    let mut tracks = seq.tracks.clone();
-    tracks.push(Arc::new(new_track));
-    Sequence {
-        id: seq.id,
-        name: seq.name.clone(),
-        frame_rate: seq.frame_rate,
-        tracks,
-        markers: seq.markers.clone(),
-        master_gain_db: seq.master_gain_db,
-        buses: seq.buses.clone(),
-        connections: seq.connections.clone(),
-        magnetic: seq.magnetic,
-        captions: seq.captions.clone(),
-        review_comments: seq.review_comments.clone(),
-        frame_size: seq.frame_size,
-    }
+    let mut track = Track::new(kind, name);
+    track.id = track_id;
+    let at = track_slot(seq, kind, kind_group(seq, kind).len());
+    let mut out = seq.clone();
+    out.tracks.insert(at, Arc::new(track));
+    renumber_automatic_names(out)
 }
 
-/// Remove a track by ID.
+/// Remove a track by ID, with its clips. Connections that referenced one of
+/// those clips are dropped too. Refuses a locked track (lock policy above).
 pub fn remove_track(seq: &Sequence, track_id: TrackId) -> Result<Sequence> {
-    let (idx, _) = find_track(seq, track_id)?;
-    let mut tracks = seq.tracks.clone();
-    tracks.remove(idx);
-    Ok(Sequence {
-        id: seq.id,
-        name: seq.name.clone(),
-        frame_rate: seq.frame_rate,
-        tracks,
-        markers: seq.markers.clone(),
-        master_gain_db: seq.master_gain_db,
-        buses: seq.buses.clone(),
-        connections: seq.connections.clone(),
-        magnetic: seq.magnetic,
-        captions: seq.captions.clone(),
-        review_comments: seq.review_comments.clone(),
-        frame_size: seq.frame_size,
-    })
+    let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
+    let mut out = seq.clone();
+    out.tracks.remove(idx);
+    Ok(renumber_automatic_names(prune_dangling_connections(out)))
 }
 
 /// Indices into `seq.tracks` of every track of `kind`, in order.
@@ -219,12 +396,28 @@ fn kind_group(seq: &Sequence, kind: TrackKind) -> Vec<usize> {
         .collect()
 }
 
+/// Index into `seq.tracks` where a new track of `kind` lands so it ends up
+/// at `position` within that kind's group (`position <= group length`;
+/// callers validate). Past the group's last track means right after it; an
+/// empty video group starts at 0 and an empty audio group at the end, so
+/// video stays first.
+fn track_slot(seq: &Sequence, kind: TrackKind, position: usize) -> usize {
+    let group = kind_group(seq, kind);
+    match (group.get(position), group.last(), kind) {
+        (Some(&i), _, _) => i,
+        (None, Some(&last), _) => last + 1,
+        (None, None, TrackKind::Video) => 0,
+        (None, None, TrackKind::Audio) => seq.tracks.len(),
+    }
+}
+
 /// Insert a new empty track of `kind` with the supplied ID at `position`
 /// within that kind's group (0 = first video / first audio track; the
 /// group's length = after its last track). With no track of that kind yet,
 /// a video track goes before every track and an audio track after them,
-/// so video stays first. Rejects a duplicate ID or a position past the end
-/// of the group.
+/// so video stays first. `name` follows the [`rename_track`] rules (an
+/// empty name gets the automatic one). Rejects a duplicate ID, a position
+/// past the end of the group, or an invalid name (see [`rename_track`]).
 pub fn insert_track_with_id(
     seq: &Sequence,
     id: TrackId,
@@ -235,30 +428,25 @@ pub fn insert_track_with_id(
     if seq.tracks.iter().any(|t| t.id == id) {
         return Err(TimelineError::invalid(format!("track {id} already exists")));
     }
-    let group = kind_group(seq, kind);
-    if position > group.len() {
+    let group_len = kind_group(seq, kind).len();
+    if position > group_len {
         return Err(TimelineError::invalid(format!(
-            "track position {position} is past the end of the {} {kind:?} track(s)",
-            group.len()
+            "track position {position} is past the end of the {group_len} {kind:?} track(s)"
         )));
     }
-    let at = match (group.get(position), group.last(), kind) {
-        (Some(&i), _, _) => i,
-        (None, Some(&last), _) => last + 1,
-        (None, None, TrackKind::Video) => 0,
-        (None, None, TrackKind::Audio) => seq.tracks.len(),
-    };
+    let name = chosen_track_name(kind, &name.into(), position)?;
+    let at = track_slot(seq, kind, position);
     let mut track = Track::new(kind, name);
     track.id = id;
     let mut out = seq.clone();
     out.tracks.insert(at, Arc::new(track));
-    Ok(out)
+    Ok(renumber_automatic_names(out))
 }
 
 /// Move a track to `to_position` within its kind's group (0 = bottom video
 /// layer / first audio track). Only that group's tracks are reordered, so
-/// tracks of the other kind keep their slots. Allowed on locked tracks: the
-/// track's own contents don't change.
+/// tracks of the other kind keep their slots. Allowed on locked tracks (see
+/// the lock policy above).
 pub fn move_track(seq: &Sequence, id: TrackId, to_position: usize) -> Result<Sequence> {
     let (idx, track) = find_track(seq, id)?;
     let group = kind_group(seq, track.kind);
@@ -283,11 +471,11 @@ pub fn move_track(seq: &Sequence, id: TrackId, to_position: usize) -> Result<Seq
     for (&slot, t) in group.iter().zip(members) {
         out.tracks[slot] = t;
     }
-    Ok(out)
+    Ok(renumber_automatic_names(out))
 }
 
 /// Set `Track.enabled` (the visibility toggle for video tracks). Allowed on
-/// locked tracks, like mute/solo.
+/// locked tracks, like mute/solo (see the lock policy above).
 pub fn set_track_enabled(seq: &Sequence, id: TrackId, enabled: bool) -> Result<Sequence> {
     let (idx, track) = find_track(seq, id)?;
     if track.enabled == enabled {
@@ -298,7 +486,44 @@ pub fn set_track_enabled(seq: &Sequence, id: TrackId, enabled: bool) -> Result<S
     Ok(replace_track(seq, idx, new_track))
 }
 
-/// Set `Clip.blend_mode`. Rejects locked tracks, like other clip params.
+/// Lock or unlock a track (`Track.locked`; lock policy above). Always
+/// allowed: unlocking is how a locked track becomes editable again.
+pub fn set_track_locked(seq: &Sequence, id: TrackId, locked: bool) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, id)?;
+    if track.locked == locked {
+        return Ok(seq.clone());
+    }
+    let mut new_track = (*track).clone();
+    new_track.locked = locked;
+    Ok(replace_track(seq, idx, new_track))
+}
+
+/// Rename a track. `name` is trimmed; an empty name reverts to the
+/// automatic positional name, and so does one in the automatic form (e.g.
+/// "V7" on a video track is stored as its position, "V2"). Rejects names
+/// over [`MAX_TRACK_NAME_CHARS`] characters or with control, line /
+/// paragraph separator or format (Unicode Cf: zero-width, text-direction,
+/// soft hyphen, tag, …) characters, except a ZWJ between two emoji, a 🏴
+/// flag's tags and a ZWNJ between two letters. The other automatic names are
+/// renumbered too, so stale ones from an older bundle can't end up
+/// duplicated. Allowed on locked tracks (see the lock policy above).
+pub fn rename_track(seq: &Sequence, id: TrackId, name: &str) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, id)?;
+    let position = seq.tracks[..idx]
+        .iter()
+        .filter(|t| t.kind == track.kind)
+        .count();
+    let name = chosen_track_name(track.kind, name, position)?;
+    if track.name == name {
+        return Ok(seq.clone());
+    }
+    let mut new_track = (*track).clone();
+    new_track.name = name;
+    Ok(renumber_automatic_names(replace_track(seq, idx, new_track)))
+}
+
+/// Set `Clip.blend_mode`. Rejects locked tracks, like other clip params
+/// (see the lock policy above).
 pub fn set_clip_blend_mode(
     seq: &Sequence,
     track: TrackId,
@@ -392,7 +617,11 @@ pub fn insert_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Result<Sequ
         output: track.output,
         sends: track.sends.clone(),
     };
-    Ok(replace_track(seq, idx, new_track))
+    Ok(replace_track(
+        seq,
+        idx,
+        follow_cuts(&track, new_track, same_clip),
+    ))
 }
 
 /// Insert `clip` at its `timeline_in`, pushing every clip that starts at
@@ -445,7 +674,11 @@ pub fn ripple_insert_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Resu
         output: track.output,
         sends: track.sends.clone(),
     };
-    Ok(replace_track(seq, idx, new_track))
+    Ok(replace_track(
+        seq,
+        idx,
+        follow_cuts(&track, new_track, same_clip),
+    ))
 }
 
 /// Place `clip` on `track_id`, removing or trimming any clips it
@@ -465,6 +698,10 @@ pub fn overwrite_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Result<S
     let new_out = clip.timeline_out();
 
     let mut kept: Vec<Arc<Clip>> = Vec::with_capacity(track.clips.len() + 1);
+    // Which re-IDed piece now holds an overwritten clip's in / out edge
+    // (`None`: the new clip covers it), for `follow_cuts`.
+    let mut edges: std::collections::HashMap<(ClipId, Edge), Option<ClipId>> =
+        std::collections::HashMap::new();
     for c in track.clips.iter() {
         let c_in = c.timeline_in;
         let c_out = c.timeline_out();
@@ -475,6 +712,8 @@ pub fn overwrite_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Result<S
         // There is overlap. Decide what to keep of the existing clip.
         let left_kept = c_in < new_in;
         let right_kept = c_out > new_out;
+        edges.insert((c.id, Edge::In), None);
+        edges.insert((c.id, Edge::Out), None);
 
         if left_kept {
             // Keep the part of `c` that ends at `new_in`.
@@ -482,6 +721,7 @@ pub fn overwrite_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Result<S
             let mut left = (**c).clone();
             left.id = ClipId::new();
             left.source_out = add(c.source_in, kept_dur);
+            edges.insert((c.id, Edge::In), Some(left.id));
             kept.push(Arc::new(left));
         }
         if right_kept {
@@ -491,6 +731,7 @@ pub fn overwrite_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Result<S
             right.id = ClipId::new();
             right.source_in = add(c.source_in, trimmed_off);
             right.timeline_in = new_out;
+            edges.insert((c.id, Edge::Out), Some(right.id));
             kept.push(Arc::new(right));
         }
     }
@@ -514,6 +755,9 @@ pub fn overwrite_clip(seq: &Sequence, track_id: TrackId, clip: Clip) -> Result<S
         output: track.output,
         sends: track.sends.clone(),
     };
+    let new_track = follow_cuts(&track, new_track, |id, edge| {
+        edges.get(&(id, edge)).copied().unwrap_or(Some(id))
+    });
     // Overwriting re-IDs trimmed survivors / removes covered clips, so any
     // connection to a vanished id is pruned (GOAT-6 integrity).
     Ok(prune_dangling_connections(replace_track(
@@ -550,7 +794,9 @@ pub fn remove_clip(seq: &Sequence, track_id: TrackId, clip_id: ClipId) -> Result
         sends: track.sends.clone(),
     };
     Ok(prune_dangling_connections(replace_track(
-        seq, idx, new_track,
+        seq,
+        idx,
+        follow_cuts(&track, new_track, same_clip),
     )))
 }
 
@@ -594,7 +840,9 @@ pub fn ripple_remove_clip(seq: &Sequence, track_id: TrackId, clip_id: ClipId) ->
         sends: track.sends.clone(),
     };
     Ok(prune_dangling_connections(replace_track(
-        seq, idx, new_track,
+        seq,
+        idx,
+        follow_cuts(&track, new_track, same_clip),
     )))
 }
 
@@ -690,7 +938,11 @@ pub fn slide(
         output: track.output,
         sends: track.sends.clone(),
     };
-    Ok(replace_track(seq, idx, new_track))
+    Ok(replace_track(
+        seq,
+        idx,
+        follow_cuts(&track, new_track, same_clip),
+    ))
 }
 
 /// Trim the in-point of a clip. `new_source_in` is the new visible
@@ -748,7 +1000,11 @@ pub fn trim_in(
         output: track.output,
         sends: track.sends.clone(),
     };
-    Ok(replace_track(seq, idx, new_track))
+    Ok(replace_track(
+        seq,
+        idx,
+        follow_cuts(&track, new_track, same_clip),
+    ))
 }
 
 /// Trim the out-point of a clip. `new_source_out` is the new visible
@@ -799,7 +1055,11 @@ pub fn trim_out(
         output: track.output,
         sends: track.sends.clone(),
     };
-    Ok(replace_track(seq, idx, new_track))
+    Ok(replace_track(
+        seq,
+        idx,
+        follow_cuts(&track, new_track, same_clip),
+    ))
 }
 
 /// Attach an `Effect` to a clip's effects list. Effects of the same
@@ -1753,6 +2013,15 @@ pub fn split(
         output: track.output,
         sends: track.sends.clone(),
     };
+    // The right half carries the clip's out-point, and with it the
+    // transition there; the left half keeps the id and the in-point.
+    let new_track = follow_cuts(&track, new_track, |id, edge| {
+        Some(if id == clip_id && edge == Edge::Out {
+            right_id
+        } else {
+            id
+        })
+    });
     let mut out = replace_track(seq, idx, new_track);
     // GOAT-6: splitting a CONNECTED clip should keep BOTH halves attached to
     // their anchor (else the right half tears free under a magnetic move).
@@ -1769,9 +2038,86 @@ pub fn split(
 
 // ---- Transitions (Phase 5.4) -----------------------------------------------
 
+// A transition belongs to the cut between its two clips (decisions
+// 2026-11-22, matching Premiere / Resolve):
+// - It follows the cut: every op that rebuilds a track's clips runs
+//   `follow_cuts`, which moves each transition to where its outgoing clip's
+//   out-point and incoming clip's in-point now meet, and removes it once
+//   they don't (a side removed, the two moved apart, a gap opened or a clip
+//   put between them). Undo brings it back like any edit.
+// - Length cap: it can't outlast either clip, so its window (centred on
+//   the cut) never reaches past them — the outgoing side is never read
+//   before its start nor the incoming side past its end, and the clip
+//   after the incoming one is never hidden. Adding one clamps its length,
+//   and `follow_cuts` clamps again when an edit shortens a side.
+//   Intentional: the requested length isn't kept, so a clamped transition
+//   stays short when its side grows again (clamp, don't remember).
+// So the ops never leave an orphaned or over-long transition; the scene
+// plan still caps on read for bundles saved by older builds.
+
+/// A clip edge a transition hangs on: the incoming clip's in-point or the
+/// outgoing clip's out-point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Edge {
+    In,
+    Out,
+}
+
+/// `follow_cuts` carrier for edits that keep every surviving clip's id.
+fn same_clip(id: ClipId, _: Edge) -> Option<ClipId> {
+    Some(id)
+}
+
+/// Re-anchor `old`'s transitions on `new`, the same track after an edit
+/// rebuilt its clips (lock policy: callers only pass unlocked tracks).
+/// `carrier(id, edge)` names the clip in `new` that now holds clip `id`'s
+/// `edge` (`None` if the edit destroyed it); it is `id` itself unless the
+/// edit re-IDed a piece (split, overwrite). A transition whose two edges
+/// still meet moves to that cut and is capped; any other is removed, and so
+/// is one that was already orphaned (it renders nothing and could otherwise
+/// spring onto an unrelated cut). Unchanged transitions stay shared.
+fn follow_cuts(
+    old: &Track,
+    mut new: Track,
+    carrier: impl Fn(ClipId, Edge) -> Option<ClipId>,
+) -> Track {
+    let live = |id: ClipId| {
+        new.clips
+            .iter()
+            .find(|c| c.id == id && c.duration() > RationalTime::ZERO)
+    };
+    let mut kept: Vec<Arc<Transition>> = Vec::with_capacity(old.transitions.len());
+    for tr in &old.transitions {
+        let (Some(from), Some(to)) = transition_sides(&old.clips, tr.position) else {
+            continue;
+        };
+        let from = carrier(from.id, Edge::Out).and_then(live);
+        let to = carrier(to.id, Edge::In).and_then(live);
+        let (Some(from), Some(to)) = (from, to) else {
+            continue;
+        };
+        if from.timeline_out() != to.timeline_in {
+            continue;
+        }
+        let (position, duration) = (to.timeline_in, capped_duration(tr.duration, from, to));
+        if (position, duration) == (tr.position, tr.duration) {
+            kept.push(tr.clone());
+        } else {
+            let mut moved = (**tr).clone();
+            moved.position = position;
+            moved.duration = duration;
+            kept.push(Arc::new(moved));
+        }
+    }
+    kept.sort_by_key(|t| t.position);
+    new.transitions = kept;
+    new
+}
+
 /// Add a transition with a pre-allocated ID. EditLog replay calls this
 /// so undo/redo produces a byte-identical sequence; UI / engine calls
-/// go through the wrapper that allocates an ID for them.
+/// go through the wrapper that allocates an ID for them. The duration is
+/// clamped as [`add_transition_at_cut`] describes.
 pub fn add_transition_at_cut_with_id(
     seq: &Sequence,
     track_id: TrackId,
@@ -1800,6 +2146,26 @@ pub fn add_transition_at_cut_with_id(
             "anchor clip overlaps its neighbor — split first",
         ));
     }
+    if clip.duration() <= RationalTime::ZERO {
+        return Err(TimelineError::invalid(
+            "the clip before the cut has no length — nothing to transition from",
+        ));
+    }
+    // A zero-length clip at the cut is never a side (scene-plan rule).
+    let incoming = track.clips[clip_pos + 1..]
+        .iter()
+        .find(|c| c.duration() > RationalTime::ZERO)
+        .ok_or_else(|| {
+            TimelineError::invalid(
+                "the clip after the cut has no length — nothing to transition to",
+            )
+        })?;
+    if incoming.timeline_in != cut {
+        return Err(TimelineError::invalid(
+            "no clip starts at the cut — a transition needs two clips that meet",
+        ));
+    }
+    let duration = capped_duration(duration, &clip, incoming);
 
     let new_t = Transition {
         id: transition_id,
@@ -1808,8 +2174,12 @@ pub fn add_transition_at_cut_with_id(
         duration,
         params: std::collections::BTreeMap::new(),
     };
+    // Against the windows as they render (capped; orphans render nothing).
     for existing in track.transitions.iter() {
-        if new_t.window_in() < existing.window_out() && existing.window_in() < new_t.window_out() {
+        let Some((win_in, win_out)) = transition_window(&track, existing) else {
+            continue;
+        };
+        if new_t.window_in() < win_out && win_in < new_t.window_out() {
             return Err(TimelineError::invalid(
                 "transition window overlaps an existing transition",
             ));
@@ -1841,9 +2211,13 @@ pub fn add_transition_at_cut_with_id(
 
 /// Add a transition to a track at the cut after `after_clip_id`. The
 /// transition is anchored at that cut (`after_clip.timeline_out()`)
-/// and extends `duration / 2` to each side. Rejects when there is no
-/// clip immediately after the anchor clip, when `duration` is zero,
-/// or when the new transition would overlap an existing one. Returns
+/// and extends `duration / 2` to each side. `duration` is clamped to the
+/// length of the anchor clip and of the next clip of positive length, so
+/// the stored transition (in the returned sequence) can be shorter than
+/// asked. Rejects when no clip starts where the anchor clip ends (none
+/// after it, or a gap), when either side has no length, when `duration`
+/// is zero, or when the new (clamped) transition would overlap an existing
+/// one. The transition then follows that cut (see `follow_cuts`). Returns
 /// the freshly allocated `TransitionId` so callers can record an
 /// EditOp that replays with the same ID.
 pub fn add_transition_at_cut(
@@ -1976,8 +2350,19 @@ pub fn add_bus_with_id(seq: &Sequence, bus_id: BusId, name: impl Into<String>) -
 
 /// Remove a bus. Anything routed to it (track/bus main outputs) falls back
 /// to master, and sends targeting it are dropped — so no dangling routes.
+/// Refused while a locked track routes or sends to it, since that would
+/// rewrite the locked track's routing (lock policy above [`add_track`]).
 pub fn remove_bus(seq: &Sequence, bus_id: BusId) -> Result<Sequence> {
     find_bus(seq, bus_id)?;
+    let uses_bus = |t: &Track| {
+        t.output == BusOutput::Bus(bus_id) || t.sends.iter().any(|s| s.target == bus_id)
+    };
+    if let Some(t) = seq.tracks.iter().find(|t| t.locked && uses_bus(t)) {
+        return Err(TimelineError::invalid(format!(
+            "track \"{}\" is locked and uses this bus; unlock it first",
+            t.name
+        )));
+    }
     let buses: Vec<AudioBus> = seq
         .buses
         .iter()
@@ -1997,7 +2382,7 @@ pub fn remove_bus(seq: &Sequence, bus_id: BusId) -> Result<Sequence> {
         .tracks
         .iter()
         .map(|t| {
-            if t.output == BusOutput::Bus(bus_id) || t.sends.iter().any(|s| s.target == bus_id) {
+            if uses_bus(t) {
                 let mut nt = (**t).clone();
                 if nt.output == BusOutput::Bus(bus_id) {
                     nt.output = BusOutput::Master;
@@ -2057,13 +2442,15 @@ pub fn set_bus_output(seq: &Sequence, bus_id: BusId, output: BusOutput) -> Resul
     Ok(with_buses(seq, buses))
 }
 
-/// Route a track's main output (to master or a bus). Rejects a missing bus.
+/// Route a track's main output (to master or a bus). Rejects a missing bus
+/// and a locked track (routing is a stored mixer parameter).
 pub fn route_track_to_bus(
     seq: &Sequence,
     track_id: TrackId,
     output: BusOutput,
 ) -> Result<Sequence> {
     let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
     if let BusOutput::Bus(target) = output {
         find_bus(seq, target)?;
     }
@@ -2072,9 +2459,11 @@ pub fn route_track_to_bus(
     Ok(replace_track(seq, idx, nt))
 }
 
-/// Add an aux send from a track to a bus. Rejects a missing target bus.
+/// Add an aux send from a track to a bus. Rejects a missing target bus and
+/// a locked track.
 pub fn add_track_send(seq: &Sequence, track_id: TrackId, send: Send) -> Result<Sequence> {
     let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
     find_bus(seq, send.target)?;
     let mut nt = (*track).clone();
     nt.sends.push(send);
@@ -2082,8 +2471,10 @@ pub fn add_track_send(seq: &Sequence, track_id: TrackId, send: Send) -> Result<S
 }
 
 /// Remove a track's send at `index`. No-op if the index is out of range.
+/// Rejects a locked track.
 pub fn remove_track_send(seq: &Sequence, track_id: TrackId, index: usize) -> Result<Sequence> {
     let (idx, track) = find_track(seq, track_id)?;
+    ensure_unlocked(&track)?;
     if index >= track.sends.len() {
         return Ok(seq.clone());
     }
@@ -2293,9 +2684,11 @@ pub fn magnetic_move_clip(
     clip_id: ClipId,
     new_timeline_in: RationalTime,
 ) -> Result<Sequence> {
-    let (idx, track) = find_track(seq, track_id)?;
+    let (_, track) = find_track(seq, track_id)?;
+    // Up front, so a move that clamps to nothing is refused on a locked
+    // track too (the other tracks in the group are checked below).
+    ensure_unlocked(&track)?;
     let (_, clip) = find_clip(&track, clip_id)?;
-    let _ = idx;
     let mut delta = sub(new_timeline_in, clip.timeline_in);
 
     let moved: std::collections::HashSet<ClipId> = connected_subtree(&seq.connections, clip_id)
@@ -2325,7 +2718,15 @@ pub fn magnetic_move_clip(
             new_tracks.push(t.clone());
             continue;
         }
-        ensure_unlocked(t)?;
+        // The dragged clip's own track passed the check above, so a locked
+        // one here only holds clips connected to it.
+        if t.locked {
+            return Err(TimelineError::invalid(format!(
+                "a clip connected to this one sits on track \"{}\", which is locked; \
+                 unlock it first",
+                t.name
+            )));
+        }
         let mut new_clips: Vec<Arc<Clip>> = Vec::with_capacity(t.clips.len());
         for c in &t.clips {
             if moved.contains(&c.id) {
@@ -2358,7 +2759,11 @@ pub fn magnetic_move_clip(
             }
         }
         new_clips.sort_by_key(|c| c.timeline_in);
-        new_tracks.push(Arc::new(rebuild_track(t, new_clips)));
+        new_tracks.push(Arc::new(follow_cuts(
+            t,
+            rebuild_track(t, new_clips),
+            same_clip,
+        )));
     }
     let mut out = seq.clone();
     out.tracks = new_tracks;
@@ -2430,7 +2835,11 @@ pub fn magnetic_ripple_delete(
                 "ripple delete would overlap clips on another track — align cuts or use plain delete",
             ));
         }
-        new_tracks.push(Arc::new(rebuild_track(t, new_clips)));
+        new_tracks.push(Arc::new(follow_cuts(
+            t,
+            rebuild_track(t, new_clips),
+            same_clip,
+        )));
     }
     let mut out = seq.clone();
     out.tracks = new_tracks;
@@ -2483,7 +2892,11 @@ pub fn magnetic_ripple_insert(seq: &Sequence, track_id: TrackId, clip: Clip) -> 
                 new_clips.push(c.clone());
             }
         }
-        new_tracks.push(Arc::new(rebuild_track(t, new_clips)));
+        new_tracks.push(Arc::new(follow_cuts(
+            t,
+            rebuild_track(t, new_clips),
+            same_clip,
+        )));
     }
     let mut out = seq.clone();
     out.tracks = new_tracks;
@@ -3688,5 +4101,1023 @@ mod tests {
         assert!(log.current().captions.is_empty());
         log.redo().unwrap();
         assert_eq!(log.current().captions.len(), 1, "redo add");
+    }
+
+    // ---- M1: track ops, connections, lock policy ----------------------------
+
+    fn track_names(seq: &Sequence) -> Vec<&str> {
+        seq.tracks.iter().map(|t| t.name.as_str()).collect()
+    }
+
+    fn lock(seq: &Sequence, id: TrackId) -> Sequence {
+        let (idx, track) = find_track(seq, id).unwrap();
+        let mut locked = (*track).clone();
+        locked.locked = true;
+        replace_track(seq, idx, locked)
+    }
+
+    #[test]
+    fn add_track_keeps_video_ahead_of_audio() {
+        let mut seq = Sequence::new("S", FrameRate::FPS_24);
+        for (kind, name) in [
+            (TrackKind::Audio, "A1"),
+            (TrackKind::Video, "V1"),
+            (TrackKind::Video, "V2"),
+            (TrackKind::Audio, "A2"),
+            (TrackKind::Video, "V3"),
+        ] {
+            seq = add_track(&seq, kind, name);
+        }
+        assert_eq!(track_names(&seq), ["V1", "V2", "V3", "A1", "A2"]);
+    }
+
+    #[test]
+    fn add_track_shares_the_existing_tracks() {
+        let mut seq = Sequence::new("S", FrameRate::FPS_24);
+        seq = add_track(&seq, TrackKind::Video, "V1");
+        seq = add_track(&seq, TrackKind::Audio, "A1");
+        let (v1, a1) = (seq.tracks[0].clone(), seq.tracks[1].clone());
+        let id = TrackId::new();
+        let seq = add_track_with_id(&seq, id, TrackKind::Video, "V2");
+        assert_eq!(seq.tracks[1].id, id);
+        assert!(Arc::ptr_eq(&seq.tracks[0], &v1));
+        assert!(Arc::ptr_eq(&seq.tracks[2], &a1));
+    }
+
+    #[test]
+    fn add_track_on_a_misordered_sequence_lands_on_the_top_layer() {
+        // An older bundle may hold [V1, A1, V2]. A new video track goes after
+        // the last video track (the top layer), not before the first audio
+        // track, which would slide it under V2.
+        let mut seq = Sequence::new("S", FrameRate::FPS_24);
+        for (kind, name) in [
+            (TrackKind::Video, "V1"),
+            (TrackKind::Audio, "A1"),
+            (TrackKind::Video, "V2"),
+        ] {
+            seq.tracks.push(Arc::new(Track::new(kind, name)));
+        }
+        let seq = add_track(&seq, TrackKind::Video, "V3");
+        assert_eq!(track_names(&seq), ["V1", "A1", "V2", "V3"]);
+        let seq = add_track(&seq, TrackKind::Audio, "A2");
+        assert_eq!(track_names(&seq), ["V1", "A1", "A2", "V2", "V3"]);
+    }
+
+    #[test]
+    fn add_track_edit_op_replays_into_the_video_group() {
+        use crate::edit_log::{EditLog, EditOp};
+        let mut log = EditLog::new(Sequence::new("S", FrameRate::FPS_24));
+        for (kind, name) in [
+            (TrackKind::Video, "V1"),
+            (TrackKind::Audio, "A1"),
+            (TrackKind::Video, "V2"),
+        ] {
+            log.apply(EditOp::AddTrack {
+                track_id: TrackId::new(),
+                kind,
+                name: name.into(),
+            })
+            .unwrap();
+        }
+        assert_eq!(track_names(log.current()), ["V1", "V2", "A1"]);
+        log.undo().unwrap();
+        assert_eq!(track_names(log.current()), ["V1", "A1"]);
+        log.redo().unwrap();
+        assert_eq!(track_names(log.current()), ["V1", "V2", "A1"]);
+    }
+
+    #[test]
+    fn remove_track_prunes_connections_to_its_clips() {
+        // V1: a [0,5), b [5,7). V2: t [1,3). Connections a→t and a→b.
+        let (seq, v1, v2, aid, tid, media) = two_track_with_clips();
+        let b = Clip::new(media, "b", t(5), t(0), t(2)).unwrap();
+        let bid = b.id;
+        let seq = insert_clip(&seq, v1, b).unwrap();
+        let seq = connect_clip(&seq, aid, tid).unwrap();
+        let seq = connect_clip(&seq, aid, bid).unwrap();
+
+        let without_v2 = remove_track(&seq, v2).unwrap();
+        assert_eq!(
+            without_v2.connections,
+            [Connection::new(aid, bid)],
+            "only the connection to V2's clip goes"
+        );
+        let without_v1 = remove_track(&seq, v1).unwrap();
+        assert!(
+            without_v1.connections.is_empty(),
+            "removing the anchor's track drops every connection from it"
+        );
+        assert!(remove_track(&seq, TrackId::new()).is_err());
+    }
+
+    #[test]
+    fn remove_track_undo_restores_its_connections() {
+        use crate::edit_log::{EditLog, EditOp};
+        let (seq, _v1, v2, aid, tid, _media) = two_track_with_clips();
+        let seq = connect_clip(&seq, aid, tid).unwrap();
+        let mut log = EditLog::new(seq.clone());
+        log.apply(EditOp::RemoveTrack { track_id: v2 }).unwrap();
+        assert!(log.current().connections.is_empty());
+        log.undo().unwrap();
+        assert_eq!(log.current(), &seq);
+    }
+
+    #[test]
+    fn locked_track_can_be_hidden_and_moved() {
+        let (seq, v1, media) = seed_seq();
+        let seq = add_track(&seq, TrackKind::Video, "V2");
+        let seq = add_track(&seq, TrackKind::Video, "V3");
+        let v3 = seq.tracks[2].id;
+        let c = Clip::new(media, "c", t(0), t(0), t(5)).unwrap();
+        let seq = lock(&insert_clip(&seq, v1, c).unwrap(), v1);
+        let contents = |s: &Sequence| {
+            let (_, tr) = find_track(s, v1).unwrap();
+            (tr.clips.clone(), tr.transitions.clone(), tr.locked)
+        };
+        let before = contents(&seq);
+
+        let v2 = seq.tracks[1].id;
+        let hidden = set_track_enabled(&seq, v1, false).unwrap();
+        assert!(!find_track(&hidden, v1).unwrap().1.enabled);
+        let moved = move_track(&seq, v1, 2).unwrap();
+        assert_eq!(track_ids(&moved), [v2, v3, v1]);
+        // Moving another track past the locked one shifts it; also allowed.
+        let under = move_track(&seq, v3, 0).unwrap();
+        assert_eq!(track_ids(&under), [v3, v1, v2]);
+        for s in [&hidden, &moved, &under] {
+            assert_eq!(contents(s), before, "the lock and contents are kept");
+            assert_eq!(track_names(s), ["V1", "V2", "V3"], "names follow position");
+        }
+    }
+
+    #[test]
+    fn locked_track_rejects_blend_mode_only_on_its_own_clips() {
+        let (seq, v1, v2, aid, tid, _media) = two_track_with_clips();
+        let seq = lock(&seq, v1);
+        let err = set_clip_blend_mode(&seq, v1, aid, BlendMode::Screen).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid argument: track \"V1\" is locked; unlock it first"
+        );
+        // Even a no-op change is rejected, like the other clip params.
+        assert!(set_clip_blend_mode(&seq, v1, aid, BlendMode::Normal).is_err());
+        let seq = set_clip_blend_mode(&seq, v2, tid, BlendMode::Screen).unwrap();
+        assert_eq!(seq.tracks[1].clips[0].blend_mode, BlendMode::Screen);
+    }
+
+    #[test]
+    fn locks_do_not_block_adding_tracks_or_sizing_the_canvas() {
+        let (seq, v1, _media) = seed_seq();
+        let seq = lock(&seq, v1);
+        let v0 = TrackId::new();
+        let seq = insert_track_with_id(&seq, v0, TrackKind::Video, "V0", 0).unwrap();
+        let seq = add_track(&seq, TrackKind::Video, "V2");
+        assert_eq!(track_ids(&seq)[..2], [v0, v1]);
+        // The locked track is renumbered V1 → V2 and keeps its lock.
+        assert_eq!(track_names(&seq), ["V1", "V2", "V3"]);
+        assert!(find_track(&seq, v1).unwrap().1.locked);
+        assert!(set_frame_size(&seq, Some((1280, 720))).is_ok());
+    }
+
+    fn track_ids(seq: &Sequence) -> Vec<TrackId> {
+        seq.tracks.iter().map(|t| t.id).collect()
+    }
+
+    /// Video `[V1, BG, V3]` + audio `[A1, Music]`, built bottom → top.
+    fn mixed_names() -> Sequence {
+        let mut seq = Sequence::new("S", FrameRate::FPS_24);
+        for (kind, name) in [
+            (TrackKind::Video, "V1"),
+            (TrackKind::Video, "BG"),
+            (TrackKind::Video, "V3"),
+            (TrackKind::Audio, "A1"),
+            (TrackKind::Audio, "Music"),
+        ] {
+            seq = add_track(&seq, kind, name);
+        }
+        assert_eq!(track_names(&seq), ["V1", "BG", "V3", "A1", "Music"]);
+        seq
+    }
+
+    #[test]
+    fn inserting_tracks_renumbers_automatic_names_only() {
+        let seq = mixed_names();
+        let ids = track_ids(&seq);
+        let insert = |s: &Sequence, kind, name: &str, position| {
+            insert_track_with_id(s, TrackId::new(), kind, name, position).unwrap()
+        };
+
+        // Below everything: every automatic video name moves up one.
+        let below = insert(&seq, TrackKind::Video, "", 0);
+        assert_eq!(track_names(&below), ["V1", "V2", "BG", "V4", "A1", "Music"]);
+        assert_eq!(track_ids(&below)[1..], ids[..]);
+        // In the middle, with a custom name: only the tracks above shift.
+        let middle = insert(&seq, TrackKind::Video, "Titles", 2);
+        assert_eq!(
+            track_names(&middle),
+            ["V1", "BG", "Titles", "V4", "A1", "Music"]
+        );
+        // At the top, with an automatic-form name: it gets its position.
+        let top = insert(&seq, TrackKind::Video, "V9", 3);
+        assert_eq!(track_names(&top), ["V1", "BG", "V3", "V4", "A1", "Music"]);
+        assert!(
+            Arc::ptr_eq(&top.tracks[0], &seq.tracks[0]),
+            "unchanged names stay shared"
+        );
+        // Audio is numbered on its own; the video names are untouched.
+        let audio = insert(&seq, TrackKind::Audio, "A7", 0);
+        assert_eq!(track_names(&audio), ["V1", "BG", "V3", "A1", "A2", "Music"]);
+        let appended = add_track(&seq, TrackKind::Audio, "A1");
+        assert_eq!(
+            track_names(&appended),
+            ["V1", "BG", "V3", "A1", "Music", "A3"]
+        );
+    }
+
+    #[test]
+    fn moving_and_removing_tracks_renumbers_automatic_names_only() {
+        let seq = mixed_names();
+        let [v1, bg, v3, a1, music] = track_ids(&seq)[..] else {
+            unreachable!()
+        };
+        // V1 up to the top: the others drop one slot.
+        let up = move_track(&seq, v1, 2).unwrap();
+        assert_eq!(track_ids(&up), [bg, v3, v1, a1, music]);
+        assert_eq!(track_names(&up), ["BG", "V2", "V3", "A1", "Music"]);
+        // The top track down to the bottom.
+        let down = move_track(&seq, v3, 0).unwrap();
+        assert_eq!(track_ids(&down), [v3, v1, bg, a1, music]);
+        assert_eq!(track_names(&down), ["V1", "V2", "BG", "A1", "Music"]);
+        // Audio reorders within its own group.
+        let audio = move_track(&seq, music, 0).unwrap();
+        assert_eq!(track_names(&audio), ["V1", "BG", "V3", "Music", "A2"]);
+
+        let without_bottom = remove_track(&seq, v1).unwrap();
+        assert_eq!(track_names(&without_bottom), ["BG", "V2", "A1", "Music"]);
+        let without_custom = remove_track(&seq, bg).unwrap();
+        assert_eq!(track_names(&without_custom), ["V1", "V2", "A1", "Music"]);
+        let without_a1 = remove_track(&seq, a1).unwrap();
+        assert_eq!(track_names(&without_a1), ["V1", "BG", "V3", "Music"]);
+    }
+
+    #[test]
+    fn automatic_names_need_the_kind_prefix_and_ascii_digits() {
+        // Only `V<digits>` on video / `A<digits>` on audio is automatic.
+        let mut seq = Sequence::new("S", FrameRate::FPS_24);
+        for name in ["v2", "V", "V2 copy", "A1", "V٣", "V01"] {
+            seq = add_track(&seq, TrackKind::Video, name);
+        }
+        seq = add_track(&seq, TrackKind::Audio, "V1");
+        assert_eq!(
+            track_names(&seq),
+            ["v2", "V", "V2 copy", "A1", "V٣", "V6", "V1"]
+        );
+    }
+
+    #[test]
+    fn remove_track_refuses_a_locked_track() {
+        use crate::edit_log::{EditLog, EditOp};
+        let (seq, v1, v2, _aid, _tid, _media) = two_track_with_clips();
+        let locked = lock(&seq, v2);
+        let err = remove_track(&locked, v2).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("track \"V2\" is locked; unlock it first"),
+            "{err}"
+        );
+        // Other tracks can still go, and the lock moves with the renumbering.
+        let without_v1 = remove_track(&locked, v1).unwrap();
+        assert_eq!(track_names(&without_v1), ["V1"]);
+        assert!(without_v1.tracks[0].locked);
+
+        let mut log = EditLog::new(locked.clone());
+        assert!(log.apply(EditOp::RemoveTrack { track_id: v2 }).is_err());
+        assert!(log.is_empty(), "a refused removal isn't recorded");
+        assert_eq!(log.current(), &locked);
+        // Unlocked, it can be removed.
+        assert!(remove_track(&seq, v2).is_ok());
+    }
+
+    #[test]
+    fn rename_track_trims_validates_and_reverts_to_the_automatic_name() {
+        let seq = mixed_names();
+        let [v1, bg, v3, _a1, music] = track_ids(&seq)[..] else {
+            unreachable!()
+        };
+        let name_of = |s: &Sequence, id| find_track(s, id).unwrap().1.name.clone();
+
+        let titled = rename_track(&seq, v3, "  Titles  ").unwrap();
+        assert_eq!(name_of(&titled, v3), "Titles");
+        assert!(Arc::ptr_eq(&titled.tracks[0], &seq.tracks[0]));
+        // Empty or blank reverts to the positional name.
+        for blank in ["", "   ", "\t"] {
+            assert_eq!(
+                name_of(&rename_track(&titled, v3, blank).unwrap(), v3),
+                "V3"
+            );
+            assert_eq!(name_of(&rename_track(&seq, bg, blank).unwrap(), bg), "V2");
+        }
+        // An automatic-form name is stored as the position and then follows it.
+        let auto = rename_track(&seq, bg, "V7").unwrap();
+        assert_eq!(name_of(&auto, bg), "V2");
+        let moved = move_track(&auto, bg, 2).unwrap();
+        assert_eq!(track_names(&moved), ["V1", "V2", "V3", "A1", "Music"]);
+        assert_eq!(name_of(&moved, bg), "V3");
+        // A name in the other kind's form is custom.
+        assert_eq!(name_of(&rename_track(&seq, v1, "A1").unwrap(), v1), "A1");
+        assert_eq!(
+            name_of(&rename_track(&seq, music, "A9").unwrap(), music),
+            "A2"
+        );
+        // Same name: no change.
+        assert_eq!(rename_track(&seq, bg, "BG").unwrap(), seq);
+
+        // The limit counts characters, not bytes.
+        let max = "é".repeat(MAX_TRACK_NAME_CHARS);
+        assert_eq!(name_of(&rename_track(&seq, bg, &max).unwrap(), bg), max);
+        let err = rename_track(&seq, bg, &format!("{max}x")).unwrap_err();
+        assert!(err.to_string().contains("limit is 64"), "{err}");
+        assert!(rename_track(&seq, bg, "two\nlines").is_err());
+        assert!(rename_track(&seq, TrackId::new(), "X").is_err());
+
+        // Allowed on a locked track: the name is a label, not content.
+        let locked = lock(&seq, bg);
+        let renamed = rename_track(&locked, bg, "Plate").unwrap();
+        assert_eq!(name_of(&renamed, bg), "Plate");
+        assert!(find_track(&renamed, bg).unwrap().1.locked);
+    }
+
+    #[test]
+    fn insert_track_validates_its_name_like_rename() {
+        let seq = mixed_names();
+        let insert =
+            |name: &str| insert_track_with_id(&seq, TrackId::new(), TrackKind::Audio, name, 2);
+        assert_eq!(track_names(&insert("  Pad ").unwrap())[5], "Pad");
+        assert_eq!(track_names(&insert("").unwrap())[5], "A3");
+        assert!(insert(&"x".repeat(MAX_TRACK_NAME_CHARS + 1)).is_err());
+        assert!(insert("a\u{0}b").is_err());
+    }
+
+    #[test]
+    fn rename_track_renumbers_stale_automatic_names() {
+        // An older bundle can hold automatic names that no longer state
+        // their positions; a rename must not leave two tracks called V2.
+        let mut seq = Sequence::new("S", FrameRate::FPS_24);
+        for (kind, name) in [
+            (TrackKind::Video, "V2"),
+            (TrackKind::Video, "V3"),
+            (TrackKind::Audio, "A1"),
+        ] {
+            seq.tracks.push(Arc::new(Track::new(kind, name)));
+        }
+        let second = seq.tracks[1].id;
+        let automatic = rename_track(&seq, second, "").unwrap();
+        assert_eq!(track_names(&automatic), ["V1", "V2", "A1"]);
+        let custom = rename_track(&seq, second, "Titles").unwrap();
+        assert_eq!(track_names(&custom), ["V1", "Titles", "A1"]);
+    }
+
+    #[test]
+    fn track_names_refuse_invisible_and_direction_characters() {
+        let seq = mixed_names();
+        let bg = seq.tracks[1].id;
+        let line = "line or paragraph separators";
+        let zero = "zero-width characters";
+        let bidi = "text-direction controls";
+        let control = "control characters";
+        let format = "invisible formatting characters";
+        let refused = [
+            ('\u{2028}', line),
+            ('\u{2029}', line),
+            ('\u{200B}', zero),
+            // U+200C between letters is allowed (Persian orthography); its
+            // refused positions are in track_names_allow_zwnj_between_letters_only.
+            ('\u{200D}', zero),
+            ('\u{2060}', zero),
+            ('\u{FEFF}', zero),
+            ('\u{202A}', bidi),
+            ('\u{202B}', bidi),
+            ('\u{202C}', bidi),
+            ('\u{202D}', bidi),
+            ('\u{202E}', bidi),
+            ('\u{2066}', bidi),
+            ('\u{2067}', bidi),
+            ('\u{2068}', bidi),
+            ('\u{2069}', bidi),
+            ('\u{200E}', bidi),
+            ('\u{200F}', bidi),
+            ('\u{061C}', bidi),
+            ('\t', control),
+            ('\n', control),
+            ('\u{7}', control),
+            ('\u{85}', control),
+            // The rest of the format category (Cf).
+            ('\u{00AD}', format),
+            ('\u{0600}', format),
+            ('\u{180E}', format),
+            ('\u{2061}', format),
+            ('\u{2062}', format),
+            ('\u{2063}', format),
+            ('\u{2064}', format),
+            ('\u{206A}', format),
+            ('\u{206F}', format),
+            ('\u{FFF9}', format),
+            ('\u{1D173}', format),
+            ('\u{E0001}', format),
+            ('\u{E0041}', format),
+            ('\u{E007F}', format),
+        ];
+        for (c, what) in refused {
+            let name = format!("Plate{c}B");
+            let err = rename_track(&seq, bg, &name).unwrap_err().to_string();
+            let code = format!("U+{:04X}", c as u32);
+            assert!(err.contains(what) && err.contains(&code), "{code}: {err}");
+            assert!(insert_track_with_id(&seq, TrackId::new(), TrackKind::Video, name, 0).is_err());
+        }
+        // A zero-width or direction character at an edge isn't whitespace,
+        // so trimming doesn't hide it.
+        assert!(rename_track(&seq, bg, "\u{FEFF}Plate").is_err());
+        assert!(rename_track(&seq, bg, "Plate\u{202E}").is_err());
+        assert!(rename_track(&seq, bg, "Plate\u{200F}").is_err());
+        // Ordinary text in any script is fine, right-to-left included.
+        for ok in [
+            "Plate é",
+            "日本語",
+            "שלום",
+            "مرحبا",
+            "قناة ٣",
+            "ܫܠܡܐ",
+            "Plate شاشة 2",
+            "Ünïcödé — B",
+            "a-b_c (2)",
+        ] {
+            let renamed = rename_track(&seq, bg, ok).unwrap();
+            assert_eq!(find_track(&renamed, bg).unwrap().1.name, ok);
+        }
+    }
+
+    #[test]
+    fn track_names_allow_emoji_sequences_and_nothing_else_invisible() {
+        let seq = mixed_names();
+        let bg = seq.tracks[1].id;
+        let scotland = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}";
+        let wales = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0077}\u{E006C}\u{E0073}\u{E007F}";
+        let technologist = "\u{1F9D1}\u{200D}\u{1F4BB}"; // 🧑‍💻
+        let allowed = [
+            technologist.to_owned(),
+            "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}".to_owned(), // 🏳️‍🌈
+            "\u{1F469}\u{1F3FD}\u{200D}\u{1F52C}".to_owned(), // 👩🏽‍🔬
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}".to_owned(), // family
+            "\u{2764}\u{FE0F}\u{200D}\u{1F525}".to_owned(),  // ❤️‍🔥
+            "\u{1F9D4}\u{1F3FB}\u{200D}\u{2642}\u{FE0F}".to_owned(), // 🧔🏻‍♂️
+            scotland.to_owned(),
+            format!("Plate {wales} B"),
+            format!("Edit {technologist} {scotland}"),
+            // Variation selectors and skin-tone modifiers aren't format
+            // characters.
+            "\u{263A}\u{FE0F} a\u{FE0E}".to_owned(),
+            "\u{1F3FB}".to_owned(),
+        ];
+        for ok in allowed {
+            let renamed =
+                rename_track(&seq, bg, &ok).unwrap_or_else(|e| panic!("{ok:?} refused: {e}"));
+            assert_eq!(find_track(&renamed, bg).unwrap().1.name, ok);
+        }
+        let zero = "zero-width characters";
+        let format = "invisible formatting characters";
+        let refused = [
+            // ZWJ between letters, at either end, next to a non-emoji, after
+            // only a variation selector, doubled.
+            ("a\u{200D}b", '\u{200D}', zero),
+            ("\u{200D}\u{1F4BB}", '\u{200D}', zero),
+            ("\u{1F4BB}\u{200D}", '\u{200D}', zero),
+            ("\u{1F9D1}\u{200D}b", '\u{200D}', zero),
+            ("a\u{200D}\u{1F4BB}", '\u{200D}', zero),
+            ("\u{FE0F}\u{200D}\u{1F4BB}", '\u{200D}', zero),
+            ("\u{1F9D1}\u{200D}\u{200D}\u{1F4BB}", '\u{200D}', zero),
+            ("\u{1F9D1}\u{200D}\u{1F3FB}", '\u{200D}', zero),
+            // Tags: alone, unterminated, without the black flag, no tags
+            // before the cancel tag, a language tag in the sequence.
+            ("tag \u{E0067}", '\u{E0067}', format),
+            ("\u{1F3F4}\u{E0067}\u{E0062}", '\u{E0067}', format),
+            ("\u{1F3F3}\u{E0067}\u{E007F}", '\u{E0067}', format),
+            ("x\u{E007F}", '\u{E007F}', format),
+            ("\u{1F3F4}\u{E007F}", '\u{E007F}', format),
+            ("\u{1F3F4}\u{E0001}\u{E0067}\u{E007F}", '\u{E0001}', format),
+        ];
+        for (name, c, what) in refused {
+            let err = rename_track(&seq, bg, name).unwrap_err().to_string();
+            let code = format!("U+{:04X}", c as u32);
+            assert!(err.contains(what) && err.contains(&code), "{name:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn track_names_allow_zwnj_between_letters_only() {
+        let seq = mixed_names();
+        let bg = seq.tracks[1].id;
+        let nameha = "\u{0646}\u{0627}\u{0645}\u{0647}\u{200C}\u{0647}\u{0627}"; // نامه‌ها
+        let allowed = [
+            "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}".to_owned(), // می‌خواهم
+            nameha.to_owned(),
+            "\u{06A9}\u{062A}\u{0627}\u{0628}\u{200C}\u{062E}\u{0627}\u{0646}\u{0647}".to_owned(), // کتاب‌خانه
+            format!("Plate {nameha} 2"),
+            // Combining marks before it are looked past: a Hindi virama
+            // (an explicit half form, क्‌ष) and an acute accent.
+            "\u{0915}\u{094D}\u{200C}\u{0937}".to_owned(),
+            "e\u{0301}\u{200C}b".to_owned(),
+        ];
+        for ok in allowed {
+            let renamed =
+                rename_track(&seq, bg, &ok).unwrap_or_else(|e| panic!("{ok:?} refused: {e}"));
+            assert_eq!(find_track(&renamed, bg).unwrap().1.name, ok);
+        }
+        let refused = [
+            "\u{200C}\u{0646}\u{0627}", // leading
+            "\u{0646}\u{0627}\u{200C}", // trailing
+            "a\u{200C}1",               // before a digit
+            "1\u{200C}a",               // after a digit
+            "\u{06F1}\u{200C}\u{0627}", // after a Persian digit
+            "a \u{200C}b",              // after a space
+            "a\u{200C} b",              // before a space
+            "a\u{200C}\u{1F4BB}",       // before an emoji
+            "\u{1F4BB}\u{200C}a",       // after an emoji
+            "a\u{200C}\u{200C}b",       // doubled
+            "\u{0301}\u{200C}a",        // only a mark before it
+            "a\u{200C}\u{0301}",        // a mark, not a letter, after it
+        ];
+        for name in refused {
+            let err = rename_track(&seq, bg, name).unwrap_err().to_string();
+            assert!(
+                err.contains("zero-width characters") && err.contains("U+200C"),
+                "{name:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn skin_tones_are_modifiers_not_emoji() {
+        // So a ZWJ right before one doesn't join two emoji.
+        assert!(is_emoji('\u{1F9D1}') && is_emoji('\u{2642}'));
+        for c in '\u{1F3FB}'..='\u{1F3FF}' {
+            assert!(!is_emoji(c), "U+{:04X}", c as u32);
+        }
+    }
+
+    #[test]
+    fn format_char_table_is_unicode_16_cf() {
+        // Unicode 16.0.0 has 170 Cf code points in these 21 ranges.
+        let mut count = 0;
+        for pair in FORMAT_CHARS.windows(2) {
+            assert!(pair[0].1 < pair[1].0, "sorted, apart: {pair:?}");
+        }
+        for &(lo, hi) in &FORMAT_CHARS {
+            assert!(lo <= hi);
+            for c in lo..=hi {
+                count += 1;
+                assert!(refused_name_char(c).is_some(), "U+{:04X}", c as u32);
+            }
+            // The neighbours of each range are outside Cf; only U+2029
+            // (before U+202A) is refused, as a paragraph separator.
+            for n in [lo as u32 - 1, hi as u32 + 1] {
+                let n = char::from_u32(n).unwrap();
+                let want = (n == '\u{2029}').then_some("line or paragraph separators");
+                assert_eq!(refused_name_char(n), want, "U+{:04X}", n as u32);
+            }
+        }
+        assert_eq!(count, 170);
+    }
+
+    #[test]
+    fn locked_track_refuses_mixer_routing_changes() {
+        let (seq, tid, _) = seed_audio_seq();
+        let bus = BusId::new();
+        let seq = add_bus_with_id(&seq, bus, "Music");
+        let seq = add_track_send(&seq, tid, Send::to(bus)).unwrap();
+        let locked = lock_first_track_for_test(&seq);
+        let attempts = [
+            route_track_to_bus(&locked, tid, BusOutput::Bus(bus)),
+            add_track_send(&locked, tid, Send::to(bus)),
+            remove_track_send(&locked, tid, 0),
+        ];
+        for result in attempts {
+            let err = result.unwrap_err();
+            assert!(
+                err.to_string()
+                    .ends_with("track \"A1\" is locked; unlock it first"),
+                "{err}"
+            );
+        }
+        // The same edits work once the track is unlocked.
+        let unlocked = set_track_locked(&locked, tid, false).unwrap();
+        let routed = route_track_to_bus(&unlocked, tid, BusOutput::Bus(bus)).unwrap();
+        assert_eq!(routed.tracks[0].output, BusOutput::Bus(bus));
+        assert_eq!(
+            remove_track_send(&unlocked, tid, 0).unwrap().tracks[0]
+                .sends
+                .len(),
+            0
+        );
+        assert_eq!(
+            add_track_send(&unlocked, tid, Send::to(bus))
+                .unwrap()
+                .tracks[0]
+                .sends
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn magnetic_move_refuses_a_locked_track_even_when_clamped_to_nothing() {
+        // Moving a clip at 0 to before 0 clamps to no move; on a locked
+        // track it is still refused, like every other clip edit there.
+        let (seq, v1, _v2, aid, _tid, _m) = two_track_with_clips();
+        let locked = lock(&seq, v1);
+        let before = RationalTime::new(-1, 2).unwrap();
+        for to in [before, t(0), t(3)] {
+            let err = magnetic_move_clip(&locked, v1, aid, to).unwrap_err();
+            assert!(
+                err.to_string()
+                    .ends_with("track \"V1\" is locked; unlock it first"),
+                "{err}"
+            );
+        }
+        assert_eq!(magnetic_move_clip(&seq, v1, aid, before).unwrap(), seq);
+    }
+
+    #[test]
+    fn magnetic_move_names_the_locked_track_its_connected_clip_is_on() {
+        // a on V1 drags t on V2 with it; V2 is locked, so the move is
+        // refused and the message points at V2, not at a's own track.
+        let (seq, v1, v2, aid, tid, _m) = two_track_with_clips();
+        let seq = connect_clip(&seq, aid, tid).unwrap();
+        let locked = lock(&seq, v2);
+        let err = magnetic_move_clip(&locked, v1, aid, t(4)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid argument: a clip connected to this one sits on track \"V2\", \
+             which is locked; unlock it first"
+        );
+        assert!(magnetic_move_clip(&seq, v1, aid, t(4)).is_ok());
+    }
+
+    #[test]
+    fn remove_bus_refuses_to_reroute_a_locked_track() {
+        // Removing a bus reroutes the tracks that use it, so a locked
+        // track routed or sending to it blocks the removal.
+        let (seq, tid, _) = seed_audio_seq();
+        let seq = add_track(&seq, TrackKind::Audio, "A2");
+        let other = seq.tracks[1].id;
+        let (music, reverb, spare) = (BusId::new(), BusId::new(), BusId::new());
+        let mut seq = seq;
+        for (bus, name) in [(music, "Music"), (reverb, "Reverb"), (spare, "Spare")] {
+            seq = add_bus_with_id(&seq, bus, name);
+        }
+        let seq = route_track_to_bus(&seq, tid, BusOutput::Bus(music)).unwrap();
+        let seq = add_track_send(&seq, tid, Send::to(reverb)).unwrap();
+        let seq = route_track_to_bus(&seq, other, BusOutput::Bus(spare)).unwrap();
+        let locked = lock_first_track_for_test(&seq);
+        for bus in [music, reverb] {
+            let err = remove_bus(&locked, bus).unwrap_err();
+            assert!(err.to_string().contains("\"A1\" is locked"), "{err}");
+        }
+        // A bus the locked track doesn't use can go; the unlocked user of
+        // it falls back to master.
+        let without_spare = remove_bus(&locked, spare).unwrap();
+        assert_eq!(without_spare.tracks[1].output, BusOutput::Master);
+        assert!(Arc::ptr_eq(&without_spare.tracks[0], &locked.tracks[0]));
+        // Unlocked, the removal reroutes it as before.
+        let without_music = remove_bus(&seq, music).unwrap();
+        assert_eq!(without_music.tracks[0].output, BusOutput::Master);
+        assert_eq!(remove_bus(&seq, reverb).unwrap().tracks[0].sends.len(), 0);
+    }
+
+    // ---- transition length cap ----------------------------------------------
+
+    fn half(num: i64) -> RationalTime {
+        RationalTime::new(num, 2).unwrap()
+    }
+
+    /// V1 holding clips of the given lengths laid end to end from 0, each
+    /// reading its source from 0.
+    fn butted(lens: &[i64]) -> (Sequence, TrackId, MediaItemId, Vec<ClipId>) {
+        let (mut seq, v1, media) = seed_seq();
+        let mut ids = Vec::new();
+        let mut at = 0;
+        for &len in lens {
+            let c = Clip::new(media, "c", t(at), t(0), t(len)).unwrap();
+            ids.push(c.id);
+            seq = insert_clip(&seq, v1, c).unwrap();
+            at += len;
+        }
+        (seq, v1, media, ids)
+    }
+
+    fn durations(seq: &Sequence) -> Vec<RationalTime> {
+        seq.tracks[0]
+            .transitions
+            .iter()
+            .map(|tr| tr.duration)
+            .collect()
+    }
+
+    fn dissolve(seq: &Sequence, v1: TrackId, after: ClipId, len: RationalTime) -> Sequence {
+        add_transition_at_cut(seq, v1, after, TransitionKind::Dissolve, len)
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn transition_is_capped_at_the_shorter_neighbour() {
+        use crate::scene_plan::{scene_plan_at, LayerContent};
+        // a [0,5) | b [5,6) | c [6,10): a 4 s dissolve after a would run to
+        // 7, hiding c at 6.5 and reading b past its end.
+        let (seq, v1, _, ids) = butted(&[5, 1, 4]);
+        let (capped, id) =
+            add_transition_at_cut(&seq, v1, ids[0], TransitionKind::Dissolve, t(4)).unwrap();
+        let tr = &capped.tracks[0].transitions[0];
+        assert_eq!((tr.id, tr.duration), (id, t(1)));
+        assert_eq!((tr.window_in(), tr.window_out()), (half(9), half(11)));
+        let plan = scene_plan_at(&capped, RationalTime::new(13, 2).unwrap());
+        match &plan.layers[0].content {
+            LayerContent::Clip(c) => assert_eq!(c.clip_id, ids[2], "c shows at 6.5"),
+            other => panic!("expected clip c, got {other:?}"),
+        }
+        // The capped window leaves room for a dissolve after b (capped too).
+        let both = dissolve(&capped, v1, ids[1], t(4));
+        assert_eq!(durations(&both), [t(1), t(1)]);
+        // The outgoing side caps it as well; one that fits is kept.
+        let (seq, v1, _, ids) = butted(&[2, 5]);
+        assert_eq!(durations(&dissolve(&seq, v1, ids[0], t(3))), [t(2)]);
+        assert_eq!(durations(&dissolve(&seq, v1, ids[0], t(2))), [t(2)]);
+        assert_eq!(durations(&dissolve(&seq, v1, ids[0], half(3))), [half(3)]);
+        // Replaying the logged op reproduces the capped transition.
+        let mut log = crate::edit_log::EditLog::new(seq.clone());
+        let op = crate::edit_log::EditOp::AddTransitionAtCut {
+            track_id: v1,
+            transition_id: TransitionId::new(),
+            after_clip_id: ids[0],
+            kind: TransitionKind::Dissolve,
+            duration: t(9),
+        };
+        log.apply(op.clone()).unwrap();
+        assert_eq!(durations(log.current()), [t(2)]);
+        log.undo().unwrap();
+        log.redo().unwrap();
+        assert_eq!(log.current(), &crate::edit_log::apply(&seq, &op).unwrap());
+    }
+
+    #[test]
+    fn transition_cap_skips_zero_length_clips_and_rejects_no_length() {
+        // [a, z, b] with z = [5,5): b is the incoming side, so b caps it.
+        let (seq, v1, media) = seed_seq();
+        let a = Clip::new(media, "a", t(0), t(0), t(5)).unwrap();
+        let z = Clip::new(media, "z", t(5), t(0), t(0)).unwrap();
+        let b = Clip::new(media, "b", t(5), t(0), t(1)).unwrap();
+        let (a_id, z_id) = (a.id, z.id);
+        let mut seq = seq;
+        for c in [a, z, b] {
+            seq = insert_clip(&seq, v1, c).unwrap();
+        }
+        assert_eq!(durations(&dissolve(&seq, v1, a_id, t(4))), [t(1)]);
+        // A zero-length anchor has no length to dissolve from.
+        let err = add_transition_at_cut(&seq, v1, z_id, TransitionKind::Dissolve, t(1))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no length"), "{err}");
+        // Only a zero-length clip after the anchor: nothing to dissolve to.
+        let (mut seq, v1, media) = seed_seq();
+        let a = Clip::new(media, "a", t(0), t(0), t(5)).unwrap();
+        let a_id = a.id;
+        seq = insert_clip(&seq, v1, a).unwrap();
+        seq = insert_clip(&seq, v1, Clip::new(media, "z", t(5), t(0), t(0)).unwrap()).unwrap();
+        assert!(add_transition_at_cut(&seq, v1, a_id, TransitionKind::Dissolve, t(1)).is_err());
+    }
+
+    #[test]
+    fn edits_that_shorten_a_side_cap_its_transition() {
+        // a [0,5) | b [5,10), a 4 s dissolve at 5 (both sides are 5 s).
+        let (seq, v1, media, ids) = butted(&[5, 5]);
+        let seq = dissolve(&seq, v1, ids[0], t(4));
+        assert_eq!(durations(&seq), [t(4)]);
+        // b's out-point trimmed to 2 s.
+        let trimmed = trim_out(&seq, v1, ids[1], t(2)).unwrap();
+        assert_eq!(durations(&trimmed), [t(2)]);
+        // A capped transition doesn't grow back when the side does.
+        assert_eq!(
+            durations(&trim_out(&trimmed, v1, ids[1], t(5)).unwrap()),
+            [t(2)]
+        );
+        // a's in-point trimmed: a = [3,5).
+        assert_eq!(durations(&trim_in(&seq, v1, ids[0], t(3)).unwrap()), [t(2)]);
+        // a split at 4.5: its right half [4.5,5) is the outgoing side.
+        assert_eq!(
+            durations(&split(&seq, v1, ids[0], half(9)).unwrap()),
+            [half(1)]
+        );
+        // Overwriting [7,10) leaves b as [5,7).
+        let x = Clip::new(media, "x", t(7), t(0), t(3)).unwrap();
+        assert_eq!(durations(&overwrite_clip(&seq, v1, x).unwrap()), [t(2)]);
+        // An edit that leaves both sides long enough keeps it, shared.
+        let longer = trim_out(&seq, v1, ids[1], half(9)).unwrap();
+        assert!(Arc::ptr_eq(
+            &longer.tracks[0].transitions[0],
+            &seq.tracks[0].transitions[0]
+        ));
+    }
+
+    // ---- transitions follow their cut ----------------------------------------
+
+    /// `(position, duration)` of V1's transitions, in order.
+    fn cuts(seq: &Sequence) -> Vec<(RationalTime, RationalTime)> {
+        seq.tracks[0]
+            .transitions
+            .iter()
+            .map(|tr| (tr.position, tr.duration))
+            .collect()
+    }
+
+    /// a [0,5) | b [5,10) | c [10,15) on V1 with 4 s dissolves at 5 and 10.
+    fn three_with_dissolves() -> (Sequence, TrackId, MediaItemId, Vec<ClipId>) {
+        let (seq, v1, media, ids) = butted(&[5, 5, 5]);
+        let seq = dissolve(&seq, v1, ids[0], t(4));
+        let seq = dissolve(&seq, v1, ids[1], t(4));
+        assert_eq!(cuts(&seq), [(t(5), t(4)), (t(10), t(4))]);
+        (seq, v1, media, ids)
+    }
+
+    #[test]
+    fn transitions_move_with_a_cut_that_shifts() {
+        let (seq, v1, media, ids) = three_with_dissolves();
+        let at = |start: i64, len: i64| Clip::new(media, "i", t(start), t(0), t(len)).unwrap();
+        // Ripple-inserting 3 s at the start pushes both cuts.
+        let pushed = [(t(8), t(4)), (t(13), t(4))];
+        assert_eq!(
+            cuts(&ripple_insert_clip(&seq, v1, at(0, 3)).unwrap()),
+            pushed
+        );
+        assert_eq!(
+            cuts(&magnetic_ripple_insert(&seq, v1, at(0, 3)).unwrap()),
+            pushed
+        );
+        // Ripple-deleting a takes its dissolve and pulls b|c back to 5.
+        assert_eq!(
+            cuts(&ripple_remove_clip(&seq, v1, ids[0]).unwrap()),
+            [(t(5), t(4))]
+        );
+        assert_eq!(
+            cuts(&magnetic_ripple_delete(&seq, v1, ids[0]).unwrap()),
+            [(t(5), t(4))]
+        );
+        // b and c moved together (c connected to b) keep the cut between them.
+        let linked = connect_clip(&seq, ids[1], ids[2]).unwrap();
+        assert_eq!(
+            cuts(&magnetic_move_clip(&linked, v1, ids[1], t(6)).unwrap()),
+            [(t(11), t(4))]
+        );
+        // Undo brings back what an edit removed, where it was.
+        let mut log = crate::edit_log::EditLog::new(seq.clone());
+        log.apply(crate::edit_log::EditOp::RippleRemoveClip {
+            track_id: v1,
+            clip_id: ids[0],
+        })
+        .unwrap();
+        log.undo().unwrap();
+        assert_eq!(log.current(), &seq);
+    }
+
+    #[test]
+    fn transitions_go_when_their_clips_stop_meeting() {
+        let (seq, v1, media, ids) = three_with_dissolves();
+        let at = |start: i64, len: i64| Clip::new(media, "i", t(start), t(0), t(len)).unwrap();
+        // A removed clip takes both its dissolves; the new a|c cut has none.
+        assert!(cuts(&remove_clip(&seq, v1, ids[1]).unwrap()).is_empty());
+        assert!(cuts(&ripple_remove_clip(&seq, v1, ids[1]).unwrap()).is_empty());
+        assert!(cuts(&magnetic_ripple_delete(&seq, v1, ids[1]).unwrap()).is_empty());
+        // A clip rippled in between a and b; b|c moves on.
+        let between = [(t(11), t(4))];
+        assert_eq!(
+            cuts(&ripple_insert_clip(&seq, v1, at(5, 1)).unwrap()),
+            between
+        );
+        assert_eq!(
+            cuts(&magnetic_ripple_insert(&seq, v1, at(5, 1)).unwrap()),
+            between
+        );
+        // Moved apart: c slid or magnetically moved away from b.
+        assert_eq!(
+            cuts(&slide(&seq, v1, ids[2], t(1)).unwrap()),
+            [(t(5), t(4))]
+        );
+        assert_eq!(
+            cuts(&magnetic_move_clip(&seq, v1, ids[2], t(11)).unwrap()),
+            [(t(5), t(4))]
+        );
+        // A gap opened by trimming a's out-point or c's in-point.
+        assert_eq!(
+            cuts(&trim_out(&seq, v1, ids[0], t(4)).unwrap()),
+            [(t(10), t(4))]
+        );
+        assert_eq!(
+            cuts(&trim_in(&seq, v1, ids[2], t(1)).unwrap()),
+            [(t(5), t(4))]
+        );
+        // An overwrite across the cut at 5 replaces b's head: a|b goes, b|c
+        // stays on b's re-IDed tail.
+        let over = overwrite_clip(&seq, v1, at(4, 2)).unwrap();
+        assert_eq!(cuts(&over), [(t(10), t(4))]);
+        assert_ne!(over.tracks[0].clips[2].id, ids[1]);
+        // A track with a gap after the anchor can't take one.
+        let gap = remove_clip(&seq, v1, ids[1]).unwrap();
+        let err = add_transition_at_cut(&gap, v1, ids[0], TransitionKind::Dissolve, t(1))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no clip starts at the cut"), "{err}");
+    }
+
+    #[test]
+    fn transitions_stay_on_clips_cut_into_pieces() {
+        let (seq, v1, media, ids) = three_with_dissolves();
+        // Splitting b leaves a|b on its left piece and b|c on its right one,
+        // each capped by the piece's length.
+        let split_b = split(&seq, v1, ids[1], t(6)).unwrap();
+        assert_eq!(cuts(&split_b), [(t(5), t(1)), (t(10), t(4))]);
+        // Splitting a leaves a|b on a's right half.
+        assert_eq!(
+            cuts(&split(&seq, v1, ids[0], half(7)).unwrap()),
+            [(t(5), half(3)), (t(10), t(4))]
+        );
+        // Overwriting inside b keeps both dissolves on b's re-IDed pieces.
+        let x = Clip::new(media, "x", t(6), t(0), t(2)).unwrap();
+        assert_eq!(
+            cuts(&overwrite_clip(&seq, v1, x).unwrap()),
+            [(t(5), t(1)), (t(10), t(2))]
+        );
+    }
+
+    #[test]
+    fn transitions_saved_by_older_builds_are_capped_or_dropped() {
+        // a [0,5) | b [5,6) | c [6,10) holding a 4 s dissolve at 5, stored
+        // as an older build could have saved it.
+        let (seq, v1, media, ids) = butted(&[5, 1, 4]);
+        let stored = |seq: &Sequence, tr: Transition| {
+            let mut track = (*seq.tracks[0]).clone();
+            track.transitions.push(Arc::new(tr));
+            replace_track(seq, 0, track)
+        };
+        let seq = stored(&seq, Transition::dissolve(t(5), t(4)));
+        // It renders as 1 s, so a dissolve at 6 fits beside it.
+        let both = dissolve(&seq, v1, ids[1], t(4));
+        assert_eq!(cuts(&both), [(t(5), t(4)), (t(6), t(1))]);
+        // The next edit of the track caps it, and drops an orphan (nothing
+        // meets at 12) rather than let it land on a cut made there later.
+        let orphaned = stored(&seq, Transition::dissolve(t(12), t(2)));
+        let x = Clip::new(media, "x", t(10), t(0), t(2)).unwrap();
+        let edited = insert_clip(&orphaned, v1, x).unwrap();
+        assert_eq!(cuts(&edited), [(t(5), t(1))]);
+        let y = Clip::new(media, "y", t(12), t(0), t(2)).unwrap();
+        assert_eq!(cuts(&insert_clip(&edited, v1, y).unwrap()), [(t(5), t(1))]);
+    }
+
+    #[test]
+    fn magnetic_ripples_carry_other_tracks_transitions() {
+        // V1: p [0,2) | q [2,5) | r [5,8). V2: x [2,5) | y [5,8), 2 s
+        // dissolve at 5.
+        let (seq, v1, media, ids) = butted(&[2, 3, 3]);
+        let seq = add_track(&seq, TrackKind::Video, "V2");
+        let v2 = seq.tracks[1].id;
+        let x = Clip::new(media, "x", t(2), t(0), t(3)).unwrap();
+        let x_id = x.id;
+        let seq = insert_clip(&seq, v2, x).unwrap();
+        let seq = insert_clip(&seq, v2, Clip::new(media, "y", t(5), t(0), t(3)).unwrap()).unwrap();
+        let (seq, _) =
+            add_transition_at_cut(&seq, v2, x_id, TransitionKind::Dissolve, t(2)).unwrap();
+        let v2_cuts = |s: &Sequence| -> Vec<RationalTime> {
+            s.tracks[1]
+                .transitions
+                .iter()
+                .map(|tr| tr.position)
+                .collect()
+        };
+        // Deleting p closes 2 s on every track: V2's cut moves to 3.
+        assert_eq!(
+            v2_cuts(&magnetic_ripple_delete(&seq, v1, ids[0]).unwrap()),
+            [t(3)]
+        );
+        // Opening 1 s at 2 (before x) moves it to 6.
+        let one = |at: i64| Clip::new(media, "i", t(at), t(0), t(1)).unwrap();
+        assert_eq!(
+            v2_cuts(&magnetic_ripple_insert(&seq, v1, one(2)).unwrap()),
+            [t(6)]
+        );
+        // Opening 1 s at 5 pushes y off x: the dissolve between them goes.
+        assert!(v2_cuts(&magnetic_ripple_insert(&seq, v1, one(5)).unwrap()).is_empty());
+        // A locked V2 doesn't ripple, so its dissolve stays put.
+        let locked = lock(&seq, v2);
+        assert_eq!(
+            v2_cuts(&magnetic_ripple_delete(&locked, v1, ids[0]).unwrap()),
+            [t(5)]
+        );
     }
 }

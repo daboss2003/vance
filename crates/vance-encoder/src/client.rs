@@ -49,8 +49,20 @@ pub struct EncoderClient {
 impl EncoderClient {
     /// Spawn the sidecar binary and complete the handshake.
     pub fn spawn(binary: impl AsRef<Path>) -> Result<Self, EncoderClientError> {
+        Self::spawn_with_env(binary, std::iter::empty::<(&str, &str)>())
+    }
+
+    /// [`EncoderClient::spawn`] with extra environment variables for the
+    /// sidecar (e.g. `TMPDIR`, where it keeps an export's temp files).
+    pub fn spawn_with_env<P, I, K, V>(binary: P, env: I) -> Result<Self, EncoderClientError>
+    where
+        P: AsRef<Path>,
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    {
         let mut sidecar: Sidecar<EncoderRequest, EncoderResponse> =
-            Sidecar::spawn(binary, std::iter::empty::<&str>())?;
+            Sidecar::spawn_with_env(binary, std::iter::empty::<&str>(), env)?;
         match sidecar.request(&EncoderRequest::Hello {
             protocol_version: PROTOCOL_VERSION,
         })? {
@@ -163,6 +175,17 @@ impl EncoderClient {
                 got: other,
             }),
         }
+    }
+
+    /// The sidecar's OS process id.
+    pub fn pid(&self) -> Option<u32> {
+        self.sidecar.pid()
+    }
+
+    /// Force-kill the sidecar. Test/diagnostic only: an export it had open
+    /// leaves its temp files until the next sidecar starts.
+    pub fn kill(&mut self) -> Result<(), EncoderClientError> {
+        Ok(self.sidecar.kill()?)
     }
 
     /// Graceful shutdown of the entire sidecar.

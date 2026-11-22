@@ -77,6 +77,7 @@ fn handshake_open_decode_close() {
     let expected_planes = match frame0.pixel_format {
         PixelFormat::Yuv420P | PixelFormat::Yuv420P10Le => 3,
         PixelFormat::Nv12 => 2,
+        PixelFormat::Rgba8 => 1,
     };
     assert_eq!(
         frame0.strides.len(),

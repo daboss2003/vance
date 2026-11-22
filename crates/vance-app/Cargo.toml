@@ -106,5 +106,10 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+# The memory budget's RAM query (GlobalMemoryStatusEx); same windows-sys
+# version vance-ipc and vance-audio already use.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -34,6 +34,7 @@ pub fn render_mograph_yuv420(
         pixel_format: PixelFormat::Yuv420P,
         strides: vec![ew, cw, cw],
         bytes: yuv.into(),
+        color: Default::default(),
     }
 }
 

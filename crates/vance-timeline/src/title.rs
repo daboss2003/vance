@@ -48,3 +48,31 @@ impl Default for TitleParams {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pre_m1_title_loads_opaque_from_json_and_ron() {
+        let title = TitleParams {
+            bg_alpha: 0.0,
+            ..Default::default()
+        };
+        let mut json = serde_json::to_value(&title).unwrap();
+        assert_eq!(
+            serde_json::from_value::<TitleParams>(json.clone()).unwrap(),
+            title
+        );
+        json.as_object_mut().unwrap().remove("bg_alpha");
+        let old: TitleParams = serde_json::from_value(json).unwrap();
+        assert_eq!(old.bg_alpha, 1.0);
+
+        let ron = ron::to_string(&title).unwrap();
+        let legacy = ron.replace(",bg_alpha:0.0", "");
+        assert_ne!(legacy, ron, "{ron}");
+        let old: TitleParams = ron::from_str(&legacy).unwrap();
+        assert_eq!(old.bg_alpha, 1.0);
+        assert_eq!(old.text, title.text);
+    }
+}

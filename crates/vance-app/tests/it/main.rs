@@ -14,6 +14,7 @@
 mod compositing_e2e;
 mod edge_cases;
 mod encrypted_effect;
+mod engine_fixes;
 mod export_audio;
 mod export_video;
 mod frame_select;

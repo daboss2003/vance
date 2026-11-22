@@ -15,36 +15,87 @@
 //! The cache stores a small header followed by raw pixel bytes:
 //!
 //! ```text
-//!  0    u8       version = 1
-//!  1    u8       pixel_format (0 = Yuv420P, 1 = Nv12)
+//!  0    u8       version = 2
+//!  1    u8       pixel_format (0 = Yuv420P, 1 = Nv12, 2 = Yuv420P10Le,
+//!                3 = Rgba8)
 //!  2    u32 LE   width
 //!  6    u32 LE   height
 //! 10    i64 LE   actual PTS (may differ from the requested target)
-//! 18    u8       stride_count
-//! 19    [u32]*n  stride per plane
-//! 19+4n …       pixel bytes
+//! 18    u8       colour range (0 = unknown, 1 = limited, 2 = full)
+//! 19    u8       colour matrix (0 = unknown, 1 = BT.601, 2 = BT.709,
+//!                3 = BT.2020 NCL)
+//! 20    u32 LE   sample aspect numerator
+//! 24    u32 LE   sample aspect denominator
+//! 28    u8       stride_count
+//! 29    [u32]*n  stride per plane
+//! 29+4n …       pixel bytes
 //! ```
+//!
+//! Version 1 entries (no colour hints) are ignored, so they re-decode.
 
 use vance_cache::{CacheKey, FrameCache};
-use vance_decoder::protocol::{FrameData, PixelFormat};
-use vance_decoder::DecoderClient;
+use vance_decoder::protocol::{ColorMatrixHint, ColorRangeHint, FrameData, PixelFormat};
+use vance_decoder::{DecoderClient, FrameColor};
 
-const CACHE_FORMAT_VERSION: u8 = 1;
+const CACHE_FORMAT_VERSION: u8 = 2;
+/// Bytes before the stride table.
+const HEADER_LEN: usize = 29;
+
+fn range_code(r: ColorRangeHint) -> u8 {
+    match r {
+        ColorRangeHint::Unknown => 0,
+        ColorRangeHint::Limited => 1,
+        ColorRangeHint::Full => 2,
+    }
+}
+
+fn range_from_code(c: u8) -> Option<ColorRangeHint> {
+    Some(match c {
+        0 => ColorRangeHint::Unknown,
+        1 => ColorRangeHint::Limited,
+        2 => ColorRangeHint::Full,
+        _ => return None,
+    })
+}
+
+fn matrix_code(m: ColorMatrixHint) -> u8 {
+    match m {
+        ColorMatrixHint::Unknown => 0,
+        ColorMatrixHint::Bt601 => 1,
+        ColorMatrixHint::Bt709 => 2,
+        ColorMatrixHint::Bt2020Ncl => 3,
+    }
+}
+
+fn matrix_from_code(c: u8) -> Option<ColorMatrixHint> {
+    Some(match c {
+        0 => ColorMatrixHint::Unknown,
+        1 => ColorMatrixHint::Bt601,
+        2 => ColorMatrixHint::Bt709,
+        3 => ColorMatrixHint::Bt2020Ncl,
+        _ => return None,
+    })
+}
 
 /// Pack a [`FrameData`] into the cache's on-wire byte format.
 pub fn pack_frame(frame: &FrameData) -> Vec<u8> {
     let stride_count = frame.strides.len();
-    let header_len = 19 + 4 * stride_count;
+    let header_len = HEADER_LEN + 4 * stride_count;
     let mut out = Vec::with_capacity(header_len + frame.bytes.len());
     out.push(CACHE_FORMAT_VERSION);
     out.push(match frame.pixel_format {
         PixelFormat::Yuv420P => 0,
         PixelFormat::Nv12 => 1,
         PixelFormat::Yuv420P10Le => 2,
+        PixelFormat::Rgba8 => 3,
     });
     out.extend_from_slice(&frame.width.to_le_bytes());
     out.extend_from_slice(&frame.height.to_le_bytes());
     out.extend_from_slice(&frame.pts.to_le_bytes());
+    out.push(range_code(frame.color.range));
+    out.push(matrix_code(frame.color.matrix));
+    out.extend_from_slice(&frame.color.sample_aspect.0.to_le_bytes());
+    out.extend_from_slice(&frame.color.sample_aspect.1.to_le_bytes());
     out.push(stride_count as u8);
     for s in &frame.strides {
         out.extend_from_slice(&s.to_le_bytes());
@@ -56,7 +107,7 @@ pub fn pack_frame(frame: &FrameData) -> Vec<u8> {
 /// Reverse of [`pack_frame`]. Returns `None` on any header mismatch
 /// so a corrupt cache entry just falls back to a fresh decode.
 pub fn unpack_frame(buf: &[u8]) -> Option<FrameData> {
-    if buf.len() < 19 {
+    if buf.len() < HEADER_LEN {
         return None;
     }
     if buf[0] != CACHE_FORMAT_VERSION {
@@ -66,20 +117,26 @@ pub fn unpack_frame(buf: &[u8]) -> Option<FrameData> {
         0 => PixelFormat::Yuv420P,
         1 => PixelFormat::Nv12,
         2 => PixelFormat::Yuv420P10Le,
+        3 => PixelFormat::Rgba8,
         _ => return None,
     };
-    let width = u32::from_le_bytes(buf[2..6].try_into().ok()?);
-    let height = u32::from_le_bytes(buf[6..10].try_into().ok()?);
+    let u32_at = |off: usize| buf[off..off + 4].try_into().ok().map(u32::from_le_bytes);
+    let width = u32_at(2)?;
+    let height = u32_at(6)?;
     let pts = i64::from_le_bytes(buf[10..18].try_into().ok()?);
-    let stride_count = buf[18] as usize;
-    let stride_table_end = 19 + 4 * stride_count;
+    let color = FrameColor {
+        range: range_from_code(buf[18])?,
+        matrix: matrix_from_code(buf[19])?,
+        sample_aspect: (u32_at(20)?, u32_at(24)?),
+    };
+    let stride_count = buf[28] as usize;
+    let stride_table_end = HEADER_LEN + 4 * stride_count;
     if buf.len() < stride_table_end {
         return None;
     }
     let mut strides = Vec::with_capacity(stride_count);
     for i in 0..stride_count {
-        let off = 19 + i * 4;
-        strides.push(u32::from_le_bytes(buf[off..off + 4].try_into().ok()?));
+        strides.push(u32_at(HEADER_LEN + i * 4)?);
     }
     let bytes = buf[stride_table_end..].to_vec().into();
     Some(FrameData {
@@ -89,6 +146,7 @@ pub fn unpack_frame(buf: &[u8]) -> Option<FrameData> {
         pixel_format,
         strides,
         bytes,
+        color,
     })
 }
 
@@ -116,7 +174,6 @@ pub fn cached_decode_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vance_decoder::protocol::{FrameData, PixelFormat};
 
     fn sample_frame() -> FrameData {
         FrameData {
@@ -130,6 +187,7 @@ mod tests {
                 .take(16 * 16 * 3 / 2)
                 .collect::<Vec<u8>>()
                 .into(),
+            color: Default::default(),
         }
     }
 
@@ -155,6 +213,57 @@ mod tests {
         let back = unpack_frame(&packed).expect("unpack");
         assert_eq!(back.pixel_format, f.pixel_format);
         assert_eq!(back.strides, f.strides);
+    }
+
+    #[test]
+    fn colour_hints_round_trip() {
+        let mut f = sample_frame();
+        f.pixel_format = PixelFormat::Yuv420P10Le;
+        f.color = FrameColor {
+            range: ColorRangeHint::Full,
+            matrix: ColorMatrixHint::Bt2020Ncl,
+            sample_aspect: (4, 3),
+        };
+        let back = unpack_frame(&pack_frame(&f)).expect("unpack");
+        assert_eq!(back.color, f.color);
+        assert_eq!(back.pixel_format, f.pixel_format);
+        assert_eq!(back.bytes, f.bytes);
+        for (range, matrix) in [
+            (ColorRangeHint::Unknown, ColorMatrixHint::Unknown),
+            (ColorRangeHint::Limited, ColorMatrixHint::Bt601),
+            (ColorRangeHint::Full, ColorMatrixHint::Bt709),
+        ] {
+            f.color.range = range;
+            f.color.matrix = matrix;
+            assert_eq!(unpack_frame(&pack_frame(&f)).unwrap().color, f.color);
+        }
+    }
+
+    #[test]
+    fn version_1_entries_are_ignored() {
+        // A pre-hint entry (19-byte header, no colour fields) whose bytes
+        // would also parse in the new layout: only the version tells them
+        // apart.
+        let f = sample_frame();
+        let mut v1 = vec![1u8, 0];
+        v1.extend_from_slice(&f.width.to_le_bytes());
+        v1.extend_from_slice(&f.height.to_le_bytes());
+        v1.extend_from_slice(&f.pts.to_le_bytes());
+        v1.push(0); // no stride table
+        v1.extend_from_slice(&[0u8; 64]);
+        assert!(unpack_frame(&v1).is_none());
+        v1[0] = CACHE_FORMAT_VERSION;
+        assert!(unpack_frame(&v1).is_some(), "the layouts overlap");
+    }
+
+    #[test]
+    fn unpack_rejects_unknown_colour_codes() {
+        let mut packed = pack_frame(&sample_frame());
+        packed[18] = 9;
+        assert!(unpack_frame(&packed).is_none());
+        let mut packed = pack_frame(&sample_frame());
+        packed[19] = 9;
+        assert!(unpack_frame(&packed).is_none());
     }
 
     #[test]

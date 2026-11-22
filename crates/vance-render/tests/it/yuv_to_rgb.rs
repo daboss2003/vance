@@ -26,6 +26,7 @@ fn solid_yuv420p(width: u32, height: u32, y: u8, u: u8, v: u8) -> FrameData {
         pixel_format: PixelFormat::Yuv420P,
         strides: vec![width, chroma_w, chroma_w],
         bytes: bytes.into(),
+        color: Default::default(),
     }
 }
 
@@ -46,6 +47,7 @@ fn solid_nv12(width: u32, height: u32, y: u8, u: u8, v: u8) -> FrameData {
         pixel_format: PixelFormat::Nv12,
         strides: vec![width, chroma_w * 2],
         bytes: bytes.into(),
+        color: Default::default(),
     }
 }
 
@@ -151,6 +153,7 @@ fn solid_yuv420p10le(width: u32, height: u32, y: u16, u: u16, v: u16) -> FrameDa
         pixel_format: PixelFormat::Yuv420P10Le,
         strides: vec![width, cw, cw],
         bytes: bytes.into(),
+        color: Default::default(),
     }
 }
 
@@ -476,6 +479,7 @@ fn malformed_frame_rejected() {
         pixel_format: PixelFormat::Yuv420P,
         strides: vec![64, 32, 32],
         bytes: vec![0; 100].into(), // way too small
+        color: Default::default(),
     };
     let err = r.upload_frame(&bad).unwrap_err();
     let s = format!("{err}");

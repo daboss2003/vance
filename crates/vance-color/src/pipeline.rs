@@ -16,7 +16,7 @@
 //! v1 ships the matrix path; the [`crate::ocio`] module (Phase 6.1b)
 //! can replace the math with an OCIO processor for arbitrary configs.
 
-use crate::space::{ColorSpace, Range, TransferFunction};
+use crate::space::{ColorSpace, Primaries, Range, TransferFunction};
 use crate::transform::{primaries_to_primaries, Transform};
 
 /// One color pipeline configuration: input space → working space →
@@ -57,6 +57,10 @@ pub struct PipelineParams {
     pub input_range: u32,
     /// Encode-side range.
     pub output_range: u32,
+    /// Decode-side YUV → RGB matrix: 0 = BT.709, 1 = BT.601, 2 = BT.2020
+    /// non-constant luminance. Defaults from the input primaries; the engine
+    /// overrides it (and `input_range`) with what the stream signals.
+    pub input_matrix: u32,
     /// Linear-RGB matrix: input primaries → working primaries.
     pub input_to_working: Transform,
     /// Linear-RGB matrix: working primaries → output primaries.
@@ -86,6 +90,7 @@ impl Pipeline {
             output_transfer: transfer_id(out_t),
             input_range: range_id(in_r),
             output_range: range_id(out_r),
+            input_matrix: matrix_id_for_primaries(in_p),
             input_to_working: primaries_to_primaries(in_p, wk_p),
             working_to_output: primaries_to_primaries(wk_p, out_p),
         })
@@ -103,6 +108,22 @@ fn transfer_id(t: TransferFunction) -> u32 {
         TransferFunction::Acescct => 6,
     }
 }
+
+/// YUV matrix id ([`PipelineParams::input_matrix`]) a source in `p`
+/// primaries uses when its stream doesn't signal one.
+pub fn matrix_id_for_primaries(p: Primaries) -> u32 {
+    match p {
+        Primaries::Bt2020 => MATRIX_BT2020_NCL,
+        _ => MATRIX_BT709,
+    }
+}
+
+/// [`PipelineParams::input_matrix`]: ITU-R BT.709.
+pub const MATRIX_BT709: u32 = 0;
+/// [`PipelineParams::input_matrix`]: ITU-R BT.601.
+pub const MATRIX_BT601: u32 = 1;
+/// [`PipelineParams::input_matrix`]: ITU-R BT.2020 non-constant luminance.
+pub const MATRIX_BT2020_NCL: u32 = 2;
 
 fn range_id(r: Range) -> u32 {
     match r {

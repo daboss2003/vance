@@ -3,6 +3,52 @@
 use thiserror::Error;
 use vance_decoder::{FrameData, PixelFormat};
 
+/// WGSL sources. Shared stages live in `common.wgsl` (colour math, no
+/// bindings), `grade.wgsl` (grade nodes; needs `samp` + `tex_curve_atlas`)
+/// and `blend.wgsl` (blend modes, no bindings), concatenated in front of
+/// each pass's own file.
+pub(crate) mod wgsl {
+    /// The legacy single-clip pipeline (`Renderer::render_to`).
+    pub(crate) const LEGACY: &str = concat!(
+        include_str!("common.wgsl"),
+        "\n",
+        include_str!("grade.wgsl"),
+        "\n",
+        include_str!("shader.wgsl"),
+    );
+    /// Compositor layer pass (plain and fused with its composite) + the
+    /// keyer pre-passes.
+    pub(crate) const LAYER: &str = concat!(
+        include_str!("common.wgsl"),
+        "\n",
+        include_str!("grade.wgsl"),
+        "\n",
+        include_str!("blend.wgsl"),
+        "\n",
+        include_str!("layer.wgsl"),
+    );
+    /// Compositor blend pass.
+    pub(crate) const COMPOSITE: &str = concat!(
+        include_str!("common.wgsl"),
+        "\n",
+        include_str!("blend.wgsl"),
+        "\n",
+        include_str!("composite.wgsl"),
+    );
+    /// Compositor keyer matte line passes (compute) + the matte copy.
+    pub(crate) const MATTE: &str = concat!(
+        include_str!("common.wgsl"),
+        "\n",
+        include_str!("matte.wgsl"),
+    );
+    /// Compositor output pass + RGBA8 pack/unpack.
+    pub(crate) const OUTPUT: &str = concat!(
+        include_str!("common.wgsl"),
+        "\n",
+        include_str!("output.wgsl"),
+    );
+}
+
 /// Renderer errors.
 #[non_exhaustive]
 #[derive(Debug, Error)]
@@ -28,9 +74,10 @@ pub enum RenderError {
     #[error("no frame uploaded yet")]
     NoFrame,
 
-    /// A compositor pass that has not been implemented yet (ADR 0007).
-    #[error("not implemented yet: {0}")]
-    Unimplemented(&'static str),
+    /// The compositor was used out of order or with bad input (no
+    /// `begin_frame`, a stale layer handle, a wrong-sized image).
+    #[error("compositor: {0}")]
+    Compositor(String),
 }
 
 /// Configuration knobs passed to [`Renderer::new`].
@@ -56,12 +103,8 @@ impl Default for RendererConfig {
 /// A wgpu renderer that converts a YUV frame into RGB on the GPU.
 ///
 /// Owned and reused across frames; resizes its plane textures lazily when
-/// the input dimensions change.
-///
-/// The renderer always binds *two* YUV plane sets (A and B). Single-input
-/// playback uses A only and leaves B's mix factor at 0 — the shader just
-/// returns A. Cross-dissolve transitions (Phase 5.4) upload both sides
-/// and dial `mix_factor` from 0 → 1 to blend.
+/// the input dimensions change. Multi-layer work (dissolves included) goes
+/// through the [`crate::Compositor`].
 /// Fullscreen-triangle RGBA passthrough blit (Phase 10 preview). Maps
 /// vertex index → a triangle covering the viewport + samples the
 /// source RGBA texture.
@@ -87,10 +130,10 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// GPU renderer for decoded video frames. Holds A- and B-side YUV plane
-/// textures (B feeds cross-dissolves), applies the per-clip color
-/// pipeline (grades, curves, LUTs, keys, crop/transform), and draws the
-/// result to a surface view or reads it back as an RGBA buffer.
+/// GPU renderer for decoded video frames. Holds one frame's plane
+/// textures, applies the per-clip color pipeline (grades, curves, LUTs,
+/// keys, crop/transform), and draws the result to a surface view or reads
+/// it back as an RGBA buffer.
 pub struct Renderer {
     adapter: wgpu::Adapter,
     device: wgpu::Device,
@@ -102,26 +145,17 @@ pub struct Renderer {
     target_format: wgpu::TextureFormat,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    /// (width, height) of the currently-allocated A-side Y texture;
-    /// `None` if no frame has been uploaded yet.
-    plane_dims_a: Option<(u32, u32)>,
     /// Whether the device enabled `TEXTURE_FORMAT_16BIT_NORM` (needed for
     /// R16Unorm 10-bit plane textures). When false, a 10-bit source falls
     /// back to 8-bit R8 planes (down-shifted) instead of crashing — the
     /// feature is native-only and absent on some Vulkan/GL adapters.
     supports_r16: bool,
-    /// Whether the A-side plane textures are `R16Unorm` (10-bit source, and
-    /// the GPU supports it) vs `R8Unorm`. Drives re-allocation on change.
-    plane_hi_a: bool,
-    tex_y_a: Option<wgpu::Texture>,
-    tex_u_a: Option<wgpu::Texture>,
-    tex_v_a: Option<wgpu::Texture>,
-    /// Same, for the B side (transition target).
-    plane_dims_b: Option<(u32, u32)>,
-    plane_hi_b: bool,
-    tex_y_b: Option<wgpu::Texture>,
-    tex_u_b: Option<wgpu::Texture>,
-    tex_v_b: Option<wgpu::Texture>,
+    /// Plane textures ([`frame_planes`]): Y / U / V, Y / UV (NV12), or RGBA
+    /// in the Y slot; an unused slot holds a 1×1 dummy. `None` until the
+    /// first upload.
+    tex_y: Option<wgpu::Texture>,
+    tex_u: Option<wgpu::Texture>,
+    tex_v: Option<wgpu::Texture>,
     /// Loaded 3D LUT — uploaded into a 3D texture sampled by the
     /// fragment shader. `None` until the first `upload_lut` call;
     /// the bind group binds a 1×1×1 dummy when no LUT is in use,
@@ -162,6 +196,8 @@ pub struct Renderer {
     blit: Option<BlitResources>,
     /// M1 multi-layer compositor on the same device (ADR 0007).
     compositor: crate::compositor::Compositor,
+    /// Reused buffer for the 10-bit → 8-bit plane fallback.
+    plane_scratch: Vec<u8>,
 }
 
 /// Resources for the RGBA passthrough blit (a fullscreen-triangle
@@ -200,20 +236,15 @@ struct RenderParams {
     /// UV. 0 = no crop; 0.1 left = drop the leftmost 10% of source.
     /// Sum on each axis must stay below 1.0 to leave something visible.
     crop_lrtb: [f32; 4],
-    /// Cross-dissolve mix factor between the A and B YUV inputs.
-    /// 0 = pure A (no transition); 1 = pure B; 0.5 = midpoint.
-    /// All other per-clip effects (opacity / transform / crop /
-    /// color) apply *after* the mix.
-    mix_factor: f32,
-    /// Per-sample scale applied to the raw A-side YUV texture samples before
-    /// the limited-range expansion. 1.0 for 8-bit (R8Unorm, sample=code/255);
-    /// `65535/1023` for 10-bit (R16Unorm, sample=code/65535 → code/1023, the
-    /// 8-bit-equivalent normalized value). Shares the `mix_factor` vec4.
+    /// Per-sample scale applied to the raw YUV texture samples before the
+    /// range expansion. 1.0 for 8-bit (R8Unorm, sample=code/255);
+    /// `65535/1023` for 10-bit (R16Unorm, sample=code/65535 → code/1023,
+    /// expanded with the 10-bit levels).
     sample_scale: f32,
-    /// Same, for the B-side (transition) samples — separate so an 8-bit↔
-    /// 10-bit cross-dissolve scales each side correctly.
-    sample_scale_b: f32,
-    _pad0: f32,
+    /// The frame's pixel aspect (`FrameColor::pixel_aspect`): power windows
+    /// are shaped in display pixels.
+    pixel_aspect: f32,
+    _pad0: [f32; 2],
     /// Chroma key: `(r, g, b, enable)`. When `enable > 0.5`, pixels
     /// within `chroma_params.x` of the key color fade toward black
     /// (no alpha out yet — `vance-render` doesn't blend tracks in v1).
@@ -247,6 +278,9 @@ struct RenderParams {
     /// is meant for display only (export bypasses it). Independent
     /// of the per-clip LUT effect.
     view_lut_params: [f32; 4],
+    /// `(YUV matrix, source kind, 10-bit R16Unorm planes, _)`: the matrix
+    /// is `PipelineParams::input_matrix`, the kind is `SRC_*`.
+    source: [u32; 4],
     /// Number of active color-grade nodes (Phase 6.6). The shader
     /// loops `grades[0..grade_count]` in linear working space. Packed
     /// into a vec4<u32> for std140 alignment; only `.x` is used.
@@ -260,12 +294,12 @@ struct RenderParams {
 
 /// Max grade nodes the single-pass renderer applies per frame. Mirror
 /// of `vance_timeline::grade::MAX_GRADE_NODES`.
-const MAX_GRADES: usize = 8;
+pub(crate) const MAX_GRADES: usize = 8;
 
 /// Curve-atlas rows per grade node (Phase 6.8 + 6.8b). Row 0 = tone
 /// curves (R/G/B/luma packed in RGBA); rows 1+2 = the five HSL hue-wheel
 /// curves (hh/hs/hl/ss/ll). Atlas height = MAX_GRADES × this.
-const CURVE_ROWS_PER_NODE: usize = 3;
+pub(crate) const CURVE_ROWS_PER_NODE: usize = 3;
 
 /// One color-grade node's GPU params. All `vec4` fields (no bare f32
 /// arrays) to dodge std140 stride traps — 9 × 16 = 144 bytes. The WGSL
@@ -276,7 +310,7 @@ const CURVE_ROWS_PER_NODE: usize = 3;
 /// (the final node mask is `qualifier_mask * window_mask`).
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct GradeNode {
+pub(crate) struct GradeNode {
     /// Lift (shadows) `(r, g, b, master)`. Additive; default 0.
     lift: [f32; 4],
     /// Gamma (midtones) `(r, g, b, master)`. Power; default 1.
@@ -318,13 +352,13 @@ struct GradeNode {
 const _: () = assert!(std::mem::size_of::<GradeNode>() == 176);
 // Compile-time gate on the FULL uniform size so a field add/reorder
 // that diverges from the WGSL std140 `Params` layout fails the build,
-// not just `cargo test`. 272-byte header + 8 × 176-byte GradeNode.
-const _: () = assert!(std::mem::size_of::<RenderParams>() == 1680);
+// not just `cargo test`. 288-byte header + 8 × 176-byte GradeNode.
+const _: () = assert!(std::mem::size_of::<RenderParams>() == 1696);
 
 impl GradeNode {
     /// Identity node: passthrough (disabled, primary mode, neutral
     /// lift/gamma/gain, qualifier off, window off).
-    fn identity() -> Self {
+    pub(crate) fn identity() -> Self {
         Self {
             lift: [0.0, 0.0, 0.0, 0.0],
             gamma: [1.0, 1.0, 1.0, 1.0],
@@ -568,7 +602,7 @@ impl GradeNodeParams {
         n
     }
 
-    fn to_gpu(&self) -> GradeNode {
+    pub(crate) fn to_gpu(&self) -> GradeNode {
         let enabled = if self.enabled { 1.0 } else { 0.0 };
         let base = match self.mode {
             GradeMode::Log => GradeNode {
@@ -633,10 +667,9 @@ impl Default for RenderParams {
             brightness: 0.0,
             contrast: 1.0,
             crop_lrtb: [0.0; 4],
-            mix_factor: 0.0,
             sample_scale: 1.0,
-            sample_scale_b: 1.0,
-            _pad0: 0.0,
+            pixel_aspect: 1.0,
+            _pad0: [0.0; 2],
             chroma_key: [0.0; 4],
             chroma_params: [0.1, 0.05, 0.0, 0.0],
             luma_key: [0.5, 1.0, 0.05, 0.0],
@@ -648,6 +681,7 @@ impl Default for RenderParams {
             pipeline_working_to_out: identity_row3(),
             lut_params: [0.0; 4],
             view_lut_params: [0.0; 4],
+            source: [vance_color::pipeline::MATRIX_BT709, SRC_PLANAR, 0, 0],
             grade_count: [0; 4],
             grades: [GradeNode::identity(); MAX_GRADES],
         }
@@ -655,7 +689,7 @@ impl Default for RenderParams {
 }
 
 #[inline]
-fn identity_row3() -> [[f32; 4]; 3] {
+pub(crate) fn identity_row3() -> [[f32; 4]; 3] {
     [
         [1.0, 0.0, 0.0, 0.0],
         [0.0, 1.0, 0.0, 0.0],
@@ -664,7 +698,7 @@ fn identity_row3() -> [[f32; 4]; 3] {
 }
 
 #[inline]
-fn matrix_to_row3(t: &vance_color::Transform) -> [[f32; 4]; 3] {
+pub(crate) fn matrix_to_row3(t: &vance_color::Transform) -> [[f32; 4]; 3] {
     [
         [t.0[0][0], t.0[0][1], t.0[0][2], 0.0],
         [t.0[1][0], t.0[1][1], t.0[1][2], 0.0],
@@ -677,7 +711,7 @@ fn matrix_to_row3(t: &vance_color::Transform) -> [[f32; 4]; 3] {
 /// out-of-range inputs; that's fine for LUT values which are
 /// normalized to ~`[0, 1]`.
 #[inline]
-fn f32_to_f16_bits(v: f32) -> u16 {
+pub(crate) fn f32_to_f16_bits(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = ((bits >> 31) & 0x1) as u16;
     let exp = ((bits >> 23) & 0xff) as i32;
@@ -701,7 +735,7 @@ fn f32_to_f16_bits(v: f32) -> u16 {
 
 /// Decode an IEEE 754 binary16 (half) bit pattern to `f32`. Inverse of
 /// [`f32_to_f16_bits`], used to read back the HDR `Rgba16Float` target.
-fn f16_to_f32(h: u16) -> f32 {
+pub(crate) fn f16_to_f32(h: u16) -> f32 {
     let sign = ((h >> 15) & 0x1) as u32;
     let exp = ((h >> 10) & 0x1f) as u32;
     let mant = (h & 0x3ff) as u32;
@@ -758,6 +792,30 @@ fn eval_curve_or_identity(points: &[vance_timeline::Keyframe], x: f64) -> f64 {
     vance_timeline::eval_curve(points, x).clamp(0.0, 1.0)
 }
 
+/// The transform's scale with near-zero axes pinned to `1e-4` (the shader
+/// divides by it).
+pub(crate) fn sanitize_scale(scale: [f32; 2]) -> [f32; 2] {
+    scale.map(|v| if v.abs() < 1e-4 { 1e-4 } else { v })
+}
+
+/// Crop fractions `(left, right, top, bottom)` clamped to `[0, 1]`, with
+/// each axis shrunk symmetrically to leave a 1% sliver — fully empty crops
+/// are an easy oops, not an art choice.
+pub(crate) fn sanitize_crop(lrtb: [f32; 4]) -> [f32; 4] {
+    let [mut l, mut r, mut t, mut b] = lrtb.map(|v| v.clamp(0.0, 1.0));
+    if l + r >= 0.99 {
+        let extra = (l + r) - 0.99;
+        l -= extra * 0.5;
+        r -= extra * 0.5;
+    }
+    if t + b >= 0.99 {
+        let extra = (t + b) - 0.99;
+        t -= extra * 0.5;
+        b -= extra * 0.5;
+    }
+    [l, r, t, b]
+}
+
 /// Clean a curve's control points before baking. The interactive editor
 /// guarantees sorted, finite, in-range points, but a project loaded from
 /// disk or authored by an external tool / CLI does NOT — and
@@ -787,6 +845,137 @@ fn sanitize_curve(points: &[vance_timeline::Keyframe]) -> Vec<vance_timeline::Ke
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     out
+}
+
+/// Bake the per-node tone curves into the 256×(8×3) LUT atlas. Rows for
+/// non-curve / identity nodes get the identity ramp (harmless — only
+/// curves-mode nodes sample the atlas). The master curve is composited into
+/// R/G/B here so the shader does a single sample per channel. Shared by the
+/// legacy renderer and the compositor's per-layer atlases.
+pub(crate) fn bake_curve_atlas(curve_inputs: &[(usize, CurveSet)]) -> Vec<f32> {
+    // 256 wide. The atlas grew in 6.8b to host the HSL hue-wheel curves:
+    // MAX_GRADES × CURVE_ROWS_PER_NODE rows × w cols × 4 channels. Per node:
+    //   row 3*i     = tone curves   (r=R, g=G, b=B, a=luma) — 6.8.
+    //   row 3*i+1   = HSL-1         (r=hh, g=hs, b=hl, a=ss) — 6.8b.
+    //   row 3*i+2   = HSL-2         (r=ll, g=_, b=_, a=_)    — 6.8b.
+    let w = vance_timeline::grade::CURVE_LUT_WIDTH;
+    let h = MAX_GRADES * CURVE_ROWS_PER_NODE;
+    let mut atlas = vec![0.0_f32; h * w * 4];
+    // Default-fill identity per row TYPE: tone + remap curves are
+    // identity y=x; HSL multipliers (hs, hl) are stored y=0.5 (the
+    // shader decodes as 2*y, so 0.5 == scale 1.0 == no-op).
+    for row in 0..h {
+        let kind = row % CURVE_ROWS_PER_NODE;
+        for u in 0..w {
+            let x = u as f32 / (w as f32 - 1.0);
+            let off = (row * w + u) * 4;
+            match kind {
+                0 => {
+                    // Tone row: r/g/b/luma all y=x.
+                    atlas[off] = x;
+                    atlas[off + 1] = x;
+                    atlas[off + 2] = x;
+                    atlas[off + 3] = x;
+                }
+                1 => {
+                    // HSL-1 identity: hh=y=x (remap), hs=hl=0.5 (the
+                    // shader decodes multipliers as 2*y, so 0.5 == no-op
+                    // scale 1.0; 1.0 here would silently double them),
+                    // ss=y=x (remap).
+                    atlas[off] = x;
+                    atlas[off + 1] = 0.5;
+                    atlas[off + 2] = 0.5;
+                    atlas[off + 3] = x;
+                }
+                _ => {
+                    // HSL-2: ll=y=x, rest unused (left 0).
+                    atlas[off] = x;
+                }
+            }
+        }
+    }
+    // Bake each curves node's row.
+    for (row, cs) in curve_inputs {
+        if *row >= MAX_GRADES {
+            continue;
+        }
+        // Sanitize ONCE per channel before the per-sample loop:
+        // eval_keyframes assumes ascending, finite control points,
+        // but project files / external tools aren't guaranteed to be
+        // sorted, finite, or in-range (only the interactive editor
+        // is). An unsorted curve would otherwise read garbage; a NaN
+        // point would pack to a NaN texel and corrupt every pixel.
+        let m_pts = sanitize_curve(&cs.master);
+        let r_pts = sanitize_curve(&cs.r);
+        let g_pts = sanitize_curve(&cs.g);
+        let b_pts = sanitize_curve(&cs.b);
+        let l_pts = sanitize_curve(&cs.luma);
+        // HSL curves (6.8b). Each Vec can be empty (identity).
+        let hh_pts = sanitize_curve(&cs.hh);
+        let hs_pts = sanitize_curve(&cs.hs);
+        let hl_pts = sanitize_curve(&cs.hl);
+        let ss_pts = sanitize_curve(&cs.ss);
+        let ll_pts = sanitize_curve(&cs.ll);
+        for u in 0..w {
+            let x = u as f64 / (w as f64 - 1.0);
+            let m = eval_curve_or_identity(&m_pts, x);
+            let r = eval_curve_or_identity(&r_pts, m);
+            let g = eval_curve_or_identity(&g_pts, m);
+            let b = eval_curve_or_identity(&b_pts, m);
+            let l = eval_curve_or_identity(&l_pts, x);
+            // Tone row (3*i) = R/G/B/luma packed into RGBA.
+            let row_tone = ((*row * CURVE_ROWS_PER_NODE) * w + u) * 4;
+            atlas[row_tone] = r as f32;
+            atlas[row_tone + 1] = g as f32;
+            atlas[row_tone + 2] = b as f32;
+            atlas[row_tone + 3] = l as f32;
+            // HSL-1 row (3*i+1) = (hh, hs, hl, ss). Empty curves bake
+            // to their type's identity (remap → x, multiplier → 0.5,
+            // decoded as 2*y in the shader so 0.5 → scale 1).
+            let hh = eval_curve_or_const(&hh_pts, x, x);
+            let hs = eval_curve_or_const(&hs_pts, x, 0.5);
+            let hl = eval_curve_or_const(&hl_pts, x, 0.5);
+            let ss = eval_curve_or_const(&ss_pts, x, x);
+            let row_hsl1 = ((*row * CURVE_ROWS_PER_NODE + 1) * w + u) * 4;
+            atlas[row_hsl1] = hh as f32;
+            atlas[row_hsl1 + 1] = hs as f32;
+            atlas[row_hsl1 + 2] = hl as f32;
+            atlas[row_hsl1 + 3] = ss as f32;
+            // HSL-2 row (3*i+2) = (ll, _, _, _). Unused lanes 0.
+            let ll = eval_curve_or_const(&ll_pts, x, x);
+            let row_hsl2 = ((*row * CURVE_ROWS_PER_NODE + 2) * w + u) * 4;
+            atlas[row_hsl2] = ll as f32;
+            atlas[row_hsl2 + 1] = 0.0;
+            atlas[row_hsl2 + 2] = 0.0;
+            atlas[row_hsl2 + 3] = 0.0;
+        }
+    }
+    atlas
+}
+
+/// The curve inputs of `nodes` (node index → curves), for the atlas bake and
+/// its change gate.
+pub(crate) fn curve_inputs_of(nodes: &[GradeNodeParams]) -> Vec<(usize, CurveSet)> {
+    nodes
+        .iter()
+        .take(MAX_GRADES)
+        .enumerate()
+        .filter(|(_, n)| n.mode == GradeMode::Curves)
+        .filter_map(|(i, n)| n.curves.clone().map(|c| (i, c)))
+        .collect()
+}
+
+/// Pack a 3D LUT as `Rgba16Float` texels (alpha 1) for upload.
+pub(crate) fn pack_lut_rgba16f(lut: &vance_color::Lut3d) -> Vec<u16> {
+    let n = lut.size as usize;
+    let mut packed: Vec<u16> = Vec::with_capacity(n * n * n * 4);
+    for triple in lut.values.chunks_exact(3) {
+        packed.push(f32_to_f16_bits(triple[0]));
+        packed.push(f32_to_f16_bits(triple[1]));
+        packed.push(f32_to_f16_bits(triple[2]));
+        packed.push(f32_to_f16_bits(1.0));
+    }
+    packed
 }
 
 #[inline]
@@ -879,9 +1068,6 @@ impl Renderer {
                     },
                     count: None,
                 },
-                yuv_plane_entry(5),
-                yuv_plane_entry(6),
-                yuv_plane_entry(7),
                 wgpu::BindGroupLayoutEntry {
                     binding: 8,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -924,7 +1110,7 @@ impl Renderer {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("vance-render.yuv-rec709-limited"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(wgsl::LEGACY.into()),
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -980,7 +1166,15 @@ impl Renderer {
         let supports_r16 = device
             .features()
             .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
-        let compositor = crate::compositor::Compositor::new(device.clone(), queue.clone());
+        // DX12's FXC rejects a workgroup leaving before a barrier; the other
+        // backends run the matte passes with an early exit.
+        let barrier_safe = adapter.get_info().backend == wgpu::Backend::Dx12;
+        let compositor = crate::compositor::Compositor::new(
+            device.clone(),
+            queue.clone(),
+            supports_r16,
+            barrier_safe,
+        );
 
         Ok(Self {
             adapter,
@@ -991,16 +1185,9 @@ impl Renderer {
             bind_group_layout,
             sampler,
             supports_r16,
-            plane_dims_a: None,
-            plane_hi_a: false,
-            plane_hi_b: false,
-            tex_y_a: None,
-            tex_u_a: None,
-            tex_v_a: None,
-            plane_dims_b: None,
-            tex_y_b: None,
-            tex_u_b: None,
-            tex_v_b: None,
+            tex_y: None,
+            tex_u: None,
+            tex_v: None,
             tex_lut: None,
             lut_size: 1,
             tex_view_lut: None,
@@ -1013,6 +1200,7 @@ impl Renderer {
             current_params: initial_params,
             blit: None,
             compositor,
+            plane_scratch: Vec::new(),
         })
     }
 
@@ -1264,21 +1452,7 @@ impl Renderer {
     /// Sums above ~0.99 on an axis are clamped to leave a 1% sliver
     /// visible — fully empty crops are an easy oops, not an art choice.
     pub fn set_crop(&mut self, left: f32, right: f32, top: f32, bottom: f32) {
-        let mut l = left.clamp(0.0, 1.0);
-        let mut r = right.clamp(0.0, 1.0);
-        let mut t = top.clamp(0.0, 1.0);
-        let mut b = bottom.clamp(0.0, 1.0);
-        if l + r >= 0.99 {
-            let extra = (l + r) - 0.99;
-            l -= extra * 0.5;
-            r -= extra * 0.5;
-        }
-        if t + b >= 0.99 {
-            let extra = (t + b) - 0.99;
-            t -= extra * 0.5;
-            b -= extra * 0.5;
-        }
-        let new = [l, r, t, b];
+        let new = sanitize_crop([left, right, top, bottom]);
         if (self.current_params.crop_lrtb[0] - new[0]).abs() < 1e-5
             && (self.current_params.crop_lrtb[1] - new[1]).abs() < 1e-5
             && (self.current_params.crop_lrtb[2] - new[2]).abs() < 1e-5
@@ -1300,18 +1474,7 @@ impl Renderer {
     /// the output UV before sampling the source frame; out-of-frame
     /// regions render black.
     pub fn set_transform(&mut self, translate: [f32; 2], scale: [f32; 2], rotation_radians: f32) {
-        let new_scale = [
-            if scale[0].abs() < 1e-4 {
-                1e-4
-            } else {
-                scale[0]
-            },
-            if scale[1].abs() < 1e-4 {
-                1e-4
-            } else {
-                scale[1]
-            },
-        ];
+        let new_scale = sanitize_scale(scale);
         if (self.current_params.rotation - rotation_radians).abs() < 1e-5
             && (self.current_params.translate[0] - translate[0]).abs() < 1e-5
             && (self.current_params.translate[1] - translate[1]).abs() < 1e-5
@@ -1341,20 +1504,55 @@ impl Renderer {
         &self.queue
     }
 
-    /// Upload a decoded frame into the renderer's A-side YUV plane textures.
-    /// Splits NV12 UV into separate U and V planes CPU-side so both formats
-    /// share the same shader path. Single-input playback only ever calls
-    /// this side; the B-side stays as the most recent upload (or a 1×1
-    /// dummy) and the shader ignores it while `mix_factor == 0`.
+    /// Upload a decoded frame into the renderer's plane textures: YUV
+    /// planes as they are (NV12's interleaved UV as one two-channel
+    /// texture), or a straight-alpha RGBA8 frame (shown premultiplied over
+    /// black).
     pub fn upload_frame(&mut self, frame: &FrameData) -> Result<(), RenderError> {
-        self.upload_frame_inner(frame, false)
-    }
-
-    /// Upload a decoded frame onto the B-side YUV plane textures.
-    /// Used by cross-dissolve transitions for the outgoing (or
-    /// incoming, depending on direction) clip while A holds the other.
-    pub fn upload_frame_b(&mut self, frame: &FrameData) -> Result<(), RenderError> {
-        self.upload_frame_inner(frame, true)
+        let expected = frame.pixel_format.frame_size(frame.width, frame.height);
+        if frame.bytes.len() != expected {
+            return Err(RenderError::MalformedFrame {
+                expected,
+                got: frame.bytes.len(),
+            });
+        }
+        let mut scratch = std::mem::take(&mut self.plane_scratch);
+        let fp = frame_planes(frame, self.supports_r16, &mut scratch);
+        let slots = [&mut self.tex_y, &mut self.tex_u, &mut self.tex_v];
+        let labels = ["tex_y", "tex_u", "tex_v"];
+        let mut realloc = false;
+        for ((slot, plane), label) in slots.into_iter().zip(&fp.planes).zip(labels) {
+            // An unused plane binds a 1×1 dummy.
+            let (size, format) = plane
+                .as_ref()
+                .map_or(((1, 1), wgpu::TextureFormat::R8Unorm), |p| {
+                    (p.size, p.format)
+                });
+            realloc |= ensure_plane_texture(&self.device, slot, size, format, label);
+            if let (Some(p), Some(t)) = (plane, slot.as_ref()) {
+                write_plane(&self.queue, t, p);
+            }
+        }
+        // Tell the shader how to read the frame: an R16Unorm 10-bit sample
+        // is code/65535, so ×65535/1023 gives code/1023.
+        let mut next = self.current_params;
+        next.sample_scale = fp.sample_scale;
+        next.source[1] = fp.kind;
+        next.source[2] = fp.ten_bit as u32;
+        next.pixel_aspect = frame.color.pixel_aspect();
+        self.plane_scratch = scratch;
+        if bytemuck::bytes_of(&next) != bytemuck::bytes_of(&self.current_params) {
+            self.current_params = next;
+            self.queue.write_buffer(
+                &self.params_buffer,
+                0,
+                bytemuck::cast_slice(&[self.current_params]),
+            );
+        }
+        if realloc {
+            self.rebuild_bind_group();
+        }
+        Ok(())
     }
 
     /// Upload a 3D LUT into the renderer's `tex_lut` slot. Allocates
@@ -1383,14 +1581,7 @@ impl Renderer {
             self.rebuild_bind_group();
         }
         // Convert RGB triples → RGBA half (alpha = 1) for upload.
-        let n = size as usize;
-        let mut packed: Vec<u16> = Vec::with_capacity(n * n * n * 4);
-        for triple in lut.values.chunks_exact(3) {
-            packed.push(f32_to_f16_bits(triple[0]));
-            packed.push(f32_to_f16_bits(triple[1]));
-            packed.push(f32_to_f16_bits(triple[2]));
-            packed.push(f32_to_f16_bits(1.0));
-        }
+        let packed = pack_lut_rgba16f(lut);
         let bytes: &[u8] = bytemuck::cast_slice(&packed);
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
@@ -1454,14 +1645,7 @@ impl Renderer {
             self.view_lut_size = size;
             self.rebuild_bind_group();
         }
-        let n = size as usize;
-        let mut packed: Vec<u16> = Vec::with_capacity(n * n * n * 4);
-        for triple in lut.values.chunks_exact(3) {
-            packed.push(f32_to_f16_bits(triple[0]));
-            packed.push(f32_to_f16_bits(triple[1]));
-            packed.push(f32_to_f16_bits(triple[2]));
-            packed.push(f32_to_f16_bits(1.0));
-        }
+        let packed = pack_lut_rgba16f(lut);
         let bytes: &[u8] = bytemuck::cast_slice(&packed);
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
@@ -1482,6 +1666,7 @@ impl Renderer {
                 depth_or_array_layers: size,
             },
         );
+        self.sync_compositor_view_lut();
     }
 
     /// Set the serial color-grade node chain (Phase 6.6/6.7/6.8).
@@ -1504,13 +1689,7 @@ impl Renderer {
 
         // Collect this call's curve inputs (node index → CurveSet) to
         // (a) gate the atlas re-bake and (b) bake the atlas rows.
-        let curve_inputs: Vec<(usize, CurveSet)> = nodes
-            .iter()
-            .take(count)
-            .enumerate()
-            .filter(|(_, n)| n.mode == GradeMode::Curves)
-            .filter_map(|(i, n)| n.curves.clone().map(|c| (i, c)))
-            .collect();
+        let curve_inputs = curve_inputs_of(nodes);
         let curves_unchanged = curve_inputs == self.last_curve_inputs;
 
         if grades_unchanged && curves_unchanged {
@@ -1531,111 +1710,10 @@ impl Renderer {
         }
     }
 
-    /// Bake the per-node tone curves into the 256×8 LUT atlas and
-    /// upload. Rows for non-curve / identity nodes get the identity
-    /// ramp (harmless — only curves-mode nodes sample the atlas). The
-    /// master curve is composited into R/G/B here so the shader does a
-    /// single sample per channel.
+    /// Bake the per-node curves ([`bake_curve_atlas`]) and upload them.
     fn bake_and_upload_curve_atlas(&mut self, curve_inputs: &[(usize, CurveSet)]) {
-        let w = vance_timeline::grade::CURVE_LUT_WIDTH; // 256
-                                                        // Atlas grew in 6.8b to host the HSL hue-wheel curves: now
-                                                        // MAX_GRADES × CURVE_ROWS_PER_NODE rows × w cols × 4 channels.
-                                                        // Per node:
-                                                        //   row 3*i     = tone curves   (r=R, g=G, b=B, a=luma) — 6.8.
-                                                        //   row 3*i+1   = HSL-1         (r=hh, g=hs, b=hl, a=ss) — 6.8b.
-                                                        //   row 3*i+2   = HSL-2         (r=ll, g=_, b=_, a=_)    — 6.8b.
-        let h = MAX_GRADES * CURVE_ROWS_PER_NODE;
-        let mut atlas = vec![0.0_f32; h * w * 4];
-        // Default-fill identity per row TYPE: tone + remap curves are
-        // identity y=x; HSL multipliers (hs, hl) are stored y=0.5 (the
-        // shader decodes as 2*y, so 0.5 == scale 1.0 == no-op).
-        for row in 0..h {
-            let kind = row % CURVE_ROWS_PER_NODE;
-            for u in 0..w {
-                let x = u as f32 / (w as f32 - 1.0);
-                let off = (row * w + u) * 4;
-                match kind {
-                    0 => {
-                        // Tone row: r/g/b/luma all y=x.
-                        atlas[off] = x;
-                        atlas[off + 1] = x;
-                        atlas[off + 2] = x;
-                        atlas[off + 3] = x;
-                    }
-                    1 => {
-                        // HSL-1 identity: hh=y=x (remap), hs=hl=0.5 (the
-                        // shader decodes multipliers as 2*y, so 0.5 == no-op
-                        // scale 1.0; 1.0 here would silently double them),
-                        // ss=y=x (remap).
-                        atlas[off] = x;
-                        atlas[off + 1] = 0.5;
-                        atlas[off + 2] = 0.5;
-                        atlas[off + 3] = x;
-                    }
-                    _ => {
-                        // HSL-2: ll=y=x, rest unused (left 0).
-                        atlas[off] = x;
-                    }
-                }
-            }
-        }
-        // Bake each curves node's row.
-        for (row, cs) in curve_inputs {
-            if *row >= MAX_GRADES {
-                continue;
-            }
-            // Sanitize ONCE per channel before the per-sample loop:
-            // eval_keyframes assumes ascending, finite control points,
-            // but project files / external tools aren't guaranteed to be
-            // sorted, finite, or in-range (only the interactive editor
-            // is). An unsorted curve would otherwise read garbage; a NaN
-            // point would pack to a NaN texel and corrupt every pixel.
-            let m_pts = sanitize_curve(&cs.master);
-            let r_pts = sanitize_curve(&cs.r);
-            let g_pts = sanitize_curve(&cs.g);
-            let b_pts = sanitize_curve(&cs.b);
-            let l_pts = sanitize_curve(&cs.luma);
-            // HSL curves (6.8b). Each Vec can be empty (identity).
-            let hh_pts = sanitize_curve(&cs.hh);
-            let hs_pts = sanitize_curve(&cs.hs);
-            let hl_pts = sanitize_curve(&cs.hl);
-            let ss_pts = sanitize_curve(&cs.ss);
-            let ll_pts = sanitize_curve(&cs.ll);
-            for u in 0..w {
-                let x = u as f64 / (w as f64 - 1.0);
-                let m = eval_curve_or_identity(&m_pts, x);
-                let r = eval_curve_or_identity(&r_pts, m);
-                let g = eval_curve_or_identity(&g_pts, m);
-                let b = eval_curve_or_identity(&b_pts, m);
-                let l = eval_curve_or_identity(&l_pts, x);
-                // Tone row (3*i) = R/G/B/luma packed into RGBA.
-                let row_tone = ((*row * CURVE_ROWS_PER_NODE) * w + u) * 4;
-                atlas[row_tone] = r as f32;
-                atlas[row_tone + 1] = g as f32;
-                atlas[row_tone + 2] = b as f32;
-                atlas[row_tone + 3] = l as f32;
-                // HSL-1 row (3*i+1) = (hh, hs, hl, ss). Empty curves bake
-                // to their type's identity (remap → x, multiplier → 0.5,
-                // decoded as 2*y in the shader so 0.5 → scale 1).
-                let hh = eval_curve_or_const(&hh_pts, x, x);
-                let hs = eval_curve_or_const(&hs_pts, x, 0.5);
-                let hl = eval_curve_or_const(&hl_pts, x, 0.5);
-                let ss = eval_curve_or_const(&ss_pts, x, x);
-                let row_hsl1 = ((*row * CURVE_ROWS_PER_NODE + 1) * w + u) * 4;
-                atlas[row_hsl1] = hh as f32;
-                atlas[row_hsl1 + 1] = hs as f32;
-                atlas[row_hsl1 + 2] = hl as f32;
-                atlas[row_hsl1 + 3] = ss as f32;
-                // HSL-2 row (3*i+2) = (ll, _, _, _). Unused lanes 0.
-                let ll = eval_curve_or_const(&ll_pts, x, x);
-                let row_hsl2 = ((*row * CURVE_ROWS_PER_NODE + 2) * w + u) * 4;
-                atlas[row_hsl2] = ll as f32;
-                atlas[row_hsl2 + 1] = 0.0;
-                atlas[row_hsl2 + 2] = 0.0;
-                atlas[row_hsl2 + 3] = 0.0;
-            }
-        }
-        self.upload_curve_atlas(&atlas, w as u32);
+        let atlas = bake_curve_atlas(curve_inputs);
+        self.upload_curve_atlas(&atlas, vance_timeline::grade::CURVE_LUT_WIDTH as u32);
     }
 
     /// Upload the baked curve atlas (`rows = MAX_GRADES × CURVE_ROWS_PER_NODE`, `width`
@@ -1699,6 +1777,18 @@ impl Renderer {
             0,
             bytemuck::cast_slice(&[self.current_params]),
         );
+        self.sync_compositor_view_lut();
+    }
+
+    /// Share the view LUT with the compositor: the loaded texture while the
+    /// view LUT is enabled, else none (`OutputSpec::view_lut` then no-ops).
+    fn sync_compositor_view_lut(&mut self) {
+        let lut = if self.current_params.view_lut_params[0] > 0.5 && self.view_lut_size > 1 {
+            self.tex_view_lut.clone()
+        } else {
+            None
+        };
+        self.compositor.set_view_lut(lut);
     }
 
     /// Push the color-pipeline params (Phase 6.3). These come from
@@ -1716,7 +1806,8 @@ impl Renderer {
         ];
         let in_to_working = matrix_to_row3(&params.input_to_working);
         let working_to_out = matrix_to_row3(&params.working_to_output);
-        let same_flags = (0..4).all(|i| self.current_params.pipeline_flags[i] == new_flags[i]);
+        let same_flags = (0..4).all(|i| self.current_params.pipeline_flags[i] == new_flags[i])
+            && self.current_params.source[0] == params.input_matrix;
         let same_in = matrices_equal(&self.current_params.pipeline_in_to_working, &in_to_working);
         let same_out = matrices_equal(
             &self.current_params.pipeline_working_to_out,
@@ -1726,6 +1817,7 @@ impl Renderer {
             return;
         }
         self.current_params.pipeline_flags = new_flags;
+        self.current_params.source[0] = params.input_matrix;
         self.current_params.pipeline_in_to_working = in_to_working;
         self.current_params.pipeline_working_to_out = working_to_out;
         self.queue.write_buffer(
@@ -1794,156 +1886,6 @@ impl Renderer {
             0,
             bytemuck::cast_slice(&[self.current_params]),
         );
-    }
-
-    /// Set the A↔B mix factor. 0 = pure A (no transition), 1 = pure B,
-    /// anything in between is a linear cross-dissolve. The renderer
-    /// initializes this to 0, so the single-input path is unaffected
-    /// until a transition explicitly opts in.
-    pub fn set_mix_factor(&mut self, value: f32) {
-        let v = value.clamp(0.0, 1.0);
-        if (self.current_params.mix_factor - v).abs() < 1e-4 {
-            return;
-        }
-        self.current_params.mix_factor = v;
-        self.queue.write_buffer(
-            &self.params_buffer,
-            0,
-            bytemuck::cast_slice(&[self.current_params]),
-        );
-    }
-
-    /// Set the YUV sample scale for the A or B side (`1.0` for 8-bit inputs,
-    /// `65535/1023` for 10-bit R16Unorm inputs). Called from `upload_frame`
-    /// per the frame's bit depth so the shader's limited-range expansion sees
-    /// a normalized `[0,1]` value regardless of source bit depth.
-    fn set_sample_scale(&mut self, value: f32, b_side: bool) {
-        let cur = if b_side {
-            self.current_params.sample_scale_b
-        } else {
-            self.current_params.sample_scale
-        };
-        if (cur - value).abs() < 1e-6 {
-            return;
-        }
-        if b_side {
-            self.current_params.sample_scale_b = value;
-        } else {
-            self.current_params.sample_scale = value;
-        }
-        self.queue.write_buffer(
-            &self.params_buffer,
-            0,
-            bytemuck::cast_slice(&[self.current_params]),
-        );
-    }
-
-    fn upload_frame_inner(&mut self, frame: &FrameData, b_side: bool) -> Result<(), RenderError> {
-        let (w, h) = (frame.width, frame.height);
-        let expected = frame.pixel_format.frame_size(w, h);
-        if frame.bytes.len() != expected {
-            return Err(RenderError::MalformedFrame {
-                expected,
-                got: frame.bytes.len(),
-            });
-        }
-
-        let is_10bit = frame.pixel_format == PixelFormat::Yuv420P10Le;
-        // Use R16Unorm planes only when the source is 10-bit AND the GPU
-        // supports 16-bit-norm textures; otherwise a 10-bit source is
-        // down-shifted into 8-bit R8 planes below (graceful, 8-bit precision).
-        let use_r16 = is_10bit && self.supports_r16;
-        let needs_alloc = if b_side {
-            self.plane_dims_b != Some((w, h)) || self.plane_hi_b != use_r16
-        } else {
-            self.plane_dims_a != Some((w, h)) || self.plane_hi_a != use_r16
-        };
-        if needs_alloc {
-            self.allocate_plane_textures(w, h, b_side, use_r16);
-            if b_side {
-                self.plane_dims_b = Some((w, h));
-                self.plane_hi_b = use_r16;
-            } else {
-                self.plane_dims_a = Some((w, h));
-                self.plane_hi_a = use_r16;
-            }
-        }
-        // Tell the shader how to normalize this side's samples: an R16Unorm
-        // 10-bit sample is code/65535, so ×65535/1023 recovers code/1023 (the
-        // 8-bit-equivalent value). The 8-bit path (native or downshifted) is
-        // already code/255, so scale 1.0.
-        let scale = if use_r16 { 65535.0 / 1023.0 } else { 1.0 };
-        self.set_sample_scale(scale, b_side);
-
-        let chroma_w = w.div_ceil(2);
-        let chroma_h = h.div_ceil(2);
-
-        let (tex_y, tex_u, tex_v) = if b_side {
-            (
-                self.tex_y_b.as_ref().unwrap(),
-                self.tex_u_b.as_ref().unwrap(),
-                self.tex_v_b.as_ref().unwrap(),
-            )
-        } else {
-            (
-                self.tex_y_a.as_ref().unwrap(),
-                self.tex_u_a.as_ref().unwrap(),
-                self.tex_v_a.as_ref().unwrap(),
-            )
-        };
-
-        match frame.pixel_format {
-            PixelFormat::Yuv420P => {
-                let y_size = (w * h) as usize;
-                let chroma_size = (chroma_w * chroma_h) as usize;
-                let (y_bytes, rest) = frame.bytes.split_at(y_size);
-                let (u_bytes, v_bytes) = rest.split_at(chroma_size);
-                self.write_plane(tex_y, w, h, y_bytes, 1);
-                self.write_plane(tex_u, chroma_w, chroma_h, u_bytes, 1);
-                self.write_plane(tex_v, chroma_w, chroma_h, v_bytes, 1);
-            }
-            PixelFormat::Yuv420P10Le => {
-                let y_size = (w * h) as usize * 2;
-                let chroma_size = (chroma_w * chroma_h) as usize * 2;
-                let (y_bytes, rest) = frame.bytes.split_at(y_size);
-                let (u_bytes, v_bytes) = rest.split_at(chroma_size);
-                if use_r16 {
-                    // 2 bytes/sample → R16Unorm planes. The little-endian u16
-                    // bytes match R16Unorm's layout, copied straight through.
-                    self.write_plane(tex_y, w, h, y_bytes, 2);
-                    self.write_plane(tex_u, chroma_w, chroma_h, u_bytes, 2);
-                    self.write_plane(tex_v, chroma_w, chroma_h, v_bytes, 2);
-                } else {
-                    // Fallback (GPU lacks 16-bit-norm): down-shift 10→8 bit
-                    // into R8 planes. 8-bit precision, but the clip plays
-                    // instead of crashing. sample_scale is 1.0 here.
-                    let down = |src: &[u8]| -> Vec<u8> {
-                        src.chunks_exact(2)
-                            .map(|c| (u16::from_le_bytes([c[0], c[1]]) >> 2) as u8)
-                            .collect()
-                    };
-                    self.write_plane(tex_y, w, h, &down(y_bytes), 1);
-                    self.write_plane(tex_u, chroma_w, chroma_h, &down(u_bytes), 1);
-                    self.write_plane(tex_v, chroma_w, chroma_h, &down(v_bytes), 1);
-                }
-            }
-            PixelFormat::Nv12 => {
-                let y_size = (w * h) as usize;
-                let uv_size = (chroma_w * chroma_h * 2) as usize;
-                let (y_bytes, uv_bytes) = frame.bytes.split_at(y_size);
-                debug_assert_eq!(uv_bytes.len(), uv_size);
-                let mut u_buf = Vec::with_capacity((chroma_w * chroma_h) as usize);
-                let mut v_buf = Vec::with_capacity((chroma_w * chroma_h) as usize);
-                for chunk in uv_bytes.chunks_exact(2) {
-                    u_buf.push(chunk[0]);
-                    v_buf.push(chunk[1]);
-                }
-                self.write_plane(tex_y, w, h, y_bytes, 1);
-                self.write_plane(tex_u, chroma_w, chroma_h, &u_buf, 1);
-                self.write_plane(tex_v, chroma_w, chroma_h, &v_buf, 1);
-            }
-        }
-        Ok(())
     }
 
     /// Pick a sensible swapchain configuration for `surface` at the given
@@ -2347,52 +2289,18 @@ impl Renderer {
         result
     }
 
-    fn allocate_plane_textures(&mut self, width: u32, height: u32, b_side: bool, is_10bit: bool) {
-        let chroma_w = width.div_ceil(2);
-        let chroma_h = height.div_ceil(2);
-        // 10-bit sources use R16Unorm single-channel plane textures; 8-bit use
-        // R8Unorm. Both sample as filterable f32 (`texture_2d<f32>`), so the
-        // bind-group layout is unchanged.
-        let plane = |dev: &wgpu::Device, w: u32, h: u32, label: &str| -> wgpu::Texture {
-            if is_10bit {
-                create_r16_texture(dev, w, h, label)
-            } else {
-                create_r8_texture(dev, w, h, label)
-            }
-        };
-        if b_side {
-            self.tex_y_b = Some(plane(&self.device, width, height, "tex_y_b"));
-            self.tex_u_b = Some(plane(&self.device, chroma_w, chroma_h, "tex_u_b"));
-            self.tex_v_b = Some(plane(&self.device, chroma_w, chroma_h, "tex_v_b"));
-        } else {
-            self.tex_y_a = Some(plane(&self.device, width, height, "tex_y_a"));
-            self.tex_u_a = Some(plane(&self.device, chroma_w, chroma_h, "tex_u_a"));
-            self.tex_v_a = Some(plane(&self.device, chroma_w, chroma_h, "tex_v_a"));
-        }
-
-        // First A-side allocation also primes a 1×1 B-side dummy so
-        // the bind group always has valid views to bind. After that
-        // first call, subsequent allocations only swap the side that
-        // resized.
-        if !b_side && self.tex_y_b.is_none() {
-            self.tex_y_b = Some(create_r8_texture(&self.device, 1, 1, "tex_y_b_dummy"));
-            self.tex_u_b = Some(create_r8_texture(&self.device, 1, 1, "tex_u_b_dummy"));
-            self.tex_v_b = Some(create_r8_texture(&self.device, 1, 1, "tex_v_b_dummy"));
-            self.plane_dims_b = Some((1, 1));
-        }
-
-        self.rebuild_bind_group();
-    }
-
     fn rebuild_bind_group(&mut self) {
+        // A LUT / curve atlas can arrive before the first frame (e.g. a view
+        // LUT loaded while only the compositor renders); the first
+        // `upload_frame` builds the bind group then.
+        if self.tex_y.is_none() {
+            return;
+        }
         let make_view =
             |t: &Option<wgpu::Texture>| t.as_ref().unwrap().create_view(&Default::default());
-        let view_y_a = make_view(&self.tex_y_a);
-        let view_u_a = make_view(&self.tex_u_a);
-        let view_v_a = make_view(&self.tex_v_a);
-        let view_y_b = make_view(&self.tex_y_b);
-        let view_u_b = make_view(&self.tex_u_b);
-        let view_v_b = make_view(&self.tex_v_b);
+        let view_y = make_view(&self.tex_y);
+        let view_u = make_view(&self.tex_u);
+        let view_v = make_view(&self.tex_v);
         // LUT slot — prime a 1×1×1 dummy so the bind group is valid
         // before the user loads anything. The shader gates against
         // `lut_params.enable`, so the dummy never contributes.
@@ -2464,31 +2372,19 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&view_y_a),
+                    resource: wgpu::BindingResource::TextureView(&view_y),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&view_u_a),
+                    resource: wgpu::BindingResource::TextureView(&view_u),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&view_v_a),
+                    resource: wgpu::BindingResource::TextureView(&view_v),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: self.params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(&view_y_b),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::TextureView(&view_u_b),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: wgpu::BindingResource::TextureView(&view_v_b),
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,
@@ -2505,35 +2401,164 @@ impl Renderer {
             ],
         }));
     }
+}
 
-    fn write_plane(
-        &self,
-        tex: &wgpu::Texture,
-        w: u32,
-        h: u32,
-        bytes: &[u8],
-        bytes_per_sample: u32,
-    ) {
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+/// Source kinds the shaders branch on (`SRC_*` in common.wgsl).
+pub(crate) const SRC_PLANAR: u32 = 0;
+/// Straight-alpha RGBA8 (images, titles, `PixelFormat::Rgba8` frames).
+pub(crate) const SRC_RGBA: u32 = 1;
+/// NV12: Y + one interleaved two-channel UV plane.
+pub(crate) const SRC_NV12: u32 = 2;
+
+/// One plane texture's upload: its size and format and the tightly packed
+/// rows.
+pub(crate) struct Plane<'a> {
+    pub(crate) size: (u32, u32),
+    pub(crate) format: wgpu::TextureFormat,
+    pub(crate) bytes: &'a [u8],
+    pub(crate) bytes_per_row: u32,
+}
+
+/// How a (size-validated) decoded frame uploads.
+pub(crate) struct FramePlanes<'a> {
+    /// `SRC_*`.
+    pub(crate) kind: u32,
+    /// The planes hold 10-bit codes as R16Unorm.
+    pub(crate) ten_bit: bool,
+    /// Shader sample scale: a sample × this = code / (2^bits − 1).
+    pub(crate) sample_scale: f32,
+    /// Y (or RGBA), U (or NV12's UV), V; `None` = unused.
+    pub(crate) planes: [Option<Plane<'a>>; 3],
+}
+
+/// The plane uploads of `frame`, as views into its bytes: NV12's UV plane
+/// stays interleaved (a two-channel texture), 10-bit samples stay
+/// little-endian `u16` for R16Unorm planes, RGBA8 is one plane. The one
+/// copy is the fallback for a GPU without 16-bit-norm textures: 10-bit
+/// samples are rounded to 8 bits into `scratch` (reused across frames) —
+/// 8-bit precision, but the clip plays instead of crashing.
+pub(crate) fn frame_planes<'a>(
+    frame: &'a FrameData,
+    supports_r16: bool,
+    scratch: &'a mut Vec<u8>,
+) -> FramePlanes<'a> {
+    use wgpu::TextureFormat::{R16Unorm, R8Unorm, Rg8Unorm, Rgba8Unorm};
+    let (w, h) = (frame.width, frame.height);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let luma = w as usize * h as usize;
+    let chroma = cw as usize * ch as usize;
+    let plane = |bytes, size: (u32, u32), format, bpp: u32| {
+        Some(Plane {
+            size,
+            format,
             bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(w * bytes_per_sample),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
+            bytes_per_row: size.0 * bpp,
+        })
+    };
+    let planar = |b: &'a [u8], format, bpp: usize| {
+        let (y, rest) = b.split_at(luma * bpp);
+        let (u, v) = rest.split_at(chroma * bpp);
+        let bpp = bpp as u32;
+        [
+            plane(y, (w, h), format, bpp),
+            plane(u, (cw, ch), format, bpp),
+            plane(v, (cw, ch), format, bpp),
+        ]
+    };
+    let bytes: &'a [u8] = &frame.bytes;
+    match frame.pixel_format {
+        PixelFormat::Yuv420P => FramePlanes {
+            kind: SRC_PLANAR,
+            ten_bit: false,
+            sample_scale: 1.0,
+            planes: planar(bytes, R8Unorm, 1),
+        },
+        PixelFormat::Nv12 => {
+            let (y, uv) = bytes.split_at(luma);
+            FramePlanes {
+                kind: SRC_NV12,
+                ten_bit: false,
+                sample_scale: 1.0,
+                planes: [
+                    plane(y, (w, h), R8Unorm, 1),
+                    plane(uv, (cw, ch), Rg8Unorm, 2),
+                    None,
+                ],
+            }
+        }
+        PixelFormat::Yuv420P10Le if supports_r16 => FramePlanes {
+            kind: SRC_PLANAR,
+            ten_bit: true,
+            sample_scale: 65535.0 / 1023.0,
+            planes: planar(bytes, R16Unorm, 2),
+        },
+        PixelFormat::Yuv420P10Le => {
+            scratch.clear();
+            scratch.extend(bytes.chunks_exact(2).map(|c| {
+                let code = u16::from_le_bytes([c[0], c[1]]).min(1023);
+                ((code + 2) >> 2).min(255) as u8
+            }));
+            let shifted: &'a [u8] = scratch;
+            FramePlanes {
+                kind: SRC_PLANAR,
+                ten_bit: false,
+                sample_scale: 1.0,
+                planes: planar(shifted, R8Unorm, 1),
+            }
+        }
+        PixelFormat::Rgba8 => FramePlanes {
+            kind: SRC_RGBA,
+            ten_bit: false,
+            sample_scale: 1.0,
+            planes: [plane(bytes, (w, h), Rgba8Unorm, 4), None, None],
+        },
     }
+}
+
+/// Keep `slot` a sampled, copy-target `size` × `format` texture, reusing a
+/// matching one; returns whether it was (re)allocated.
+pub(crate) fn ensure_plane_texture(
+    device: &wgpu::Device,
+    slot: &mut Option<wgpu::Texture>,
+    size: (u32, u32),
+    format: wgpu::TextureFormat,
+    label: &str,
+) -> bool {
+    if slot
+        .as_ref()
+        .is_some_and(|t| (t.width(), t.height()) == size && t.format() == format)
+    {
+        return false;
+    }
+    *slot = Some(device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    }));
+    true
+}
+
+/// Queue `p`'s rows into `t` (sized for it by [`ensure_plane_texture`]).
+pub(crate) fn write_plane(queue: &wgpu::Queue, t: &wgpu::Texture, p: &Plane<'_>) {
+    queue.write_texture(
+        t.as_image_copy(),
+        p.bytes,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(p.bytes_per_row),
+            rows_per_image: Some(p.size.1),
+        },
+        t.size(),
+    );
 }
 
 async fn create_device(
@@ -2572,7 +2597,7 @@ async fn create_device(
     Ok((adapter, device, queue))
 }
 
-fn yuv_plane_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+pub(crate) fn yuv_plane_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -2583,46 +2608,6 @@ fn yuv_plane_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
         },
         count: None,
     }
-}
-
-fn create_r8_texture(device: &wgpu::Device, w: u32, h: u32, label: &str) -> wgpu::Texture {
-    device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::R8Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    })
-}
-
-/// A single-channel 16-bit-unorm plane texture (for 10-bit YUV sources).
-/// R16Unorm samples as filterable f32, so it binds through the same
-/// `texture_2d<f32>` layout as R8Unorm — but it is a NATIVE-only format
-/// gated by `Features::TEXTURE_FORMAT_16BIT_NORM` (NOT in the WebGPU
-/// baseline). Callers must only reach this when `Renderer::supports_r16` is
-/// true; the 8-bit fallback in `upload_frame` handles adapters without it.
-fn create_r16_texture(device: &wgpu::Device, w: u32, h: u32, label: &str) -> wgpu::Texture {
-    device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::R16Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    })
 }
 
 #[cfg(test)]
@@ -2692,15 +2677,16 @@ mod layout_tests {
     fn render_params_size_matches_std140() {
         // Field offsets (bytes), all naturally 4/16-aligned under repr(C):
         //  opacity 0, rotation 4, translate 8, scale 16, brightness 24,
-        //  contrast 28, crop_lrtb 32, mix_factor 48, _pad0 52,
+        //  contrast 28, crop_lrtb 32, sample_scale 48, pixel_aspect 52,
+        //  _pad0 56,
         //  chroma_key 64, chroma_params 80, luma_key 96,
         //  pipeline_flags 112, in_to_working 128, working_to_out 176,
-        //  lut_params 224, view_lut_params 240, grade_count 256,
-        //  grades 272 (8 * 176 = 1408) -> total 1680.
+        //  lut_params 224, view_lut_params 240, source 256,
+        //  grade_count 272, grades 288 (8 * 176 = 1408) -> total 1696.
         // GradeNode is 11 vec4 = 176: lift/gamma/gain/log_offset/log_smh/
         // flags + qual_a (96) + qual_b (112) + qual_c (128) (6.9) +
         // win_a (144) + win_b (160) per node (6.10).
-        assert_eq!(std::mem::size_of::<RenderParams>(), 1680);
+        assert_eq!(std::mem::size_of::<RenderParams>(), 1696);
         assert_eq!(std::mem::size_of::<GradeNode>(), 176);
     }
 

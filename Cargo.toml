@@ -172,3 +172,12 @@ debug = false
 opt-level = 2
 [profile.dev.package.vance-decoder]
 opt-level = 2
+# Compositing (ADR 0007): the per-layer render passes, frame cache and colour
+# maths run on every frame of every layer. Unoptimised, 4-layer 1080p playback
+# dropped 12–37 of 240 frames and export ran at 19 fps on an M1.
+[profile.dev.package.vance-render]
+opt-level = 2
+[profile.dev.package.vance-cache]
+opt-level = 2
+[profile.dev.package.vance-color]
+opt-level = 2

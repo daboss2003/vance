@@ -80,6 +80,7 @@ pub fn render_title_yuv420(params: &TitleParams) -> Result<FrameData, TitleError
         // YUV420P stride per plane equals each plane's row width.
         strides: vec![w, cw, cw],
         bytes: yuv.into(),
+        color: Default::default(),
     })
 }
 

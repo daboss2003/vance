@@ -15,6 +15,10 @@
 
 use crate::fnv::Fnv1a64;
 
+/// The source URI of the one ring every render-cache entry shares (see
+/// [`CacheKey::for_render`]). Never a real media path.
+pub const RENDER_URI: &str = "render:";
+
 /// Cache key for one decoded (and optionally transformed) frame.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct CacheKey {
@@ -40,13 +44,17 @@ impl CacheKey {
     /// Phase 9.6 — convenience: build a render-cache key from the
     /// hash of an input frame's bytes + the hash of the effect chain
     /// that produced the output. The render cache shares the same
-    /// two-tier storage as the frame cache; keying via a synthetic
-    /// URI like `render:<input_hash>` keeps the ring isolation
-    /// semantics intact (per-input-frame ring).
+    /// two-tier storage as the frame cache. Every render entry lives in
+    /// ONE ring ([`RENDER_URI`]), keyed by (input hash, chain hash), so
+    /// render-cache memory is bounded by a single ring's budget.
     pub fn for_render(input_frame_hash: u64, effect_chain_hash: u64) -> Self {
         Self {
-            source_uri: format!("render:{input_frame_hash:016x}"),
-            pts: 0,
+            source_uri: RENDER_URI.to_owned(),
+            // Intentional: the input hash rides in `pts` (bit-cast) so all
+            // render entries share one ring. A ring per input frame (the
+            // old `render:<hash>` URI) was never freed: every distinct
+            // frame grew memory without bound.
+            pts: input_frame_hash as i64,
             transform_hash: effect_chain_hash,
         }
     }
@@ -115,6 +123,17 @@ mod tests {
         let c = CacheKey::for_render(1, 2);
         assert_ne!(a.disk_key(), b.disk_key());
         assert_ne!(a.disk_key(), c.disk_key());
+        let high = CacheKey::for_render(u64::MAX, 1);
+        assert_ne!(high.disk_key(), a.disk_key(), "the input hash's high bit");
+    }
+
+    #[test]
+    fn render_keys_share_one_ring() {
+        let a = CacheKey::for_render(1, 9);
+        let b = CacheKey::for_render(0xdead_beef_0000_0001, 9);
+        assert_eq!(a.source_uri, RENDER_URI);
+        assert_eq!(a.source_uri, b.source_uri, "one ring for every input frame");
+        assert_ne!((a.pts, a.transform_hash), (b.pts, b.transform_hash));
     }
 
     /// Separator-injection guard: the manual zero-byte separator

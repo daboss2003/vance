@@ -6,7 +6,8 @@
 //!    O(log n) (BTreeMap by PTS); writes evict the oldest insertion
 //!    when over the byte budget. Per Phase 9 spec, "ring per source"
 //!    means independent buffers keyed by source URI so scrubs within
-//!    one clip don't evict another clip's hot frames.
+//!    one clip don't evict another clip's hot frames. Render-cache
+//!    entries all share one ring ([`key::RENDER_URI`]).
 //! 2. **On-disk LRU** — content-addressed file store under a base
 //!    directory. Survives restarts. Used by both the decoded-frame
 //!    cache (key = URI + PTS + transform_hash) and the render cache
@@ -27,7 +28,7 @@ pub mod ring;
 
 pub use disk::{DiskLru, DiskLruError, DiskLruStats};
 pub use fnv::Fnv1a64;
-pub use key::CacheKey;
+pub use key::{CacheKey, RENDER_URI};
 pub use ring::FrameCacheRing;
 
 use parking_lot::Mutex;
@@ -304,6 +305,33 @@ mod tests {
         assert_eq!(s.disk_hits, 1);
         assert_eq!(s.ring_hits, 0);
         assert_eq!(s.misses, 0);
+    }
+
+    /// Every distinct input frame of the render cache used to get its own
+    /// ring that was never freed; they now share one ring and its budget.
+    #[test]
+    fn render_entries_share_one_bounded_ring() {
+        let dir = tempdir().unwrap();
+        let ring_budget = 64 * 1024;
+        let cache = FrameCache::new(dir.path().to_path_buf(), ring_budget, 1 << 30).unwrap();
+        let frame = [3u8; 1024];
+        for input in 0..1000u64 {
+            cache.put(&CacheKey::for_render(input, 7), &frame).unwrap();
+        }
+        let s = cache.stats();
+        assert_eq!(s.ring_count, 1, "one ring for all render entries");
+        assert!(
+            s.ring_total_bytes <= ring_budget,
+            "{} bytes over the {ring_budget} budget",
+            s.ring_total_bytes
+        );
+        let newest = CacheKey::for_render(999, 7);
+        assert_eq!(cache.get(&newest).unwrap(), frame);
+        assert_eq!(
+            cache.stats().ring_hits,
+            1,
+            "the newest entry is still in memory"
+        );
     }
 
     /// The Phase 9 acceptance criterion: a typical left-right jog over a

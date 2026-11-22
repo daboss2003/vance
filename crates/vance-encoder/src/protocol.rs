@@ -110,6 +110,25 @@ pub enum EncoderPreset {
         /// default is 30.
         crf: u8,
     },
+    /// Apple ProRes 422 Proxy: 10-bit 4:2:2 at the lowest ProRes data
+    /// rate, for proxies (HDR ones included, see [`VideoConfig::hdr`]).
+    /// Last in the enum so the other variants keep their wire indices.
+    ProRes422Proxy,
+}
+
+impl EncoderPreset {
+    /// One of the ProRes presets. With [`VideoConfig::hdr`] set these stay
+    /// ProRes (tagged with the HDR signaling); every other preset becomes
+    /// an HEVC Main10 (libx265) HDR10 encode.
+    pub fn is_prores(&self) -> bool {
+        matches!(
+            self,
+            EncoderPreset::ProRes422Proxy
+                | EncoderPreset::ProRes422
+                | EncoderPreset::ProRes422HQ
+                | EncoderPreset::ProRes4444
+        )
+    }
 }
 
 /// Audio codec the encoder writes alongside video.
@@ -200,8 +219,14 @@ pub struct VideoConfig {
     pub time_base_num: u32,
     /// Time-base denominator.
     pub time_base_den: u32,
-    /// HDR10 signaling + mastering metadata. When `Some`, the sidecar encodes
-    /// a 10-bit HDR10 stream (libx265 Main10) tagged with these values.
+    /// HDR signaling + mastering metadata. When `Some`, the sidecar encodes
+    /// 10-bit HDR tagged with `signaling` (transfer, primaries, matrix,
+    /// range), converting RGB → YUV with its matrix (BT.2020 NCL):
+    /// - a ProRes preset stays that ProRes, 10-bit (MOV keeps the transfer,
+    ///   primaries and matrix; not the mastering display or light levels);
+    /// - every other preset becomes HEVC Main10 via libx265 with the full
+    ///   HDR10 metadata (mastering display, MaxCLL / MaxFALL).
+    ///
     /// `#[serde(default)]` so existing SDR configs deserialize as `None`.
     #[serde(default)]
     pub hdr: Option<HdrMetadata>,
@@ -665,10 +690,30 @@ mod tests {
             EncoderPreset::H264 { crf: 23 },
             EncoderPreset::Hevc { crf: 28 },
             EncoderPreset::Av1 { crf: 30 },
+            EncoderPreset::ProRes422Proxy,
         ] {
             let s = serde_json::to_string(&preset).unwrap();
             let back: EncoderPreset = serde_json::from_str(&s).unwrap();
             assert_eq!(back, preset);
+            // And through the sidecar's own wire format.
+            let mut wire = Vec::new();
+            vance_ipc::write_frame(&mut wire, &preset).unwrap();
+            let back: EncoderPreset = vance_ipc::read_frame(&mut wire.as_slice()).unwrap();
+            assert_eq!(back, preset);
+        }
+        assert_eq!(
+            serde_json::to_string(&EncoderPreset::ProRes422Proxy).unwrap(),
+            "\"ProRes422Proxy\""
+        );
+        for (preset, prores) in [
+            (EncoderPreset::ProRes422Proxy, true),
+            (EncoderPreset::ProRes422, true),
+            (EncoderPreset::ProRes422HQ, true),
+            (EncoderPreset::ProRes4444, true),
+            (EncoderPreset::DnxhrHq, false),
+            (EncoderPreset::Hevc { crf: 20 }, false),
+        ] {
+            assert_eq!(preset.is_prores(), prores, "{preset:?}");
         }
     }
 }

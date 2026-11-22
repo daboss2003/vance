@@ -298,6 +298,14 @@ fn assert_avi_plays_like_mov(
         .open(avi.to_string_lossy().into_owned())
         .unwrap_or_else(|e| panic!("{what}: open: {e}"));
     let tb = info.time_base;
+    // The rate frames are shown at, not the AVI's chunk rate: the `-c copy`
+    // remux counts 24 chunks a frame (23 of them empty), 600 "fps".
+    let (rate, mov_rate) = (info.frame_rate, mov_info.frame_rate);
+    assert_eq!(
+        i128::from(rate.0) * i128::from(mov_rate.1),
+        i128::from(mov_rate.0) * i128::from(rate.1),
+        "{what}: frame rate {rate:?} vs the mov's {mov_rate:?}"
+    );
     client.start_stream(0, 4).expect("start_stream at 0");
     let frames = drain(&format!("{what}: stream from 0"), &mut client);
     let pts: Vec<i64> = frames.iter().map(|f| f.pts).collect();

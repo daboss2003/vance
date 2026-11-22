@@ -601,4 +601,107 @@ mod tests {
         let title = reopened.media.values().next().unwrap();
         assert_eq!(title.title.as_ref().unwrap().bg_alpha, 0.25);
     }
+
+    #[test]
+    fn renamed_and_renumbered_track_names_round_trip_through_save_and_open() {
+        let tmp = TempDir::new().unwrap();
+        let bundle = tmp.path().join("Names.vance");
+        let mut project = build_compositing_project(vance_timeline::BlendMode::Normal, 1.0, None);
+        let mut log = EditLog::new((*project.sequences[0]).clone());
+        let v1 = log.current().tracks[0].id;
+        log.apply(EditOp::RenameTrack {
+            track_id: v1,
+            name: " Plate \"B\" — é ".into(),
+        })
+        .unwrap();
+        for position in [0, 2] {
+            log.apply(EditOp::InsertTrack {
+                track_id: TrackId::new(),
+                kind: TrackKind::Video,
+                name: String::new(),
+                position,
+            })
+            .unwrap();
+        }
+        let names = |p: &Project| -> Vec<String> {
+            p.sequences[0]
+                .tracks
+                .iter()
+                .map(|t| t.name.clone())
+                .collect()
+        };
+        project.sequences[0] = Arc::new(log.current().clone());
+        assert_eq!(names(&project), ["V1", "Plate \"B\" — é", "V3"]);
+
+        save(&project, &bundle).unwrap();
+        let reopened = open(&bundle).unwrap();
+        assert_eq!(reopened, project);
+        assert_eq!(names(&reopened), names(&project));
+    }
+
+    /// One video track holding a clip per blend mode, in `ALL` order.
+    fn build_every_blend_mode_project() -> Project {
+        let mut p = build_compositing_project(vance_timeline::BlendMode::Normal, 1.0, None);
+        let mut seq = (*p.sequences[0]).clone();
+        let track_id = seq.tracks[0].id;
+        let media = seq.tracks[0].clips[0].media;
+        seq = vance_timeline::ops::remove_clip(&seq, track_id, seq.tracks[0].clips[0].id).unwrap();
+        for (i, mode) in vance_timeline::BlendMode::ALL.into_iter().enumerate() {
+            let mut clip = Clip::new(media, "Title", t(5 * i as i64), t(0), t(5)).unwrap();
+            clip.blend_mode = mode;
+            seq = vance_timeline::ops::insert_clip(&seq, track_id, clip).unwrap();
+        }
+        p.sequences[0] = Arc::new(seq);
+        p
+    }
+
+    fn blend_modes_of(p: &Project) -> Vec<vance_timeline::BlendMode> {
+        p.sequences[0].tracks[0]
+            .clips
+            .iter()
+            .map(|c| c.blend_mode)
+            .collect()
+    }
+
+    #[test]
+    fn every_blend_mode_round_trips_through_save_and_open() {
+        let tmp = TempDir::new().unwrap();
+        let bundle = tmp.path().join("Modes.vance");
+        let project = build_every_blend_mode_project();
+        save(&project, &bundle).unwrap();
+        let reopened = open(&bundle).unwrap();
+        assert_eq!(blend_modes_of(&reopened), vance_timeline::BlendMode::ALL);
+        assert_eq!(reopened, project);
+    }
+
+    #[test]
+    fn unknown_or_bare_blend_modes_open_as_normal() {
+        // A newer build's mode name, and the bare-identifier spelling a
+        // hand-edited bundle might use, both load as Normal instead of
+        // making the project unopenable.
+        let tmp = TempDir::new().unwrap();
+        let bundle = tmp.path().join("Edited.vance");
+        let project = build_every_blend_mode_project();
+        save(&project, &bundle).unwrap();
+        let path = bundle.join("project.ron");
+        let body = fs::read_to_string(&path).unwrap();
+        let edited = body
+            .replace("blend_mode: \"screen\"", "blend_mode: \"vivid_light\"")
+            .replace("blend_mode: \"multiply\"", "blend_mode: Multiply");
+        assert_eq!(edited.matches("vivid_light").count(), 1, "{body}");
+        assert_eq!(edited.matches("blend_mode: Multiply").count(), 1);
+        fs::write(&path, edited).unwrap();
+
+        let reopened = open(&bundle).unwrap();
+        let mut expected = vance_timeline::BlendMode::ALL.to_vec();
+        for m in &mut expected {
+            if matches!(
+                m,
+                vance_timeline::BlendMode::Screen | vance_timeline::BlendMode::Multiply
+            ) {
+                *m = vance_timeline::BlendMode::Normal;
+            }
+        }
+        assert_eq!(blend_modes_of(&reopened), expected);
+    }
 }

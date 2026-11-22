@@ -35,7 +35,8 @@ use crate::protocol::{
 };
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
-use std::sync::Arc;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use thiserror::Error;
 use vance_ipc::shm::{self, Access, Adopted, LeaseTable, ReleaseQueue, ShmRegion, SLOT_ALIGN};
 use vance_ipc::Sidecar;
@@ -193,13 +194,137 @@ pub struct TransportStats {
     pub spilled: u64,
 }
 
+/// Kills a decoder's sidecar from any thread, e.g. one stuck in a read on a
+/// hung network share while its client is blocked waiting for it. Get one
+/// with [`DecoderClient::kill_handle`].
+#[derive(Clone)]
+pub struct SidecarKill(Arc<KillState>);
+
+struct KillState {
+    pid: Option<u32>,
+    flags: Mutex<KillFlags>,
+    /// Signalled when a kill in flight finishes.
+    idle: Condvar,
+}
+
+#[derive(Default)]
+struct KillFlags {
+    /// The client may have reaped the process: its pid may be reused.
+    reaped: bool,
+    /// Killed through a handle (or a kill is under way).
+    killed: bool,
+    /// A kill is sending its signal now, without the lock.
+    in_flight: bool,
+    /// A signal has been sent (whether or not it found the process).
+    sent: bool,
+}
+
+impl SidecarKill {
+    /// Kill the sidecar now (SIGKILL / `TerminateProcess`): a request its
+    /// client is blocked in returns promptly with an IPC error. Idempotent,
+    /// and a no-op once the client has (or may have) reaped the process.
+    pub fn kill(&self) {
+        let pid = {
+            let mut flags = self.flags();
+            let Some(pid) = self.0.pid.filter(|_| !flags.reaped && !flags.killed) else {
+                return;
+            };
+            flags.killed = true;
+            flags.in_flight = true;
+            flags.sent = true;
+            pid
+        };
+        // Intentional: signalled by pid, without the lock, but while
+        // `in_flight` keeps the client from reaping the process (it waits
+        // in `mark_reaped`): until reaped, the process keeps its pid, even as
+        // a zombie. One reap the client can only record afterwards: vance-ipc
+        // checks the exit status when a read fails, which happens only once
+        // the process has died. Died through this handle, `killed` stops a
+        // second signal; died on its own, a kill() in the instant before the
+        // client's record would need the OS to hand the pid out again in that
+        // instant. (A `Child` shared by vance-ipc's `Sidecar` would close it.)
+        let sent = force_kill(pid);
+        let mut flags = self.flags();
+        flags.in_flight = false;
+        // A failed attempt may be retried.
+        flags.killed = sent;
+        drop(flags);
+        self.0.idle.notify_all();
+    }
+
+    /// Whether a kill through this handle (or a clone) has sent the sidecar
+    /// a signal. `false` after kills that came too late: the client had
+    /// reaped the process, whose pid may be another's by then.
+    pub fn signalled(&self) -> bool {
+        self.flags().sent
+    }
+
+    fn flags(&self) -> std::sync::MutexGuard<'_, KillFlags> {
+        self.0.flags.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Record that the client may reap the process now; first waits for a
+    /// kill in flight, which signals it by pid.
+    fn mark_reaped(&self) {
+        let mut flags = self.flags();
+        flags.reaped = true;
+        while flags.in_flight {
+            flags = self
+                .0
+                .idle
+                .wait(flags)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+/// Kill process `pid` without the `libc` / `windows-sys` this crate doesn't
+/// depend on: `kill -KILL`, or `taskkill /F` (without a console window).
+/// Whether that worked.
+fn force_kill(pid: u32) -> bool {
+    let pid = pid.to_string();
+    let mut cmd = if cfg!(windows) {
+        let mut cmd = Command::new("taskkill");
+        cmd.args(["/F", "/PID", &pid]);
+        cmd
+    } else {
+        let mut cmd = Command::new("kill");
+        cmd.args(["-KILL", &pid]);
+        cmd
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    vance_ipc::process::status(&mut cmd).is_ok_and(|status| status.success())
+}
+
+/// Marks the sidecar reaped when the client drops, before its `Sidecar`
+/// field (which kills and waits for the process) does.
+struct ReapGuard(SidecarKill);
+
+impl Drop for ReapGuard {
+    fn drop(&mut self) {
+        self.0.mark_reaped();
+    }
+}
+
 /// Parent-side decoder client. Owns one sidecar process.
 pub struct DecoderClient {
+    /// Declared first, so it drops before `sidecar`.
+    reap: ReapGuard,
     sidecar: Sidecar<DecoderEnvelope, DecoderResponse>,
     ffmpeg_version: String,
     options: ClientOptions,
     stats: TransportStats,
     shm: ShmState,
+    /// Encoding hints of the open stream, stamped on every frame.
+    color: crate::frame::FrameColor,
 }
 
 /// The client's side of the shared-memory transport.
@@ -284,6 +409,29 @@ impl DecoderClient {
         K: AsRef<std::ffi::OsStr>,
         V: AsRef<std::ffi::OsStr>,
     {
+        Self::spawn_with_kill_handle(binary, env, options, |_| {})
+    }
+
+    /// [`DecoderClient::spawn_with_options`], handing `on_spawn` the
+    /// sidecar's [`SidecarKill`] as soon as the process has started, before
+    /// the `Hello` handshake: a sidecar that hangs during startup can then be
+    /// killed from another thread, and this returns an error promptly.
+    /// `on_spawn` runs on the calling thread, once, unless the process can't
+    /// be started at all. It is the same handle as
+    /// [`DecoderClient::kill_handle`]'s.
+    pub fn spawn_with_kill_handle<P, I, K, V, F>(
+        binary: P,
+        env: I,
+        options: ClientOptions,
+        on_spawn: F,
+    ) -> Result<Self, ClientError>
+    where
+        P: AsRef<Path>,
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+        F: FnOnce(SidecarKill),
+    {
         let mut env: Vec<(OsString, OsString)> = env
             .into_iter()
             .map(|(k, v)| (k.as_ref().to_owned(), v.as_ref().to_owned()))
@@ -306,6 +454,15 @@ impl DecoderClient {
             std::iter::empty::<&str>(),
             env.iter().map(|(k, v)| (k, v)),
         )?;
+        let kill = SidecarKill(Arc::new(KillState {
+            pid: sidecar.pid(),
+            flags: Mutex::default(),
+            idle: Condvar::new(),
+        }));
+        // Declared after `sidecar`, so on an early return it drops first:
+        // the process is marked reaped before the `Sidecar` reaps it.
+        let reap = ReapGuard(kill.clone());
+        on_spawn(kill);
         // No releases: a sidecar on another protocol version must still
         // read this as its `Hello` (see `PROTOCOL_VERSION`).
         let resp = sidecar.request(&DecoderEnvelope {
@@ -313,7 +470,11 @@ impl DecoderClient {
             request: DecoderRequest::Hello {
                 protocol_version: PROTOCOL_VERSION,
             },
-        })?;
+        });
+        if resp.is_err() {
+            reap.0.mark_reaped();
+        }
+        let resp = resp?;
         match resp {
             DecoderResponse::Hello {
                 protocol_version,
@@ -326,11 +487,13 @@ impl DecoderClient {
                     });
                 }
                 Ok(Self {
+                    reap,
                     sidecar,
                     ffmpeg_version,
                     options,
                     stats: TransportStats::default(),
                     shm,
+                    color: Default::default(),
                 })
             }
             other => Err(ClientError::UnexpectedResponse {
@@ -355,6 +518,7 @@ impl DecoderClient {
         match self.request(DecoderRequest::Open { path: path.into() })? {
             DecoderResponse::Opened(info) => {
                 self.offer_region(&info)?;
+                self.color = crate::frame::FrameColor::from_stream(&info);
                 Ok(info)
             }
             DecoderResponse::OpenFailed(e) => Err(ClientError::Open(e)),
@@ -373,7 +537,9 @@ impl DecoderClient {
             releases: self.shm.take_releases(),
             request,
         };
-        Ok(self.sidecar.request(&envelope)?)
+        let reply = self.sidecar.request(&envelope);
+        self.reaped_after(&reply);
+        Ok(reply?)
     }
 
     /// After an open: offer the sidecar a region whose slots fit `info`'s
@@ -556,7 +722,9 @@ impl DecoderClient {
     ) -> Result<FrameData, ClientError> {
         let bytes = match payload {
             FramePayload::Inline { len } => {
-                let bytes = self.sidecar.recv_blob(len)?;
+                let bytes = self.sidecar.recv_blob(len);
+                self.reaped_after(&bytes);
+                let bytes = bytes?;
                 self.stats.inline += 1;
                 bytes.into()
             }
@@ -598,6 +766,7 @@ impl DecoderClient {
             pixel_format: meta.pixel_format,
             strides: meta.strides,
             bytes,
+            color: self.color,
         })
     }
 
@@ -626,9 +795,31 @@ impl DecoderClient {
     /// Send `Shutdown`, wait for `Goodbye`, then wait for the child to exit.
     pub fn shutdown(mut self) -> Result<(), ClientError> {
         let _ = self.request(DecoderRequest::Shutdown);
+        // The shutdown below waits for (reaps) the process.
+        self.reap.0.mark_reaped();
         // Sidecar may have already exited after replying; that's fine.
         let _ = self.sidecar.shutdown();
         Ok(())
+    }
+
+    /// A handle that kills this client's sidecar from any thread (see
+    /// [`SidecarKill`]).
+    pub fn kill_handle(&self) -> SidecarKill {
+        self.reap.0.clone()
+    }
+
+    /// The sidecar's OS process id (`None` once it has been shut down).
+    pub fn pid(&self) -> Option<u32> {
+        self.sidecar.pid()
+    }
+
+    /// After a failed exchange with the sidecar: vance-ipc then checks the
+    /// child's exit status, which reaps a process that has exited, so its
+    /// pid is no longer safe to signal.
+    fn reaped_after<T>(&self, result: &vance_ipc::Result<T>) {
+        if result.is_err() {
+            self.reap.0.mark_reaped();
+        }
     }
 
     /// Force-kill the sidecar process. Test/diagnostic only — production

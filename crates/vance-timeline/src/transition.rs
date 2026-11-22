@@ -35,8 +35,8 @@ use crate::id::TransitionId;
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum TransitionKind {
     /// Linear cross-dissolve. Mix factor ramps 0 → 1 over the
-    /// transition's duration, blended on the GPU via the renderer's
-    /// `mix_factor` uniform.
+    /// transition's duration; the compositor blends the two sides
+    /// (`Compositor::composite_dissolve`, ADR 0007).
     Dissolve,
     /// A WASM transition plugin (manifest `kind: Transition`). The string
     /// is the plugin manifest id (e.g. `com.vance.sample.dissolve`). The
@@ -96,30 +96,31 @@ impl Transition {
         }
     }
 
-    /// Half the transition's duration (used as the left/right
-    /// extent around `position`).
-    fn half_duration(&self) -> Rational {
+    /// The `[in, out]` window a transition of `duration` centred on this
+    /// one's cut covers, `in` clamped at zero. The stored window is
+    /// `window_with(self.duration)`; the scene plan renders a capped length.
+    pub(crate) fn window_with(&self, duration: RationalTime) -> (RationalTime, RationalTime) {
         let half = Rational::new(1, 2).expect("1/2 is valid");
-        self.duration.0.checked_mul(half).unwrap_or(Rational::ZERO)
+        let half = duration.0.checked_mul(half).unwrap_or(Rational::ZERO);
+        let start = self.position.0 - half;
+        let start = if start < Rational::ZERO {
+            RationalTime::ZERO
+        } else {
+            RationalTime(start)
+        };
+        (start, RationalTime(self.position.0 + half))
     }
 
     /// Start of the transition's window on the timeline. Clamped at
     /// zero — transitions placed near t=0 (with a long duration)
     /// don't extend into negative time.
     pub fn window_in(&self) -> RationalTime {
-        let half = self.half_duration();
-        let start = self.position.0 - half;
-        if start < Rational::ZERO {
-            RationalTime::ZERO
-        } else {
-            RationalTime(start)
-        }
+        self.window_with(self.duration).0
     }
 
     /// End of the transition's window on the timeline.
     pub fn window_out(&self) -> RationalTime {
-        let half = self.half_duration();
-        RationalTime(self.position.0 + half)
+        self.window_with(self.duration).1
     }
 
     /// `true` iff the given timeline time falls inside this

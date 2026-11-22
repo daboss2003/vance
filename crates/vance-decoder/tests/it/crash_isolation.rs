@@ -122,3 +122,162 @@ fn leased_frames_outlive_a_killed_sidecar() {
     drop(client);
     assert_eq!(f0.bytes, want0.bytes, "lease after its client is gone");
 }
+
+/// A decoder stuck on its sidecar (stopped with SIGSTOP here, as one hung on
+/// a network share would be) is freed by a kill handle used from another
+/// thread: the blocked request returns promptly with an IPC error. Killing
+/// again does nothing more, and after the client has shut its sidecar down
+/// (reaped it, so its pid could be anyone's) the handle sends no signal.
+///
+/// The request runs on a thread of its own with a deadline, so a handle
+/// that does nothing fails this test instead of hanging it.
+#[cfg(unix)]
+#[test]
+fn a_kill_handle_unblocks_a_request_stuck_on_its_sidecar() {
+    use std::time::{Duration, Instant};
+    let signal = |sig: &str, pid: u32| {
+        std::process::Command::new("kill")
+            .args([sig, &pid.to_string()])
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let mut client = DecoderClient::spawn(sidecar_binary_path()).expect("spawn");
+    client
+        .open(fixture_path().to_string_lossy().into_owned())
+        .expect("open");
+    let pid = client.pid().expect("pid");
+    let handle = client.kill_handle();
+    assert!(!handle.signalled());
+    assert!(signal("-STOP", pid), "SIGSTOP {pid}");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let start = Instant::now();
+        let result = client.decode_at(0).map(|f| f.pts);
+        let _ = tx.send((result, start.elapsed(), client));
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    handle.kill();
+    let Ok((result, waited, client)) = rx.recv_timeout(Duration::from_secs(10)) else {
+        // Don't leave a stopped sidecar behind.
+        signal("-KILL", pid);
+        panic!("the request was still blocked 10 s after kill()");
+    };
+    assert!(
+        matches!(result, Err(ClientError::Ipc(_))),
+        "a killed sidecar's request fails with an IPC error: {result:?}"
+    );
+    assert!(waited < Duration::from_secs(5), "returned after {waited:?}");
+    assert!(handle.signalled());
+    handle.kill();
+    drop(client);
+    handle.kill();
+    assert!(handle.signalled(), "still the one signal");
+
+    // After a clean shutdown: reaped, so no signal at all.
+    let client = DecoderClient::spawn(sidecar_binary_path()).expect("spawn");
+    let handle = client.kill_handle();
+    client.shutdown().expect("shutdown");
+    handle.kill();
+    handle.kill();
+    assert!(
+        !handle.signalled(),
+        "no signal after the process was reaped"
+    );
+    // And after a plain drop.
+    let client = DecoderClient::spawn(sidecar_binary_path()).expect("spawn");
+    let handle = client.kill_handle();
+    drop(client);
+    handle.kill();
+    assert!(!handle.signalled(), "no signal after drop");
+}
+
+/// The handle crosses threads and clones freely.
+#[test]
+fn kill_handles_are_send_sync_and_clone() {
+    fn assert_traits<T: Clone + Send + Sync + 'static>() {}
+    assert_traits::<vance_decoder::SidecarKill>();
+}
+
+/// A sidecar that hangs during startup (this fake one never answers
+/// `Hello`) can be killed from another thread: `spawn_with_kill_handle`
+/// hands over the kill handle before the handshake, and the spawn then
+/// fails promptly instead of blocking forever.
+#[cfg(unix)]
+#[test]
+fn a_sidecar_stuck_in_its_handshake_can_be_killed() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+    let dir = std::env::temp_dir();
+    let script = dir.join(format!("vance-fake-decoder-{}.sh", std::process::id()));
+    let pid_file = dir.join(format!("vance-fake-decoder-{}.pid", std::process::id()));
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec sleep 3600\n",
+            pid_file.display()
+        ),
+    )
+    .expect("write the fake sidecar");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let cleanup = || {
+        if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", pid.trim()])
+                .status();
+        }
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(&pid_file);
+    };
+
+    let (handle_tx, handle_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let binary = script.clone();
+    std::thread::spawn(move || {
+        let start = Instant::now();
+        let spawned = DecoderClient::spawn_with_kill_handle(
+            &binary,
+            std::iter::empty::<(&str, &str)>(),
+            vance_decoder::ClientOptions::default(),
+            |kill| handle_tx.send(kill).expect("send the handle"),
+        );
+        let _ = done_tx.send((spawned.err().map(|e| e.to_string()), start.elapsed()));
+    });
+    let Ok(handle) = handle_rx.recv_timeout(Duration::from_secs(5)) else {
+        cleanup();
+        panic!("no kill handle before the handshake");
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    handle.kill();
+    let Ok((error, waited)) = done_rx.recv_timeout(Duration::from_secs(10)) else {
+        cleanup();
+        panic!("spawn still blocked 10 s after kill()");
+    };
+    cleanup();
+    assert!(handle.signalled());
+    let error = error.expect("a killed handshake is an error");
+    assert!(error.contains("ipc"), "{error}");
+    assert!(waited < Duration::from_secs(5), "returned after {waited:?}");
+}
+
+/// The handle `spawn_with_kill_handle` hands over is the client's own.
+#[test]
+fn the_spawn_time_kill_handle_is_the_clients() {
+    let mut early = None;
+    let mut client = DecoderClient::spawn_with_kill_handle(
+        sidecar_binary_path(),
+        std::iter::empty::<(&str, &str)>(),
+        vance_decoder::ClientOptions::default(),
+        |kill| early = Some(kill),
+    )
+    .expect("spawn");
+    let early = early.expect("the handle was handed over");
+    client
+        .open(fixture_path().to_string_lossy().into_owned())
+        .expect("open");
+    early.kill();
+    assert!(early.signalled() && client.kill_handle().signalled());
+    assert!(
+        matches!(client.decode_at(0), Err(ClientError::Ipc(_))),
+        "killed through the early handle"
+    );
+}

@@ -19,8 +19,10 @@ pub mod frame;
 pub mod hwaccel;
 pub mod protocol;
 
-pub use client::{thread_budget, ClientOptions, DecoderClient, ThreadBudget, TransportStats};
-pub use frame::{FrameBytes, FrameData};
+pub use client::{
+    thread_budget, ClientOptions, DecoderClient, SidecarKill, ThreadBudget, TransportStats,
+};
+pub use frame::{FrameBytes, FrameColor, FrameData};
 pub use protocol::{
     DecoderEnvelope, DecoderRequest, DecoderResponse, FrameMeta, FramePayload, OpenError,
     PixelFormat, StreamInfo,

@@ -16,6 +16,7 @@
 //!   retained history is bounded by `MAX_HISTORY_NODES`.
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use vance_core::RationalTime;
 
 use crate::blend::BlendMode;
@@ -26,7 +27,7 @@ use crate::error::Result;
 use crate::id::{BusId, ClipId, EffectId, TrackId, TransitionId};
 use crate::ops;
 use crate::sequence::Sequence;
-use crate::track::TrackKind;
+use crate::track::{Track, TrackKind};
 use crate::transition::TransitionKind;
 
 /// A serializable edit. Each variant maps 1:1 to a function in
@@ -684,6 +685,20 @@ pub enum EditOp {
         /// `(width, height)` in pixels, or `None` for the default.
         size: Option<(u32, u32)>,
     },
+    /// M1 — rename a track (see [`ops::rename_track`]; empty = automatic).
+    RenameTrack {
+        /// Track to rename.
+        track_id: TrackId,
+        /// New name as entered (trimmed by the op).
+        name: String,
+    },
+    /// M1 — lock / unlock a track (`Track.locked`).
+    SetTrackLocked {
+        /// Track to lock or unlock.
+        track_id: TrackId,
+        /// New locked state.
+        locked: bool,
+    },
 }
 
 /// Apply a single op to a sequence, returning the new sequence.
@@ -957,6 +972,10 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
             blend_mode,
         } => ops::set_clip_blend_mode(seq, *track_id, *clip_id, *blend_mode),
         EditOp::SetFrameSize { size } => ops::set_frame_size(seq, *size),
+        EditOp::RenameTrack { track_id, name } => ops::rename_track(seq, *track_id, name),
+        EditOp::SetTrackLocked { track_id, locked } => {
+            ops::set_track_locked(seq, *track_id, *locked)
+        }
     }
 }
 
@@ -1056,11 +1075,18 @@ impl EditLog {
     /// If the current node already has children (the user undid and is now
     /// editing from mid-history), this creates a NEW branch rather than
     /// truncating the existing one — the old branch stays reachable.
+    ///
+    /// An op that leaves the sequence unchanged (renaming a track to its
+    /// name, hiding a hidden track, moving a track to where it is, …)
+    /// records nothing, so undo never steps over an empty edit.
     pub fn apply(&mut self, op: EditOp) -> Result<&Sequence> {
         let after = {
             let cur = &self.nodes[self.current];
             apply(&cur.snapshot, &op)?
         };
+        if same_sequence(&self.nodes[self.current].snapshot, &after) {
+            return Ok(&self.nodes[self.current].snapshot);
+        }
         // Safety valve: collapse to a fresh history at the current snapshot
         // before exceeding the node cap, bounding memory.
         if self.nodes.len() >= MAX_HISTORY_NODES {
@@ -1192,6 +1218,81 @@ impl EditLog {
     }
 }
 
+/// `a == b`, cheaply for an op's result: ops share every track (and clip,
+/// and transition) they didn't touch, so pointer equality settles most of
+/// them and only the rebuilt ones are compared by value.
+fn same_sequence(a: &Sequence, b: &Sequence) -> bool {
+    // Destructured so a new field can't be left out of the comparison.
+    let Sequence {
+        id,
+        name,
+        frame_rate,
+        tracks,
+        markers,
+        master_gain_db,
+        buses,
+        connections,
+        magnetic,
+        captions,
+        review_comments,
+        frame_size,
+    } = a;
+    *id == b.id
+        && *frame_rate == b.frame_rate
+        && *master_gain_db == b.master_gain_db
+        && *magnetic == b.magnetic
+        && *frame_size == b.frame_size
+        && *name == b.name
+        && same_arcs(tracks, &b.tracks, same_track)
+        && *markers == b.markers
+        && *buses == b.buses
+        && *connections == b.connections
+        && *captions == b.captions
+        && *review_comments == b.review_comments
+}
+
+fn same_track(a: &Track, b: &Track) -> bool {
+    let Track {
+        id,
+        kind,
+        name,
+        enabled,
+        locked,
+        clips,
+        transitions,
+        mute,
+        solo,
+        gain_db,
+        gain_keyframes,
+        pan,
+        audio_effects,
+        output,
+        sends,
+    } = a;
+    *id == b.id
+        && *kind == b.kind
+        && *enabled == b.enabled
+        && *locked == b.locked
+        && *mute == b.mute
+        && *solo == b.solo
+        && *gain_db == b.gain_db
+        && *pan == b.pan
+        && *output == b.output
+        && *name == b.name
+        && same_arcs(clips, &b.clips, |x, y| x == y)
+        && same_arcs(transitions, &b.transitions, |x, y| x == y)
+        && *gain_keyframes == b.gain_keyframes
+        && *audio_effects == b.audio_effects
+        && *sends == b.sends
+}
+
+fn same_arcs<T>(a: &[Arc<T>], b: &[Arc<T>], same: impl Fn(&T, &T) -> bool) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| Arc::ptr_eq(x, y) || same(x, y))
+}
+
 /// Short human label for an op, shown in the history panel.
 fn op_label(op: &EditOp) -> String {
     match op {
@@ -1283,6 +1384,14 @@ fn op_label(op: &EditOp) -> String {
         }
         EditOp::SetClipBlendMode { .. } => "Blend mode".into(),
         EditOp::SetFrameSize { .. } => "Frame size".into(),
+        EditOp::RenameTrack { .. } => "Rename track".into(),
+        EditOp::SetTrackLocked { locked, .. } => {
+            if *locked {
+                "Lock track".into()
+            } else {
+                "Unlock track".into()
+            }
+        }
     }
 }
 
@@ -1726,6 +1835,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(names(log.current()), ["V1", "V2", "A1"]);
+        let before = log.current().clone();
         let v0 = TrackId::new();
         log.apply(EditOp::InsertTrack {
             track_id: v0,
@@ -1734,8 +1844,10 @@ mod tests {
             position: 0,
         })
         .unwrap();
-        assert_eq!(names(log.current()), ["V0", "V1", "V2", "A1"]);
+        // The new bottom track is V1; the ones above are renumbered.
+        assert_eq!(names(log.current()), ["V1", "V2", "V3", "A1"]);
         assert_eq!(log.current().tracks[0].id, v0);
+        assert_eq!(log.current().tracks[1].id, before.tracks[0].id);
 
         // Past the end of the group, or a duplicate id, is rejected.
         let bad = EditOp::InsertTrack {
@@ -1754,9 +1866,10 @@ mod tests {
         assert!(log.apply(dup).is_err());
 
         log.undo().unwrap();
-        assert_eq!(names(log.current()), ["V1", "V2", "A1"]);
+        assert_eq!(log.current(), &before, "undo restores the old names");
         log.redo().unwrap();
-        assert_eq!(names(log.current()), ["V0", "V1", "V2", "A1"]);
+        assert_eq!(names(log.current()), ["V1", "V2", "V3", "A1"]);
+        assert_eq!(log.current().tracks[0].id, v0);
     }
 
     #[test]
@@ -1795,12 +1908,18 @@ mod tests {
             })
             .unwrap();
         }
+        let ids = |s: &Sequence| s.tracks.iter().map(|t| t.id).collect::<Vec<_>>();
+        let before = log.current().clone();
+        let [_, v2, v3, a1] = ids(&before)[..] else {
+            unreachable!()
+        };
         log.apply(EditOp::MoveTrack {
             track_id: v1,
             to_position: 2,
         })
         .unwrap();
-        assert_eq!(names(log.current()), ["V2", "V3", "V1", "A1"]);
+        assert_eq!(ids(log.current()), [v2, v3, v1, a1]);
+        assert_eq!(names(log.current()), ["V1", "V2", "V3", "A1"]);
         // Out of range for the video group (3 tracks).
         assert!(log
             .apply(EditOp::MoveTrack {
@@ -1809,9 +1928,62 @@ mod tests {
             })
             .is_err());
         log.undo().unwrap();
-        assert_eq!(names(log.current()), ["V1", "V2", "V3", "A1"]);
+        assert_eq!(log.current(), &before);
         log.redo().unwrap();
-        assert_eq!(names(log.current()), ["V2", "V3", "V1", "A1"]);
+        assert_eq!(ids(log.current()), [v2, v3, v1, a1]);
+    }
+
+    #[test]
+    fn rename_track_undoes_to_the_exact_previous_names() {
+        let (mut log, v1, _media) = seed_log();
+        let v2 = TrackId::new();
+        log.apply(EditOp::InsertTrack {
+            track_id: v2,
+            kind: TrackKind::Video,
+            name: String::new(),
+            position: 1,
+        })
+        .unwrap();
+        assert_eq!(names(log.current()), ["V1", "V2"]);
+        let base = log.current().clone();
+        log.apply(EditOp::RenameTrack {
+            track_id: v1,
+            name: " Plate ".into(),
+        })
+        .unwrap();
+        assert_eq!(names(log.current()), ["Plate", "V2"]);
+        // Moving the custom track up renumbers only the automatic one.
+        log.apply(EditOp::MoveTrack {
+            track_id: v1,
+            to_position: 1,
+        })
+        .unwrap();
+        assert_eq!(names(log.current()), ["V1", "Plate"]);
+        assert_eq!(log.current().tracks[0].id, v2);
+        log.apply(EditOp::RenameTrack {
+            track_id: v1,
+            name: String::new(),
+        })
+        .unwrap();
+        assert_eq!(names(log.current()), ["V1", "V2"]);
+        assert!(log
+            .apply(EditOp::RenameTrack {
+                track_id: v1,
+                name: "x".repeat(ops::MAX_TRACK_NAME_CHARS + 1),
+            })
+            .is_err());
+
+        log.undo().unwrap();
+        assert_eq!(names(log.current()), ["V1", "Plate"]);
+        log.undo().unwrap();
+        assert_eq!(names(log.current()), ["Plate", "V2"]);
+        log.undo().unwrap();
+        assert_eq!(log.current(), &base);
+        log.redo().unwrap();
+        log.redo().unwrap();
+        log.redo().unwrap();
+        assert_eq!(names(log.current()), ["V1", "V2"]);
+        assert_eq!(log.current().tracks[1].id, v1);
     }
 
     #[test]
@@ -1925,10 +2097,304 @@ mod tests {
             EditOp::SetFrameSize {
                 size: Some((3840, 2160)),
             },
+            EditOp::RenameTrack {
+                track_id: TrackId::new(),
+                name: "Plate \"B\"".into(),
+            },
         ];
         let json = serde_json::to_string(&ops).unwrap();
         assert_eq!(serde_json::from_str::<Vec<EditOp>>(&json).unwrap(), ops);
         let ron = ron::to_string(&ops).unwrap();
         assert_eq!(ron::from_str::<Vec<EditOp>>(&ron).unwrap(), ops);
+    }
+
+    // ---- empty undo steps ---------------------------------------------------
+
+    /// V1 (one clip with one effect, an EQ insert, a send to a bus) + V2
+    /// (custom name "Plate") + A1, a 1920×1080 canvas, one caption and one
+    /// review comment, after one real edit.
+    fn noop_log() -> (EditLog, [TrackId; 3], ClipId, EffectId, BusId) {
+        use crate::audio_effect::AudioEffectSpec;
+        let (mut log, v1, media) = seed_log();
+        let (v2, a1, bus) = (TrackId::new(), TrackId::new(), BusId::new());
+        let clip = Clip::new(media, "c", t(0), t(0), t(5)).unwrap();
+        let cid = clip.id;
+        let effect = Effect::new("grade");
+        let eid = effect.id;
+        let cue = vance_captions::Cue::new(0, 1000, "hi");
+        let comment = crate::review::ReviewComment::new(1000, "me", "note", 0);
+        for op in [
+            EditOp::InsertTrack {
+                track_id: v2,
+                kind: TrackKind::Video,
+                name: "Plate".into(),
+                position: 1,
+            },
+            EditOp::AddTrack {
+                track_id: a1,
+                kind: TrackKind::Audio,
+                name: "A1".into(),
+            },
+            EditOp::InsertClip { track_id: v1, clip },
+            EditOp::AddEffectToClip {
+                track_id: v1,
+                clip_id: cid,
+                effect,
+            },
+            EditOp::AddAudioEffect {
+                track_id: v1,
+                effect: AudioEffectSpec::default_eq6(),
+            },
+            EditOp::AddBus {
+                bus_id: bus,
+                name: "Music".into(),
+            },
+            EditOp::AddTrackSend {
+                track_id: v1,
+                send: Send::to(bus),
+            },
+            EditOp::SetFrameSize {
+                size: Some((1920, 1080)),
+            },
+            EditOp::AddCaption { cue },
+            EditOp::AddReviewComment { comment },
+        ] {
+            log.apply(op).unwrap();
+        }
+        (log, [v1, v2, a1], cid, eid, bus)
+    }
+
+    #[test]
+    fn ops_that_change_nothing_record_no_undo_step() {
+        use crate::audio_effect::AudioEffectSpec;
+        let (mut log, [v1, v2, a1], cid, eid, bus) = noop_log();
+        let base = log.current().clone();
+        let depth = log.len();
+        let cue_id = base.captions[0].id;
+        let comment_id = base.review_comments[0].id;
+        let noops = vec![
+            EditOp::RenameTrack {
+                track_id: v2,
+                name: " Plate ".into(),
+            },
+            // An automatic-form name that maps back to the same name.
+            EditOp::RenameTrack {
+                track_id: v1,
+                name: "V7".into(),
+            },
+            EditOp::RenameTrack {
+                track_id: v1,
+                name: String::new(),
+            },
+            EditOp::SetTrackEnabled {
+                track_id: v1,
+                enabled: true,
+            },
+            EditOp::SetTrackLocked {
+                track_id: v1,
+                locked: false,
+            },
+            EditOp::SetTrackMute {
+                track_id: a1,
+                mute: false,
+            },
+            EditOp::SetTrackSolo {
+                track_id: a1,
+                solo: false,
+            },
+            EditOp::SetClipMute {
+                track_id: v1,
+                clip_id: cid,
+                mute: false,
+            },
+            EditOp::MoveTrack {
+                track_id: v2,
+                to_position: 1,
+            },
+            // Rounds down to the current even size.
+            EditOp::SetFrameSize {
+                size: Some((1921, 1081)),
+            },
+            EditOp::SetClipBlendMode {
+                track_id: v1,
+                clip_id: cid,
+                blend_mode: BlendMode::Normal,
+            },
+            EditOp::SetTrackGainDb {
+                track_id: a1,
+                gain_db: 0.0,
+            },
+            EditOp::SetMasterGainDb { gain_db: 0.0 },
+            // Returns a fresh sequence even when the order is unchanged.
+            EditOp::MoveEffectOnClip {
+                track_id: v1,
+                clip_id: cid,
+                effect_id: eid,
+                new_index: 0,
+            },
+            EditOp::SetEffectEnabled {
+                track_id: v1,
+                clip_id: cid,
+                effect_id: eid,
+                enabled: true,
+            },
+            EditOp::RemoveAudioEffect {
+                track_id: v1,
+                index: 9,
+            },
+            EditOp::UpdateAudioEffect {
+                track_id: v1,
+                index: 0,
+                effect: AudioEffectSpec::default_eq6(),
+            },
+            EditOp::RemoveTrackSend {
+                track_id: v1,
+                index: 9,
+            },
+            EditOp::RouteTrackToBus {
+                track_id: v1,
+                output: BusOutput::Master,
+            },
+            EditOp::SetBusMute {
+                bus_id: bus,
+                mute: false,
+            },
+            EditOp::SetMagnetic { magnetic: false },
+            EditOp::DisconnectClip { connected: cid },
+            EditOp::SetCaptionText {
+                cue_id,
+                text: "hi".into(),
+            },
+            EditOp::ResolveReviewComment {
+                comment_id,
+                resolved: false,
+            },
+            EditOp::Compound {
+                ops: Vec::new(),
+                label: "nothing".into(),
+            },
+            // Changes that cancel out within one compound.
+            EditOp::Compound {
+                ops: vec![
+                    EditOp::SetTrackEnabled {
+                        track_id: v1,
+                        enabled: false,
+                    },
+                    EditOp::SetTrackEnabled {
+                        track_id: v1,
+                        enabled: true,
+                    },
+                ],
+                label: "toggle twice".into(),
+            },
+        ];
+        for op in noops {
+            let current = log.apply(op.clone()).unwrap().clone();
+            assert_eq!(current, base, "{op:?}");
+            assert_eq!(log.len(), depth, "{op:?} recorded an undo step");
+        }
+        // Undo still steps back over the last real edit.
+        log.undo().unwrap();
+        assert!(log.current().review_comments.is_empty());
+        // A real change is still recorded.
+        log.redo().unwrap();
+        log.apply(EditOp::SetTrackEnabled {
+            track_id: v1,
+            enabled: false,
+        })
+        .unwrap();
+        assert_eq!(log.len(), depth + 1);
+    }
+
+    #[test]
+    fn noop_after_undo_keeps_the_redo_branch() {
+        let (mut log, [v1, ..], _, _, _) = noop_log();
+        log.apply(EditOp::SetTrackEnabled {
+            track_id: v1,
+            enabled: false,
+        })
+        .unwrap();
+        let tip = log.current_id();
+        log.undo().unwrap();
+        log.apply(EditOp::SetTrackEnabled {
+            track_id: v1,
+            enabled: true,
+        })
+        .unwrap();
+        assert!(log.can_redo(), "the no-op didn't fork a branch");
+        log.redo().unwrap();
+        assert_eq!(log.current_id(), tip);
+        assert_eq!(log.branch_tips(), [tip]);
+    }
+
+    // ---- SetTrackLocked -----------------------------------------------------
+
+    #[test]
+    fn set_track_locked_applies_undoes_redoes_and_labels() {
+        let (mut log, v1, media) = seed_log();
+        log.apply(EditOp::SetTrackLocked {
+            track_id: v1,
+            locked: true,
+        })
+        .unwrap();
+        assert!(log.current().tracks[0].locked);
+        assert_eq!(log.history().last().unwrap().label, "Lock track");
+        // Locked: content edits are refused and record nothing.
+        let depth = log.len();
+        let clip = Clip::new(media, "c", t(0), t(0), t(5)).unwrap();
+        let insert = EditOp::InsertClip {
+            track_id: v1,
+            clip: clip.clone(),
+        };
+        assert!(log.apply(insert.clone()).is_err());
+        assert_eq!(log.len(), depth);
+        // Locking again is allowed and changes nothing.
+        log.apply(EditOp::SetTrackLocked {
+            track_id: v1,
+            locked: true,
+        })
+        .unwrap();
+        assert_eq!(log.len(), depth);
+        // Unlocking works on the locked track; then the edit goes through.
+        log.apply(EditOp::SetTrackLocked {
+            track_id: v1,
+            locked: false,
+        })
+        .unwrap();
+        assert!(!log.current().tracks[0].locked);
+        assert_eq!(log.history().last().unwrap().label, "Unlock track");
+        log.apply(insert).unwrap();
+        assert_eq!(log.current().tracks[0].clips[0].id, clip.id);
+
+        log.undo().unwrap(); // the insert
+        assert!(log.current().tracks[0].clips.is_empty());
+        log.undo().unwrap(); // the unlock
+        assert!(log.current().tracks[0].locked);
+        log.undo().unwrap(); // the lock
+        assert!(!log.current().tracks[0].locked);
+        log.redo().unwrap();
+        assert!(log.current().tracks[0].locked);
+        log.redo().unwrap();
+        log.redo().unwrap();
+        assert!(!log.current().tracks[0].locked);
+        assert_eq!(log.current().tracks[0].clips.len(), 1);
+        assert!(log
+            .apply(EditOp::SetTrackLocked {
+                track_id: TrackId::new(),
+                locked: true,
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn set_track_locked_serializes_round_trip() {
+        let op = EditOp::SetTrackLocked {
+            track_id: TrackId::new(),
+            locked: true,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert_eq!(serde_json::from_str::<EditOp>(&json).unwrap(), op);
+        let ron = ron::to_string(&op).unwrap();
+        assert_eq!(ron::from_str::<EditOp>(&ron).unwrap(), op);
     }
 }

@@ -161,7 +161,8 @@ pub const KEY_WIN_SHAPE: &str = "win_shape";
 pub const KEY_WIN_CENTER_X: &str = "win_cx";
 /// Center Y in source-UV [0,1]. Default 0.5.
 pub const KEY_WIN_CENTER_Y: &str = "win_cy";
-/// Half-width (radius x) in source-UV units. Default 0.25.
+/// Half-width (radius x) as a fraction of the clip's width. Default: round
+/// on screen with the default half-height, `0.25 × height / display width`.
 pub const KEY_WIN_SIZE_X: &str = "win_sx";
 /// Half-height (radius y) in source-UV units. Default 0.25.
 pub const KEY_WIN_SIZE_Y: &str = "win_sy";

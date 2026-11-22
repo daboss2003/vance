@@ -21,13 +21,15 @@ use serde::{Deserialize, Serialize};
 ///   its own. `Release` / `Released` are gone.
 /// - v5: `OpenError::NeedsContainer` for raw elementary streams that can't
 ///   be seeked (no timestamps).
+/// - v6: `StreamInfo` carries the stream's colour range, YUV matrix and
+///   sample aspect ratio; `PixelFormat::Rgba8` for sources with alpha.
 ///
 /// Every version keeps `Hello` as the first variant of both enums, with the
 /// same fields, so mismatched builds still complete a handshake and report
 /// [`crate::client::ClientError::ProtocolMismatch`]: a v3 sidecar reads a v4
 /// `Hello` envelope (no releases) as a v3 `Hello`, and a v4 sidecar answers
 /// a first request it can't read with its own `Hello`.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 pub use crate::frame::FrameData;
 pub use vance_ipc::shm::{ShmRegionDesc, SlotRef};
@@ -218,6 +220,43 @@ pub struct StreamInfo {
     /// → `Unknown` for older sidecars.
     #[serde(default)]
     pub color_transfer: ColorTransferHint,
+    /// Sample range of the frames as sent (`Unknown` when the stream doesn't
+    /// say). Describes the wire bytes: an RGB source the sidecar converts to
+    /// YUV is `Limited` (with `Bt709`), and [`PixelFormat::Rgba8`] is `Full`.
+    pub color_range: ColorRangeHint,
+    /// YUV → RGB matrix of the frames as sent (`Unknown` when the stream
+    /// doesn't say, and for [`PixelFormat::Rgba8`], which has none).
+    pub color_matrix: ColorMatrixHint,
+    /// Sample (pixel) aspect ratio `(num, den)`, reduced; `(1, 1)` for square
+    /// pixels and when the stream doesn't say. Display width =
+    /// `width * num / den`.
+    pub sample_aspect: (u32, u32),
+}
+
+/// The YUV sample range a stream signals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColorRangeHint {
+    /// Not signalled.
+    #[default]
+    Unknown,
+    /// Limited / "TV" / MPEG range (Y' 16–235 at 8 bits).
+    Limited,
+    /// Full / "PC" / JPEG range.
+    Full,
+}
+
+/// The YUV → RGB matrix a stream signals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColorMatrixHint {
+    /// Not signalled (or a matrix the renderer doesn't implement).
+    #[default]
+    Unknown,
+    /// ITU-R BT.601 (SMPTE 170M / BT.470BG): standard-definition video.
+    Bt601,
+    /// ITU-R BT.709: HD video.
+    Bt709,
+    /// ITU-R BT.2020 non-constant luminance: UHD / HDR video.
+    Bt2020Ncl,
 }
 
 /// A coarse transfer-characteristic hint read from the stream's color VUI,
@@ -251,15 +290,23 @@ pub enum PixelFormat {
     /// `Yuv420P`, twice the bytes. Carried 10-bit end to end so HDR
     /// highlights survive to the render pipeline.
     Yuv420P10Le,
+    /// Packed 8-bit RGBA with STRAIGHT (not premultiplied) alpha, one plane,
+    /// `strides = [width * 4]`. The wire format for sources with an alpha
+    /// channel (ProRes 4444, PNG, QuickTime Animation …): full-range RGB in
+    /// the source's transfer.
+    Rgba8,
 }
 
 impl PixelFormat {
     /// Number of bytes for a frame of this format at `width` × `height`.
     pub fn frame_size(self, width: u32, height: u32) -> usize {
+        let luma = width as usize * height as usize;
+        if self == PixelFormat::Rgba8 {
+            return luma * 4;
+        }
         // 4:2:0: a full-size luma plane plus two chroma planes (planar) or one
         // interleaved UV plane (NV12) of ceil(w/2) x ceil(h/2) samples each,
         // so odd sizes round chroma UP (w*h*3/2 would come out short).
-        let luma = width as usize * height as usize;
         let chroma = width.div_ceil(2) as usize * height.div_ceil(2) as usize;
         (luma + 2 * chroma) * self.bytes_per_sample()
     }
@@ -267,9 +314,14 @@ impl PixelFormat {
     /// Bytes per sample on the wire (1 for 8-bit, 2 for 10/16-bit).
     pub fn bytes_per_sample(self) -> usize {
         match self {
-            PixelFormat::Yuv420P | PixelFormat::Nv12 => 1,
+            PixelFormat::Yuv420P | PixelFormat::Nv12 | PixelFormat::Rgba8 => 1,
             PixelFormat::Yuv420P10Le => 2,
         }
+    }
+
+    /// `true` for the packed RGBA format (no YUV matrix or range applies).
+    pub fn is_rgba(self) -> bool {
+        self == PixelFormat::Rgba8
     }
 }
 

@@ -52,6 +52,7 @@ pub mod sequence;
 pub mod title;
 pub mod track;
 pub mod transition;
+mod unicode_tables;
 
 pub use audio_effect::{
     AudioEffectSpec, CompressorSpec, DeHumSpec, Eq6Spec, EqBandKind, EqBandSpec, LimiterSpec,
@@ -76,8 +77,8 @@ pub use media_query::{Condition, MediaField, MediaQuery, QueryOp, SmartBin};
 pub use project::{OcioView, Project};
 pub use review::{ReviewComment, ReviewReply};
 pub use scene_plan::{
-    scene_at, scene_plan_at, transition_at, ActiveClip, ActiveTransition, Layer, LayerClip,
-    LayerContent, LayerTransition, SceneAt, ScenePlan,
+    scene_at, scene_plan_at, transition_at, transition_window, ActiveClip, ActiveTransition, Layer,
+    LayerClip, LayerContent, LayerTransition, SceneAt, ScenePlan,
 };
 pub use sequence::Sequence;
 pub use title::TitleParams;

@@ -113,6 +113,7 @@ fn yuv_planes(f: &FrameData) -> [Vec<u16>; 3] {
             let v = uv.iter().skip(1).step_by(2).copied().collect();
             [samples(y), u, v]
         }
+        PixelFormat::Rgba8 => panic!("{:?} is not a YUV format", f.pixel_format),
     }
 }
 
@@ -296,13 +297,14 @@ fn mjpeg_full_range_422_keeps_its_range() {
 }
 
 #[test]
-fn videotoolbox_codec_decoded_in_software_is_converted_to_nv12() {
+fn a_codec_videotoolbox_cannot_decode_reports_the_software_format() {
     // MPEG-4 Part 2 is on the VideoToolbox allowlist, so on macOS the device
-    // attaches and StreamInfo says Nv12. Apple Silicon's VideoToolbox has no
-    // MPEG-4 Part 2 decoder, so FFmpeg falls back to software and the frames
-    // arrive as yuv420p; they must be converted to the reported Nv12 (where
-    // VT does decode it they arrive as NV12 already). Elsewhere this is the
-    // plain software path. Odd size: NV12 rows carry 2 * ceil(w/2) UV bytes.
+    // attaches, but Apple Silicon's VideoToolbox has no MPEG-4 Part 2 decoder
+    // and FFmpeg falls back to software. `open` must notice (it decodes the
+    // first frame to see) and report the software path's Yuv420P, as on
+    // every other platform, not Nv12 with a pointless conversion per frame.
+    // An Intel Mac may decode it on VideoToolbox: then Nv12, with the frames
+    // to match. Odd size: NV12 rows carry 2 * ceil(w/2) UV bytes.
     let Some(fx) = make_fixture(
         "mkv",
         "color=c=gray:s=161x91:r=25:d=0.2,format=yuv420p,lutyuv=y=180:u=90:v=200",
@@ -310,15 +312,15 @@ fn videotoolbox_codec_decoded_in_software_is_converted_to_nv12() {
     ) else {
         return;
     };
-    let expected = if cfg!(target_os = "macos") {
-        PixelFormat::Nv12
-    } else {
-        PixelFormat::Yuv420P
-    };
     let mut client = spawn_default();
     let info = client.open(fx.path()).expect("open MPEG-4 Part 2");
     assert_eq!(info.codec_name, "mpeg4");
-    assert_eq!(info.pixel_format, expected);
+    let expected = info.pixel_format;
+    if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        assert!(matches!(expected, PixelFormat::Nv12 | PixelFormat::Yuv420P));
+    } else {
+        assert_eq!(expected, PixelFormat::Yuv420P);
+    }
 
     let f = client.decode_at(0).expect("decode frame 0");
     assert_eq!(f.pixel_format, expected);

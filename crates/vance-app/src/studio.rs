@@ -127,7 +127,7 @@ pub async fn shader_save(
     std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
 
-    let found = engine.lock().rescan_plugins();
+    let found = crate::accounts::rescan_after_export(&engine).await?;
     Ok(json!({ "id": id, "installed": found }))
 }
 

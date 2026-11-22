@@ -6555,6 +6555,7 @@ dependencies = [
  "vance-tracker",
  "vance-viewport",
  "wgpu",
+ "windows-sys 0.59.0",
  "x25519-dalek",
 ]
 

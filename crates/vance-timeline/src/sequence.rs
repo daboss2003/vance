@@ -152,6 +152,20 @@ mod tests {
     }
 
     #[test]
+    fn frame_size_round_trips_and_defaults_to_none() {
+        let mut s = Sequence::new("Seq 01", FrameRate::FPS_24);
+        s.frame_size = Some((3840, 2160));
+        let ron = ron::to_string(&s).unwrap();
+        assert_eq!(ron::from_str::<Sequence>(&ron).unwrap(), s);
+        let mut json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["frame_size"], serde_json::json!([3840, 2160]));
+        assert_eq!(serde_json::from_value::<Sequence>(json.clone()).unwrap(), s);
+        json.as_object_mut().unwrap().remove("frame_size");
+        let old: Sequence = serde_json::from_value(json).unwrap();
+        assert_eq!(old.frame_size, None, "pre-M1 sequence");
+    }
+
+    #[test]
     fn duration_is_longest_track() {
         let media = MediaItemId::new();
         let c_short = Arc::new(Clip::new(media, "s", t(0), t(0), t(3)).unwrap());

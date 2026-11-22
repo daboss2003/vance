@@ -10,25 +10,18 @@
 )]
 
 mod accounts;
-// Intentional: the M1 compositing modules (ADR 0007) are contract stubs the
-// bin doesn't call until the integration seam wires them in; the lib target
-// exports them for the integration tests.
-#[allow(dead_code)]
 mod addons;
 mod audio_bounce;
 mod cached_decode;
 mod capabilities;
 mod comp_playback;
-#[allow(dead_code)]
 mod compose;
 mod compositing_cmds;
 mod control;
 mod crash;
-#[allow(dead_code)]
 mod decoder_pool;
 mod engine;
 mod generate;
-#[allow(dead_code)]
 mod layer_feed;
 mod magicmask;
 mod nodegraph;
@@ -547,13 +540,13 @@ struct PeaksBackfillUpdate {
 /// PeaksService — typical cost ~5-15 ms per video file. A
 /// project with 100 video clips therefore pays ~1 s total, executed
 /// after the initial project-open render so the UI stays responsive.
-#[tauri::command]
+#[tauri::command(async)]
 fn peaks_backfill_video_audio(
     engine: tauri::State<'_, EngineHandle>,
     peaks: tauri::State<'_, PeaksHandle>,
 ) -> Result<PeaksBackfillResult, String> {
     let svc = checkout_peaks(&peaks)?;
-    let targets = engine.lock().list_video_media_needing_audio_probe();
+    let targets = engine.engine()?.list_video_media_needing_audio_probe();
     let mut updates = Vec::with_capacity(targets.len());
     let mut flipped = 0;
     for (id, path) in &targets {
@@ -562,7 +555,10 @@ fn peaks_backfill_video_audio(
         if has_audio {
             flipped += 1;
         }
-        let _ = engine.lock().set_media_has_audio_track(*id, has_audio);
+        // Intentional: waits an export out; the probe is already done.
+        let _ = engine
+            .engine_after_export()
+            .set_media_has_audio_track(*id, has_audio);
         updates.push(PeaksBackfillUpdate {
             media_id: id.to_string(),
             has_audio_track: has_audio,
@@ -613,7 +609,7 @@ fn backend_version() -> String {
     )
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_viewport_bounds(
     state: tauri::State<'_, EngineHandle>,
     x: u32,
@@ -621,13 +617,16 @@ fn set_viewport_bounds(
     w: u32,
     h: u32,
 ) -> Result<(), String> {
-    state
-        .lock()
-        .set_viewport_bounds(ViewportBounds::new(x, y, w, h))
-        .map_err(|e| e.to_string())
+    // The window moves even during an export; its surface follows when the
+    // engine is free.
+    state.set_monitor_bounds(
+        engine::Monitor::Record,
+        ViewportBounds::new(x, y, w, h),
+        POLL_WAIT,
+    )
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_source_viewport_bounds(
     state: tauri::State<'_, EngineHandle>,
     x: u32,
@@ -635,13 +634,14 @@ fn set_source_viewport_bounds(
     w: u32,
     h: u32,
 ) -> Result<(), String> {
-    state
-        .lock()
-        .set_source_viewport_bounds(ViewportBounds::new(x, y, w, h))
-        .map_err(|e| e.to_string())
+    state.set_monitor_bounds(
+        engine::Monitor::Source,
+        ViewportBounds::new(x, y, w, h),
+        POLL_WAIT,
+    )
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn load_source(
     state: tauri::State<'_, EngineHandle>,
     media_id: String,
@@ -650,44 +650,48 @@ fn load_source(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid media id: {e}"))?;
     let info = state
-        .lock()
+        .engine()?
         .load_source(vance_timeline::MediaItemId::from_uuid(media_uuid))
         .map_err(|e| e.to_string())?;
     Ok(info.into())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn decode_source_at(state: tauri::State<'_, EngineHandle>, target_pts: i64) -> Result<i64, String> {
     state
-        .lock()
+        .engine()?
         .decode_source_at(target_pts)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn source_state(state: tauri::State<'_, EngineHandle>) -> Option<SourceState> {
-    state.lock().source_state()
+#[tauri::command(async)]
+fn source_state(state: tauri::State<'_, EngineHandle>) -> Result<Option<SourceState>, String> {
+    Ok(state.engine()?.source_state())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_source_mark_in(state: tauri::State<'_, EngineHandle>) -> Result<(), String> {
-    state.lock().set_source_mark_in().map_err(|e| e.to_string())
+    state
+        .engine()?
+        .set_source_mark_in()
+        .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_source_mark_out(state: tauri::State<'_, EngineHandle>) -> Result<(), String> {
     state
-        .lock()
+        .engine()?
         .set_source_mark_out()
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn clear_source_marks(state: tauri::State<'_, EngineHandle>) {
-    state.lock().clear_source_marks();
+#[tauri::command(async)]
+fn clear_source_marks(state: tauri::State<'_, EngineHandle>) -> Result<(), String> {
+    state.engine()?.clear_source_marks();
+    Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn insert_from_source(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -697,80 +701,135 @@ fn insert_from_source(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid track id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .insert_from_source(vance_timeline::TrackId::from_uuid(track_uuid), overwrite)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn open_file(state: tauri::State<'_, EngineHandle>, path: String) -> Result<OpenResponse, String> {
-    let info = state.lock().open_file(&path).map_err(|e| e.to_string())?;
+    let info = state
+        .engine()?
+        .open_file(&path)
+        .map_err(|e| e.to_string())?;
     Ok(info.into())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn decode_and_render_at(
     state: tauri::State<'_, EngineHandle>,
     target_pts: i64,
 ) -> Result<i64, String> {
     state
-        .lock()
+        .engine()?
         .decode_and_render_at(target_pts)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn start_playback(state: tauri::State<'_, EngineHandle>, from_pts: i64) -> Result<(), String> {
     state
-        .lock()
+        .engine()?
         .start_playback(from_pts)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn stop_playback(state: tauri::State<'_, EngineHandle>) -> Result<i64, String> {
-    state.lock().stop_playback().map_err(|e| e.to_string())
+    state.engine()?.stop_playback().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn is_playing(state: tauri::State<'_, EngineHandle>) -> bool {
-    state.lock().is_playing()
+/// Emit the engine's queued UI notices (e.g. "generating proxies") as
+/// `engine://notice` events carrying the message text.
+fn emit_engine_notices(app: &tauri::AppHandle, engine: &mut engine::Engine) {
+    for message in engine.take_notices() {
+        if let Err(e) = app.emit("engine://notice", message) {
+            tracing::warn!(?e, "engine notice not delivered");
+        }
+    }
 }
 
-#[tauri::command]
-fn last_resume_pts(state: tauri::State<'_, EngineHandle>) -> Option<i64> {
-    state.lock().last_resume_pts()
+/// How long a periodic poll waits for the engine before giving up: an export
+/// holds it for minutes, and these run on the main thread.
+const POLL_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+// Intentional: the UI polls this every 250 ms, so it also delivers notices
+// raised during playback. While an export holds the engine it answers
+// "not playing" (exports stop playback) instead of an error or a wait.
+#[tauri::command(async)]
+fn is_playing(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, EngineHandle>,
+) -> Result<bool, String> {
+    let Some(mut engine) = state.lock_within(POLL_WAIT) else {
+        return Ok(false);
+    };
+    let playing = engine.is_playing();
+    emit_engine_notices(&app, &mut engine);
+    Ok(playing)
 }
 
-#[tauri::command]
+/// Cancel the export in progress (`render_sequence` / `render_and_replace`
+/// then return "Export cancelled" and write nothing). A no-op when none runs.
+/// Async and lock-free: it must get through while the export holds the
+/// engine.
+#[tauri::command(async)]
+fn cancel_export(state: tauri::State<'_, EngineHandle>) -> Result<(), String> {
+    state.export_canceller().cancel();
+    Ok(())
+}
+
+/// Whether an export is running (`render_sequence` / `render_and_replace`,
+/// from the call until it returns). Lock-free: it answers during the export.
+#[tauri::command(async)]
+fn export_status(state: tauri::State<'_, EngineHandle>) -> Result<bool, String> {
+    Ok(state.is_exporting())
+}
+
+#[tauri::command(async)]
+fn last_resume_pts(state: tauri::State<'_, EngineHandle>) -> Result<Option<i64>, String> {
+    Ok(state.engine()?.last_resume_pts())
+}
+
+#[tauri::command(async)]
 fn load_project(
     state: tauri::State<'_, EngineHandle>,
     path: String,
 ) -> Result<ProjectInfo, String> {
-    state.lock().load_project(&path).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn new_project(state: tauri::State<'_, EngineHandle>, name: String) -> Result<ProjectInfo, String> {
-    state.lock().new_project(name).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn save_project(state: tauri::State<'_, EngineHandle>, path: Option<String>) -> Result<(), String> {
-    state.lock().save_project(path).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn current_project_path(state: tauri::State<'_, EngineHandle>) -> Option<String> {
     state
-        .lock()
-        .current_project_path()
-        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .engine()?
+        .load_project(&path)
+        .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn current_sequence_contents(state: tauri::State<'_, EngineHandle>) -> Option<SequenceContents> {
-    state.lock().current_sequence_contents()
+#[tauri::command(async)]
+fn new_project(state: tauri::State<'_, EngineHandle>, name: String) -> Result<ProjectInfo, String> {
+    state.engine()?.new_project(name).map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn save_project(state: tauri::State<'_, EngineHandle>, path: Option<String>) -> Result<(), String> {
+    state
+        .engine()?
+        .save_project(path)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn current_project_path(state: tauri::State<'_, EngineHandle>) -> Result<Option<String>, String> {
+    Ok({
+        state
+            .engine()?
+            .current_project_path()
+            .and_then(|p| p.to_str().map(|s| s.to_string()))
+    })
+}
+
+#[tauri::command(async)]
+fn current_sequence_contents(
+    state: tauri::State<'_, EngineHandle>,
+) -> Result<Option<SequenceContents>, String> {
+    Ok(state.engine()?.current_sequence_contents())
 }
 
 /// Lets the chrome write a free-form line into the engine's tracing
@@ -780,144 +839,139 @@ fn diag_log(message: String) {
     tracing::info!(target: "ui_diag", "{message}");
 }
 
+/// Payload of `engine://import-waiting` / `engine://import-settled`.
+/// FROZEN: the UI matches `file_name`, the bare file name ("clip.mov").
+#[derive(Clone, Serialize)]
+struct ImportWaitEvent {
+    file_name: String,
+}
+
+/// Import a media file. The file opens off the engine lock, on a blocking
+/// thread: a slow or hung drive can take up to two minutes. After 2 s of
+/// waiting `engine://import-waiting` goes out, and `cancel_import` can stop
+/// it ("Import cancelled"); `engine://import-settled` follows when that wait
+/// ends, however it ends. The file is then added to the project (after an
+/// export, if one started meanwhile), with whether it has audio.
 #[tauri::command]
-fn import_media_file(
+async fn import_media_file(
+    app: tauri::AppHandle,
     state: tauri::State<'_, EngineHandle>,
-    peaks: tauri::State<'_, PeaksHandle>,
     path: String,
 ) -> Result<MediaItemInfo, String> {
-    // Phase 7.2 import has two steps that must each acquire the
-    // engine lock (one to import, one to set has_audio_track), with
-    // the probe IPC happening BETWEEN them so we don't hold the lock
-    // across a possibly-slow sidecar round-trip. A concurrent command
-    // could in principle delete the just-imported item between those
-    // two engine.lock() acquisitions — set_media_has_audio_track
-    // tolerates that case (returns Ok if the id is unknown).
-    let info = state
-        .lock()
-        .import_media_file(&path)
-        .map_err(|e| e.to_string())?;
-    // info.id was just generated by MediaItemId::new() inside the
-    // engine, so the UUID parse cannot fail. Unwrap is safe here.
-    let media_id = vance_timeline::MediaItemId::from_uuid(
-        info.id
-            .parse::<uuid::Uuid>()
-            .expect("engine-generated UUID"),
-    );
-
-    // Only Video items need probing. Audio is always true (forced by
-    // MediaItem::new + bundle-load sweep); Image/Title stay false.
-    if info.kind == "video" {
-        match checkout_peaks(&peaks) {
-            Ok(svc) => match svc.probe_audio(&path) {
-                Ok(has_audio) => {
-                    let _ = state.lock().set_media_has_audio_track(media_id, has_audio);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "vance_app.peaks",
-                        path = %path,
-                        err = ?e,
-                        "audio probe failed; treating as no-audio (waveform won't render until backfill)"
-                    );
-                }
+    let engine = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let event = ImportWaitEvent {
+            file_name: engine::file_label(&path),
+        };
+        let (waiting_app, waiting_event) = (app.clone(), event.clone());
+        engine.import_file(
+            &path,
+            move || {
+                let _ = waiting_app.emit("engine://import-waiting", waiting_event);
             },
-            Err(e) => {
-                // PeaksService never spawned (sidecar missing). UI's
-                // backfill pass will retry on next project-open once
-                // the service comes back; until then, video clips
-                // won't render waveforms.
-                tracing::warn!(
-                    target: "vance_app.peaks",
-                    path = %path,
-                    err = %e,
-                    "peaks service unavailable at import; has_audio_track stays false"
-                );
-            }
-        }
-    }
-    // Re-read the (possibly updated) info from the engine so the UI
-    // sees has_audio_track reflecting the probe.
-    Ok(state.lock().media_get_info(media_id).unwrap_or(info))
+            || {
+                let _ = app.emit("engine://import-settled", event);
+            },
+        )
+    })
+    .await
+    .map_err(|e| format!("import task failed: {e}"))?
 }
 
-#[tauri::command]
-fn media_list(state: tauri::State<'_, EngineHandle>) -> Vec<MediaItemInfo> {
-    state.lock().media_list()
+/// Stop the import waiting on its file (see `import_media_file`): it then
+/// answers "Import cancelled" and adds nothing. Lock-free; a no-op when no
+/// import is waiting.
+#[tauri::command(async)]
+fn cancel_import(state: tauri::State<'_, EngineHandle>) -> Result<(), String> {
+    state.cancel_import();
+    Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
+fn media_list(state: tauri::State<'_, EngineHandle>) -> Result<Vec<MediaItemInfo>, String> {
+    Ok(state.engine()?.media_list())
+}
+
+#[tauri::command(async)]
 fn play_sequence(
+    app: tauri::AppHandle,
     state: tauri::State<'_, EngineHandle>,
     timeline_seconds: f64,
 ) -> Result<(), String> {
-    state
-        .lock()
-        .play_sequence(timeline_seconds)
-        .map_err(|e| e.to_string())
+    let mut engine = state.engine()?;
+    let result = engine.play_sequence(timeline_seconds);
+    emit_engine_notices(&app, &mut engine);
+    result.map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn decode_sequence_at(
+    app: tauri::AppHandle,
     state: tauri::State<'_, EngineHandle>,
     timeline_seconds: f64,
 ) -> Result<i64, String> {
-    state
-        .lock()
-        .decode_sequence_at(timeline_seconds)
-        .map_err(|e| e.to_string())
+    let mut engine = state.engine()?;
+    let result = engine.decode_sequence_at(timeline_seconds);
+    emit_engine_notices(&app, &mut engine);
+    result.map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn current_timeline_seconds(state: tauri::State<'_, EngineHandle>) -> Option<f64> {
-    state.lock().current_timeline_seconds()
+// Intentional: a poll; during an export (or a long command) it answers "no
+// playhead" (the UI keeps its own) instead of an error or a wait.
+#[tauri::command(async)]
+fn current_timeline_seconds(state: tauri::State<'_, EngineHandle>) -> Result<Option<f64>, String> {
+    Ok(state
+        .lock_within(POLL_WAIT)
+        .and_then(|engine| engine.current_timeline_seconds()))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn undo(state: tauri::State<'_, EngineHandle>) -> Result<bool, String> {
-    state.lock().undo().map_err(|e| e.to_string())
+    state.engine()?.undo().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn redo(state: tauri::State<'_, EngineHandle>) -> Result<bool, String> {
-    state.lock().redo().map_err(|e| e.to_string())
+    state.engine()?.redo().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn can_undo(state: tauri::State<'_, EngineHandle>) -> bool {
-    state.lock().can_undo()
+#[tauri::command(async)]
+fn can_undo(state: tauri::State<'_, EngineHandle>) -> Result<bool, String> {
+    Ok(state.engine()?.can_undo())
 }
 
-#[tauri::command]
-fn can_redo(state: tauri::State<'_, EngineHandle>) -> bool {
-    state.lock().can_redo()
+#[tauri::command(async)]
+fn can_redo(state: tauri::State<'_, EngineHandle>) -> Result<bool, String> {
+    Ok(state.engine()?.can_redo())
 }
 
 /// The current sequence's edit-history tree (for the history / branch panel).
-#[tauri::command]
-fn edit_history(state: tauri::State<'_, EngineHandle>) -> Vec<vance_timeline::HistoryNodeView> {
-    state.lock().edit_history()
+#[tauri::command(async)]
+fn edit_history(
+    state: tauri::State<'_, EngineHandle>,
+) -> Result<Vec<vance_timeline::HistoryNodeView>, String> {
+    Ok(state.engine()?.edit_history())
 }
 
 /// Name the current history node as a checkpoint / branch.
-#[tauri::command]
+#[tauri::command(async)]
 fn checkpoint_history(state: tauri::State<'_, EngineHandle>, name: String) -> Result<(), String> {
     state
-        .lock()
+        .engine()?
         .checkpoint_history(name)
         .map_err(|e| e.to_string())
 }
 
 /// Jump to a history node by id (switch branch / restore version).
-#[tauri::command]
+#[tauri::command(async)]
 fn goto_history(state: tauri::State<'_, EngineHandle>, node_id: usize) -> Result<bool, String> {
     state
-        .lock()
+        .engine()?
         .goto_history(node_id)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn trim_clip_in(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -931,7 +985,7 @@ fn trim_clip_in(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid clip id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .trim_clip_in(
             vance_timeline::TrackId::from_uuid(track_uuid),
             vance_timeline::ClipId::from_uuid(clip_uuid),
@@ -940,7 +994,7 @@ fn trim_clip_in(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn trim_clip_out(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -954,7 +1008,7 @@ fn trim_clip_out(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid clip id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .trim_clip_out(
             vance_timeline::TrackId::from_uuid(track_uuid),
             vance_timeline::ClipId::from_uuid(clip_uuid),
@@ -963,7 +1017,7 @@ fn trim_clip_out(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn add_effect_to_clip(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -978,7 +1032,7 @@ fn add_effect_to_clip(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid clip id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .add_effect_to_clip(
             vance_timeline::TrackId::from_uuid(track_uuid),
             vance_timeline::ClipId::from_uuid(clip_uuid),
@@ -995,7 +1049,7 @@ fn validate_expression(expr: String) -> Option<String> {
     vance_timeline::validate_expr(&expr)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn update_effect_param(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -1014,7 +1068,7 @@ fn update_effect_param(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid effect id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .update_effect_param(
             vance_timeline::TrackId::from_uuid(track_uuid),
             vance_timeline::ClipId::from_uuid(clip_uuid),
@@ -1025,7 +1079,7 @@ fn update_effect_param(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_effect_from_clip(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -1042,7 +1096,7 @@ fn remove_effect_from_clip(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid effect id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .remove_effect_from_clip(
             vance_timeline::TrackId::from_uuid(track_uuid),
             vance_timeline::ClipId::from_uuid(clip_uuid),
@@ -1051,7 +1105,7 @@ fn remove_effect_from_clip(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn move_effect_on_clip(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -1069,7 +1123,7 @@ fn move_effect_on_clip(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid effect id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .move_effect_on_clip(
             vance_timeline::TrackId::from_uuid(track_uuid),
             vance_timeline::ClipId::from_uuid(clip_uuid),
@@ -1080,7 +1134,7 @@ fn move_effect_on_clip(
 }
 
 /// Phase 7.3 mixer command: set a track's mute.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_track_mute(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -1090,13 +1144,13 @@ fn set_track_mute(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid track id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .set_track_mute(vance_timeline::TrackId::from_uuid(track_uuid), mute)
         .map_err(|e| e.to_string())
 }
 
 /// Phase 7.3 mixer command: set a track's solo flag.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_track_solo(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -1106,13 +1160,13 @@ fn set_track_solo(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid track id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .set_track_solo(vance_timeline::TrackId::from_uuid(track_uuid), solo)
         .map_err(|e| e.to_string())
 }
 
 /// Phase 7.3 mixer command: set a track's gain in dB.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_track_gain_db(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -1122,14 +1176,14 @@ fn set_track_gain_db(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid track id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .set_track_gain_db(vance_timeline::TrackId::from_uuid(track_uuid), gain_db)
         .map_err(|e| e.to_string())
 }
 
 /// Phase 7.3 mixer command: set a clip's mute (routes through
 /// `Clip.enabled` per the existing semantics).
-#[tauri::command]
+#[tauri::command(async)]
 fn set_clip_mute(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -1143,7 +1197,7 @@ fn set_clip_mute(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid clip id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .set_clip_mute(
             vance_timeline::TrackId::from_uuid(track_uuid),
             vance_timeline::ClipId::from_uuid(clip_uuid),
@@ -1154,10 +1208,10 @@ fn set_clip_mute(
 
 /// Phase 7.4 mixer command: set the master bus gain in dB. Sequence-
 /// level; no per-track lock to respect.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_master_gain_db(state: tauri::State<'_, EngineHandle>, gain_db: f32) -> Result<(), String> {
     state
-        .lock()
+        .engine()?
         .set_master_gain_db(gain_db)
         .map_err(|e| e.to_string())
 }
@@ -1176,24 +1230,24 @@ fn parse_track_id(s: &str) -> Result<vance_timeline::TrackId, String> {
 }
 
 /// All buses on the current sequence (console channel strips).
-#[tauri::command]
-fn buses(state: tauri::State<'_, EngineHandle>) -> Vec<vance_timeline::AudioBus> {
-    state.lock().buses()
+#[tauri::command(async)]
+fn buses(state: tauri::State<'_, EngineHandle>) -> Result<Vec<vance_timeline::AudioBus>, String> {
+    Ok(state.engine()?.buses())
 }
 
 /// Add a submix bus. Returns its id.
-#[tauri::command]
+#[tauri::command(async)]
 fn add_bus(state: tauri::State<'_, EngineHandle>, name: String) -> Result<String, String> {
-    state.lock().add_bus(name).map_err(|e| e.to_string())
+    state.engine()?.add_bus(name).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_bus(state: tauri::State<'_, EngineHandle>, bus_id: String) -> Result<(), String> {
     let id = parse_bus_id(&bus_id)?;
-    state.lock().remove_bus(id).map_err(|e| e.to_string())
+    state.engine()?.remove_bus(id).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_bus_gain_db(
     state: tauri::State<'_, EngineHandle>,
     bus_id: String,
@@ -1201,22 +1255,25 @@ fn set_bus_gain_db(
 ) -> Result<(), String> {
     let id = parse_bus_id(&bus_id)?;
     state
-        .lock()
+        .engine()?
         .set_bus_gain_db(id, gain_db)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_bus_pan(
     state: tauri::State<'_, EngineHandle>,
     bus_id: String,
     pan: f32,
 ) -> Result<(), String> {
     let id = parse_bus_id(&bus_id)?;
-    state.lock().set_bus_pan(id, pan).map_err(|e| e.to_string())
+    state
+        .engine()?
+        .set_bus_pan(id, pan)
+        .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_bus_mute(
     state: tauri::State<'_, EngineHandle>,
     bus_id: String,
@@ -1224,12 +1281,12 @@ fn set_bus_mute(
 ) -> Result<(), String> {
     let id = parse_bus_id(&bus_id)?;
     state
-        .lock()
+        .engine()?
         .set_bus_mute(id, mute)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_bus_output(
     state: tauri::State<'_, EngineHandle>,
     bus_id: String,
@@ -1237,12 +1294,12 @@ fn set_bus_output(
 ) -> Result<(), String> {
     let id = parse_bus_id(&bus_id)?;
     state
-        .lock()
+        .engine()?
         .set_bus_output(id, output)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn route_track_to_bus(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -1250,12 +1307,12 @@ fn route_track_to_bus(
 ) -> Result<(), String> {
     let id = parse_track_id(&track_id)?;
     state
-        .lock()
+        .engine()?
         .route_track_to_bus(id, output)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn add_track_send(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -1263,12 +1320,12 @@ fn add_track_send(
 ) -> Result<(), String> {
     let id = parse_track_id(&track_id)?;
     state
-        .lock()
+        .engine()?
         .add_track_send(id, send)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_track_send(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -1276,12 +1333,12 @@ fn remove_track_send(
 ) -> Result<(), String> {
     let id = parse_track_id(&track_id)?;
     state
-        .lock()
+        .engine()?
         .remove_track_send(id, index)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn add_bus_insert(
     state: tauri::State<'_, EngineHandle>,
     bus_id: String,
@@ -1289,12 +1346,12 @@ fn add_bus_insert(
 ) -> Result<(), String> {
     let id = parse_bus_id(&bus_id)?;
     state
-        .lock()
+        .engine()?
         .add_bus_insert(id, effect)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_bus_insert(
     state: tauri::State<'_, EngineHandle>,
     bus_id: String,
@@ -1302,12 +1359,12 @@ fn remove_bus_insert(
 ) -> Result<(), String> {
     let id = parse_bus_id(&bus_id)?;
     state
-        .lock()
+        .engine()?
         .remove_bus_insert(id, index)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn move_bus_insert(
     state: tauri::State<'_, EngineHandle>,
     bus_id: String,
@@ -1316,12 +1373,12 @@ fn move_bus_insert(
 ) -> Result<(), String> {
     let id = parse_bus_id(&bus_id)?;
     state
-        .lock()
+        .engine()?
         .move_bus_insert(id, from_index, to_index)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn update_bus_insert(
     state: tauri::State<'_, EngineHandle>,
     bus_id: String,
@@ -1330,12 +1387,12 @@ fn update_bus_insert(
 ) -> Result<(), String> {
     let id = parse_bus_id(&bus_id)?;
     state
-        .lock()
+        .engine()?
         .update_bus_insert(id, index, effect)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn add_bus_send(
     state: tauri::State<'_, EngineHandle>,
     bus_id: String,
@@ -1343,12 +1400,12 @@ fn add_bus_send(
 ) -> Result<(), String> {
     let id = parse_bus_id(&bus_id)?;
     state
-        .lock()
+        .engine()?
         .add_bus_send(id, send)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_bus_send(
     state: tauri::State<'_, EngineHandle>,
     bus_id: String,
@@ -1356,7 +1413,7 @@ fn remove_bus_send(
 ) -> Result<(), String> {
     let id = parse_bus_id(&bus_id)?;
     state
-        .lock()
+        .engine()?
         .remove_bus_send(id, index)
         .map_err(|e| e.to_string())
 }
@@ -1442,9 +1499,10 @@ struct UiRenderOutcome {
 }
 
 /// Phase 8 — kick off a sequence render via the encoder sidecar.
-/// Blocks until the encode is complete. Background queue + cancellation
-/// land with 8.5.
-#[tauri::command]
+/// Resolves when the encode is complete; `cancel_export` stops it.
+// Intentional: async (off the main thread), so the UI stays responsive and
+// `cancel_export` can get through during the export.
+#[tauri::command(async)]
 fn render_sequence(
     state: tauri::State<'_, EngineHandle>,
     req: UiRenderRequest,
@@ -1477,9 +1535,9 @@ fn render_sequence(
         end_seconds: req.end_seconds,
         hdr: req.hdr,
     };
+    // Other commands answer "Export in progress" meanwhile.
     let outcome = state
-        .lock()
-        .render_sequence(opts)
+        .run_export(|engine| engine.render_sequence(opts))?
         .map_err(|e| e.to_string())?;
     Ok(UiRenderOutcome {
         output_path: outcome.output_path,
@@ -1490,12 +1548,12 @@ fn render_sequence(
 }
 
 /// Phase 8.7 — render-and-replace request from the UI.
+// Intentional: no `preset` / `crf`. Render-and-replace always writes ProRes
+// 4444 (the track's transparency, decision 2); serde ignores the fields an
+// older UI still sends.
 #[derive(serde::Deserialize, Clone, Debug)]
 struct UiRenderAndReplaceRequest {
     output_path: String,
-    preset: String,
-    #[serde(default)]
-    crf: Option<u8>,
     #[serde(default)]
     width: Option<u32>,
     #[serde(default)]
@@ -1516,36 +1574,18 @@ struct UiRenderAndReplaceOutcome {
 /// media file + replace the range on `track_id` with a clip
 /// referencing it. Composes render_sequence + import_media_file +
 /// OverwriteClip into one undoable operation.
-#[tauri::command]
+// Intentional: async for the same reason as `render_sequence`.
+#[tauri::command(async)]
 fn render_and_replace(
     state: tauri::State<'_, EngineHandle>,
     req: UiRenderAndReplaceRequest,
 ) -> Result<UiRenderAndReplaceOutcome, String> {
-    let preset = match req.preset.as_str() {
-        "ProRes422HQ" => vance_encoder::EncoderPreset::ProRes422HQ,
-        "ProRes422" => vance_encoder::EncoderPreset::ProRes422,
-        "ProRes4444" => vance_encoder::EncoderPreset::ProRes4444,
-        "DnxhrHq" => vance_encoder::EncoderPreset::DnxhrHq,
-        "DnxhrSq" => vance_encoder::EncoderPreset::DnxhrSq,
-        "DnxhrLb" => vance_encoder::EncoderPreset::DnxhrLb,
-        "H264" => vance_encoder::EncoderPreset::H264 {
-            crf: req.crf.unwrap_or(23),
-        },
-        "Hevc" => vance_encoder::EncoderPreset::Hevc {
-            crf: req.crf.unwrap_or(28),
-        },
-        "Av1" => vance_encoder::EncoderPreset::Av1 {
-            crf: req.crf.unwrap_or(30),
-        },
-        other => return Err(format!("unknown preset `{other}`")),
-    };
     let track_uuid: uuid::Uuid = req
         .track_id
         .parse()
         .map_err(|e| format!("invalid track id: {e}"))?;
     let opts = crate::engine::RenderAndReplaceOptions {
         output_path: req.output_path,
-        preset,
         width: req.width,
         height: req.height,
         track_id: vance_timeline::TrackId::from_uuid(track_uuid),
@@ -1553,8 +1593,7 @@ fn render_and_replace(
         end_seconds: req.end_seconds,
     };
     let outcome = state
-        .lock()
-        .render_and_replace(opts)
+        .run_export(|engine| engine.render_and_replace(opts))?
         .map_err(|e| e.to_string())?;
     Ok(UiRenderAndReplaceOutcome {
         render: UiRenderOutcome {
@@ -1570,7 +1609,7 @@ fn render_and_replace(
 
 /// Phase 9.4 — enqueue a proxy generation job. Returns the job id.
 /// `codec` is `"prores"` (default) or `"dnxhr_lb"`.
-#[tauri::command]
+#[tauri::command(async)]
 fn enqueue_proxy_generation(
     state: tauri::State<'_, EngineHandle>,
     source_path: String,
@@ -1582,7 +1621,7 @@ fn enqueue_proxy_generation(
         .map(crate::proxy::ProxyCodec::from_ui_str)
         .unwrap_or_default();
     state
-        .lock()
+        .engine()?
         .enqueue_proxy_generation(source_path, output_path, codec)
         .map_err(|e| e.to_string())
 }
@@ -1601,33 +1640,35 @@ struct UiProxyJobSnapshot {
 }
 
 /// Phase 9.4 — poll proxy-generation status. Safe to call at any rate.
-#[tauri::command]
-fn proxy_jobs(state: tauri::State<'_, EngineHandle>) -> Vec<UiProxyJobSnapshot> {
-    state
-        .lock()
-        .proxy_jobs_snapshot()
-        .into_iter()
-        .map(|j| {
-            let (st, frames_done, error) = match j.status {
-                crate::proxy::ProxyJobStatus::Queued => ("queued", None, None),
-                crate::proxy::ProxyJobStatus::Running { frames_done } => {
-                    ("running", Some(frames_done), None)
+#[tauri::command(async)]
+fn proxy_jobs(state: tauri::State<'_, EngineHandle>) -> Result<Vec<UiProxyJobSnapshot>, String> {
+    Ok({
+        state
+            .engine()?
+            .proxy_jobs_snapshot()
+            .into_iter()
+            .map(|j| {
+                let (st, frames_done, error) = match j.status {
+                    crate::proxy::ProxyJobStatus::Queued => ("queued", None, None),
+                    crate::proxy::ProxyJobStatus::Running { frames_done } => {
+                        ("running", Some(frames_done), None)
+                    }
+                    crate::proxy::ProxyJobStatus::Done { frames_done } => {
+                        ("done", Some(frames_done), None)
+                    }
+                    crate::proxy::ProxyJobStatus::Error(msg) => ("error", None, Some(msg)),
+                };
+                UiProxyJobSnapshot {
+                    id: j.id,
+                    source_path: j.source_path,
+                    output_path: j.output_path,
+                    state: st,
+                    frames_done,
+                    error,
                 }
-                crate::proxy::ProxyJobStatus::Done { frames_done } => {
-                    ("done", Some(frames_done), None)
-                }
-                crate::proxy::ProxyJobStatus::Error(msg) => ("error", None, Some(msg)),
-            };
-            UiProxyJobSnapshot {
-                id: j.id,
-                source_path: j.source_path,
-                output_path: j.output_path,
-                state: st,
-                frames_done,
-                error,
-            }
-        })
-        .collect()
+            })
+            .collect()
+    })
 }
 
 /// Phase 10 — UI descriptor for one discovered WASM plugin.
@@ -1655,9 +1696,9 @@ struct UiWasmPlugin {
 }
 
 /// Phase 10.3 — rescan the plugin folders. Returns the count found.
-#[tauri::command]
-fn rescan_plugins(state: tauri::State<'_, EngineHandle>) -> usize {
-    state.lock().rescan_plugins()
+#[tauri::command(async)]
+fn rescan_plugins(state: tauri::State<'_, EngineHandle>) -> Result<usize, String> {
+    Ok(state.engine()?.rescan_plugins())
 }
 
 /// Map a discovered plugin to its UI descriptor.
@@ -1690,21 +1731,23 @@ fn ui_wasm_plugin(d: &vance_plugin_sdk::discovery::DiscoveredPlugin) -> UiWasmPl
 /// Phase 10.5 — list discovered WASM plugins for the effects browser.
 /// Triggers a rescan first so freshly-dropped plugins appear without
 /// a restart.
-#[tauri::command]
-fn list_wasm_plugins(state: tauri::State<'_, EngineHandle>) -> Vec<UiWasmPlugin> {
-    let mut eng = state.lock();
-    eng.rescan_plugins();
-    eng.discovered_plugins()
-        .iter()
-        .map(ui_wasm_plugin)
-        .collect()
+#[tauri::command(async)]
+fn list_wasm_plugins(state: tauri::State<'_, EngineHandle>) -> Result<Vec<UiWasmPlugin>, String> {
+    Ok({
+        let mut eng = state.engine()?;
+        eng.rescan_plugins();
+        eng.discovered_plugins()
+            .iter()
+            .map(ui_wasm_plugin)
+            .collect()
+    })
 }
 
 /// Uninstall an add-on effect by id: delete its `.wasm` from the managed
 /// add-ons folder and rescan. Refuses to touch project-bundled effects.
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_wasm_plugin(state: tauri::State<'_, EngineHandle>, id: String) -> Result<(), String> {
-    let mut eng = state.lock();
+    let mut eng = state.engine()?;
     eng.rescan_plugins();
     let path = eng
         .discovered_plugins()
@@ -1736,7 +1779,7 @@ fn plugins_folder() -> Result<String, String> {
 /// Install a dropped/imported `.wasm` add-on effect: copy it into the managed
 /// add-ons folder, rescan, and return the newly-usable effect — or an error if
 /// the file isn't a valid Vance effect. So the user never touches a folder.
-#[tauri::command]
+#[tauri::command(async)]
 fn add_wasm_plugin(
     state: tauri::State<'_, EngineHandle>,
     source: String,
@@ -1760,7 +1803,7 @@ fn add_wasm_plugin(
 
     std::fs::copy(&src, &dest).map_err(|e| format!("saving the effect: {e}"))?;
 
-    let mut eng = state.lock();
+    let mut eng = state.engine()?;
     eng.rescan_plugins();
     let found = eng
         .discovered_plugins()
@@ -1800,42 +1843,44 @@ struct UiOfxCatalog {
 /// crashes only the sidecar). Read-only catalog: OFX plugins are not
 /// yet runnable in the render pipeline (post-v1). Returns an empty
 /// catalog when the sidecar binary is absent.
-#[tauri::command]
-fn list_ofx_plugins(_state: tauri::State<'_, EngineHandle>) -> UiOfxCatalog {
-    let bin = match locate_ofx_host_binary() {
-        Some(p) => p,
-        None => return UiOfxCatalog::default(),
-    };
-    let mut client = match vance_ofx::OfxHostClient::spawn(&bin) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(?e, "ofx host spawn failed");
-            return UiOfxCatalog::default();
+#[tauri::command(async)]
+fn list_ofx_plugins(_state: tauri::State<'_, EngineHandle>) -> Result<UiOfxCatalog, String> {
+    Ok({
+        let bin = match locate_ofx_host_binary() {
+            Some(p) => p,
+            None => return Ok(UiOfxCatalog::default()),
+        };
+        let mut client = match vance_ofx::OfxHostClient::spawn(&bin) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(?e, "ofx host spawn failed");
+                return Ok(UiOfxCatalog::default());
+            }
+        };
+        let (plugins, errors) = match client.list_plugins(Vec::new()) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(?e, "ofx list_plugins failed");
+                let _ = client.shutdown();
+                return Ok(UiOfxCatalog::default());
+            }
+        };
+        let _ = client.shutdown();
+        UiOfxCatalog {
+            plugins: plugins
+                .into_iter()
+                .map(|p| UiOfxPlugin {
+                    bundle: p.bundle,
+                    identifier: p.identifier,
+                    api: p.api,
+                    api_version: p.api_version,
+                    version_major: p.version_major,
+                    version_minor: p.version_minor,
+                })
+                .collect(),
+            errors,
         }
-    };
-    let (plugins, errors) = match client.list_plugins(Vec::new()) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(?e, "ofx list_plugins failed");
-            let _ = client.shutdown();
-            return UiOfxCatalog::default();
-        }
-    };
-    let _ = client.shutdown();
-    UiOfxCatalog {
-        plugins: plugins
-            .into_iter()
-            .map(|p| UiOfxPlugin {
-                bundle: p.bundle,
-                identifier: p.identifier,
-                api: p.api,
-                api_version: p.api_version,
-                version_major: p.version_major,
-                version_minor: p.version_minor,
-            })
-            .collect(),
-        errors,
-    }
+    })
 }
 
 /// Locate the `vance-ofx-host` sidecar binary (next to the app exe, or
@@ -1863,14 +1908,17 @@ fn locate_ofx_host_binary() -> Option<std::path::PathBuf> {
 }
 
 /// Phase 9.5 — toggle the project-level "use proxies" flag.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_use_proxies(state: tauri::State<'_, EngineHandle>, on: bool) -> Result<(), String> {
-    state.lock().set_use_proxies(on).map_err(|e| e.to_string())
+    state
+        .engine()?
+        .set_use_proxies(on)
+        .map_err(|e| e.to_string())
 }
 
 /// Phase 9.5 — register a proxy file for a media item. Passing
 /// `null` clears it.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_media_proxy_path(
     state: tauri::State<'_, EngineHandle>,
     media_id: String,
@@ -1880,7 +1928,7 @@ fn set_media_proxy_path(
     let id = vance_timeline::MediaItemId::from_uuid(uuid);
     let path = proxy_path.map(std::path::PathBuf::from);
     state
-        .lock()
+        .engine()?
         .set_media_proxy_path(id, path)
         .map_err(|e| e.to_string())
 }
@@ -1888,7 +1936,7 @@ fn set_media_proxy_path(
 // ---- GOAT-3: Avid-grade bins (custom columns + smart bins) ----------------
 
 /// Set or clear (value=null) a custom-column value on a media item.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_media_metadata(
     state: tauri::State<'_, EngineHandle>,
     media_id: String,
@@ -1898,58 +1946,63 @@ fn set_media_metadata(
     let uuid: uuid::Uuid = media_id.parse().map_err(|e| format!("bad media id: {e}"))?;
     let id = vance_timeline::MediaItemId::from_uuid(uuid);
     state
-        .lock()
+        .engine()?
         .set_media_metadata(id, key, value)
         .map_err(|e| e.to_string())
 }
 
 /// Media ids matching a query (the browser filter box / deep search).
-#[tauri::command]
+#[tauri::command(async)]
 fn query_media(
     state: tauri::State<'_, EngineHandle>,
     query: vance_timeline::MediaQuery,
-) -> Vec<String> {
-    state.lock().query_media(&query)
+) -> Result<Vec<String>, String> {
+    Ok(state.engine()?.query_media(&query))
 }
 
 /// Union of custom-column keys across the library (the browser's columns).
-#[tauri::command]
-fn custom_columns(state: tauri::State<'_, EngineHandle>) -> Vec<String> {
-    state.lock().custom_columns()
+#[tauri::command(async)]
+fn custom_columns(state: tauri::State<'_, EngineHandle>) -> Result<Vec<String>, String> {
+    Ok(state.engine()?.custom_columns())
 }
 
 /// Add a smart bin (saved search). Returns its id.
-#[tauri::command]
+#[tauri::command(async)]
 fn add_smart_bin(
     state: tauri::State<'_, EngineHandle>,
     name: String,
     query: vance_timeline::MediaQuery,
 ) -> Result<String, String> {
     state
-        .lock()
+        .engine()?
         .add_smart_bin(name, query)
         .map_err(|e| e.to_string())
 }
 
 /// Remove a smart bin by id. Returns whether one was removed.
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_smart_bin(state: tauri::State<'_, EngineHandle>, id: String) -> Result<bool, String> {
     state
-        .lock()
+        .engine()?
         .remove_smart_bin(&id)
         .map_err(|e| e.to_string())
 }
 
 /// All smart bins (for the browser sidebar).
-#[tauri::command]
-fn smart_bins(state: tauri::State<'_, EngineHandle>) -> Vec<vance_timeline::SmartBin> {
-    state.lock().smart_bins()
+#[tauri::command(async)]
+fn smart_bins(
+    state: tauri::State<'_, EngineHandle>,
+) -> Result<Vec<vance_timeline::SmartBin>, String> {
+    Ok(state.engine()?.smart_bins())
 }
 
 /// Current member ids of a smart bin.
-#[tauri::command]
-fn smart_bin_members(state: tauri::State<'_, EngineHandle>, id: String) -> Vec<String> {
-    state.lock().smart_bin_members(&id)
+#[tauri::command(async)]
+fn smart_bin_members(
+    state: tauri::State<'_, EngineHandle>,
+    id: String,
+) -> Result<Vec<String>, String> {
+    Ok(state.engine()?.smart_bin_members(&id))
 }
 
 /// Phase 9.2 — poll frame-cache stats.
@@ -1966,22 +2019,24 @@ struct UiCacheStats {
     hit_ratio: f64,
 }
 
-#[tauri::command]
-fn frame_cache_stats(state: tauri::State<'_, EngineHandle>) -> UiCacheStats {
-    if let Some(s) = state.lock().frame_cache_stats() {
-        UiCacheStats {
-            ring_count: s.ring_count as u64,
-            ring_total_bytes: s.ring_total_bytes as u64,
-            disk_entries: s.disk_entries as u64,
-            disk_bytes: s.disk_bytes,
-            ring_hits: s.ring_hits,
-            disk_hits: s.disk_hits,
-            misses: s.misses,
-            hit_ratio: s.hit_ratio(),
+#[tauri::command(async)]
+fn frame_cache_stats(state: tauri::State<'_, EngineHandle>) -> Result<UiCacheStats, String> {
+    Ok({
+        if let Some(s) = state.engine()?.frame_cache_stats() {
+            UiCacheStats {
+                ring_count: s.ring_count as u64,
+                ring_total_bytes: s.ring_total_bytes as u64,
+                disk_entries: s.disk_entries as u64,
+                disk_bytes: s.disk_bytes,
+                ring_hits: s.ring_hits,
+                disk_hits: s.disk_hits,
+                misses: s.misses,
+                hit_ratio: s.hit_ratio(),
+            }
+        } else {
+            UiCacheStats::default()
         }
-    } else {
-        UiCacheStats::default()
-    }
+    })
 }
 
 /// Phase 7.10 / 7.11 — UI-facing plugin descriptor.
@@ -1998,7 +2053,7 @@ struct UiPluginDescriptor {
 /// `vance-plugin-host` sidecar can host on the current system.
 /// Returns an empty list (NOT an error) when the sidecar binary is
 /// not present so the UI degrades gracefully.
-#[tauri::command]
+#[tauri::command(async)]
 fn list_audio_plugins(
     _state: tauri::State<'_, EngineHandle>,
 ) -> Result<Vec<UiPluginDescriptor>, String> {
@@ -2082,7 +2137,7 @@ struct UiPluginParam {
 /// then tears down — mirroring [`list_audio_plugins`]. Returns an empty
 /// list (not an error) when the sidecar / plugin can't be loaded, so the
 /// UI degrades gracefully.
-#[tauri::command]
+#[tauri::command(async)]
 fn list_plugin_params(
     format: String,
     id: String,
@@ -2166,50 +2221,56 @@ fn locate_plugin_host_binary() -> Option<std::path::PathBuf> {
 /// time_base_den) = (1, 48_000)` and a PTS computed from
 /// `timelineSeconds * 48000`.
 /// Begin a scrub session (warm up the decoder + output) on drag-start.
-#[tauri::command]
+#[tauri::command(async)]
 fn scrub_begin(state: tauri::State<'_, EngineHandle>) -> Result<(), String> {
-    state.lock().scrub_begin().map_err(|e| e.to_string())
+    state.engine()?.scrub_begin().map_err(|e| e.to_string())
 }
 
 /// Play a sample-accurate grain of mixed audio at `at_seconds`. Replaces
 /// the previous grain so the audio tracks the playhead.
-#[tauri::command]
+#[tauri::command(async)]
 fn scrub_grain(state: tauri::State<'_, EngineHandle>, at_seconds: f64) -> Result<(), String> {
     state
-        .lock()
+        .engine()?
         .scrub_grain(at_seconds)
         .map_err(|e| e.to_string())
 }
 
 /// End the scrub session (tear down the output + warm decoder).
-#[tauri::command]
+#[tauri::command(async)]
 fn scrub_end(state: tauri::State<'_, EngineHandle>) -> Result<(), String> {
-    state.lock().scrub_end();
+    state.engine()?.scrub_end();
     Ok(())
 }
 
 /// Phase 7.5 M1: read the latest mixer metering snapshot. Cheap
 /// ArcSwap load; safe to poll at 30Hz from the UI.
-#[tauri::command]
-fn meter_snapshot(state: tauri::State<'_, EngineHandle>) -> Option<UiMeterSnapshot> {
-    let snap = state.lock().meter_snapshot()?;
-    let tracks = snap
-        .tracks
-        .into_iter()
-        .map(|(uuid, m)| (uuid.to_string(), m.into()))
-        .collect();
-    let loudness = UiLoudness {
-        lufs_m: snap.loudness.lufs_m,
-        lufs_s: snap.loudness.lufs_s,
-        lufs_i: snap.loudness.lufs_i,
-        true_peak_l_db: vance_audio::loudness::lin_to_dbfs(snap.master_true_peak[0]),
-        true_peak_r_db: vance_audio::loudness::lin_to_dbfs(snap.master_true_peak[1]),
-    };
-    Some(UiMeterSnapshot {
-        master: snap.master.into(),
-        tracks,
-        generation: snap.generation,
-        loudness,
+#[tauri::command(async)]
+fn meter_snapshot(
+    state: tauri::State<'_, EngineHandle>,
+) -> Result<Option<UiMeterSnapshot>, String> {
+    Ok({
+        let Some(snap) = state.engine()?.meter_snapshot() else {
+            return Ok(None);
+        };
+        let tracks = snap
+            .tracks
+            .into_iter()
+            .map(|(uuid, m)| (uuid.to_string(), m.into()))
+            .collect();
+        let loudness = UiLoudness {
+            lufs_m: snap.loudness.lufs_m,
+            lufs_s: snap.loudness.lufs_s,
+            lufs_i: snap.loudness.lufs_i,
+            true_peak_l_db: vance_audio::loudness::lin_to_dbfs(snap.master_true_peak[0]),
+            true_peak_r_db: vance_audio::loudness::lin_to_dbfs(snap.master_true_peak[1]),
+        };
+        Some(UiMeterSnapshot {
+            master: snap.master.into(),
+            tracks,
+            generation: snap.generation,
+            loudness,
+        })
     })
 }
 
@@ -2247,7 +2308,7 @@ fn parse_keyframes(kfs: Vec<UiKeyframe>) -> Result<Vec<vance_timeline::Keyframe>
 
 /// Phase 7.4: replace a track's gain automation lane. Empty list =
 /// revert to the static `Track.gain_db`.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_track_gain_keyframes(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -2258,13 +2319,13 @@ fn set_track_gain_keyframes(
         .map_err(|e| format!("invalid track id: {e}"))?;
     let parsed = parse_keyframes(keyframes)?;
     state
-        .lock()
+        .engine()?
         .set_track_gain_keyframes(vance_timeline::TrackId::from_uuid(track_uuid), parsed)
         .map_err(|e| e.to_string())
 }
 
 /// Phase 7.4: replace a clip's gain automation lane (clip-relative time).
-#[tauri::command]
+#[tauri::command(async)]
 fn set_clip_gain_keyframes(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -2279,7 +2340,7 @@ fn set_clip_gain_keyframes(
         .map_err(|e| format!("invalid clip id: {e}"))?;
     let parsed = parse_keyframes(keyframes)?;
     state
-        .lock()
+        .engine()?
         .set_clip_gain_keyframes(
             vance_timeline::TrackId::from_uuid(track_uuid),
             vance_timeline::ClipId::from_uuid(clip_uuid),
@@ -2301,7 +2362,7 @@ fn parse_fade_curve(s: Option<String>) -> vance_timeline::FadeCurve {
 
 /// Phase 7.4 M3: set the clip's fade-in. `duration_seconds == 0.0`
 /// clears it. `curve` accepts `"linear" | "equal_power" | "logarithmic"`.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_clip_fade_in(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -2316,7 +2377,7 @@ fn set_clip_fade_in(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid clip id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .set_clip_fade_in(
             vance_timeline::TrackId::from_uuid(track_uuid),
             vance_timeline::ClipId::from_uuid(clip_uuid),
@@ -2327,7 +2388,7 @@ fn set_clip_fade_in(
 }
 
 /// Phase 7.4 M3: set the clip's fade-out. Mirror of [`set_clip_fade_in`].
-#[tauri::command]
+#[tauri::command(async)]
 fn set_clip_fade_out(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -2342,7 +2403,7 @@ fn set_clip_fade_out(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid clip id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .set_clip_fade_out(
             vance_timeline::TrackId::from_uuid(track_uuid),
             vance_timeline::ClipId::from_uuid(clip_uuid),
@@ -2353,7 +2414,7 @@ fn set_clip_fade_out(
 }
 
 /// Phase 7.3 mixer command: set a clip's mixer gain in dB.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_clip_gain_db(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -2367,7 +2428,7 @@ fn set_clip_gain_db(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid clip id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .set_clip_gain_db(
             vance_timeline::TrackId::from_uuid(track_uuid),
             vance_timeline::ClipId::from_uuid(clip_uuid),
@@ -2377,7 +2438,7 @@ fn set_clip_gain_db(
 }
 
 /// Phase 7.6: set a track's stereo pan. `pan ∈ [-1, +1]`.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_track_pan(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -2387,13 +2448,13 @@ fn set_track_pan(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid track id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .set_track_pan(vance_timeline::TrackId::from_uuid(track_uuid), pan)
         .map_err(|e| e.to_string())
 }
 
 /// Phase 7.6: set a clip's stereo pan. `pan ∈ [-1, +1]`.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_clip_pan(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -2407,7 +2468,7 @@ fn set_clip_pan(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid clip id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .set_clip_pan(
             vance_timeline::TrackId::from_uuid(track_uuid),
             vance_timeline::ClipId::from_uuid(clip_uuid),
@@ -2419,7 +2480,7 @@ fn set_clip_pan(
 /// Phase 7.7: append a built-in audio effect to a track's chain. The
 /// UI side passes a JSON `AudioEffectSpec` (tagged enum) — serde
 /// hydrates the typed variant before we dispatch.
-#[tauri::command]
+#[tauri::command(async)]
 fn add_audio_effect(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -2429,13 +2490,13 @@ fn add_audio_effect(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid track id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .add_audio_effect(vance_timeline::TrackId::from_uuid(track_uuid), effect)
         .map_err(|e| e.to_string())
 }
 
 /// Phase 7.7: remove the audio effect at `index` from a track's chain.
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_audio_effect(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -2445,13 +2506,13 @@ fn remove_audio_effect(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid track id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .remove_audio_effect(vance_timeline::TrackId::from_uuid(track_uuid), index)
         .map_err(|e| e.to_string())
 }
 
 /// Phase 7.7: reorder one effect within the chain.
-#[tauri::command]
+#[tauri::command(async)]
 fn move_audio_effect(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -2462,7 +2523,7 @@ fn move_audio_effect(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid track id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .move_audio_effect(
             vance_timeline::TrackId::from_uuid(track_uuid),
             from_index,
@@ -2473,7 +2534,7 @@ fn move_audio_effect(
 
 /// Phase 7.7: replace one effect's full spec — the call every knob
 /// commit goes through.
-#[tauri::command]
+#[tauri::command(async)]
 fn update_audio_effect(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -2484,7 +2545,7 @@ fn update_audio_effect(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid track id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .update_audio_effect(
             vance_timeline::TrackId::from_uuid(track_uuid),
             index,
@@ -2493,7 +2554,7 @@ fn update_audio_effect(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_effect_enabled(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -2511,7 +2572,7 @@ fn set_effect_enabled(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid effect id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .set_effect_enabled(
             vance_timeline::TrackId::from_uuid(track_uuid),
             vance_timeline::ClipId::from_uuid(clip_uuid),
@@ -2521,7 +2582,7 @@ fn set_effect_enabled(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn update_effect_params(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -2539,7 +2600,7 @@ fn update_effect_params(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid effect id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .update_effect_params(
             vance_timeline::TrackId::from_uuid(track_uuid),
             vance_timeline::ClipId::from_uuid(clip_uuid),
@@ -2549,7 +2610,7 @@ fn update_effect_params(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn preview_grade_params(
     state: tauri::State<'_, EngineHandle>,
     clip_id: String,
@@ -2563,7 +2624,7 @@ fn preview_grade_params(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid effect id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .preview_grade_params(
             vance_timeline::ClipId::from_uuid(clip_uuid),
             vance_timeline::EffectId::from_uuid(effect_uuid),
@@ -2572,7 +2633,7 @@ fn preview_grade_params(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_media_input_color_space(
     state: tauri::State<'_, EngineHandle>,
     media_id: String,
@@ -2582,7 +2643,7 @@ fn set_media_input_color_space(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid media id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .set_media_input_color_space(
             vance_timeline::MediaItemId::from_uuid(uuid),
             color_space.as_deref(),
@@ -2590,29 +2651,29 @@ fn set_media_input_color_space(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_project_working_color_space(
     state: tauri::State<'_, EngineHandle>,
     color_space: String,
 ) -> Result<(), String> {
     state
-        .lock()
+        .engine()?
         .set_project_working_color_space(&color_space)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_project_view_lut(
     state: tauri::State<'_, EngineHandle>,
     path: Option<String>,
 ) -> Result<(), String> {
     state
-        .lock()
+        .engine()?
         .set_project_view_lut(path.as_deref())
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_ocio_view_transform(
     state: tauri::State<'_, EngineHandle>,
     config: Option<String>,
@@ -2621,26 +2682,26 @@ fn set_ocio_view_transform(
     size: u32,
 ) -> Result<(), String> {
     state
-        .lock()
+        .engine()?
         .set_ocio_view_transform(config.as_deref(), &src, &dst, size)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn clear_ocio_view_transform(state: tauri::State<'_, EngineHandle>) -> Result<(), String> {
     state
-        .lock()
+        .engine()?
         .clear_ocio_view_transform()
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn ocio_list_colorspaces(
     state: tauri::State<'_, EngineHandle>,
     config: Option<String>,
 ) -> Result<Vec<String>, String> {
     state
-        .lock()
+        .engine()?
         .ocio_list_colorspaces(config.as_deref())
         .map_err(|e| e.to_string())
 }
@@ -2648,7 +2709,7 @@ fn ocio_list_colorspaces(
 /// Solo a grade node's HSL-qualifier matte to the viewport, or clear it
 /// (pass `effectId: null`). Transient viewer state — never persisted.
 /// Phase 6.9.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_matte_node(
     state: tauri::State<'_, EngineHandle>,
     clip_id: String,
@@ -2665,7 +2726,7 @@ fn set_matte_node(
         None => None,
     };
     state
-        .lock()
+        .engine()?
         .set_matte_node(vance_timeline::ClipId::from_uuid(clip_uuid), effect)
         .map_err(|e| e.to_string())
 }
@@ -2676,13 +2737,13 @@ fn set_matte_node(
 /// Apply ONE typed grading command (Phase 6.13). Convenience wrapper
 /// around `apply_grading_commands` with a single-element batch; produces
 /// one undo step on success.
-#[tauri::command]
+#[tauri::command(async)]
 fn apply_grading_command(
     state: tauri::State<'_, EngineHandle>,
     cmd: vance_grading_cmd::GradingCommand,
 ) -> Result<vance_grading_cmd::GradingCommandOutcome, String> {
     let mut outcomes = state
-        .lock()
+        .engine()?
         .apply_grading_batch(&[cmd], None)
         .map_err(|e| e.to_string())?;
     Ok(outcomes
@@ -2694,14 +2755,14 @@ fn apply_grading_command(
 /// turn. Sequence-affecting commands collapse into one `EditOp::Compound`
 /// (one undo step labeled `label`). Project-level / tracker commands run
 /// outside the compound and add their own entries.
-#[tauri::command]
+#[tauri::command(async)]
 fn apply_grading_commands(
     state: tauri::State<'_, EngineHandle>,
     cmds: Vec<vance_grading_cmd::GradingCommand>,
     label: Option<String>,
 ) -> Result<Vec<vance_grading_cmd::GradingCommandOutcome>, String> {
     state
-        .lock()
+        .engine()?
         .apply_grading_batch(&cmds, label)
         .map_err(|e| e.to_string())
 }
@@ -2714,7 +2775,7 @@ fn grading_command_schema() -> serde_json::Value {
         .unwrap_or(serde_json::Value::Null)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 // Intentional: a Tauri command's arguments are the named fields of its
 // IPC payload, so grouping them would change the frontend contract.
 #[allow(clippy::too_many_arguments)]
@@ -2738,7 +2799,7 @@ fn track_window(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid effect id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .track_window(
             vance_timeline::TrackId::from_uuid(track_uuid),
             vance_timeline::ClipId::from_uuid(clip_uuid),
@@ -2753,7 +2814,7 @@ fn track_window(
 
 /// GOAT-9 — smart reframe: track the subject then write a keyframed
 /// transform that keeps it centered for the target aspect.
-#[tauri::command]
+#[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
 fn smart_reframe(
     state: tauri::State<'_, EngineHandle>,
@@ -2776,7 +2837,7 @@ fn smart_reframe(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid clip id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .smart_reframe(
             vance_timeline::TrackId::from_uuid(t),
             vance_timeline::ClipId::from_uuid(c),
@@ -2793,9 +2854,9 @@ fn smart_reframe(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_scopes_enabled(state: tauri::State<'_, EngineHandle>, on: bool) -> Result<(), String> {
-    state.lock().set_scopes_enabled(on);
+    state.engine()?.set_scopes_enabled(on);
     Ok(())
 }
 
@@ -2804,7 +2865,7 @@ fn set_scopes_enabled(state: tauri::State<'_, EngineHandle>, on: bool) -> Result
 /// side receives an ArrayBuffer, avoiding JSON-stringification of the
 /// hundreds-of-thousands of integer counts. An empty response means
 /// "no update" (scopes disabled, playing, or no cached frame). Phase 6.12.
-#[tauri::command]
+#[tauri::command(async)]
 fn compute_scopes(
     state: tauri::State<'_, EngineHandle>,
     width: u32,
@@ -2813,14 +2874,14 @@ fn compute_scopes(
 ) -> Result<tauri::ipc::Response, String> {
     let cfg = vance_scopes::ScopeConfig::default();
     let data = state
-        .lock()
+        .engine()?
         .compute_scopes(cfg, width, height, pre_view_lut)
         .map_err(|e| e.to_string())?;
     let bytes = data.map(|d| d.to_bytes()).unwrap_or_default();
     Ok(tauri::ipc::Response::new(bytes))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 // Intentional: a Tauri command's arguments are the named fields of its
 // IPC payload, so grouping them would change the frontend contract.
 #[allow(clippy::too_many_arguments)]
@@ -2852,44 +2913,44 @@ fn create_title_media(
         bg_alpha,
     };
     state
-        .lock()
+        .engine()?
         .create_title_media(display_name, duration_seconds, params)
         .map_err(|e| e.to_string())
 }
 
 /// GOAT-5 — built-in MoGraph template catalog as `[key, name]` pairs.
-#[tauri::command]
-fn mograph_catalog(state: tauri::State<'_, EngineHandle>) -> Vec<(String, String)> {
-    state.lock().mograph_catalog()
+#[tauri::command(async)]
+fn mograph_catalog(state: tauri::State<'_, EngineHandle>) -> Result<Vec<(String, String)>, String> {
+    Ok(state.engine()?.mograph_catalog())
 }
 
 /// GOAT-5 — instantiate a built-in MoGraph template as a new media item.
-#[tauri::command]
+#[tauri::command(async)]
 fn create_mograph_media(
     state: tauri::State<'_, EngineHandle>,
     template_key: String,
     display_name: Option<String>,
 ) -> Result<MediaItemInfo, String> {
     state
-        .lock()
+        .engine()?
         .create_mograph_media(template_key, display_name)
         .map_err(|e| e.to_string())
 }
 
 /// GOAT-5 — the placed MoGraph instance (template + control values) for
 /// the control-editor panel.
-#[tauri::command]
+#[tauri::command(async)]
 fn mograph_instance(
     state: tauri::State<'_, EngineHandle>,
     media_id: String,
 ) -> Result<Option<vance_mograph::MographInstance>, String> {
     let uuid: uuid::Uuid = media_id.parse().map_err(|e| format!("bad media id: {e}"))?;
     let id = vance_timeline::MediaItemId::from_uuid(uuid);
-    Ok(state.lock().mograph_instance(id))
+    Ok(state.engine()?.mograph_instance(id))
 }
 
 /// GOAT-5 — set one control value on a MoGraph media item.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_mograph_value(
     state: tauri::State<'_, EngineHandle>,
     media_id: String,
@@ -2899,13 +2960,13 @@ fn set_mograph_value(
     let uuid: uuid::Uuid = media_id.parse().map_err(|e| format!("bad media id: {e}"))?;
     let id = vance_timeline::MediaItemId::from_uuid(uuid);
     state
-        .lock()
+        .engine()?
         .set_mograph_value(id, control_id, value)
         .map_err(|e| e.to_string())
 }
 
 /// GOAT-12 — create a new Fusion composition media item (starter graph).
-#[tauri::command]
+#[tauri::command(async)]
 fn create_fusion_media(
     state: tauri::State<'_, EngineHandle>,
     display_name: Option<String>,
@@ -2914,25 +2975,25 @@ fn create_fusion_media(
     duration_seconds: f64,
 ) -> Result<MediaItemInfo, String> {
     state
-        .lock()
+        .engine()?
         .create_fusion_media(display_name, width, height, duration_seconds)
         .map_err(|e| e.to_string())
 }
 
 /// GOAT-12 — the Fusion composition (whole node graph) for the node editor.
-#[tauri::command]
+#[tauri::command(async)]
 fn fusion_comp(
     state: tauri::State<'_, EngineHandle>,
     media_id: String,
 ) -> Result<Option<vance_fusion::Comp>, String> {
     let uuid: uuid::Uuid = media_id.parse().map_err(|e| format!("bad media id: {e}"))?;
     let id = vance_timeline::MediaItemId::from_uuid(uuid);
-    Ok(state.lock().fusion_comp(id))
+    Ok(state.engine()?.fusion_comp(id))
 }
 
 /// GOAT-12 — replace the Fusion composition on a media item (the editor
 /// pushes the whole edited graph back).
-#[tauri::command]
+#[tauri::command(async)]
 fn set_fusion_comp(
     state: tauri::State<'_, EngineHandle>,
     media_id: String,
@@ -2941,12 +3002,12 @@ fn set_fusion_comp(
     let uuid: uuid::Uuid = media_id.parse().map_err(|e| format!("bad media id: {e}"))?;
     let id = vance_timeline::MediaItemId::from_uuid(uuid);
     state
-        .lock()
+        .engine()?
         .set_fusion_comp(id, comp)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn add_transition_at_cut(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -2970,7 +3031,7 @@ fn add_transition_at_cut(
         return Err(format!("unknown transition kind: {kind}"));
     };
     state
-        .lock()
+        .engine()?
         .add_transition_at_cut(
             vance_timeline::TrackId::from_uuid(track_uuid),
             vance_timeline::ClipId::from_uuid(clip_uuid),
@@ -2980,7 +3041,7 @@ fn add_transition_at_cut(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_transition(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -2993,7 +3054,7 @@ fn remove_transition(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid transition id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .remove_transition(
             vance_timeline::TrackId::from_uuid(track_uuid),
             vance_timeline::TransitionId::from_uuid(transition_uuid),
@@ -3001,7 +3062,7 @@ fn remove_transition(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_transition_param(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -3016,7 +3077,7 @@ fn set_transition_param(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid transition id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .set_transition_param(
             vance_timeline::TrackId::from_uuid(track_uuid),
             vance_timeline::TransitionId::from_uuid(transition_uuid),
@@ -3026,7 +3087,7 @@ fn set_transition_param(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_clip(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -3039,7 +3100,7 @@ fn remove_clip(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid clip id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .remove_clip(
             vance_timeline::TrackId::from_uuid(track_uuid),
             vance_timeline::ClipId::from_uuid(clip_uuid),
@@ -3047,7 +3108,7 @@ fn remove_clip(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn move_clip_to(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -3061,7 +3122,7 @@ fn move_clip_to(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid clip id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .move_clip_to(
             vance_timeline::TrackId::from_uuid(track_uuid),
             vance_timeline::ClipId::from_uuid(clip_uuid),
@@ -3070,7 +3131,7 @@ fn move_clip_to(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn insert_clip_at(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -3084,7 +3145,7 @@ fn insert_clip_at(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid media id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .insert_clip_at(
             vance_timeline::TrackId::from_uuid(track_uuid),
             vance_timeline::MediaItemId::from_uuid(media_uuid),
@@ -3095,25 +3156,27 @@ fn insert_clip_at(
 
 // ---- GOAT-6: magnetic timeline + clip connections --------------------------
 
-#[tauri::command]
-fn is_magnetic(state: tauri::State<'_, EngineHandle>) -> bool {
-    state.lock().is_magnetic()
+#[tauri::command(async)]
+fn is_magnetic(state: tauri::State<'_, EngineHandle>) -> Result<bool, String> {
+    Ok(state.engine()?.is_magnetic())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_magnetic(state: tauri::State<'_, EngineHandle>, magnetic: bool) -> Result<(), String> {
     state
-        .lock()
+        .engine()?
         .set_magnetic(magnetic)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn clip_connections(state: tauri::State<'_, EngineHandle>) -> Vec<(String, String)> {
-    state.lock().connections()
+#[tauri::command(async)]
+fn clip_connections(
+    state: tauri::State<'_, EngineHandle>,
+) -> Result<Vec<(String, String)>, String> {
+    Ok(state.engine()?.connections())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn connect_clip(
     state: tauri::State<'_, EngineHandle>,
     anchor_id: String,
@@ -3126,7 +3189,7 @@ fn connect_clip(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("bad connected id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .connect_clip(
             vance_timeline::ClipId::from_uuid(a),
             vance_timeline::ClipId::from_uuid(c),
@@ -3134,7 +3197,7 @@ fn connect_clip(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn disconnect_clip(
     state: tauri::State<'_, EngineHandle>,
     connected_id: String,
@@ -3143,12 +3206,12 @@ fn disconnect_clip(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("bad clip id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .disconnect_clip(vance_timeline::ClipId::from_uuid(c))
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn magnetic_move_clip(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -3162,7 +3225,7 @@ fn magnetic_move_clip(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("bad clip id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .magnetic_move_clip(
             vance_timeline::TrackId::from_uuid(t),
             vance_timeline::ClipId::from_uuid(c),
@@ -3171,7 +3234,7 @@ fn magnetic_move_clip(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn append_clip(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -3184,7 +3247,7 @@ fn append_clip(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("bad media id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .append_clip(
             vance_timeline::TrackId::from_uuid(t),
             vance_timeline::MediaItemId::from_uuid(m),
@@ -3192,7 +3255,7 @@ fn append_clip(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn magnetic_ripple_delete(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -3205,7 +3268,7 @@ fn magnetic_ripple_delete(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("bad clip id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .magnetic_ripple_delete(
             vance_timeline::TrackId::from_uuid(t),
             vance_timeline::ClipId::from_uuid(c),
@@ -3213,7 +3276,7 @@ fn magnetic_ripple_delete(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn magnetic_ripple_insert(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -3227,7 +3290,7 @@ fn magnetic_ripple_insert(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("bad media id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .magnetic_ripple_insert(
             vance_timeline::TrackId::from_uuid(t),
             vance_timeline::MediaItemId::from_uuid(m),
@@ -3243,9 +3306,9 @@ fn parse_cue_id(s: &str) -> Result<vance_captions::CueId, String> {
         .map_err(|e| format!("bad cue id: {e}"))
 }
 
-#[tauri::command]
-fn captions(state: tauri::State<'_, EngineHandle>) -> Vec<vance_captions::Cue> {
-    state.lock().captions()
+#[tauri::command(async)]
+fn captions(state: tauri::State<'_, EngineHandle>) -> Result<Vec<vance_captions::Cue>, String> {
+    Ok(state.engine()?.captions())
 }
 
 // ---- GOAT-gated (collaboration): review comments ----------------------
@@ -3256,13 +3319,15 @@ fn parse_comment_id(s: &str) -> Result<vance_timeline::id::CommentId, String> {
 }
 
 /// All review comments on the current sequence (sorted by position).
-#[tauri::command]
-fn review_comments(state: tauri::State<'_, EngineHandle>) -> Vec<vance_timeline::ReviewComment> {
-    state.lock().review_comments()
+#[tauri::command(async)]
+fn review_comments(
+    state: tauri::State<'_, EngineHandle>,
+) -> Result<Vec<vance_timeline::ReviewComment>, String> {
+    Ok(state.engine()?.review_comments())
 }
 
 /// Add a review comment at `timeline_ms`. Returns its id.
-#[tauri::command]
+#[tauri::command(async)]
 fn add_review_comment(
     state: tauri::State<'_, EngineHandle>,
     timeline_ms: i64,
@@ -3273,24 +3338,24 @@ fn add_review_comment(
         return Err("comment text is empty".into());
     }
     state
-        .lock()
+        .engine()?
         .add_review_comment(timeline_ms, author, text)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_review_comment(
     state: tauri::State<'_, EngineHandle>,
     comment_id: String,
 ) -> Result<(), String> {
     let id = parse_comment_id(&comment_id)?;
     state
-        .lock()
+        .engine()?
         .remove_review_comment(id)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn resolve_review_comment(
     state: tauri::State<'_, EngineHandle>,
     comment_id: String,
@@ -3298,12 +3363,12 @@ fn resolve_review_comment(
 ) -> Result<(), String> {
     let id = parse_comment_id(&comment_id)?;
     state
-        .lock()
+        .engine()?
         .resolve_review_comment(id, resolved)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_review_comment_text(
     state: tauri::State<'_, EngineHandle>,
     comment_id: String,
@@ -3311,12 +3376,12 @@ fn set_review_comment_text(
 ) -> Result<(), String> {
     let id = parse_comment_id(&comment_id)?;
     state
-        .lock()
+        .engine()?
         .set_review_comment_text(id, text)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn reply_review_comment(
     state: tauri::State<'_, EngineHandle>,
     comment_id: String,
@@ -3328,12 +3393,12 @@ fn reply_review_comment(
     }
     let id = parse_comment_id(&comment_id)?;
     state
-        .lock()
+        .engine()?
         .reply_review_comment(id, author, text)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn add_caption(
     state: tauri::State<'_, EngineHandle>,
     start_ms: i64,
@@ -3341,18 +3406,21 @@ fn add_caption(
     text: String,
 ) -> Result<String, String> {
     state
-        .lock()
+        .engine()?
         .add_caption(start_ms, end_ms, text)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_caption(state: tauri::State<'_, EngineHandle>, cue_id: String) -> Result<(), String> {
     let id = parse_cue_id(&cue_id)?;
-    state.lock().remove_caption(id).map_err(|e| e.to_string())
+    state
+        .engine()?
+        .remove_caption(id)
+        .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_caption_text(
     state: tauri::State<'_, EngineHandle>,
     cue_id: String,
@@ -3360,12 +3428,12 @@ fn set_caption_text(
 ) -> Result<(), String> {
     let id = parse_cue_id(&cue_id)?;
     state
-        .lock()
+        .engine()?
         .set_caption_text(id, text)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_caption_timing(
     state: tauri::State<'_, EngineHandle>,
     cue_id: String,
@@ -3374,12 +3442,12 @@ fn set_caption_timing(
 ) -> Result<(), String> {
     let id = parse_cue_id(&cue_id)?;
     state
-        .lock()
+        .engine()?
         .set_caption_timing(id, start_ms, end_ms)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn split_caption(
     state: tauri::State<'_, EngineHandle>,
     cue_id: String,
@@ -3387,47 +3455,47 @@ fn split_caption(
 ) -> Result<(), String> {
     let id = parse_cue_id(&cue_id)?;
     state
-        .lock()
+        .engine()?
         .split_caption(id, at_ms)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn merge_caption_with_next(
     state: tauri::State<'_, EngineHandle>,
     cue_id: String,
 ) -> Result<(), String> {
     let id = parse_cue_id(&cue_id)?;
     state
-        .lock()
+        .engine()?
         .merge_caption_with_next(id)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn shift_all_captions(state: tauri::State<'_, EngineHandle>, delta_ms: i64) -> Result<(), String> {
     state
-        .lock()
+        .engine()?
         .shift_all_captions(delta_ms)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn import_captions(state: tauri::State<'_, EngineHandle>, path: String) -> Result<usize, String> {
     state
-        .lock()
+        .engine()?
         .import_captions(&path)
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn export_captions(
     state: tauri::State<'_, EngineHandle>,
     path: String,
     vtt: bool,
 ) -> Result<(), String> {
     state
-        .lock()
+        .engine()?
         .export_captions(&path, vtt)
         .map_err(|e| e.to_string())
 }
@@ -3441,7 +3509,7 @@ fn transcription_available() -> bool {
 /// Auto-transcribe a media item into captions. Runs the Whisper subprocess
 /// WITHOUT holding the engine lock (it can take minutes), then applies the
 /// result. Returns the cue count.
-#[tauri::command]
+#[tauri::command(async)]
 fn transcribe_media(
     state: tauri::State<'_, EngineHandle>,
     media_id: String,
@@ -3453,7 +3521,7 @@ fn transcribe_media(
     // Read the media path + capture the TARGET sequence under a brief lock,
     // then DROP it for the (slow) subprocess.
     let (path, target_seq) = {
-        let eng = state.lock();
+        let eng = state.engine()?;
         let path = eng
             .media_path_for(mid)
             .ok_or_else(|| "media has no file to transcribe".to_string())?;
@@ -3473,7 +3541,8 @@ fn transcribe_media(
     // user switched sequences / loaded a project mid-run and the cues would
     // overwrite the wrong timeline.
     {
-        let mut eng = state.lock();
+        // Intentional: waits an export out; the transcript is already made.
+        let mut eng = state.engine_after_export();
         if eng.current_sequence_id_string() != target_seq {
             return Err(
                 "the current sequence changed during transcription; captions were not applied"
@@ -3488,20 +3557,20 @@ fn transcribe_media(
 // ---- GOAT-8: dialogue leveling + voice isolation ---------------------------
 
 /// Measure a media item's integrated loudness (LUFS). Decodes off-lock.
-#[tauri::command]
+#[tauri::command(async)]
 fn analyze_loudness(
     state: tauri::State<'_, EngineHandle>,
     media_id: String,
 ) -> Result<Option<f32>, String> {
     let uuid: uuid::Uuid = media_id.parse().map_err(|e| format!("bad media id: {e}"))?;
     let mid = vance_timeline::MediaItemId::from_uuid(uuid);
-    let path = { state.lock().media_path_for(mid) };
+    let path = { state.engine()?.media_path_for(mid) };
     Ok(path.and_then(|p| engine::measure_loudness(&p)))
 }
 
 /// Auto dialogue leveling: measure a clip's loudness off-lock, then set its
 /// gain to land at `target_lufs`. Returns the applied gain in dB.
-#[tauri::command]
+#[tauri::command(async)]
 fn level_clip(
     state: tauri::State<'_, EngineHandle>,
     track_id: String,
@@ -3519,7 +3588,7 @@ fn level_clip(
     // Resolve the clip's media path + active source range under a brief
     // lock, measure only that region off-lock (correct for trimmed clips).
     let (path, start_sec, dur_sec) = {
-        let eng = state.lock();
+        let eng = state.engine()?;
         let (mid, start, dur) = eng
             .clip_media_and_range(tid, cid)
             .ok_or_else(|| "clip not found".to_string())?;
@@ -3534,7 +3603,8 @@ fn level_clip(
     // Re-validate the clip still exists before applying (it may have been
     // deleted during the off-lock measure).
     {
-        let mut eng = state.lock();
+        // Intentional: waits an export out; the measurement is already made.
+        let mut eng = state.engine_after_export();
         if eng.clip_media_and_range(tid, cid).is_none() {
             return Err("clip was removed during analysis".into());
         }
@@ -3558,7 +3628,7 @@ fn magic_mask_available() -> bool {
 
 /// GOAT-9 Magic Mask — isolate the subject of a media item (off-lock) and
 /// import the matted result as new media. Returns the new item's info.
-#[tauri::command]
+#[tauri::command(async)]
 fn magic_mask(
     state: tauri::State<'_, EngineHandle>,
     media_id: String,
@@ -3567,7 +3637,7 @@ fn magic_mask(
     let mid = vance_timeline::MediaItemId::from_uuid(uuid);
     let path = {
         state
-            .lock()
+            .engine()?
             .media_path_for(mid)
             .ok_or_else(|| "media has no file to mask".to_string())?
     };
@@ -3580,15 +3650,16 @@ fn magic_mask(
     std::fs::copy(&out, &dest).map_err(|e| format!("copy matte: {e}"))?;
     let dest_str = dest.to_string_lossy().into_owned();
     // Matted output has a video stream → the normal video import path works.
+    // Intentional: waits an export out; the matte is already made.
     state
-        .lock()
+        .engine_after_export()
         .import_media_file(&dest_str)
         .map_err(|e| e.to_string())
 }
 
 /// Isolate vocals from a media item (off-lock) and import the vocal stem as
 /// a new media item. Returns the new item's info.
-#[tauri::command]
+#[tauri::command(async)]
 fn isolate_voice(
     state: tauri::State<'_, EngineHandle>,
     media_id: String,
@@ -3597,7 +3668,7 @@ fn isolate_voice(
     let mid = vance_timeline::MediaItemId::from_uuid(uuid);
     let path = {
         state
-            .lock()
+            .engine()?
             .media_path_for(mid)
             .ok_or_else(|| "media has no file to isolate".to_string())?
     };
@@ -3615,9 +3686,10 @@ fn isolate_voice(
     std::fs::copy(&stems.vocals, &dest).map_err(|e| format!("copy stem: {e}"))?;
     let dest_str = dest.to_string_lossy().into_owned();
     // Audio-only stem → import via the audio-aware path (the video decoder
-    // would reject it with NoVideoStream).
+    // would reject it with NoVideoStream). Intentional: waits an export
+    // out; the stem is already made.
     state
-        .lock()
+        .engine_after_export()
         .import_audio_file(&dest_str)
         .map_err(|e| e.to_string())
 }
@@ -3729,10 +3801,17 @@ async fn generate_image(
 
     let produced = produced.map_err(|e| e.to_string())?;
     let path_str = produced.to_string_lossy().into_owned();
-    state
-        .lock()
-        .import_generated_image(&path_str, duration_seconds.unwrap_or(5.0))
-        .map_err(|e| e.to_string())
+    // Intentional: waits an export out (on a blocking thread); the image is
+    // already made.
+    let engine = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine
+            .engine_after_export()
+            .import_generated_image(&path_str, duration_seconds.unwrap_or(5.0))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("import task failed: {e}"))?
 }
 
 // ---- Phase 11: capabilities, settings, onboarding -------------------
@@ -4037,12 +4116,12 @@ fn publish_video(
     }
 }
 
-#[tauri::command]
-fn project_info(state: tauri::State<'_, EngineHandle>) -> Option<ProjectInfo> {
-    state.lock().project_info()
+#[tauri::command(async)]
+fn project_info(state: tauri::State<'_, EngineHandle>) -> Result<Option<ProjectInfo>, String> {
+    Ok(state.engine()?.project_info())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_current_sequence(
     state: tauri::State<'_, EngineHandle>,
     sequence_id: String,
@@ -4051,7 +4130,7 @@ fn set_current_sequence(
         .parse::<uuid::Uuid>()
         .map_err(|e| format!("invalid sequence id: {e}"))?;
     state
-        .lock()
+        .engine()?
         .set_current_sequence(SequenceId::from_uuid(uuid))
         .map_err(|e| e.to_string())
 }
@@ -4522,8 +4601,13 @@ fn main() {
             nodegraph::nodegraph_compile,
             compositing_cmds::add_track,
             compositing_cmds::remove_track,
+            compositing_cmds::rename_track,
             compositing_cmds::move_track,
             compositing_cmds::set_track_enabled,
+            compositing_cmds::set_track_locked,
+            cancel_export,
+            export_status,
+            cancel_import,
             compositing_cmds::set_clip_blend_mode,
             compositing_cmds::set_frame_size,
             compositing_cmds::set_matte_view,

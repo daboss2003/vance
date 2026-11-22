@@ -1,38 +1,18 @@
-// Phase 1 video viewport shader.
+// Phase 1 video viewport shader (the legacy single-clip path).
 //
-// Inputs: three R8 luminance textures — Y at full resolution, U and V at
-// half resolution. (NV12 sources are split into separate U and V CPU-side
-// at upload; this shader is format-agnostic.)
-//
-// Color: Rec.709 limited-range YUV → linear-light Rec.709 RGB. NOT color
-// managed; that's Phase 6.
+// Inputs: the frame's plane textures — Y, U, V (R8, or R16Unorm for
+// 10-bit); Y + an interleaved UV (Rg8) for NV12; or one straight-alpha RGBA8
+// texture in the Y slot (`Params.source`). The colour pipeline (range, YUV
+// matrix, transfers, primaries) comes from `Params`.
 
-// Fullscreen triangle. Generates UVs in [0,1] for a triangle that covers
-// the whole viewport when rasterized.
-struct VsOut {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
-    // Three vertices forming a triangle larger than the viewport.
-    // (-1,-1), (3,-1), (-1,3) in clip space → UVs (0,1), (2,1), (0,-1).
-    var out: VsOut;
-    let x = f32(((vid << 1u) & 2u));   // 0, 2, 0
-    let y = f32((vid & 2u));            // 0, 0, 2
-    out.clip_position = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
-    out.uv = vec2<f32>(x, y);
-    return out;
-}
+// Shared code: common.wgsl (transfer functions, YUV, fullscreen vertex
+// shader) and grade.wgsl (grade nodes) are concatenated in front of this
+// file at pipeline build time — see `renderer::wgsl`.
 
 @group(0) @binding(0) var samp: sampler;
-@group(0) @binding(1) var tex_y_a: texture_2d<f32>;
-@group(0) @binding(2) var tex_u_a: texture_2d<f32>;
-@group(0) @binding(3) var tex_v_a: texture_2d<f32>;
-@group(0) @binding(5) var tex_y_b: texture_2d<f32>;
-@group(0) @binding(6) var tex_u_b: texture_2d<f32>;
-@group(0) @binding(7) var tex_v_b: texture_2d<f32>;
+@group(0) @binding(1) var tex_y: texture_2d<f32>;
+@group(0) @binding(2) var tex_u: texture_2d<f32>;
+@group(0) @binding(3) var tex_v: texture_2d<f32>;
 @group(0) @binding(8) var tex_lut: texture_3d<f32>;
 @group(0) @binding(9) var tex_view_lut: texture_3d<f32>;
 // Curve LUT atlas (Phase 6.8): 256 wide × 8 rows (one per grade node).
@@ -49,12 +29,11 @@ struct Params {
     brightness: f32,
     contrast: f32,
     crop_lrtb: vec4<f32>,
-    // (mix_factor, sample_scale_a, sample_scale_b, _pad) — the transition
-    // blend factor plus the per-side YUV sample scale (1.0 for 8-bit,
-    // 65535/1023 for 10-bit R16Unorm sources). A 16-byte-aligned vec4 at
-    // offset 48, matching Rust's `mix_factor + sample_scale + sample_scale_b
-    // + _pad0`.
-    mix_misc: vec4<f32>,
+    // (sample_scale, pixel_aspect, _, _) — the YUV sample scale (1.0 for
+    // 8-bit, 65535/1023 for 10-bit R16Unorm sources) and the frame's pixel
+    // aspect. A 16-byte-aligned vec4 at offset 48, matching Rust's
+    // `sample_scale + pixel_aspect + _pad0`.
+    misc: vec4<f32>,
     // (r, g, b, enable) — chroma key color + on/off.
     chroma_key: vec4<f32>,
     // (tolerance, softness, _, _) — match radius + falloff width.
@@ -73,6 +52,9 @@ struct Params {
     lut_params: vec4<f32>,
     // View-LUT enable. Applies post-output as a monitoring stage.
     view_lut_params: vec4<f32>,
+    // (YUV matrix, source kind A, source kind B, 10-bit R16Unorm planes:
+    // bit 0 = A, bit 1 = B). Kinds are SRC_* (common.wgsl).
+    source: vec4<u32>,
     // Number of active grade nodes; only .x is read.
     grade_count: vec4<u32>,
     // Serial color-grade chain (Phase 6.6/6.7/6.9/6.10). Must match the
@@ -80,258 +62,12 @@ struct Params {
     grades: array<GradeNode, 8>,
 };
 
-// One color-grade node. Layout mirrors `GradeNode` in renderer.rs.
-struct GradeNode {
-    lift: vec4<f32>,        // (r, g, b, master)
-    gamma: vec4<f32>,       // (r, g, b, master)
-    gain: vec4<f32>,        // (r, g, b, master)
-    log_offset: vec4<f32>,  // (offset_r, offset_g, offset_b, _)
-    log_smh: vec4<f32>,     // (.x = curves non-identity flag)
-    flags: vec4<f32>,       // (enabled, mode 0=primary/1=log/2=curves, qual_enable, qual_invert)
-    qual_a: vec4<f32>,      // (hue_center, hue_range, sat_lo, sat_hi)
-    qual_b: vec4<f32>,      // (luma_lo, luma_hi, hue_soft, sat_soft)
-    qual_c: vec4<f32>,      // (luma_soft, show_mask, _, _)
-    win_a: vec4<f32>,       // (shape 0=off/1=ellipse/2=rect, center_x, center_y, rotation_rad)
-    win_b: vec4<f32>,       // (half_size_x, half_size_y, feather, invert)
-};
 @group(0) @binding(4) var<uniform> params: Params;
 
 // Set by apply_grades when a node's qualifier "show mask" is on; fs_main
 // returns the raw grayscale matte BEFORE the downstream contrast / keys /
 // output matrix / view-LUT (which would otherwise tint it). Per-invocation.
 var<private> g_matte_hit: bool = false;
-
-// Primary grade: per-channel lift/gamma/gain with a master fold.
-// DaVinci-style (NOT ASC-CDL): the gamma exponent is the RECIPROCAL,
-// so gamma > 1 brightens midtones. Order: out = pow(max(in*gain +
-// lift, 0), 1/gamma), channelwise. We do NOT clamp the upper bound —
-// values may exceed 1.0 between nodes so a later node can pull a
-// highlight back down (true serial-chain behavior); the pow base is
-// only floored at 0 because pow of a negative base is undefined.
-fn apply_primary(rgb: vec3<f32>, n: GradeNode) -> vec3<f32> {
-    let gain = n.gain.xyz * n.gain.w;
-    let lift = n.lift.xyz + vec3<f32>(n.lift.w);
-    // Guard gamma away from 0; master multiplies the per-channel gamma.
-    let gamma = max(n.gamma.xyz * n.gamma.w, vec3<f32>(1e-3));
-    let lifted = max(rgb * gain + lift, vec3<f32>(0.0));
-    return pow(lifted, vec3<f32>(1.0) / gamma);
-}
-
-// Log grade: an overall offset plus tonal-band shadow / midtone /
-// highlight balances. Shadow rides `lift.xyz`, midtone `gamma.xyz`,
-// highlight `gain.xyz` (see GradeNodeParams::to_gpu in renderer.rs).
-// The bands are windowed in a PERCEPTUAL encoding (approx gamma-2.2 of
-// the linear luma) so "midtone" lands near perceptual mid-gray
-// (linear ~0.18) rather than linear 0.5 — matching what a colorist's
-// eye expects from a printer-lights/log tool. No upper clamp, for the
-// same serial-chain reason as apply_primary.
-fn apply_log(rgb: vec3<f32>, n: GradeNode) -> vec3<f32> {
-    let luma_lin = dot(max(rgb, vec3<f32>(0.0)), vec3<f32>(0.2126, 0.7152, 0.0722));
-    let luma = pow(min(luma_lin, 1.0), 1.0 / 2.2);
-    // Smooth tonal-band weights partitioning [0,1] (sum == 1).
-    let w_sh = 1.0 - smoothstep(0.0, 0.5, luma);
-    let w_hi = smoothstep(0.5, 1.0, luma);
-    let w_mid = 1.0 - w_sh - w_hi;
-    var out = rgb + n.log_offset.xyz;
-    out = out + n.lift.xyz * w_sh + n.gamma.xyz * w_mid + n.gain.xyz * w_hi;
-    return max(out, vec3<f32>(0.0));
-}
-
-// Curves grade: per-channel tone curve sampled from the atlas row for
-// node `i`. The atlas is a function LUT — column p of a row holds the
-// curve's output at input level p. Master is folded into R/G/B at bake
-// time, so each channel is one sample. The luma curve (alpha lane) is
-// applied as a hue-preserving ratio.
-//
-// The luma curve reads the *input* luma (computed from `rgb`, BEFORE the
-// R/G/B curves) rather than the post-R/G/B luma: this decouples the luma
-// curve from the R/G/B curves so a colorist's luma adjustment is
-// predictable from the source pixel and independent of channel curves.
-// (With an identity luma curve `cl == l`, so the ratio is exactly 1
-// regardless of which luma is used — the choice only matters when both
-// the luma curve and the R/G/B curves are non-identity.)
-//
-// Sample COORDINATEs are clamped to the LUT's [0,1] domain (super-1.0
-// inputs flatten to the curve endpoint), but the output is not
-// upper-clamped — same serial-chain convention as apply_primary. Uses
-// textureSampleLevel because we're in the (non-uniform) grade loop where
-// implicit-derivative sampling is illegal in WGSL.
-// ---- HSL hue-wheel curves (Phase 6.8b) ------------------------------------
-//
-// Five secondary curves operating in the SAME perceptual-encode HSL space
-// the 6.9 qualifier uses (encode = pow(linear, 1/2.2)):
-//   hh: hue -> hue REMAP, cyclic input. y = sampled (direct remap).
-//   hs: hue -> sat MULTIPLIER. scale = 2*sampled (y=0.5 is no-op).
-//   hl: hue -> lum MULTIPLIER. scale = 2*sampled (y=0.5 is no-op).
-//   ss: sat -> sat REMAP. y = sampled.
-//   ll: lum -> lum REMAP. y = sampled.
-// Stored in atlas rows 3*i+1 (lanes r,g,b,a = hh,hs,hl,ss) and 3*i+2
-// (lane r = ll). Hue domain is CYCLIC; we wrap the sample coordinate
-// via fract() in-shader so the existing clamp sampler suffices.
-
-fn hsl_to_rgb_enc(h: f32, s: f32, l: f32) -> vec3<f32> {
-    // Standard HSL -> encoded RGB (in [0,1]); returns the gamma-encoded
-    // RGB that, when run through pow(_, 2.2), gives back linear RGB.
-    let c = (1.0 - abs(2.0 * l - 1.0)) * s;
-    let hp = fract(h) * 6.0;
-    let x = c * (1.0 - abs((hp - 2.0 * floor(hp / 2.0)) - 1.0));
-    var rgb = vec3<f32>(0.0);
-    if (hp < 1.0)      { rgb = vec3<f32>(c, x, 0.0); }
-    else if (hp < 2.0) { rgb = vec3<f32>(x, c, 0.0); }
-    else if (hp < 3.0) { rgb = vec3<f32>(0.0, c, x); }
-    else if (hp < 4.0) { rgb = vec3<f32>(0.0, x, c); }
-    else if (hp < 5.0) { rgb = vec3<f32>(x, 0.0, c); }
-    else               { rgb = vec3<f32>(c, 0.0, x); }
-    let m = l - 0.5 * c;
-    return rgb + vec3<f32>(m);
-}
-
-fn apply_hsl_curves(rgb_lin: vec3<f32>, i: u32) -> vec3<f32> {
-    let row1 = (3.0 * f32(i) + 1.5) / 24.0;     // HSL-1: hh, hs, hl, ss
-    let row2 = (3.0 * f32(i) + 2.5) / 24.0;     // HSL-2: ll, _, _, _
-    let hsl = rgb_to_hsl(rgb_lin);
-    let h = hsl.x;
-    let s = hsl.y;
-    let l = hsl.z;
-    // Hue is cyclic — wrap via fract() before the clamp sample. (The
-    // 0/1 seam can produce a tiny filter blip for curves with very
-    // different endpoints; cheaper than a separate Repeat sampler.)
-    let by_hue = textureSampleLevel(tex_curve_atlas, samp, vec2<f32>(fract(h), row1), 0.0);
-    // hh = REMAP (direct, cyclic).
-    let new_h = fract(by_hue.r);
-    // hs / hl = MULTIPLIERS keyed by hue. Stored 0..1 with 0.5 == no-op;
-    // decoded as 2*y so the range is [0, 2].
-    let s1 = clamp(s * (2.0 * by_hue.g), 0.0, 1.0);
-    let l1 = clamp(l * (2.0 * by_hue.b), 0.0, 1.0);
-    // ss = REMAP keyed by the intermediate saturation (row1, alpha lane).
-    let by_sat = textureSampleLevel(tex_curve_atlas, samp, vec2<f32>(s1, row1), 0.0);
-    let new_s = clamp(by_sat.a, 0.0, 1.0);
-    // ll = REMAP keyed by the intermediate luminance (row2, r lane).
-    let by_lum = textureSampleLevel(tex_curve_atlas, samp, vec2<f32>(l1, row2), 0.0);
-    let new_l = clamp(by_lum.r, 0.0, 1.0);
-    // Back to linear RGB via HSL -> encoded RGB -> pow(_, 2.2).
-    let out_enc = hsl_to_rgb_enc(new_h, new_s, new_l);
-    return pow(out_enc, vec3<f32>(2.2));
-}
-
-fn apply_curve(rgb: vec3<f32>, i: u32, n: GradeNode) -> vec3<f32> {
-    // Atlas is MAX_GRADES × 3 rows tall (6.8b). For node i:
-    //   row 3*i     = tone (R/G/B + luma)
-    //   row 3*i+1   = HSL-1 (hh, hs, hl, ss)
-    //   row 3*i+2   = HSL-2 (ll, _, _, _)
-    let row_tone = (3.0 * f32(i) + 0.5) / 24.0;
-    var out = rgb;
-    if (n.log_smh.x > 0.5) {                              // tone block
-        let cr = textureSampleLevel(tex_curve_atlas, samp, vec2<f32>(clamp(rgb.r, 0.0, 1.0), row_tone), 0.0).r;
-        let cg = textureSampleLevel(tex_curve_atlas, samp, vec2<f32>(clamp(rgb.g, 0.0, 1.0), row_tone), 0.0).g;
-        let cb = textureSampleLevel(tex_curve_atlas, samp, vec2<f32>(clamp(rgb.b, 0.0, 1.0), row_tone), 0.0).b;
-        out = vec3<f32>(cr, cg, cb);
-        let l = dot(max(rgb, vec3<f32>(0.0)), vec3<f32>(0.2126, 0.7152, 0.0722));
-        let cl = textureSampleLevel(tex_curve_atlas, samp, vec2<f32>(clamp(l, 0.0, 1.0), row_tone), 0.0).a;
-        // Scale by curve(input_luma)/input_luma to keep hue; guard near black.
-        out = select(out, out * (cl / max(l, 1e-4)), l > 1e-4);
-    }
-    if (n.log_smh.y > 0.5) {                              // HSL block (6.8b)
-        out = apply_hsl_curves(out, i);
-    }
-    return out;
-}
-
-// ---- HSL qualifier (secondary key), Phase 6.9 -----------------------------
-//
-// The key is computed in a PERCEPTUAL encoding (approx gamma 1/2.2) of the
-// node's linear input — consistent with apply_log's tonal windowing, and
-// because hue/sat are numerically unstable for dark pixels in linear light
-// (a "red shirt" must key by appearance). The encode is clamped to [0,1]
-// for KEY STABILITY only; the graded value itself is never clamped.
-
-// RGB (linear) -> HSL on the perceptual encoding. Returns (h in [0,1),
-// s in [0,1], l in [0,1]).
-fn rgb_to_hsl(rgb_lin: vec3<f32>) -> vec3<f32> {
-    let c = pow(clamp(rgb_lin, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
-    let mx = max(c.r, max(c.g, c.b));
-    let mn = min(c.r, min(c.g, c.b));
-    let d = mx - mn;
-    let l = 0.5 * (mx + mn);
-    var h = 0.0;
-    if (d > 1e-6) {
-        if (mx == c.r) {
-            h = (c.g - c.b) / d + select(0.0, 6.0, c.g < c.b);
-        } else if (mx == c.g) {
-            h = (c.b - c.r) / d + 2.0;
-        } else {
-            h = (c.r - c.g) / d + 4.0;
-        }
-        h = h / 6.0;
-    }
-    let s = select(0.0, d / (1.0 - abs(2.0 * l - 1.0) + 1e-6), d > 1e-6);
-    return vec3<f32>(h, clamp(s, 0.0, 1.0), clamp(l, 0.0, 1.0));
-}
-
-// Cyclic hue distance in [0, 0.5] (wraps at 1.0).
-fn hue_dist(a: f32, b: f32) -> f32 {
-    return abs(fract(a - b + 0.5) - 0.5);
-}
-
-// One-sided soft band: 1 inside |dist| <= half, feathered to 0 over `soft`.
-fn soft_band(dist: f32, half_width: f32, soft: f32) -> f32 {
-    return 1.0 - smoothstep(half_width, half_width + max(soft, 1e-4), dist);
-}
-
-// Two-sided soft range: 1 inside [lo, hi], feathered by `soft` on each edge.
-fn soft_range(x: f32, lo: f32, hi: f32, soft: f32) -> f32 {
-    let s = max(soft, 1e-4);
-    return smoothstep(lo - s, lo, x) * (1.0 - smoothstep(hi, hi + s, x));
-}
-
-// Qualifier mask in [0,1] for the node's input pixel: hue wedge ∩ sat band
-// ∩ luma band, optionally inverted. (6.10 will multiply in a window mask.)
-fn qualifier_mask(rgb_lin: vec3<f32>, n: GradeNode) -> f32 {
-    let hsl = rgb_to_hsl(rgb_lin);
-    let k_h = soft_band(hue_dist(hsl.x, n.qual_a.x), n.qual_a.y * 0.5, n.qual_b.z);
-    let k_s = soft_range(hsl.y, n.qual_a.z, n.qual_a.w, n.qual_b.w);
-    let k_l = soft_range(hsl.z, n.qual_b.x, n.qual_b.y, n.qual_c.x);
-    var m = k_h * k_s * k_l;
-    if (n.flags.w > 0.5) { m = 1.0 - m; }   // invert
-    return clamp(m, 0.0, 1.0);
-}
-
-// ---- Power window (shape mask), Phase 6.10 --------------------------------
-//
-// A geometric mask on the node's correction, computed in SOURCE-UV space
-// (image content) so it stays locked to the subject under clip
-// transform/crop and so the 6.11 point tracker (which tracks image
-// content) can animate the center directly. `aspect = width/height` makes
-// equal half-sizes draw a circle in pixels rather than an ellipse.
-fn window_mask(uv: vec2<f32>, n: GradeNode, aspect: f32) -> f32 {
-    let shape = n.win_a.x;
-    if (shape < 0.5) { return 1.0; }   // 0 = off -> no restriction
-    let center = n.win_a.yz;
-    let rot = n.win_a.w;
-    let half = max(n.win_b.xy, vec2<f32>(1e-4));
-    let feather = max(n.win_b.z, 1e-4);
-    let invert = n.win_b.w;
-    // Aspect-correct BOTH the delta and the x radius so the ratio is
-    // preserved (a one-sided multiply makes egg shapes).
-    var d = uv - center;
-    d.x = d.x * aspect;
-    let c = cos(-rot);
-    let s = sin(-rot);
-    let local = vec2<f32>(d.x * c - d.y * s, d.x * s + d.y * c);
-    let r = vec2<f32>(half.x * aspect, half.y);
-    var nd: f32;
-    if (shape < 1.5) {
-        nd = length(local / r);                          // ellipse: 1.0 on boundary
-    } else {
-        let q = abs(local) / r;
-        nd = max(q.x, q.y);                              // rect: Chebyshev box
-    }
-    // Convert the uv-space feather to the nd metric via the mean radius.
-    let band = feather / max(0.5 * (r.x + r.y), 1e-4);
-    var m = 1.0 - smoothstep(1.0, 1.0 + band, nd);
-    if (invert > 0.5) { m = 1.0 - m; }
-    return clamp(m, 0.0, 1.0);
-}
 
 // Apply the serial grade chain in linear working space. Intermediate
 // values are NOT clamped to [0,1] (only floored at 0) so nodes compose
@@ -345,182 +81,27 @@ fn window_mask(uv: vec2<f32>, n: GradeNode, aspect: f32) -> f32 {
 fn apply_grades(rgb_in: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
     var rgb = rgb_in;
     let count = params.grade_count.x;
-    // Frame aspect for circular windows — tex_y_a is always bound when
-    // the shader runs (render errors NoFrame otherwise). Hoisted out of
-    // the loop.
-    let dims = textureDimensions(tex_y_a);
-    let aspect = f32(dims.x) / max(f32(dims.y), 1.0);
+    // Display aspect for the power windows (storage width × pixel aspect /
+    // height) — tex_y is always bound when the shader runs (render errors
+    // NoFrame otherwise). Hoisted out of the loop.
+    let dims = textureDimensions(tex_y);
+    let aspect = f32(dims.x) / max(f32(dims.y), 1.0) * params.misc.y;
     for (var i = 0u; i < count; i = i + 1u) {
         let n = params.grades[i];
         if (n.flags.x < 0.5) { continue; }      // bypassed node
         let src = rgb;
-        var graded = src;
-        if (n.flags.y < 0.5) {
-            graded = apply_primary(src, n);
-        } else if (n.flags.y < 1.5) {
-            graded = apply_log(src, n);
-        } else {
-            // mode 2 = curves; run apply_curve when EITHER the tone
-            // (log_smh.x) or the HSL (log_smh.y, 6.8b) block is active —
-            // each block self-gates inside.
-            if (n.log_smh.x > 0.5 || n.log_smh.y > 0.5) {
-                graded = apply_curve(src, i, n);
-            }
-        }
-        // Combined node mask: qualifier (hue/sat/luma) ∩ power window.
-        var mask = 1.0;
-        if (n.flags.z > 0.5) {                  // qualifier enabled
-            mask = qualifier_mask(src, n);
-        }
-        mask = mask * window_mask(uv, n, aspect);
-        rgb = mix(src, graded, mask);
+        // Graded colour (xyz) + combined qualifier ∩ window mask (w).
+        let gm = grade_node_eval(src, uv, i, n, aspect);
+        rgb = mix(src, gm.xyz, gm.w);
         // Matte solo: show this node's COMBINED mask as grayscale and
         // stop. Gated on show_mask alone so a window-only node can solo.
         if (n.qual_c.y > 0.5) {
             g_matte_hit = true;
-            rgb = vec3<f32>(mask);
+            rgb = vec3<f32>(gm.w);
             break;
         }
     }
     return rgb;
-}
-
-fn yuv_to_rgb(y_raw: f32, u_raw: f32, v_raw: f32, range: u32) -> vec3<f32> {
-    // Range expansion. Limited (0): Y' ∈ [16, 235], chroma ∈ [16, 240].
-    // Full (1): pass through.
-    var y: f32;
-    var u: f32;
-    var v: f32;
-    if (range == 0u) {
-        y = (y_raw - 16.0 / 255.0) * (255.0 / 219.0);
-        u = (u_raw - 128.0 / 255.0) * (255.0 / 224.0);
-        v = (v_raw - 128.0 / 255.0) * (255.0 / 224.0);
-    } else {
-        y = y_raw;
-        u = u_raw - 128.0 / 255.0;
-        v = v_raw - 128.0 / 255.0;
-    }
-    // Rec.709 Y'CbCr → R'G'B' (gamma-encoded; transfer applied
-    // separately by `linearize`). v1 assumes all YUV inputs use the
-    // 709 matrix; a 2020-coefficient matrix can be picked up via the
-    // input primaries flag in a later refinement.
-    let r = y + 1.5748 * v;
-    let g = y - 0.1873 * u - 0.4681 * v;
-    let b = y + 1.8556 * u;
-    return clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
-}
-
-// Transfer-function IDs — keep in sync with vance_color::pipeline.
-// 0 = Linear, 1 = sRGB, 2 = Rec.709, 3 = Rec.2020,
-// 4 = PQ, 5 = HLG, 6 = ACEScct. v1 ships 0/1/2/3; 4/5/6 fall through
-// as passthrough (Phase 6.1b's OCIO path handles them).
-fn linearize(rgb: vec3<f32>, id: u32) -> vec3<f32> {
-    if (id == 1u) {
-        // sRGB inverse EOTF. Piecewise: linear toe below 0.04045,
-        // pow((v + 0.055) / 1.055, 2.4) above.
-        let toe = rgb / vec3<f32>(12.92);
-        let lift = pow(max(rgb + vec3<f32>(0.055), vec3<f32>(0.0)) / vec3<f32>(1.055), vec3<f32>(2.4));
-        return select(toe, lift, rgb > vec3<f32>(0.04045));
-    } else if (id == 2u || id == 3u) {
-        // Rec.709 / Rec.2020 inverse OETF. Linear below 0.081 (709
-        // breakpoint; 2020 is 0.0812 for 12-bit which we round here).
-        let toe = rgb / vec3<f32>(4.5);
-        let lift = pow(max(rgb + vec3<f32>(0.099), vec3<f32>(0.0)) / vec3<f32>(1.099), vec3<f32>(1.0 / 0.45));
-        return select(toe, lift, rgb > vec3<f32>(0.081));
-    } else if (id == 4u) {
-        // PQ (ST 2084) EOTF → normalized L/10000, scaled ×100 so working 1.0
-        // = 100 cd/m² (reference white). This is the exact inverse of the
-        // output encode (pq_oetf(lin*100/10000)), so HDR round-trips; HDR
-        // highlights land above 1.0 (up to 100.0 = 10000 nits).
-        return pq_eotf(rgb) * 100.0;
-    } else if (id == 5u) {
-        // HLG EOTF → scene-linear [0,1] (relative; working 1.0 = peak white).
-        return hlg_eotf(rgb);
-    }
-    return rgb;
-}
-
-// SMPTE ST 2084 (PQ) forward OETF. Input is display luminance NORMALIZED to
-// the 10000 cd/m² peak (E = L/10000, in [0,1]); output is the PQ code value
-// in [0,1]. Used only on the HDR (Rgba16Float) export target, where the
-// store applies no implicit transfer.
-fn pq_oetf(e: vec3<f32>) -> vec3<f32> {
-    let m1 = 0.1593017578125;
-    let m2 = 78.84375;
-    let c1 = 0.8359375;
-    let c2 = 18.8515625;
-    let c3 = 18.6875;
-    let en = clamp(e, vec3<f32>(0.0), vec3<f32>(1.0));
-    let ym1 = pow(en, vec3<f32>(m1));
-    let num = vec3<f32>(c1) + c2 * ym1;
-    let den = vec3<f32>(1.0) + c3 * ym1;
-    return pow(num / den, vec3<f32>(m2));
-}
-
-// ARIB STD-B67 (HLG) forward OETF. Input is scene linear in [0,1]; output is
-// the HLG signal in [0,1].
-fn hlg_oetf(e: vec3<f32>) -> vec3<f32> {
-    let a = 0.17883277;
-    let b = 0.28466892;
-    let c = 0.55991073;
-    let en = clamp(e, vec3<f32>(0.0), vec3<f32>(1.0));
-    let lo = sqrt(3.0 * en);
-    let hi = a * log(12.0 * en - b) + vec3<f32>(c);
-    return select(lo, hi, en > vec3<f32>(1.0 / 12.0));
-}
-
-// SMPTE ST 2084 (PQ) inverse EOTF. Input is the PQ code value in [0,1];
-// output is display luminance normalized to 10000 cd/m² (E = L/10000).
-fn pq_eotf(code: vec3<f32>) -> vec3<f32> {
-    let m1 = 0.1593017578125;
-    let m2 = 78.84375;
-    let c1 = 0.8359375;
-    let c2 = 18.8515625;
-    let c3 = 18.6875;
-    let cn = clamp(code, vec3<f32>(0.0), vec3<f32>(1.0));
-    let v = pow(cn, vec3<f32>(1.0 / m2));
-    let num = max(v - vec3<f32>(c1), vec3<f32>(0.0));
-    // den = c2 - c3·v ∈ [0.16, 18.85] for v∈[0,1] — always positive.
-    let den = vec3<f32>(c2) - c3 * v;
-    return pow(num / den, vec3<f32>(1.0 / m1));
-}
-
-// ARIB STD-B67 (HLG) inverse OETF. Input is the HLG signal in [0,1]; output
-// is scene-linear in [0,1].
-fn hlg_eotf(sig: vec3<f32>) -> vec3<f32> {
-    let a = 0.17883277;
-    let b = 0.28466892;
-    let c = 0.55991073;
-    let sn = clamp(sig, vec3<f32>(0.0), vec3<f32>(1.0));
-    let lo = sn * sn / vec3<f32>(3.0);
-    let hi = (exp((sn - vec3<f32>(c)) / vec3<f32>(a)) + vec3<f32>(b)) / vec3<f32>(12.0);
-    return select(lo, hi, sn > vec3<f32>(0.5));
-}
-
-// Narkowicz ACES-filmic tone map. Compresses HDR working linear (where 1.0 =
-// 100 cd/m² reference white and highlights run up to 100.0 = 10000 nits) into
-// SDR [0,1] with a filmic highlight roll-off, so an HDR source shown on an
-// SDR display preserves highlight DETAIL instead of clipping to flat white.
-fn aces_tonemap(x: vec3<f32>) -> vec3<f32> {
-    let a = 2.51;
-    let b = 0.03;
-    let c = 2.43;
-    let d = 0.59;
-    let e = 0.14;
-    let xn = max(x, vec3<f32>(0.0));
-    let mapped = (xn * (a * xn + vec3<f32>(b))) / (xn * (c * xn + vec3<f32>(d)) + vec3<f32>(e));
-    return clamp(mapped, vec3<f32>(0.0), vec3<f32>(1.0));
-}
-
-fn apply_mat3(rgb: vec3<f32>, m: array<vec4<f32>, 3>) -> vec3<f32> {
-    let m0 = m[0].xyz;
-    let m1 = m[1].xyz;
-    let m2 = m[2].xyz;
-    return vec3<f32>(
-        dot(m0, rgb),
-        dot(m1, rgb),
-        dot(m2, rgb),
-    );
 }
 
 @fragment
@@ -559,37 +140,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     let input_range = params.pipeline_flags.z;
-    // Per-side sample scale: 1.0 for 8-bit (R8Unorm, code/255) or 65535/1023
-    // for 10-bit (R16Unorm, code/65535 → code/1023) so the normalized value
-    // feeds the same limited-range expansion regardless of source bit depth.
-    let sc_a = params.mix_misc.y;
-    let rgb_a_enc = yuv_to_rgb(
-        textureSample(tex_y_a, samp, source_uv).r * sc_a,
-        textureSample(tex_u_a, samp, source_uv).r * sc_a,
-        textureSample(tex_v_a, samp, source_uv).r * sc_a,
-        input_range,
+    let matrix = params.source.x;
+    // Sample scale: 1.0 for 8-bit (R8Unorm, code/255) or 65535/1023 for
+    // 10-bit (R16Unorm, code/65535 → code/1023).
+    let src = sample_planes(
+        tex_y, tex_u, tex_v, samp, source_uv, params.source.y, params.misc.x, input_range,
+        matrix, params.source.z != 0u,
     );
-
-    // Cross-dissolve blend with the B-side. When mix_factor == 0
-    // (the common case) the B samples vanish; the GPU still touches
-    // those textures but the cost is negligible. Sampling B with
-    // the same source_uv assumes both clips share the resolved
-    // frame UV — the transform/crop apply uniformly to the blended
-    // image. (If we ever want per-side transforms, that's a future
-    // refactor.)
-    let sc_b = params.mix_misc.z;
-    let rgb_b_enc = yuv_to_rgb(
-        textureSample(tex_y_b, samp, source_uv).r * sc_b,
-        textureSample(tex_u_b, samp, source_uv).r * sc_b,
-        textureSample(tex_v_b, samp, source_uv).r * sc_b,
-        input_range,
-    );
-
-    // 1. Mix in gamma-encoded space so the cross-dissolve curve
-    //    behaves the same way the renderer did pre-6.3. We could
-    //    blend in linear, but for SDR sources the perceptual change
-    //    is minor and the gamma-space mix is what colorists expect.
-    var rgb_enc = mix(rgb_a_enc, rgb_b_enc, params.mix_misc.x);
+    var rgb_enc = src.rgb;
+    // Straight alpha of an RGBA source (1 for YUV).
+    let src_alpha = src.a;
     // 1b. Apply the loaded 3D LUT, if enabled. LUTs are sampled in
     //     source-space gamma RGB — matches the convention colorists
     //     use when authoring Rec.709 / sRGB film-emulation LUTs.
@@ -695,6 +255,20 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         rgb_out = aces_tonemap(rgb_out);
     } else {
         rgb_out = clamp(rgb_out, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+    // 5b. An RGBA source shows premultiplied over black, as the compositor
+    //     blends it: display-encoded for SDR (the store re-encodes), linear
+    //     before the PQ / HLG encode. Skipped at alpha 1 so YUV stays exact.
+    if (src_alpha < 1.0) {
+        if (out_transfer == 4u || out_transfer == 5u) {
+            rgb_out = select(
+                hlg_oetf(hlg_eotf(rgb_out) * src_alpha),
+                pq_oetf(pq_eotf(rgb_out) * src_alpha),
+                out_transfer == 4u,
+            );
+        } else {
+            rgb_out = srgb_eotf(srgb_oetf(rgb_out) * src_alpha);
+        }
     }
     // 6. Optional view LUT — a monitoring transform applied *after*
     //    the project's color pipeline. Export bypasses this slot

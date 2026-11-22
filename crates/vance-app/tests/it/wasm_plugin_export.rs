@@ -9,6 +9,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
+use vance_app_lib::addons::AddonHost;
 use vance_app_lib::engine::{Engine, RenderOptions};
 use vance_encoder::EncoderPreset;
 use vance_timeline::EffectValue;
@@ -29,10 +31,12 @@ fn tools_present() -> bool {
         && Command::new("ffprobe").arg("-version").output().is_ok()
 }
 
-/// Phase 9.6 — the render-cache-wrapped WASM apply must produce the
+/// Phase 9.6 — the render-cache-wrapped add-on apply must produce the
 /// SAME output as the uncached apply on both the miss (first call) and
 /// the hit (second identical call). Proves the cache doesn't corrupt
-/// the frame + returns the cached output on re-visit.
+/// the frame + returns the cached output on re-visit. The add-on host is
+/// what the engine's preview runs each layer's WASM chain through
+/// (ADR 0007), with the engine's frame cache as its render cache.
 #[test]
 fn render_cache_matches_uncached_and_hits_on_revisit() {
     if !stylize_dir().join("vance_plugin_stylize.wasm").exists() {
@@ -61,27 +65,34 @@ fn render_cache_matches_uncached_and_hits_on_revisit() {
         }
     };
 
-    let mut engine = Engine::default();
-    engine.new_project("rc".into()).expect("project");
-    assert!(engine.add_plugin_dir(stylize_dir()) >= 1);
+    let mut host = AddonHost::default();
+    assert!(host.scan_dir(&stylize_dir()) >= 1);
+    let cache_dir = tempfile::tempdir().expect("cache dir");
+    let cache = Arc::new(
+        vance_cache::FrameCache::new(cache_dir.path().to_path_buf(), 1 << 20, 1 << 24)
+            .expect("frame cache"),
+    );
+    host.set_render_cache(Some(cache.clone()));
 
     // Uncached reference.
     let mut a = input.clone();
-    engine.apply_wasm_effects(&mut a, w, h, std::slice::from_ref(&effect), 0.0);
+    host.apply_effects(&mut a, w, h, std::slice::from_ref(&effect), 0.0);
     assert_ne!(a, input, "effect should change the frame");
 
     // Cached miss (first) then cached hit (second), both from the same
     // pristine input.
     let mut b = input.clone();
-    engine.apply_wasm_effects_cached(&mut b, w, h, std::slice::from_ref(&effect), 0.0);
+    host.apply_effects_cached(&mut b, w, h, std::slice::from_ref(&effect), 0.0);
     let mut c = input.clone();
-    engine.apply_wasm_effects_cached(&mut c, w, h, std::slice::from_ref(&effect), 0.0);
+    host.apply_effects_cached(&mut c, w, h, std::slice::from_ref(&effect), 0.0);
 
     assert_eq!(a, b, "cached miss must match uncached");
     assert_eq!(b, c, "cached hit must match cached miss");
     // A render-cache entry now exists.
-    let stats = engine.frame_cache_stats().expect("cache stats");
-    assert!(stats.disk_entries >= 1, "render cache entry not created");
+    assert!(
+        cache.stats().disk_entries >= 1,
+        "render cache entry not created"
+    );
 }
 
 fn sidecars_present() -> bool {
