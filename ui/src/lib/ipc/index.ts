@@ -255,7 +255,24 @@ export type ClipContents = {
   fade_out: Fade | null;
   /** Phase 7.6: per-clip stereo pan position, range `[-1, +1]`. */
   pan: number;
+  /** M1: how this clip's layer combines with the tracks below it. */
+  blend_mode: BlendMode;
 };
+
+/** M1 compositing blend modes (ADR 0007), in the engine's frozen order. */
+export type BlendMode =
+  | 'normal'
+  | 'add'
+  | 'multiply'
+  | 'screen'
+  | 'overlay'
+  | 'darken'
+  | 'lighten'
+  | 'difference'
+  | 'soft_light'
+  | 'hard_light'
+  | 'color_dodge'
+  | 'color_burn';
 
 export type FadeCurveName = 'linear' | 'equal_power' | 'logarithmic';
 
@@ -462,12 +479,43 @@ export type SequenceContents = {
   /** Phase 7.4: master bus gain in dB. UI's master fader binds to
    *  `set_master_gain_db`. */
   master_gain_db: number;
+  /** M1: compositing canvas `[width, height]`; `null` until the first clip
+   *  sets it (renderers then use 1920×1080). */
+  frame_size: [number, number] | null;
 };
 
 /** Full contents of the engine's current sequence, ready to render on
  *  the timeline canvas. `null` when no project / no active sequence. */
 export const currentSequenceContents = (): Promise<SequenceContents | null> =>
   invoke('current_sequence_contents');
+
+// ---- M1 compositing: tracks, blend modes, canvas (ADR 0007) ------------
+
+/** Add a track; `position` is the index within its kind's group (omit to
+ *  append). Resolves to the new track's id. */
+export const addTrack = (
+  kind: 'video' | 'audio',
+  name?: string,
+  position?: number
+): Promise<string> => invoke('add_track', { kind, name: name ?? null, position: position ?? null });
+export const removeTrack = (trackId: string): Promise<void> => invoke('remove_track', { trackId });
+/** Move a track within its kind's group (0 = bottom video layer). */
+export const moveTrack = (trackId: string, toPosition: number): Promise<void> =>
+  invoke('move_track', { trackId, toPosition });
+/** Show / hide a track. */
+export const setTrackEnabled = (trackId: string, enabled: boolean): Promise<void> =>
+  invoke('set_track_enabled', { trackId, enabled });
+export const setClipBlendMode = (
+  trackId: string,
+  clipId: string,
+  blendMode: BlendMode
+): Promise<void> => invoke('set_clip_blend_mode', { trackId, clipId, blendMode });
+/** Set the sequence canvas size; both `null` resets to the default. */
+export const setFrameSize = (width: number | null, height: number | null): Promise<void> =>
+  invoke('set_frame_size', { width, height });
+/** Solo a clip's keyer matte in the viewer; `null` clears it. */
+export const setMatteView = (clipId: string | null): Promise<void> =>
+  invoke('set_matte_view', { clipId });
 
 /** Send a debug line into the engine's tracing log. */
 export const diagLog = (message: string): Promise<void> => invoke('diag_log', { message });
@@ -514,6 +562,9 @@ export const createTitleMedia = (args: {
   bgRgb: [number, number, number];
   width: number;
   height: number;
+  /** M1: background opacity in `[0, 1]`. Omitted = 1 (the pre-M1 opaque
+   *  card); new titles should pass 0 so they sit over lower tracks. */
+  bgAlpha?: number | null;
 }): Promise<MediaItemInfo> => invoke('create_title_media', args);
 
 // ---- GOAT-5: Motion Graphics Templates (.cmgt) -----------------------

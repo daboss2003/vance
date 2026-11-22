@@ -103,6 +103,11 @@ pub enum EngineError {
     /// Scope computation error (Phase 6.12).
     #[error("scopes: {0}")]
     Scopes(String),
+
+    /// An M1 compositing entry point whose implementation hasn't landed yet
+    /// (ADR 0007). Names the function.
+    #[error("not implemented yet: {0}")]
+    Unimplemented(&'static str),
 }
 
 impl EngineError {
@@ -223,6 +228,9 @@ pub struct SequenceContents {
     /// Phase 7.4: master bus gain in dB. UI's master fader binds to
     /// `set_master_gain_db`.
     pub master_gain_db: f32,
+    /// M1: compositing canvas `[width, height]`; `None` until the first
+    /// clip sets it (renderers then use 1920×1080).
+    pub frame_size: Option<[u32; 2]>,
 }
 
 /// One track's worth of clips in `SequenceContents`.
@@ -305,6 +313,8 @@ pub struct ClipContents {
     pub fade_out: Option<vance_timeline::Fade>,
     /// Phase 7.6: per-clip stereo pan position, range `[-1, +1]`.
     pub pan: f32,
+    /// M1: compositing blend mode (`BlendMode::as_str`, e.g. "soft_light").
+    pub blend_mode: String,
 }
 
 /// One effect's worth of info for the UI.
@@ -6719,6 +6729,117 @@ impl Engine {
         self.apply_edit_op(EditOp::SetMagnetic { magnetic })
     }
 
+    // ---- M1 compositing: tracks, blend modes, canvas (ADR 0007) -------------
+
+    /// Add an empty track of `kind` at `position` within its kind's group
+    /// (`None` = after the last one). `name` defaults to the first free
+    /// "V<n>" / "A<n>" from the group's next number. Returns the new id.
+    pub fn add_track(
+        &mut self,
+        kind: TrackKind,
+        name: Option<String>,
+        position: Option<usize>,
+    ) -> Result<TrackId, EngineError> {
+        let seq = self.current_sequence_ref()?;
+        let group_len = seq.tracks.iter().filter(|t| t.kind == kind).count();
+        let name = name.unwrap_or_else(|| {
+            let prefix = if kind == TrackKind::Video { "V" } else { "A" };
+            (group_len + 1..)
+                .map(|n| format!("{prefix}{n}"))
+                .find(|candidate| !seq.tracks.iter().any(|t| &t.name == candidate))
+                .unwrap_or_default()
+        });
+        let track_id = TrackId::new();
+        self.pause_for_edit();
+        self.apply_edit_op(EditOp::InsertTrack {
+            track_id,
+            kind,
+            name,
+            position: position.unwrap_or(group_len),
+        })?;
+        Ok(track_id)
+    }
+
+    /// Remove a track (and its clips).
+    pub fn remove_track(&mut self, id: TrackId) -> Result<(), EngineError> {
+        self.pause_for_edit();
+        self.apply_edit_op(EditOp::RemoveTrack { track_id: id })
+    }
+
+    /// Move a track to `to_position` within its kind's group (0 = bottom
+    /// video layer).
+    pub fn move_track(&mut self, id: TrackId, to_position: usize) -> Result<(), EngineError> {
+        self.pause_for_edit();
+        self.apply_edit_op(EditOp::MoveTrack {
+            track_id: id,
+            to_position,
+        })
+    }
+
+    /// Show or hide a track (`Track.enabled`).
+    pub fn set_track_enabled(&mut self, id: TrackId, enabled: bool) -> Result<(), EngineError> {
+        self.pause_for_edit();
+        self.apply_edit_op(EditOp::SetTrackEnabled {
+            track_id: id,
+            enabled,
+        })
+    }
+
+    /// Set a clip's compositing blend mode.
+    pub fn set_clip_blend_mode(
+        &mut self,
+        t: TrackId,
+        c: vance_timeline::ClipId,
+        m: vance_timeline::BlendMode,
+    ) -> Result<(), EngineError> {
+        self.pause_for_edit();
+        self.apply_edit_op(EditOp::SetClipBlendMode {
+            track_id: t,
+            clip_id: c,
+            blend_mode: m,
+        })
+    }
+
+    /// Set (or clear) the current sequence's compositing canvas size.
+    pub fn set_frame_size(&mut self, size: Option<(u32, u32)>) -> Result<(), EngineError> {
+        self.pause_for_edit();
+        self.apply_edit_op(EditOp::SetFrameSize { size })
+    }
+
+    /// Solo a clip's keyer matte in the viewer (`None` clears). Transient
+    /// viewer state, like `set_matte_node`.
+    // Intentional: returns Unimplemented until the integration seam wires
+    // ViewerState into compose_frame (ADR 0007).
+    pub fn set_matte_view(
+        &mut self,
+        _clip: Option<vance_timeline::ClipId>,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unimplemented("Engine::set_matte_view"))
+    }
+
+    /// Composite the current sequence at timeline `t` seconds through the
+    /// scrub path and read back `w × h` RGBA8.
+    // Intentional: Unimplemented until the integration seam lands; lib API
+    // for the integration tests, which the bin target never calls.
+    #[allow(dead_code)]
+    pub fn preview_frame_rgba(
+        &mut self,
+        _t: f64,
+        _w: u32,
+        _h: u32,
+    ) -> Result<Vec<u8>, EngineError> {
+        Err(EngineError::Unimplemented("Engine::preview_frame_rgba"))
+    }
+
+    /// Composite the current sequence at timeline `t` seconds through the
+    /// export per-frame function and read back `w × h` RGBA8.
+    // Intentional: Unimplemented until the integration seam lands; lib API
+    // for the integration tests, which the bin target never calls.
+    #[allow(dead_code)]
+    pub fn export_frame_rgba(&mut self, _t: f64, _w: u32, _h: u32) -> Result<Vec<u8>, EngineError> {
+        Err(EngineError::Unimplemented("Engine::export_frame_rgba"))
+    }
+
     /// The current sequence's connections as `(anchor, connected)` id pairs.
     pub fn connections(&self) -> Vec<(String, String)> {
         self.current_sequence_ref()
@@ -7314,6 +7435,7 @@ impl Engine {
                             fade_in: c.fade_in,
                             fade_out: c.fade_out,
                             pan: c.pan,
+                            blend_mode: c.blend_mode.as_str().to_string(),
                         })
                         .collect(),
                     transitions: t
@@ -7341,6 +7463,7 @@ impl Engine {
                 })
                 .collect(),
             master_gain_db: seq.master_gain_db,
+            frame_size: seq.frame_size.map(|(w, h)| [w, h]),
         })
     }
 
@@ -10700,6 +10823,71 @@ pub(crate) fn sidecar_presence() -> (bool, bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compositing_track_ops_edit_the_current_sequence() {
+        let mut e = Engine::default();
+        e.new_project("t".into()).unwrap();
+        let names = |e: &Engine| -> Vec<String> {
+            let c = e.current_sequence_contents().unwrap();
+            c.tracks.iter().map(|t| t.name.clone()).collect()
+        };
+        let v1 = TrackId::from_uuid(
+            e.current_sequence_contents().unwrap().tracks[0]
+                .id
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(names(&e), ["V1", "A1"]);
+
+        let v2 = e.add_track(TrackKind::Video, None, None).unwrap();
+        let music = e
+            .add_track(TrackKind::Audio, Some("Music".into()), Some(0))
+            .unwrap();
+        assert_eq!(names(&e), ["V1", "V2", "Music", "A1"]);
+        e.move_track(v2, 0).unwrap();
+        assert_eq!(names(&e), ["V2", "V1", "Music", "A1"]);
+        e.remove_track(music).unwrap();
+        e.remove_track(v1).unwrap();
+        // The default name skips one still in use.
+        e.add_track(TrackKind::Video, None, None).unwrap();
+        assert_eq!(names(&e), ["V2", "V3", "A1"]);
+        e.undo().unwrap();
+        e.undo().unwrap();
+        assert_eq!(names(&e), ["V2", "V1", "A1"], "undo restores V1");
+
+        e.set_track_enabled(v2, false).unwrap();
+        e.set_frame_size(Some((1281, 720))).unwrap();
+        let c = e.current_sequence_contents().unwrap();
+        assert!(!c.tracks[0].enabled);
+        assert_eq!(c.frame_size, Some([1280, 720]));
+        assert!(e.set_frame_size(Some((0, 720))).is_err());
+
+        let title = e
+            .create_title_media("T".into(), 2.0, TitleParams::default())
+            .unwrap();
+        let media = MediaItemId::from_uuid(title.id.parse().unwrap());
+        let clip = e.insert_clip_at(v1, media, 0.0).unwrap();
+        let clip = vance_timeline::ClipId::from_uuid(clip.parse().unwrap());
+        let blend_of = |e: &Engine| {
+            e.current_sequence_contents().unwrap().tracks[1].clips[0]
+                .blend_mode
+                .clone()
+        };
+        assert_eq!(blend_of(&e), "normal");
+        e.set_clip_blend_mode(v1, clip, vance_timeline::BlendMode::Screen)
+            .unwrap();
+        assert_eq!(blend_of(&e), "screen");
+
+        assert!(matches!(
+            e.set_matte_view(None),
+            Err(EngineError::Unimplemented(_))
+        ));
+        assert!(matches!(
+            e.preview_frame_rgba(0.0, 16, 16),
+            Err(EngineError::Unimplemented(_))
+        ));
+    }
 
     #[test]
     fn a_bare_stream_import_error_says_how_to_fix_it() {

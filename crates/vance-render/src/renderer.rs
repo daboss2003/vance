@@ -27,6 +27,10 @@ pub enum RenderError {
     /// The renderer has not yet been given a frame.
     #[error("no frame uploaded yet")]
     NoFrame,
+
+    /// A compositor pass that has not been implemented yet (ADR 0007).
+    #[error("not implemented yet: {0}")]
+    Unimplemented(&'static str),
 }
 
 /// Configuration knobs passed to [`Renderer::new`].
@@ -156,6 +160,8 @@ pub struct Renderer {
     /// Lazily-built RGBA blit resources for [`Renderer::present_rgba`]
     /// (Phase 10 — showing CPU-side WASM effect output in the preview).
     blit: Option<BlitResources>,
+    /// M1 multi-layer compositor on the same device (ADR 0007).
+    compositor: crate::compositor::Compositor,
 }
 
 /// Resources for the RGBA passthrough blit (a fullscreen-triangle
@@ -974,6 +980,7 @@ impl Renderer {
         let supports_r16 = device
             .features()
             .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
+        let compositor = crate::compositor::Compositor::new(device.clone(), queue.clone());
 
         Ok(Self {
             adapter,
@@ -1005,7 +1012,13 @@ impl Renderer {
             params_buffer,
             current_params: initial_params,
             blit: None,
+            compositor,
         })
+    }
+
+    /// The multi-layer compositor, sharing this renderer's device (ADR 0007).
+    pub fn compositor(&mut self) -> &mut crate::compositor::Compositor {
+        &mut self.compositor
     }
 
     /// Phase 10 — blit a CPU-side RGBA8 (sRGB) buffer to `target_view`

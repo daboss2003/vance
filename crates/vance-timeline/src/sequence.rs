@@ -65,6 +65,12 @@ pub struct Sequence {
     /// bundles open with none.
     #[serde(default)]
     pub review_comments: Vec<crate::review::ReviewComment>,
+    /// M1: the compositing canvas `(width, height)` in pixels. `None` until
+    /// the first clip added sets it from its source; renderers then fall
+    /// back to 1920×1080. Export defaults to it. `#[serde(default)]` so
+    /// older bundles open with `None`.
+    #[serde(default)]
+    pub frame_size: Option<(u32, u32)>,
 }
 
 impl Sequence {
@@ -82,6 +88,7 @@ impl Sequence {
             magnetic: false,
             captions: Vec::new(),
             review_comments: Vec::new(),
+            frame_size: None,
         }
     }
 
@@ -195,6 +202,7 @@ mod tests {
             magnetic: false,
             captions: Vec::new(),
             review_comments: Vec::new(),
+            frame_size: None,
         };
         assert_eq!(seq.duration(), t(7));
         assert_eq!(seq.clip_count(), 2);

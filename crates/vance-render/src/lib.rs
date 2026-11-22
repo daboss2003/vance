@@ -16,11 +16,16 @@
 
 #![warn(missing_docs)]
 
+pub mod compositor;
 pub mod fusion;
 pub mod mograph;
 mod renderer;
 pub mod title;
 
+pub use compositor::{
+    render_fusion_rgba, render_mograph_rgba, render_title_rgba, CompositeOp, Compositor,
+    KeyerParams, LayerHandle, LayerKey, LayerParams, LayerSource, OutputSpec, RgbaImage,
+};
 pub use fusion::render_fusion_yuv420;
 pub use mograph::render_mograph_yuv420;
 pub use renderer::{

@@ -20,6 +20,7 @@
 use std::sync::Arc;
 use vance_core::RationalTime;
 
+use crate::blend::BlendMode;
 use crate::bus::{bus_graph_cycle, AudioBus, BusOutput, Send};
 use crate::clip::Clip;
 use crate::connection::{connected_subtree, would_cycle, Connection};
@@ -93,6 +94,7 @@ fn replace_track(seq: &Sequence, idx: usize, new_track: Track) -> Sequence {
         magnetic: seq.magnetic,
         captions: seq.captions.clone(),
         review_comments: seq.review_comments.clone(),
+        frame_size: seq.frame_size,
     }
 }
 
@@ -182,6 +184,7 @@ pub fn add_track_with_id(
         magnetic: seq.magnetic,
         captions: seq.captions.clone(),
         review_comments: seq.review_comments.clone(),
+        frame_size: seq.frame_size,
     }
 }
 
@@ -202,7 +205,148 @@ pub fn remove_track(seq: &Sequence, track_id: TrackId) -> Result<Sequence> {
         magnetic: seq.magnetic,
         captions: seq.captions.clone(),
         review_comments: seq.review_comments.clone(),
+        frame_size: seq.frame_size,
     })
+}
+
+/// Indices into `seq.tracks` of every track of `kind`, in order.
+fn kind_group(seq: &Sequence, kind: TrackKind) -> Vec<usize> {
+    seq.tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.kind == kind)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Insert a new empty track of `kind` with the supplied ID at `position`
+/// within that kind's group (0 = first video / first audio track; the
+/// group's length = after its last track). With no track of that kind yet,
+/// a video track goes before every track and an audio track after them,
+/// so video stays first. Rejects a duplicate ID or a position past the end
+/// of the group.
+pub fn insert_track_with_id(
+    seq: &Sequence,
+    id: TrackId,
+    kind: TrackKind,
+    name: impl Into<String>,
+    position: usize,
+) -> Result<Sequence> {
+    if seq.tracks.iter().any(|t| t.id == id) {
+        return Err(TimelineError::invalid(format!("track {id} already exists")));
+    }
+    let group = kind_group(seq, kind);
+    if position > group.len() {
+        return Err(TimelineError::invalid(format!(
+            "track position {position} is past the end of the {} {kind:?} track(s)",
+            group.len()
+        )));
+    }
+    let at = match (group.get(position), group.last(), kind) {
+        (Some(&i), _, _) => i,
+        (None, Some(&last), _) => last + 1,
+        (None, None, TrackKind::Video) => 0,
+        (None, None, TrackKind::Audio) => seq.tracks.len(),
+    };
+    let mut track = Track::new(kind, name);
+    track.id = id;
+    let mut out = seq.clone();
+    out.tracks.insert(at, Arc::new(track));
+    Ok(out)
+}
+
+/// Move a track to `to_position` within its kind's group (0 = bottom video
+/// layer / first audio track). Only that group's tracks are reordered, so
+/// tracks of the other kind keep their slots. Allowed on locked tracks: the
+/// track's own contents don't change.
+pub fn move_track(seq: &Sequence, id: TrackId, to_position: usize) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, id)?;
+    let group = kind_group(seq, track.kind);
+    if to_position >= group.len() {
+        return Err(TimelineError::invalid(format!(
+            "track position {to_position} is out of range for {} {:?} track(s)",
+            group.len(),
+            track.kind
+        )));
+    }
+    let from = group
+        .iter()
+        .position(|&i| i == idx)
+        .ok_or_else(|| TimelineError::invalid(format!("track {id} not in its kind group")))?;
+    if from == to_position {
+        return Ok(seq.clone());
+    }
+    let mut members: Vec<Arc<Track>> = group.iter().map(|&i| seq.tracks[i].clone()).collect();
+    let moved = members.remove(from);
+    members.insert(to_position, moved);
+    let mut out = seq.clone();
+    for (&slot, t) in group.iter().zip(members) {
+        out.tracks[slot] = t;
+    }
+    Ok(out)
+}
+
+/// Set `Track.enabled` (the visibility toggle for video tracks). Allowed on
+/// locked tracks, like mute/solo.
+pub fn set_track_enabled(seq: &Sequence, id: TrackId, enabled: bool) -> Result<Sequence> {
+    let (idx, track) = find_track(seq, id)?;
+    if track.enabled == enabled {
+        return Ok(seq.clone());
+    }
+    let mut new_track = (*track).clone();
+    new_track.enabled = enabled;
+    Ok(replace_track(seq, idx, new_track))
+}
+
+/// Set `Clip.blend_mode`. Rejects locked tracks, like other clip params.
+pub fn set_clip_blend_mode(
+    seq: &Sequence,
+    track: TrackId,
+    clip: ClipId,
+    mode: BlendMode,
+) -> Result<Sequence> {
+    let (idx, tr) = find_track(seq, track)?;
+    ensure_unlocked(&tr)?;
+    let (clip_idx, c) = find_clip(&tr, clip)?;
+    if c.blend_mode == mode {
+        return Ok(seq.clone());
+    }
+    let mut updated = (*c).clone();
+    updated.blend_mode = mode;
+    let mut clips = tr.clips.clone();
+    clips[clip_idx] = Arc::new(updated);
+    Ok(replace_track(seq, idx, rebuild_track(&tr, clips)))
+}
+
+/// Smallest accepted canvas edge, in pixels.
+const MIN_FRAME_EDGE: u32 = 16;
+/// Largest accepted canvas edge, in pixels (the mograph/fusion raster cap).
+const MAX_FRAME_EDGE: u32 = 16384;
+
+/// Set (or clear, with `None`) the sequence's compositing canvas size. Each
+/// edge must be in `[16, 16384]`.
+pub fn set_frame_size(seq: &Sequence, size: Option<(u32, u32)>) -> Result<Sequence> {
+    let size = match size {
+        None => None,
+        Some((w, h)) => {
+            for (label, v) in [("width", w), ("height", h)] {
+                if !(MIN_FRAME_EDGE..=MAX_FRAME_EDGE).contains(&v) {
+                    return Err(TimelineError::invalid(format!(
+                        "frame {label} {v} must be in [{MIN_FRAME_EDGE}, {MAX_FRAME_EDGE}]"
+                    )));
+                }
+            }
+            // Intentional: odd edges round DOWN to even — 4:2:0 encoders and
+            // the YUV paths need even dimensions.
+            Some((w & !1, h & !1))
+        }
+    };
+    if seq.frame_size == size {
+        return Ok(seq.clone());
+    }
+    let mut out = seq.clone();
+    out.frame_size = size;
+    Ok(out)
 }
 
 // ---- clip insertion ---------------------------------------------------------
@@ -1553,6 +1697,7 @@ pub fn set_master_gain_db(seq: &Sequence, gain_db: f32) -> Result<Sequence> {
         magnetic: seq.magnetic,
         captions: seq.captions.clone(),
         review_comments: seq.review_comments.clone(),
+        frame_size: seq.frame_size,
     })
 }
 
@@ -1809,6 +1954,7 @@ fn with_buses(seq: &Sequence, buses: Vec<AudioBus>) -> Sequence {
         magnetic: seq.magnetic,
         captions: seq.captions.clone(),
         review_comments: seq.review_comments.clone(),
+        frame_size: seq.frame_size,
     }
 }
 
@@ -3001,6 +3147,7 @@ mod tests {
             magnetic: seq.magnetic,
             captions: seq.captions.clone(),
             review_comments: seq.review_comments.clone(),
+            frame_size: seq.frame_size,
         }
     }
 

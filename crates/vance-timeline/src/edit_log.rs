@@ -18,6 +18,7 @@
 use serde::{Deserialize, Serialize};
 use vance_core::RationalTime;
 
+use crate::blend::BlendMode;
 use crate::bus::{BusOutput, Send};
 use crate::clip::Clip;
 use crate::effect::{Effect, EffectValue};
@@ -643,6 +644,46 @@ pub enum EditOp {
         /// The reply.
         reply: crate::review::ReviewReply,
     },
+    /// M1 — insert a new (empty) track at a position within its kind's
+    /// group (see [`ops::insert_track_with_id`]).
+    InsertTrack {
+        /// The ID the new track will have (caller-allocated for replay).
+        track_id: TrackId,
+        /// Track kind (video / audio).
+        kind: TrackKind,
+        /// Display name.
+        name: String,
+        /// Index within the kind's group; the group's length appends.
+        position: usize,
+    },
+    /// M1 — move a track within its kind's group.
+    MoveTrack {
+        /// Track to move.
+        track_id: TrackId,
+        /// Destination index within the kind's group.
+        to_position: usize,
+    },
+    /// M1 — show / hide a track (`Track.enabled`).
+    SetTrackEnabled {
+        /// Track to toggle.
+        track_id: TrackId,
+        /// New enabled state.
+        enabled: bool,
+    },
+    /// M1 — set a clip's compositing blend mode.
+    SetClipBlendMode {
+        /// Track holding the clip.
+        track_id: TrackId,
+        /// Clip to change.
+        clip_id: ClipId,
+        /// New blend mode.
+        blend_mode: BlendMode,
+    },
+    /// M1 — set or clear the sequence's compositing canvas size.
+    SetFrameSize {
+        /// `(width, height)` in pixels, or `None` for the default.
+        size: Option<(u32, u32)>,
+    },
 }
 
 /// Apply a single op to a sequence, returning the new sequence.
@@ -897,6 +938,25 @@ pub fn apply(seq: &Sequence, op: &EditOp) -> Result<Sequence> {
         EditOp::ReplyReviewComment { comment_id, reply } => {
             Ok(ops::reply_review_comment(seq, *comment_id, reply.clone()))
         }
+        EditOp::InsertTrack {
+            track_id,
+            kind,
+            name,
+            position,
+        } => ops::insert_track_with_id(seq, *track_id, *kind, name.clone(), *position),
+        EditOp::MoveTrack {
+            track_id,
+            to_position,
+        } => ops::move_track(seq, *track_id, *to_position),
+        EditOp::SetTrackEnabled { track_id, enabled } => {
+            ops::set_track_enabled(seq, *track_id, *enabled)
+        }
+        EditOp::SetClipBlendMode {
+            track_id,
+            clip_id,
+            blend_mode,
+        } => ops::set_clip_blend_mode(seq, *track_id, *clip_id, *blend_mode),
+        EditOp::SetFrameSize { size } => ops::set_frame_size(seq, *size),
     }
 }
 
@@ -1212,6 +1272,17 @@ fn op_label(op: &EditOp) -> String {
         EditOp::ResolveReviewComment { .. } => "Resolve review comment".into(),
         EditOp::SetReviewCommentText { .. } => "Edit review comment".into(),
         EditOp::ReplyReviewComment { .. } => "Reply to review comment".into(),
+        EditOp::InsertTrack { .. } => "Add track".into(),
+        EditOp::MoveTrack { .. } => "Move track".into(),
+        EditOp::SetTrackEnabled { enabled, .. } => {
+            if *enabled {
+                "Show track".into()
+            } else {
+                "Hide track".into()
+            }
+        }
+        EditOp::SetClipBlendMode { .. } => "Blend mode".into(),
+        EditOp::SetFrameSize { .. } => "Frame size".into(),
     }
 }
 
@@ -1627,5 +1698,237 @@ mod tests {
             &before,
             "empty compound must not change state"
         );
+    }
+
+    // ---- M1 compositing ops -------------------------------------------------
+
+    fn names(seq: &Sequence) -> Vec<&str> {
+        seq.tracks.iter().map(|t| t.name.as_str()).collect()
+    }
+
+    #[test]
+    fn insert_track_keeps_video_first_and_undoes() {
+        let (mut log, _v1, _media) = seed_log();
+        let a1 = TrackId::new();
+        log.apply(EditOp::InsertTrack {
+            track_id: a1,
+            kind: TrackKind::Audio,
+            name: "A1".into(),
+            position: 0,
+        })
+        .unwrap();
+        let v2 = TrackId::new();
+        log.apply(EditOp::InsertTrack {
+            track_id: v2,
+            kind: TrackKind::Video,
+            name: "V2".into(),
+            position: 1, // after V1, still before A1
+        })
+        .unwrap();
+        assert_eq!(names(log.current()), ["V1", "V2", "A1"]);
+        let v0 = TrackId::new();
+        log.apply(EditOp::InsertTrack {
+            track_id: v0,
+            kind: TrackKind::Video,
+            name: "V0".into(),
+            position: 0,
+        })
+        .unwrap();
+        assert_eq!(names(log.current()), ["V0", "V1", "V2", "A1"]);
+        assert_eq!(log.current().tracks[0].id, v0);
+
+        // Past the end of the group, or a duplicate id, is rejected.
+        let bad = EditOp::InsertTrack {
+            track_id: TrackId::new(),
+            kind: TrackKind::Audio,
+            name: "A9".into(),
+            position: 2,
+        };
+        assert!(log.apply(bad).is_err());
+        let dup = EditOp::InsertTrack {
+            track_id: v2,
+            kind: TrackKind::Video,
+            name: "dup".into(),
+            position: 0,
+        };
+        assert!(log.apply(dup).is_err());
+
+        log.undo().unwrap();
+        assert_eq!(names(log.current()), ["V1", "V2", "A1"]);
+        log.redo().unwrap();
+        assert_eq!(names(log.current()), ["V0", "V1", "V2", "A1"]);
+    }
+
+    #[test]
+    fn insert_first_video_track_goes_before_audio() {
+        let mut log = EditLog::new(Sequence::new("S", FrameRate::FPS_24));
+        log.apply(EditOp::InsertTrack {
+            track_id: TrackId::new(),
+            kind: TrackKind::Audio,
+            name: "A1".into(),
+            position: 0,
+        })
+        .unwrap();
+        log.apply(EditOp::InsertTrack {
+            track_id: TrackId::new(),
+            kind: TrackKind::Video,
+            name: "V1".into(),
+            position: 0,
+        })
+        .unwrap();
+        assert_eq!(names(log.current()), ["V1", "A1"]);
+    }
+
+    #[test]
+    fn move_track_reorders_within_kind_only_and_undoes() {
+        let (mut log, v1, _media) = seed_log();
+        for (name, kind, position) in [
+            ("V2", TrackKind::Video, 1),
+            ("V3", TrackKind::Video, 2),
+            ("A1", TrackKind::Audio, 0),
+        ] {
+            log.apply(EditOp::InsertTrack {
+                track_id: TrackId::new(),
+                kind,
+                name: name.into(),
+                position,
+            })
+            .unwrap();
+        }
+        log.apply(EditOp::MoveTrack {
+            track_id: v1,
+            to_position: 2,
+        })
+        .unwrap();
+        assert_eq!(names(log.current()), ["V2", "V3", "V1", "A1"]);
+        // Out of range for the video group (3 tracks).
+        assert!(log
+            .apply(EditOp::MoveTrack {
+                track_id: v1,
+                to_position: 3,
+            })
+            .is_err());
+        log.undo().unwrap();
+        assert_eq!(names(log.current()), ["V1", "V2", "V3", "A1"]);
+        log.redo().unwrap();
+        assert_eq!(names(log.current()), ["V2", "V3", "V1", "A1"]);
+    }
+
+    #[test]
+    fn set_track_enabled_and_blend_mode_round_trip_undo() {
+        let (mut log, tid, media) = seed_log();
+        let clip = Clip::new(media, "c", t(0), t(0), t(5)).unwrap();
+        let cid = clip.id;
+        log.apply(EditOp::InsertClip {
+            track_id: tid,
+            clip,
+        })
+        .unwrap();
+        log.apply(EditOp::SetTrackEnabled {
+            track_id: tid,
+            enabled: false,
+        })
+        .unwrap();
+        assert!(!log.current().tracks[0].enabled);
+        log.apply(EditOp::SetClipBlendMode {
+            track_id: tid,
+            clip_id: cid,
+            blend_mode: BlendMode::Multiply,
+        })
+        .unwrap();
+        assert_eq!(
+            log.current().tracks[0].clips[0].blend_mode,
+            BlendMode::Multiply
+        );
+        log.undo().unwrap();
+        assert_eq!(
+            log.current().tracks[0].clips[0].blend_mode,
+            BlendMode::Normal
+        );
+        log.undo().unwrap();
+        assert!(log.current().tracks[0].enabled);
+        log.redo().unwrap();
+        log.redo().unwrap();
+        assert!(!log.current().tracks[0].enabled);
+        assert_eq!(
+            log.current().tracks[0].clips[0].blend_mode,
+            BlendMode::Multiply
+        );
+    }
+
+    #[test]
+    fn blend_mode_rejected_on_locked_track_but_enable_allowed() {
+        let (log, tid, media) = seed_log();
+        let clip = Clip::new(media, "c", t(0), t(0), t(5)).unwrap();
+        let cid = clip.id;
+        let seq = ops::insert_clip(log.current(), tid, clip).unwrap();
+        let mut locked = (*seq.tracks[0]).clone();
+        locked.locked = true;
+        let mut seq = seq;
+        seq.tracks[0] = std::sync::Arc::new(locked);
+        assert!(ops::set_clip_blend_mode(&seq, tid, cid, BlendMode::Add).is_err());
+        assert!(ops::set_track_enabled(&seq, tid, false).is_ok());
+    }
+
+    #[test]
+    fn set_frame_size_validates_evens_and_undoes() {
+        let (mut log, _tid, _media) = seed_log();
+        assert_eq!(log.current().frame_size, None);
+        log.apply(EditOp::SetFrameSize {
+            size: Some((1921, 1081)),
+        })
+        .unwrap();
+        assert_eq!(log.current().frame_size, Some((1920, 1080)));
+        for bad in [(0, 1080), (1920, 8), (20000, 1080)] {
+            assert!(log.apply(EditOp::SetFrameSize { size: Some(bad) }).is_err());
+        }
+        // Later edits carry the size forward.
+        log.apply(EditOp::AddTrack {
+            track_id: TrackId::new(),
+            kind: TrackKind::Audio,
+            name: "A1".into(),
+        })
+        .unwrap();
+        assert_eq!(log.current().frame_size, Some((1920, 1080)));
+        log.apply(EditOp::SetFrameSize { size: None }).unwrap();
+        assert_eq!(log.current().frame_size, None);
+        log.undo().unwrap();
+        log.undo().unwrap();
+        log.undo().unwrap();
+        assert_eq!(log.current().frame_size, None);
+        log.redo().unwrap();
+        assert_eq!(log.current().frame_size, Some((1920, 1080)));
+    }
+
+    #[test]
+    fn new_ops_serialize_round_trip() {
+        let ops = vec![
+            EditOp::InsertTrack {
+                track_id: TrackId::new(),
+                kind: TrackKind::Video,
+                name: "V2".into(),
+                position: 1,
+            },
+            EditOp::MoveTrack {
+                track_id: TrackId::new(),
+                to_position: 0,
+            },
+            EditOp::SetTrackEnabled {
+                track_id: TrackId::new(),
+                enabled: false,
+            },
+            EditOp::SetClipBlendMode {
+                track_id: TrackId::new(),
+                clip_id: ClipId::new(),
+                blend_mode: BlendMode::SoftLight,
+            },
+            EditOp::SetFrameSize {
+                size: Some((3840, 2160)),
+            },
+        ];
+        let json = serde_json::to_string(&ops).unwrap();
+        assert_eq!(serde_json::from_str::<Vec<EditOp>>(&json).unwrap(), ops);
+        let ron = ron::to_string(&ops).unwrap();
+        assert_eq!(ron::from_str::<Vec<EditOp>>(&ron).unwrap(), ops);
     }
 }

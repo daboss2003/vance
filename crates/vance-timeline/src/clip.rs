@@ -79,6 +79,10 @@ pub struct Clip {
     /// as 0.0 via `#[serde(default)]`.
     #[serde(default)]
     pub pan: f32,
+    /// M1: how this clip's layer combines with the tracks below it
+    /// (video clips only). `#[serde(default)]` → `Normal` for older bundles.
+    #[serde(default)]
+    pub blend_mode: crate::blend::BlendMode,
 }
 
 impl Clip {
@@ -108,6 +112,7 @@ impl Clip {
             fade_in: None,
             fade_out: None,
             pan: 0.0,
+            blend_mode: crate::blend::BlendMode::Normal,
         })
     }
 

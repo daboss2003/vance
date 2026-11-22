@@ -24,6 +24,15 @@ pub struct TitleParams {
     pub width: u32,
     /// Output height in pixels.
     pub height: u32,
+    /// M1: background opacity in `[0, 1]`. `1.0` is the pre-M1 opaque card
+    /// (and the default for older bundles); titles the UI creates now
+    /// default to `0.0` so they sit over the tracks below.
+    #[serde(default = "one_f32")]
+    pub bg_alpha: f32,
+}
+
+fn one_f32() -> f32 {
+    1.0
 }
 
 impl Default for TitleParams {
@@ -35,6 +44,7 @@ impl Default for TitleParams {
             bg: [0.0, 0.0, 0.0],
             width: 1280,
             height: 720,
+            bg_alpha: 1.0,
         }
     }
 }

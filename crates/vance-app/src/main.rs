@@ -10,13 +10,26 @@
 )]
 
 mod accounts;
+// Intentional: the M1 compositing modules (ADR 0007) are contract stubs the
+// bin doesn't call until the integration seam wires them in; the lib target
+// exports them for the integration tests.
+#[allow(dead_code)]
+mod addons;
 mod audio_bounce;
 mod cached_decode;
 mod capabilities;
+mod comp_playback;
+#[allow(dead_code)]
+mod compose;
+mod compositing_cmds;
 mod control;
 mod crash;
+#[allow(dead_code)]
+mod decoder_pool;
 mod engine;
 mod generate;
+#[allow(dead_code)]
+mod layer_feed;
 mod magicmask;
 mod nodegraph;
 mod peaks;
@@ -2821,7 +2834,14 @@ fn create_title_media(
     bg_rgb: [f32; 3],
     width: u32,
     height: u32,
+    bg_alpha: Option<f32>,
 ) -> Result<MediaItemInfo, String> {
+    // `None` keeps the pre-M1 opaque card; the UI passes 0 for new titles.
+    let bg_alpha = match bg_alpha {
+        None => 1.0,
+        Some(a) if a.is_finite() => a.clamp(0.0, 1.0),
+        Some(_) => return Err("bg_alpha must be a finite number".into()),
+    };
     let params = vance_timeline::TitleParams {
         text,
         size_px,
@@ -2829,6 +2849,7 @@ fn create_title_media(
         bg: bg_rgb,
         width,
         height,
+        bg_alpha,
     };
     state
         .lock()
@@ -4499,6 +4520,13 @@ fn main() {
             studio::shader_template,
             nodegraph::nodegraph_palette,
             nodegraph::nodegraph_compile,
+            compositing_cmds::add_track,
+            compositing_cmds::remove_track,
+            compositing_cmds::move_track,
+            compositing_cmds::set_track_enabled,
+            compositing_cmds::set_clip_blend_mode,
+            compositing_cmds::set_frame_size,
+            compositing_cmds::set_matte_view,
         ])
         .build(tauri::generate_context!())
         .expect("tauri failed to start")

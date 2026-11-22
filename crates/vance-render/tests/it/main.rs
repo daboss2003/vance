@@ -7,5 +7,8 @@
 //! a new top-level `tests/*.rs` file. Run one module with:
 //!   cargo test -p vance-render --test it <module>::
 
+mod blend_modes;
+mod compositing;
+mod keyer;
 mod present_rgba;
 mod yuv_to_rgb;

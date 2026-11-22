@@ -11,11 +11,16 @@
 // spawn lock (vance_ipc::process, enforced by ../../clippy.toml) is for app code.
 #![allow(clippy::disallowed_methods)]
 
+mod compositing_e2e;
 mod edge_cases;
 mod encrypted_effect;
 mod export_audio;
 mod export_video;
+mod frame_select;
+mod hdr_composite;
 mod hdr_export;
+mod lockstep;
+mod perf_compositing;
 mod prefetch;
 mod project_roundtrip;
 mod render_sequence;

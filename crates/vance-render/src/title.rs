@@ -46,24 +46,99 @@ pub enum TitleError {
 /// coverage is converted to YUV via Rec.709 limited-range coefficients
 /// so the title sits in the same color space as decoded video.
 pub fn render_title_yuv420(params: &TitleParams) -> Result<FrameData, TitleError> {
-    let w = params.width.max(2) & !1; // even
-    let h = params.height.max(2) & !1;
+    let (w, h) = title_dims(params);
 
     // 1. RGB fill on a CPU buffer (linear-ish sRGB; we never linearize
     //    explicitly because the rest of the pipeline operates in
     //    gamma-encoded space too).
     let mut rgb = vec![0u8; (w * h * 3) as usize];
-    let bg_r = (params.bg[0].clamp(0.0, 1.0) * 255.0) as u8;
-    let bg_g = (params.bg[1].clamp(0.0, 1.0) * 255.0) as u8;
-    let bg_b = (params.bg[2].clamp(0.0, 1.0) * 255.0) as u8;
+    let [bg_r, bg_g, bg_b] = to_u8_rgb(params.bg);
     for chunk in rgb.chunks_exact_mut(3) {
         chunk[0] = bg_r;
         chunk[1] = bg_g;
         chunk[2] = bg_b;
     }
 
-    // 2. Lay out the glyphs of `params.text` on a single line and
-    //    composite into the RGB buffer via per-glyph alpha.
+    // 2. Lay out the glyphs and alpha-blend the foreground over the
+    //    existing pixel.
+    let [fg_r, fg_g, fg_b] = to_u8_rgb(params.fg);
+    rasterize_glyphs(params, w, h, |px, alpha| {
+        let off = px * 3;
+        rgb[off] = blend(rgb[off], fg_r, alpha);
+        rgb[off + 1] = blend(rgb[off + 1], fg_g, alpha);
+        rgb[off + 2] = blend(rgb[off + 2], fg_b, alpha);
+    })?;
+
+    // 3. Convert RGB → Rec.709 limited-range YUV420P.
+    let yuv = rgb_to_yuv420p_rec709(&rgb, w, h);
+    let cw = w / 2;
+    Ok(FrameData {
+        pts: 0,
+        width: w,
+        height: h,
+        pixel_format: PixelFormat::Yuv420P,
+        // YUV420P stride per plane equals each plane's row width.
+        strides: vec![w, cw, cw],
+        bytes: yuv.into(),
+    })
+}
+
+/// Render the title as straight-alpha sRGB RGBA8, the background at
+/// `params.bg_alpha`. Same (even) size and glyph layout as
+/// [`render_title_yuv420`]; with `bg_alpha == 1` the colours match its
+/// pre-YUV RGB buffer exactly.
+pub(crate) fn render_title_rgba_image(
+    params: &TitleParams,
+) -> Result<vance_mograph::RgbaImage, TitleError> {
+    let (w, h) = title_dims(params);
+    let bg = to_u8_rgb(params.bg);
+    let bg_a = (params.bg_alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let mut pixels = vec![0u8; (w as usize) * (h as usize) * 4];
+    for px in pixels.chunks_exact_mut(4) {
+        px[..3].copy_from_slice(&bg);
+        px[3] = bg_a;
+    }
+    let fg = to_u8_rgb(params.fg);
+    rasterize_glyphs(params, w, h, |i, alpha| {
+        let px = &mut pixels[i * 4..i * 4 + 4];
+        // Straight-alpha "over": `w_fg` is the glyph's share of the result
+        // colour. Over an opaque pixel it is exactly `alpha` (the YUV path's
+        // `blend`), so the opaque case stays bit-identical.
+        let (out_a, w_fg) = if px[3] == 255 {
+            (1.0, alpha)
+        } else {
+            let out_a = alpha + px[3] as f32 / 255.0 * (1.0 - alpha);
+            (out_a, alpha / out_a)
+        };
+        for (dst, &src) in px[..3].iter_mut().zip(&fg) {
+            *dst = blend(*dst, src, w_fg);
+        }
+        px[3] = (out_a.clamp(0.0, 1.0) * 255.0).round() as u8;
+    })?;
+    Ok(vance_mograph::RgbaImage {
+        width: w,
+        height: h,
+        pixels,
+    })
+}
+
+/// Output size: `params.width × params.height` rounded DOWN to even (≥ 2).
+fn title_dims(params: &TitleParams) -> (u32, u32) {
+    (params.width.max(2) & !1, params.height.max(2) & !1)
+}
+
+fn to_u8_rgb(c: [f32; 3]) -> [u8; 3] {
+    c.map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8)
+}
+
+/// Lay out `params.text` on one centred line in a `w × h` canvas and call
+/// `plot(pixel_index, coverage)` for every covered pixel, in glyph order.
+fn rasterize_glyphs(
+    params: &TitleParams,
+    w: u32,
+    h: u32,
+    mut plot: impl FnMut(usize, f32),
+) -> Result<(), TitleError> {
     let font = load_default_font()?;
     let size = params.size_px.max(8.0);
     // Compute advance widths to find total line width.
@@ -81,9 +156,6 @@ pub fn render_title_yuv420(params: &TitleParams) -> Result<FrameData, TitleError
     let pen_x = ((w as f32 - total_w) * 0.5).max(0.0);
     let line_h = max_ascent + max_descent;
     let y_baseline = ((h as f32 + line_h) * 0.5) - max_descent;
-    let fg_r = (params.fg[0].clamp(0.0, 1.0) * 255.0) as u8;
-    let fg_g = (params.fg[1].clamp(0.0, 1.0) * 255.0) as u8;
-    let fg_b = (params.fg[2].clamp(0.0, 1.0) * 255.0) as u8;
 
     let mut x_cursor = pen_x;
     for ch in params.text.chars() {
@@ -103,28 +175,12 @@ pub fn render_title_yuv420(params: &TitleParams) -> Result<FrameData, TitleError
                 if px < 0 || py < 0 || (px as u32) >= w || (py as u32) >= h {
                     continue;
                 }
-                let off = ((py as u32 * w + px as u32) * 3) as usize;
-                // Alpha-blend the foreground over the existing pixel.
-                rgb[off] = blend(rgb[off], fg_r, alpha);
-                rgb[off + 1] = blend(rgb[off + 1], fg_g, alpha);
-                rgb[off + 2] = blend(rgb[off + 2], fg_b, alpha);
+                plot((py as u32 * w + px as u32) as usize, alpha);
             }
         }
         x_cursor += metrics.advance_width;
     }
-
-    // 3. Convert RGB → Rec.709 limited-range YUV420P.
-    let yuv = rgb_to_yuv420p_rec709(&rgb, w, h);
-    let cw = w / 2;
-    Ok(FrameData {
-        pts: 0,
-        width: w,
-        height: h,
-        pixel_format: PixelFormat::Yuv420P,
-        // YUV420P stride per plane equals each plane's row width.
-        strides: vec![w, cw, cw],
-        bytes: yuv.into(),
-    })
+    Ok(())
 }
 
 #[inline]
@@ -283,5 +339,52 @@ mod tests {
         // Rec.709 limited-range maps full-black RGB → Y=16.
         let y0 = f.bytes[0];
         assert_eq!(y0, 16, "black should map to limited-range Y=16");
+    }
+
+    #[test]
+    fn rgba_background_carries_bg_alpha() {
+        if !system_font_candidates().iter().any(|p| p.exists()) {
+            return;
+        }
+        let base = TitleParams {
+            text: "".into(),
+            bg: [0.2, 0.4, 0.6],
+            width: 63, // rounds down to the YUV path's even size
+            height: 32,
+            ..Default::default()
+        };
+        let opaque = render_title_rgba_image(&base).expect("title render");
+        assert_eq!((opaque.width, opaque.height), (62, 32));
+        assert_eq!(&opaque.pixels[..4], &[51, 102, 153, 255]);
+        let clear = render_title_rgba_image(&TitleParams {
+            bg_alpha: 0.0,
+            ..base
+        })
+        .expect("title render");
+        assert!(clear.pixels.chunks_exact(4).all(|p| p[3] == 0));
+    }
+
+    #[test]
+    fn rgba_glyphs_are_opaque_fg_over_a_clear_background() {
+        if !system_font_candidates().iter().any(|p| p.exists()) {
+            return;
+        }
+        let img = render_title_rgba_image(&TitleParams {
+            text: "H".into(),
+            fg: [1.0, 0.0, 0.0],
+            bg_alpha: 0.0,
+            width: 128,
+            height: 128,
+            ..Default::default()
+        })
+        .expect("title render");
+        let covered: Vec<&[u8]> = img.pixels.chunks_exact(4).filter(|p| p[3] > 0).collect();
+        assert!(!covered.is_empty(), "the glyph covers some pixels");
+        assert!(
+            covered.iter().any(|p| p[3] == 255),
+            "glyph interior is solid"
+        );
+        // Over a fully transparent backdrop the colour is pure foreground.
+        assert!(covered.iter().all(|p| p[..3] == [255, 0, 0]));
     }
 }

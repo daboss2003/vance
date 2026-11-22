@@ -12,8 +12,9 @@
 
 use vance_core::{Rational, RationalTime};
 
+use crate::blend::BlendMode;
 use crate::clip::Clip;
-use crate::id::{ClipId, MediaItemId, TransitionId};
+use crate::id::{ClipId, MediaItemId, TrackId, TransitionId};
 use crate::sequence::Sequence;
 use crate::track::{Track, TrackKind};
 use crate::transition::{Transition, TransitionKind};
@@ -169,6 +170,141 @@ pub fn transition_at(seq: &Sequence, timeline_t: RationalTime) -> Option<ActiveT
     None
 }
 
+// ---- M1: layered scene plan (ADR 0007) ---------------------------------------
+
+/// Every visible layer at one timeline position, for the compositor.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ScenePlan {
+    /// Layers bottom → top (V1 first). Empty = black frame.
+    pub layers: Vec<Layer>,
+}
+
+/// One video track's contribution to a [`ScenePlan`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Layer {
+    /// Track this layer comes from.
+    pub track_id: TrackId,
+    /// Index of the track among ALL the sequence's video tracks (0 = V1),
+    /// counting disabled ones, so it stays stable when a track is hidden.
+    pub video_index: usize,
+    /// What the track shows at this time.
+    pub content: LayerContent,
+}
+
+/// What a layer draws.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LayerContent {
+    /// A single clip.
+    Clip(LayerClip),
+    /// A transition between two adjacent clips on the track.
+    Transition(LayerTransition),
+}
+
+/// A clip resolved at one timeline position.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayerClip {
+    /// Which clip.
+    pub clip_id: ClipId,
+    /// The clip's source media.
+    pub media: MediaItemId,
+    /// Position inside the source: `source_in + (t − timeline_in)`.
+    pub source_pts: RationalTime,
+    /// Clip-relative time `t − timeline_in`, for keyframe evaluation.
+    /// Negative for a transition's incoming side before its cut.
+    pub clip_time: RationalTime,
+    /// The clip's blend mode.
+    pub blend_mode: BlendMode,
+}
+
+/// A transition resolved at one timeline position. Both sides are full
+/// clips (each with its own effects and grades).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerTransition {
+    /// Which transition.
+    pub transition_id: TransitionId,
+    /// Dissolve or a WASM plugin.
+    pub kind: TransitionKind,
+    /// Outgoing clip (A side).
+    pub from: LayerClip,
+    /// Incoming clip (B side).
+    pub to: LayerClip,
+    /// Linear progress in `[0, 1]`; 0 = all A, 1 = all B.
+    pub mix: f32,
+    /// Plugin param overrides (WASM transitions; empty otherwise).
+    pub params: std::collections::BTreeMap<String, crate::effect::EffectValue>,
+}
+
+/// Resolve every visible layer at `t`, bottom → top.
+///
+/// Enabled video tracks only. Per track: an enclosing transition (both
+/// neighbours present and enabled) wins, else the enabled clip at `t`.
+/// Orphaned transitions fall through to the clip. Negative `t` → empty.
+pub fn scene_plan_at(seq: &Sequence, t: RationalTime) -> ScenePlan {
+    let mut plan = ScenePlan::default();
+    if t.0 < Rational::ZERO {
+        return plan;
+    }
+    let video = seq.tracks.iter().filter(|tr| tr.kind == TrackKind::Video);
+    for (video_index, track) in video.enumerate() {
+        if !track.enabled {
+            continue;
+        }
+        let content = layer_transition_at(track, t)
+            .map(LayerContent::Transition)
+            .or_else(|| {
+                clip_at(track, t)
+                    .filter(|c| c.enabled)
+                    .map(|c| LayerContent::Clip(layer_clip(c, t)))
+            });
+        if let Some(content) = content {
+            plan.layers.push(Layer {
+                track_id: track.id,
+                video_index,
+                content,
+            });
+        }
+    }
+    plan
+}
+
+/// `clip` resolved at timeline `t` (virtually extended past its edges, as a
+/// transition's sides are).
+fn layer_clip(clip: &Clip, t: RationalTime) -> LayerClip {
+    LayerClip {
+        clip_id: clip.id,
+        media: clip.media,
+        source_pts: RationalTime(clip.source_in.0 + (t.0 - clip.timeline_in.0)),
+        clip_time: RationalTime(t.0 - clip.timeline_in.0),
+        blend_mode: clip.blend_mode,
+    }
+}
+
+/// First transition on `track` whose window contains `t` and whose two
+/// neighbouring clips both exist and are enabled.
+fn layer_transition_at(track: &Track, t: RationalTime) -> Option<LayerTransition> {
+    track.transitions.iter().find_map(|tr| {
+        if !tr.contains(t) {
+            return None;
+        }
+        let from = track
+            .clips
+            .iter()
+            .find(|c| c.timeline_out() == tr.position)?;
+        let to = track.clips.iter().find(|c| c.timeline_in == tr.position)?;
+        if !from.enabled || !to.enabled {
+            return None;
+        }
+        Some(LayerTransition {
+            transition_id: tr.id,
+            kind: tr.kind.clone(),
+            from: layer_clip(from, t),
+            to: layer_clip(to, t),
+            mix: transition_mix(tr, t),
+            params: tr.params.clone(),
+        })
+    })
+}
+
 /// Linear mix factor for a transition at `timeline_t`: 0 at
 /// `window_in`, 1 at `window_out`, linear between.
 fn transition_mix(tr: &Transition, timeline_t: RationalTime) -> f32 {
@@ -281,5 +417,133 @@ mod tests {
         seq = ops::insert_clip(&seq, tid, clip).unwrap();
         // No video track present — scene_at should be Empty.
         assert_eq!(scene_at(&seq, t(2)), SceneAt::Empty);
+    }
+
+    // ---- scene_plan_at ----------------------------------------------------
+
+    /// V1 [0,10) source 0, V2 [2,6) source 20 (Screen), plus A1 with a clip.
+    fn two_layer_seq() -> (Sequence, [TrackId; 2], [ClipId; 2]) {
+        let media = MediaItemId::new();
+        let mut seq = Sequence::new("S", FrameRate::FPS_24);
+        seq = ops::add_track(&seq, TrackKind::Video, "V1");
+        seq = ops::add_track(&seq, TrackKind::Video, "V2");
+        seq = ops::add_track(&seq, TrackKind::Audio, "A1");
+        let (v1, v2, a1) = (seq.tracks[0].id, seq.tracks[1].id, seq.tracks[2].id);
+        let low = Clip::new(media, "low", t(0), t(0), t(10)).unwrap();
+        let mut high = Clip::new(media, "high", t(2), t(20), t(24)).unwrap();
+        high.blend_mode = BlendMode::Screen;
+        let ids = [low.id, high.id];
+        seq = ops::insert_clip(&seq, v1, low).unwrap();
+        seq = ops::insert_clip(&seq, v2, high).unwrap();
+        let audio = Clip::new(media, "a", t(0), t(0), t(10)).unwrap();
+        seq = ops::insert_clip(&seq, a1, audio).unwrap();
+        (seq, [v1, v2], ids)
+    }
+
+    fn clip_layer(l: &Layer) -> LayerClip {
+        match &l.content {
+            LayerContent::Clip(c) => *c,
+            other => panic!("expected a clip layer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_stacks_layers_bottom_to_top_with_times() {
+        let (seq, [v1, v2], [low, high]) = two_layer_seq();
+        let plan = scene_plan_at(&seq, t(3));
+        assert_eq!(plan.layers.len(), 2, "audio track contributes no layer");
+        assert_eq!(plan.layers[0].track_id, v1);
+        assert_eq!(plan.layers[0].video_index, 0);
+        assert_eq!(plan.layers[1].track_id, v2);
+        assert_eq!(plan.layers[1].video_index, 1);
+        let (a, b) = (clip_layer(&plan.layers[0]), clip_layer(&plan.layers[1]));
+        assert_eq!((a.clip_id, a.source_pts, a.clip_time), (low, t(3), t(3)));
+        assert_eq!((b.clip_id, b.source_pts, b.clip_time), (high, t(21), t(1)));
+        assert_eq!(a.blend_mode, BlendMode::Normal);
+        assert_eq!(b.blend_mode, BlendMode::Screen);
+    }
+
+    #[test]
+    fn plan_skips_gaps_and_is_empty_outside_clips() {
+        let (seq, [v1, _], _) = two_layer_seq();
+        let plan = scene_plan_at(&seq, t(7)); // V2 clip ended at 6
+        assert_eq!(plan.layers.len(), 1);
+        assert_eq!(plan.layers[0].track_id, v1);
+        assert_eq!(scene_plan_at(&seq, t(10)), ScenePlan::default());
+        assert!(scene_plan_at(&seq, RationalTime::new(-1, 1).unwrap())
+            .layers
+            .is_empty());
+    }
+
+    #[test]
+    fn plan_hidden_track_keeps_video_index_of_the_rest() {
+        let (seq, [v1, v2], _) = two_layer_seq();
+        let seq = ops::set_track_enabled(&seq, v1, false).unwrap();
+        let plan = scene_plan_at(&seq, t(3));
+        assert_eq!(plan.layers.len(), 1);
+        assert_eq!(plan.layers[0].track_id, v2);
+        assert_eq!(plan.layers[0].video_index, 1, "V2 stays index 1");
+    }
+
+    #[test]
+    fn plan_skips_disabled_clips() {
+        let (seq, [_, v2], [_, high]) = two_layer_seq();
+        let seq = ops::set_clip_mute(&seq, v2, high, true).unwrap();
+        assert_eq!(scene_plan_at(&seq, t(3)).layers.len(), 1);
+    }
+
+    #[test]
+    fn plan_resolves_transition_per_track_and_orphans_fall_through() {
+        // V1: a [0,5) src 0 | b [5,10) src 100, 2 s dissolve at the cut.
+        // V2: c [0,10) — no transition.
+        let media = MediaItemId::new();
+        let mut seq = Sequence::new("S", FrameRate::FPS_24);
+        seq = ops::add_track(&seq, TrackKind::Video, "V1");
+        seq = ops::add_track(&seq, TrackKind::Video, "V2");
+        let (v1, v2) = (seq.tracks[0].id, seq.tracks[1].id);
+        let a = Clip::new(media, "a", t(0), t(0), t(5)).unwrap();
+        let b = Clip::new(media, "b", t(5), t(100), t(105)).unwrap();
+        let c = Clip::new(media, "c", t(0), t(0), t(10)).unwrap();
+        let (a_id, b_id, c_id) = (a.id, b.id, c.id);
+        seq = ops::insert_clip(&seq, v1, a).unwrap();
+        seq = ops::insert_clip(&seq, v1, b).unwrap();
+        seq = ops::insert_clip(&seq, v2, c).unwrap();
+        let (seq, tr_id) =
+            ops::add_transition_at_cut(&seq, v1, a_id, TransitionKind::Dissolve, t(2)).unwrap();
+
+        let plan = scene_plan_at(&seq, t(5)); // window [4, 6], midpoint
+        assert_eq!(plan.layers.len(), 2);
+        match &plan.layers[0].content {
+            LayerContent::Transition(tr) => {
+                assert_eq!(tr.transition_id, tr_id);
+                assert_eq!(tr.kind, TransitionKind::Dissolve);
+                assert_eq!(tr.from.clip_id, a_id);
+                assert_eq!(tr.to.clip_id, b_id);
+                assert!((tr.mix - 0.5).abs() < 1e-6);
+                assert_eq!(tr.from.source_pts, t(5), "A virtually extends");
+                assert_eq!(tr.to.source_pts, t(100));
+                assert_eq!(tr.to.clip_time, t(0));
+            }
+            other => panic!("expected a transition on V1, got {other:?}"),
+        }
+        assert_eq!(clip_layer(&plan.layers[1]).clip_id, c_id);
+
+        // Before the cut, B's clip time is negative (it starts early).
+        let early = scene_plan_at(&seq, RationalTime::new(9, 2).unwrap());
+        match &early.layers[0].content {
+            LayerContent::Transition(tr) => {
+                assert_eq!(tr.to.clip_time, RationalTime::new(-1, 2).unwrap());
+                assert!((tr.mix - 0.25).abs() < 1e-6);
+            }
+            other => panic!("expected a transition, got {other:?}"),
+        }
+
+        // Disable B: the transition is orphaned and the plain clip shows.
+        let muted = ops::set_clip_mute(&seq, v1, b_id, true).unwrap();
+        let plan = scene_plan_at(&muted, RationalTime::new(9, 2).unwrap());
+        assert_eq!(clip_layer(&plan.layers[0]).clip_id, a_id);
+        let plan = scene_plan_at(&muted, RationalTime::new(11, 2).unwrap());
+        assert_eq!(plan.layers.len(), 1, "B disabled → V1 shows nothing");
+        assert_eq!(clip_layer(&plan.layers[0]).clip_id, c_id);
     }
 }

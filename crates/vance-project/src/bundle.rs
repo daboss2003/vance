@@ -501,4 +501,104 @@ mod tests {
             "Audio-kind item's has_audio_track forced true by load sweep"
         );
     }
+
+    // ---- M1 compositing fields ----------------------------------------
+
+    /// One video clip on a title media item, with the M1 fields set by the
+    /// caller.
+    fn build_compositing_project(
+        blend: vance_timeline::BlendMode,
+        bg_alpha: f32,
+        frame_size: Option<(u32, u32)>,
+    ) -> Project {
+        let mut p = Project::new("Compositing");
+        let params = vance_timeline::TitleParams {
+            text: "Hi".into(),
+            bg_alpha,
+            ..Default::default()
+        };
+        let media = MediaItem::new_title("Title", t(5), params);
+        let media_id = media.id;
+        p.media.insert(media_id, Arc::new(media));
+        let mut log = EditLog::new(Sequence::new("Seq 01", FrameRate::FPS_24));
+        let track_id = TrackId::new();
+        log.apply(EditOp::AddTrack {
+            track_id,
+            kind: TrackKind::Video,
+            name: "V1".into(),
+        })
+        .unwrap();
+        let mut clip = Clip::new(media_id, "Title", t(0), t(0), t(5)).unwrap();
+        clip.blend_mode = blend;
+        log.apply(EditOp::InsertClip { track_id, clip }).unwrap();
+        log.apply(EditOp::SetFrameSize { size: frame_size })
+            .unwrap();
+        p.sequences.push(Arc::new(log.current().clone()));
+        p
+    }
+
+    #[test]
+    fn pre_m1_bundle_loads_compositing_defaults() {
+        // A pre-M1 bundle has none of the three fields. Strip them from a
+        // freshly written file and check they come back as Normal / 1.0 /
+        // None.
+        let tmp = TempDir::new().unwrap();
+        let bundle = tmp.path().join("PreM1.vance");
+        let project = build_compositing_project(vance_timeline::BlendMode::Normal, 1.0, None);
+        save(&project, &bundle).unwrap();
+        let path = bundle.join("project.ron");
+        let body = fs::read_to_string(&path).unwrap();
+        let legacy: String = body
+            .lines()
+            .filter(|l| {
+                let l = l.trim_start();
+                !(l.starts_with("blend_mode:")
+                    || l.starts_with("bg_alpha:")
+                    || l.starts_with("frame_size:"))
+            })
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(
+            body.lines().count() - legacy.lines().count(),
+            3,
+            "exactly the three M1 fields were stripped"
+        );
+        fs::write(&path, legacy).unwrap();
+
+        let reopened = open(&bundle).unwrap();
+        assert_eq!(reopened, project, "defaults restore the original values");
+        let seq = &reopened.sequences[0];
+        assert_eq!(seq.frame_size, None);
+        assert_eq!(
+            seq.tracks[0].clips[0].blend_mode,
+            vance_timeline::BlendMode::Normal
+        );
+        let title = reopened.media.values().next().unwrap();
+        assert_eq!(title.title.as_ref().unwrap().bg_alpha, 1.0);
+    }
+
+    #[test]
+    fn compositing_fields_round_trip_through_save_and_open() {
+        let tmp = TempDir::new().unwrap();
+        let bundle = tmp.path().join("M1.vance");
+        let project = build_compositing_project(
+            vance_timeline::BlendMode::ColorDodge,
+            0.25,
+            Some((1280, 720)),
+        );
+        save(&project, &bundle).unwrap();
+        let body = fs::read_to_string(bundle.join("project.ron")).unwrap();
+        assert!(body.contains("blend_mode: \"color_dodge\""), "{body}");
+
+        let reopened = open(&bundle).unwrap();
+        assert_eq!(reopened, project);
+        let seq = &reopened.sequences[0];
+        assert_eq!(seq.frame_size, Some((1280, 720)));
+        assert_eq!(
+            seq.tracks[0].clips[0].blend_mode,
+            vance_timeline::BlendMode::ColorDodge
+        );
+        let title = reopened.media.values().next().unwrap();
+        assert_eq!(title.title.as_ref().unwrap().bg_alpha, 0.25);
+    }
 }

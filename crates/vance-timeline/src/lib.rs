@@ -30,6 +30,7 @@
 #![warn(missing_docs)]
 
 pub mod audio_effect;
+pub mod blend;
 pub mod bus;
 pub mod clip;
 pub mod connection;
@@ -39,6 +40,7 @@ pub mod error;
 pub mod fade;
 pub mod grade;
 pub mod id;
+pub mod keyer;
 pub mod marker;
 pub mod media;
 pub mod media_query;
@@ -55,6 +57,7 @@ pub use audio_effect::{
     AudioEffectSpec, CompressorSpec, DeHumSpec, Eq6Spec, EqBandKind, EqBandSpec, LimiterSpec,
     NoiseGateSpec, PluginParamValue, PluginRefSpec,
 };
+pub use blend::BlendMode;
 pub use bus::{bus_graph_cycle, routing_cycle, AudioBus, BusOutput, Send};
 pub use clip::Clip;
 pub use connection::{connected_subtree, would_cycle, Connection};
@@ -72,7 +75,10 @@ pub use media::{ContentHash, MediaItem, MediaKind};
 pub use media_query::{Condition, MediaField, MediaQuery, QueryOp, SmartBin};
 pub use project::{OcioView, Project};
 pub use review::{ReviewComment, ReviewReply};
-pub use scene_plan::{scene_at, transition_at, ActiveClip, ActiveTransition, SceneAt};
+pub use scene_plan::{
+    scene_at, scene_plan_at, transition_at, ActiveClip, ActiveTransition, Layer, LayerClip,
+    LayerContent, LayerTransition, SceneAt, ScenePlan,
+};
 pub use sequence::Sequence;
 pub use title::TitleParams;
 pub use track::{Track, TrackKind};
