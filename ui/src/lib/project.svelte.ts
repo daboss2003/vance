@@ -59,6 +59,7 @@ import {
   mediaList,
   moveClipTo,
   isMagnetic,
+  clipConnections as ipcClipConnections,
   setMagnetic as ipcSetMagnetic,
   connectClip as ipcConnectClip,
   disconnectClip as ipcDisconnectClip,
@@ -89,9 +90,28 @@ import {
   peaksSetCacheDir,
   peaksServiceStatus,
   peaksUseUntitledCacheDir,
-  peaksBackfillVideoAudio
+  peaksBackfillVideoAudio,
+  addTrack as ipcAddTrack,
+  removeTrack as ipcRemoveTrack,
+  moveTrack as ipcMoveTrack,
+  setTrackEnabled as ipcSetTrackEnabled,
+  setTrackLocked as ipcSetTrackLocked,
+  renameTrack as ipcRenameTrack,
+  setClipBlendMode as ipcSetClipBlendMode,
+  setFrameSize as ipcSetFrameSize,
+  setMatteView as ipcSetMatteView,
+  currentTimelineSeconds,
+  evalNumber,
+  isKeyframes,
+  upsertKeyframe,
+  type BlendMode,
+  type ClipContents,
+  type EffectInfo,
+  type KeyframeInterp
 } from './ipc';
 import { peaksCache } from './peaks-cache.svelte';
+import { toast } from './toast.svelte';
+import { isExportBusy } from './export-busy';
 import type { ImportOutcome } from './import-feedback';
 
 class ProjectState {
@@ -108,6 +128,9 @@ class ProjectState {
   /** Counter bumped after every edit (clip insert, etc.) so the
    *  Timeline canvas can refresh its sequence contents. */
   editTick = $state<number>(0);
+  /** Bumped each time a project is created or opened (also when the same
+   *  bundle is reopened), so per-project UI state can reset itself. */
+  projectEpoch = $state<number>(0);
   /** Live state of the current sequence's edit log, refreshed
    *  after every edit op and after undo / redo. Drives toolbar
    *  button enable-disable. */
@@ -138,11 +161,21 @@ class ProjectState {
   private untitledCounter = 0;
   private untitledCacheDir: string | null = null;
 
+  /** Report a failed engine call in the Browser banner (`error`). During an
+   *  export the engine turned it away and did nothing: show the one
+   *  "exporting" hint instead and leave `error` (and all state) as it was. */
+  #fail(e: unknown) {
+    if (isExportBusy(e)) toast.exportBusy();
+    else this.error = String(e);
+  }
+
   private async refreshUndoState() {
     try {
       this.canUndo = await ipcCanUndo();
       this.canRedo = await ipcCanRedo();
-    } catch {
+    } catch (e) {
+      // Intentional: kept during an export (the engine turns refreshes away).
+      if (isExportBusy(e)) return;
       this.canUndo = false;
       this.canRedo = false;
     }
@@ -152,7 +185,10 @@ class ProjectState {
   async refreshSequence() {
     try {
       this.sequence = await currentSequenceContents();
-    } catch {
+    } catch (e) {
+      // Intentional: an export turning the refresh away doesn't empty the
+      // timeline; the contents are unchanged.
+      if (isExportBusy(e)) return;
       this.sequence = null;
     }
   }
@@ -165,6 +201,7 @@ class ProjectState {
     await this.refreshSequence();
     await this.refreshUndoState();
     await this.refreshMagnetic();
+    await this.refreshConnections();
   }
 
   /** Replace the current project with a freshly created empty one. */
@@ -172,6 +209,7 @@ class ProjectState {
     this.error = null;
     try {
       this.info = await ipcNew(name);
+      this.#projectReplaced();
       this.path = null;
       this.media = [];
       // Dispose the UI cache AND retarget the backend service to a
@@ -185,7 +223,7 @@ class ProjectState {
       );
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -194,6 +232,7 @@ class ProjectState {
     this.error = null;
     try {
       this.info = await loadProject(path);
+      this.#projectReplaced();
       this.path = path;
       this.media = await mediaList();
       // Reset the UI peaks cache (drops listener + entries) before
@@ -213,7 +252,7 @@ class ProjectState {
       // land and the cache picks them up via subsequent enqueueAllAudio.
       void this.backfillVideoAudioProbes();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -370,7 +409,7 @@ class ProjectState {
         await this.enqueueAllAudio();
       }
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -401,20 +440,35 @@ class ProjectState {
   async selectSequence(sequenceId: string) {
     this.error = null;
     try {
+      // The solo names a clip of the sequence being left. The engine drops
+      // it on a switch too; clearing it here as well keeps the UI state and
+      // any in-flight "Show matte" call in step with that.
+      if (sequenceId !== this.info?.current_sequence_id && this.matteViewClipId !== null) {
+        await this.setMatteView(null);
+      }
       await ipcSetSeq(sequenceId);
       // Refresh so `info.current_sequence_id` reflects the change.
       this.info = await projectInfo();
+      // Contents, undo history and the magnetic flag are per sequence.
+      await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
   /** Re-fetch the engine's view of the project. Useful after edit-log
    *  operations once Phase 4.x writes them. */
   async refresh() {
-    this.info = await projectInfo();
-    this.path = await currentProjectPath();
-    this.media = await mediaList();
+    try {
+      this.info = await projectInfo();
+      this.path = await currentProjectPath();
+      this.media = await mediaList();
+    } catch (e) {
+      // Intentional: a refresh an export turned away keeps what the store had
+      // (every caller runs it after an action, which the export refused
+      // first); other failures still reach the caller, as before.
+      if (!isExportBusy(e)) throw e;
+    }
   }
 
   /** Load a media item into the Source monitor. Double-click in
@@ -427,7 +481,7 @@ class ProjectState {
       this.sourceName = m?.name ?? '';
       this.source = await ipcSourceState();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -441,7 +495,7 @@ class ProjectState {
       await decodeSourceAt(pts);
       this.source = await ipcSourceState();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -451,7 +505,7 @@ class ProjectState {
       await ipcSetSourceMarkIn();
       this.source = await ipcSourceState();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -461,7 +515,7 @@ class ProjectState {
       await ipcSetSourceMarkOut();
       this.source = await ipcSourceState();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -471,7 +525,7 @@ class ProjectState {
       await ipcClearSourceMarks();
       this.source = await ipcSourceState();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -484,7 +538,7 @@ class ProjectState {
       this.info = await projectInfo();
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -527,10 +581,14 @@ class ProjectState {
     sizePx?: number;
     fgRgb?: [number, number, number];
     bgRgb?: [number, number, number];
+    /** Background opacity in `[0, 1]`; new titles default to transparent. */
+    bgAlpha?: number;
     width?: number;
     height?: number;
   }): Promise<string | null> {
     this.error = null;
+    // New titles match the sequence canvas; existing titles keep their size.
+    const [seqW, seqH] = this.sequence?.frame_size ?? [1920, 1080];
     try {
       const item = await createTitleMedia({
         displayName: args.displayName,
@@ -539,13 +597,16 @@ class ProjectState {
         sizePx: args.sizePx ?? 96,
         fgRgb: args.fgRgb ?? [1, 1, 1],
         bgRgb: args.bgRgb ?? [0, 0, 0],
-        width: args.width ?? 1280,
-        height: args.height ?? 720
+        // M1 (ADR 0007): titles composite over the tracks below, so a new
+        // one has no background card unless the caller asks for it.
+        bgAlpha: args.bgAlpha ?? 0,
+        width: args.width ?? seqW,
+        height: args.height ?? seqH
       });
       this.media = [...this.media, item];
       return item.id;
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
       return null;
     }
   }
@@ -563,7 +624,7 @@ class ProjectState {
         m.id === mediaId ? { ...m, input_color_space: space } : m
       );
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -576,7 +637,7 @@ class ProjectState {
         this.info = { ...this.info, working_color_space: space };
       }
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -591,7 +652,7 @@ class ProjectState {
       }
       return true;
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
       return false;
     }
   }
@@ -603,7 +664,7 @@ class ProjectState {
     try {
       return await ocioListColorspaces(config);
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
       return [];
     }
   }
@@ -621,7 +682,7 @@ class ProjectState {
         };
       }
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -634,7 +695,7 @@ class ProjectState {
         this.info = { ...this.info, ocio_view: null };
       }
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -679,19 +740,21 @@ class ProjectState {
         searchRadius
       );
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
       return null;
     }
   }
 
   /** Solo a grade node's qualifier matte to the viewport, or clear it
    *  (`effectId: null`). Transient viewer state (Phase 6.9). */
-  async setMatteNode(clipId: string, effectId: string | null) {
+  async setMatteNode(clipId: string, effectId: string | null): Promise<'ok' | 'busy' | 'failed'> {
     this.error = null;
     try {
       await ipcSetMatteNode(clipId, effectId);
+      return 'ok';
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
+      return isExportBusy(e) ? 'busy' : 'failed';
     }
   }
 
@@ -727,7 +790,7 @@ class ProjectState {
       this.info = await projectInfo();
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -747,7 +810,7 @@ class ProjectState {
       }
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -759,7 +822,7 @@ class ProjectState {
       this.magnetic = on;
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -767,8 +830,23 @@ class ProjectState {
   async refreshMagnetic() {
     try {
       this.magnetic = await isMagnetic();
-    } catch {
+    } catch (e) {
+      if (isExportBusy(e)) return;
       this.magnetic = false;
+    }
+  }
+
+  /** GOAT-6 clip connections of the current sequence, `[anchor, connected]`
+   *  pairs: a magnetic move carries every clip connected below the moved one,
+   *  so the timeline checks all their tracks for a lock before a drag. */
+  connections = $state<[string, string][]>([]);
+
+  async refreshConnections() {
+    try {
+      this.connections = await ipcClipConnections();
+    } catch (e) {
+      if (isExportBusy(e)) return;
+      this.connections = [];
     }
   }
 
@@ -779,7 +857,7 @@ class ProjectState {
       await ipcConnectClip(anchorId, connectedId);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -790,7 +868,7 @@ class ProjectState {
       await ipcDisconnectClip(connectedId);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -801,7 +879,7 @@ class ProjectState {
       await ipcAppendClip(trackId, mediaId);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -812,7 +890,7 @@ class ProjectState {
       await magneticRippleDelete(trackId, clipId);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -831,7 +909,7 @@ class ProjectState {
       await ipcRemoveClip(trackId, clipId);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -847,7 +925,7 @@ class ProjectState {
       await ipcAddEffect(trackId, clipId, kind, params);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -858,7 +936,7 @@ class ProjectState {
       await ipcRemoveEffect(trackId, clipId, effectId);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -875,7 +953,7 @@ class ProjectState {
       await ipcUpdateEffectParam(trackId, clipId, effectId, key, value);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -886,7 +964,7 @@ class ProjectState {
       await ipcMoveEffect(trackId, clipId, effectId, newIndex);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -897,7 +975,231 @@ class ProjectState {
       await ipcSetEffectEnabled(trackId, clipId, effectId, enabled);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
+    }
+  }
+
+  // ---- M1 compositing (ADR 0007) -------------------------------------------
+  //
+  // Intentional: these mutators report failures as toasts and leave `error`
+  // alone (like importMedia), so a failed track / blend / canvas / keyer edit
+  // surfaces next to the action instead of in the Browser panel's banner.
+  // Each resolves to whether the edit landed.
+
+  /** Clip whose keyer matte is soloed in the Record viewer. Transient viewer
+   *  state, never saved. */
+  matteViewClipId = $state<string | null>(null);
+  /** Bumped by every matte-view change, so a failed call only rolls back a
+   *  state no later call (or project switch) has replaced. */
+  #matteSeq = 0;
+
+  /** A new or opened project replaced the old one; the engine has already
+   *  dropped its viewer state (matte solo included). */
+  #projectReplaced() {
+    this.projectEpoch++;
+    this.#matteSeq++;
+    this.matteViewClipId = null;
+  }
+
+  async #edit(failure: string, op: () => Promise<unknown>): Promise<boolean> {
+    try {
+      await op();
+    } catch (e) {
+      // During an export this is the "exporting" hint, not an error (toast).
+      toast.error(`${failure}\n${String(e)}`);
+      return false;
+    }
+    await this.commitEdit();
+    return true;
+  }
+
+  /** Add a track; `position` is the index within its kind's group (omit to
+   *  put it after the last one: the top video layer / the last audio row). */
+  async addTrack(kind: 'video' | 'audio', position?: number): Promise<boolean> {
+    return this.#edit(`Couldn't add the ${kind} track.`, () =>
+      ipcAddTrack(kind, undefined, position)
+    );
+  }
+
+  /** Delete a track and every clip on it (undoable). */
+  async removeTrack(trackId: string): Promise<boolean> {
+    const ok = await this.#edit("Couldn't delete the track.", () => ipcRemoveTrack(trackId));
+    if (ok) {
+      // Clip counts changed, which drives whether Play has a sequence to play.
+      try {
+        this.info = await projectInfo();
+      } catch {
+        /* keep the previous info; the next refresh corrects it */
+      }
+    }
+    return ok;
+  }
+
+  /** Move a track within its kind's group (0 = bottom video layer). */
+  async moveTrack(trackId: string, toPosition: number): Promise<boolean> {
+    return this.#edit("Couldn't move the track.", () => ipcMoveTrack(trackId, toPosition));
+  }
+
+  /** Show or hide a track. */
+  async setTrackEnabled(trackId: string, enabled: boolean): Promise<boolean> {
+    return this.#edit(enabled ? "Couldn't show the track." : "Couldn't hide the track.", () =>
+      ipcSetTrackEnabled(trackId, enabled)
+    );
+  }
+
+  /** Lock or unlock a track. Locked: its clips and their effects can't change
+   *  and it can't be deleted; mute, solo, visibility, order and name still
+   *  can. */
+  async setTrackLocked(trackId: string, locked: boolean): Promise<boolean> {
+    return this.#edit(locked ? "Couldn't lock the track." : "Couldn't unlock the track.", () =>
+      ipcSetTrackLocked(trackId, locked)
+    );
+  }
+
+  /** Rename a track; an empty name restores its automatic name (V1, A2…). */
+  async renameTrack(trackId: string, name: string): Promise<boolean> {
+    return this.#edit("Couldn't rename the track.", () => ipcRenameTrack(trackId, name));
+  }
+
+  /** Set how a clip's layer combines with the tracks below it. */
+  async setClipBlendMode(trackId: string, clipId: string, mode: BlendMode): Promise<boolean> {
+    return this.#edit("Couldn't change the blend mode.", () =>
+      ipcSetClipBlendMode(trackId, clipId, mode)
+    );
+  }
+
+  /** Set the sequence canvas size; both `null` resets it to the default. */
+  async setFrameSize(width: number | null, height: number | null): Promise<boolean> {
+    return this.#edit("Couldn't change the frame size.", () => ipcSetFrameSize(width, height));
+  }
+
+  /** Attach an effect, toasting on failure. */
+  async addClipEffect(
+    trackId: string,
+    clipId: string,
+    kind: string,
+    params: Record<string, EffectValue>
+  ): Promise<boolean> {
+    return this.#edit("Couldn't add the effect.", () =>
+      ipcAddEffect(trackId, clipId, kind, params)
+    );
+  }
+
+  /** Playhead position relative to `clip`'s start, clamped to >= 0. */
+  async clipTimeAtPlayhead(clip: ClipContents): Promise<number> {
+    // No playhead (none yet, or the engine is busy exporting): the clip start.
+    const t = (await currentTimelineSeconds().catch(() => null)) ?? clip.timeline_in_seconds;
+    return Math.max(0, t - clip.timeline_in_seconds);
+  }
+
+  /** Set numeric effect params as ONE undoable step. A param that is already
+   *  keyframed gets a keyframe at the playhead (replacing one there) so its
+   *  animation survives; a static param is overwritten. Pass `atClipT` (clip
+   *  time) when the caller already read the playhead, so both use one time. */
+  async setEffectNumbers(
+    trackId: string,
+    clip: ClipContents,
+    effect: EffectInfo,
+    entries: [string, number][],
+    atClipT?: number
+  ): Promise<boolean> {
+    return this.#edit("Couldn't update the effect.", async () => {
+      let clipT: number | null = atClipT ?? null;
+      const params: [string, EffectValue][] = [];
+      for (const [key, value] of entries) {
+        const existing = effect.params[key];
+        if (existing !== undefined && isKeyframes(existing)) {
+          clipT ??= await this.clipTimeAtPlayhead(clip);
+          params.push([key, upsertKeyframe(existing, clipT, value)]);
+        } else {
+          params.push([key, value]);
+        }
+      }
+      await ipcUpdateEffectParams(trackId, clip.id, effect.id, params);
+    });
+  }
+
+  /** Pin a keyframe at the playhead holding the param's current value. The
+   *  first one turns a static value into an animated param. */
+  async addEffectKeyframe(
+    trackId: string,
+    clip: ClipContents,
+    effect: EffectInfo,
+    key: string,
+    fallback: number
+  ): Promise<boolean> {
+    return this.#edit("Couldn't add the keyframe.", async () => {
+      const clipT = await this.clipTimeAtPlayhead(clip);
+      const existing = effect.params[key];
+      const value = existing !== undefined ? evalNumber(existing, clipT, fallback) : fallback;
+      const kfs = existing !== undefined && isKeyframes(existing) ? existing : [];
+      await ipcUpdateEffectParam(
+        trackId,
+        clip.id,
+        effect.id,
+        key,
+        upsertKeyframe(kfs, clipT, value)
+      );
+    });
+  }
+
+  /** Remove the keyframe at `timeSeconds`. Removing the last one leaves the
+   *  param static at that keyframe's value. */
+  async removeEffectKeyframe(
+    trackId: string,
+    clip: ClipContents,
+    effect: EffectInfo,
+    key: string,
+    timeSeconds: number
+  ): Promise<boolean> {
+    const existing = effect.params[key];
+    if (existing === undefined || !isKeyframes(existing)) return false;
+    const removed = existing.find((k) => Math.abs(k.time_seconds - timeSeconds) <= 1e-3);
+    if (!removed) return false;
+    const kfs = existing.filter((k) => Math.abs(k.time_seconds - timeSeconds) > 1e-3);
+    const next: EffectValue = kfs.length > 0 ? kfs : removed.value;
+    return this.#edit("Couldn't remove the keyframe.", () =>
+      ipcUpdateEffectParam(trackId, clip.id, effect.id, key, next)
+    );
+  }
+
+  /** Cycle a keyframe's outgoing easing: Linear, then Bezier, then Hold. */
+  async cycleEffectKeyframeInterp(
+    trackId: string,
+    clip: ClipContents,
+    effect: EffectInfo,
+    key: string,
+    timeSeconds: number
+  ): Promise<boolean> {
+    const existing = effect.params[key];
+    if (existing === undefined || !isKeyframes(existing)) return false;
+    const order: KeyframeInterp[] = ['Linear', 'Bezier', 'Hold'];
+    const kfs = existing.map((k) =>
+      Math.abs(k.time_seconds - timeSeconds) <= 1e-3
+        ? { ...k, interp: order[(order.indexOf(k.interp ?? 'Linear') + 1) % order.length] }
+        : k
+    );
+    return this.#edit("Couldn't change the keyframe.", () =>
+      ipcUpdateEffectParam(trackId, clip.id, effect.id, key, kfs)
+    );
+  }
+
+  /** Solo `clipId`'s keyer matte in the viewer, or clear it with `null`.
+   *  Optimistic: the state changes before the call, so deselecting the clip
+   *  while a "Show matte" call is in flight (the keyer inspector clears its
+   *  solo on teardown) still clears it. A failure rolls the state back. */
+  async setMatteView(clipId: string | null): Promise<boolean> {
+    const prev = this.matteViewClipId;
+    const seq = ++this.#matteSeq;
+    this.matteViewClipId = clipId;
+    try {
+      await ipcSetMatteView(clipId);
+      return true;
+    } catch (e) {
+      if (seq === this.#matteSeq) this.matteViewClipId = prev;
+      const what = clipId !== null ? "Couldn't show the matte." : "Couldn't hide the matte.";
+      toast.error(`${what}\n${String(e)}`);
+      return false;
     }
   }
 
@@ -913,7 +1215,7 @@ class ProjectState {
       await ipcSetTrackMute(trackId, mute);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -923,7 +1225,7 @@ class ProjectState {
       await ipcSetTrackSolo(trackId, solo);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -933,7 +1235,7 @@ class ProjectState {
       await ipcSetTrackGainDb(trackId, gainDb);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -943,7 +1245,7 @@ class ProjectState {
       await ipcSetClipMute(trackId, clipId, mute);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -953,7 +1255,7 @@ class ProjectState {
       await ipcSetClipGainDb(trackId, clipId, gainDb);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -965,7 +1267,7 @@ class ProjectState {
       await ipcSetTrackPan(trackId, pan);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -977,7 +1279,7 @@ class ProjectState {
       await ipcSetClipPan(trackId, clipId, pan);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -988,7 +1290,7 @@ class ProjectState {
       await ipcAddAudioEffect(trackId, effect);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -999,7 +1301,7 @@ class ProjectState {
       await ipcRemoveAudioEffect(trackId, index);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -1010,7 +1312,7 @@ class ProjectState {
       await ipcMoveAudioEffect(trackId, fromIndex, toIndex);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -1021,7 +1323,7 @@ class ProjectState {
       await ipcUpdateAudioEffect(trackId, index, effect);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -1033,7 +1335,7 @@ class ProjectState {
       await ipcSetMasterGainDb(gainDb);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -1045,7 +1347,7 @@ class ProjectState {
       await ipcSetTrackGainKeyframes(trackId, keyframes);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -1057,7 +1359,7 @@ class ProjectState {
       await ipcSetClipGainKeyframes(trackId, clipId, keyframes);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -1075,7 +1377,7 @@ class ProjectState {
       await ipcSetClipFadeIn(trackId, clipId, durationSeconds, curve);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -1092,7 +1394,7 @@ class ProjectState {
       await ipcSetClipFadeOut(trackId, clipId, durationSeconds, curve);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -1109,7 +1411,7 @@ class ProjectState {
       await ipcUpdateEffectParams(trackId, clipId, effectId, params);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -1140,7 +1442,7 @@ class ProjectState {
       await ipcAddTransition(trackId, afterClipId, kind, durationSeconds);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -1156,7 +1458,7 @@ class ProjectState {
       await ipcRemoveTransition(trackId, transitionId);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -1167,7 +1469,7 @@ class ProjectState {
       await trimClipIn(trackId, clipId, newSourceInSeconds);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -1178,7 +1480,7 @@ class ProjectState {
       await trimClipOut(trackId, clipId, newSourceOutSeconds);
       await this.commitEdit();
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -1194,7 +1496,7 @@ class ProjectState {
         await this.refreshUndoState();
       }
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 
@@ -1210,7 +1512,7 @@ class ProjectState {
         await this.refreshUndoState();
       }
     } catch (e) {
-      this.error = String(e);
+      this.#fail(e);
     }
   }
 }

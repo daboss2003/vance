@@ -13,20 +13,42 @@
    * offscreen wgpu readback for real sequence content lands in 8.5.
    */
 
-  import { renderSequence, type EncoderPresetKey, type RenderOutcome } from '$lib/ipc';
-  import { toast } from '$lib/toast.svelte';
+  import { tick } from 'svelte';
+  import type { EncoderPresetKey } from '$lib/ipc';
+  import { projectState } from '$lib/project.svelte';
+  import { exportRun } from '$lib/export-run.svelte';
+  import {
+    exportEdge,
+    exportSizeBasis,
+    sequenceSize,
+    sizeEdit,
+    type SizeEdit
+  } from '$lib/export-size';
 
   let outputPath = $state('vance-export.mp4');
   let preset = $state<EncoderPresetKey>('H264');
-  let width = $state<number | null>(1920);
-  let height = $state<number | null>(1080);
+  // The size follows the sequence frame size (1920×1080 until the first clip
+  // sets it) until the user types a different one (rules in export-size.ts).
+  const seqWidth = $derived(sequenceSize(projectState.sequence)[0]);
+  const seqHeight = $derived(sequenceSize(projectState.sequence)[1]);
+  const sizeBasis = $derived(exportSizeBasis(projectState.projectEpoch, projectState.sequence));
+  // Intentional: writable $derived. Typing assigns a value; any change of the
+  // basis (project opened or created, sequence switched, frame size changed)
+  // re-derives it to `undefined`, so the export follows the sequence again.
+  let widthEdit = $derived.by<SizeEdit>(() => {
+    void sizeBasis;
+    return undefined;
+  });
+  let heightEdit = $derived.by<SizeEdit>(() => {
+    void sizeBasis;
+    return undefined;
+  });
+  const width = $derived(exportEdge(widthEdit, seqWidth));
+  const height = $derived(exportEdge(heightEdit, seqHeight));
   let startSeconds = $state<number | null>(null);
   let endSeconds = $state<number | null>(null);
   let crf = $state<number | null>(23);
   let hdr = $state(false);
-
-  let rendering = $state(false);
-  let lastOutcome = $state<RenderOutcome | null>(null);
 
   /** Pretty label for each preset key. */
   const PRESETS: { value: EncoderPresetKey; label: string }[] = [
@@ -43,135 +65,180 @@
 
   const needsCrf = $derived(preset === 'H264' || preset === 'Hevc' || preset === 'Av1');
 
-  async function doRender() {
-    rendering = true;
-    lastOutcome = null;
-    try {
-      lastOutcome = await renderSequence({
-        output_path: outputPath,
-        preset,
-        crf: needsCrf ? crf : null,
-        width,
-        height,
-        start_seconds: startSeconds,
-        end_seconds: endSeconds,
-        hdr
-      });
-      toast.success('Export finished — saved to ' + lastOutcome.output_path);
-    } catch (e) {
-      toast.error('Export failed.\n' + String(e));
-    } finally {
-      rendering = false;
-    }
+  // One export at a time, app-wide (export-run.svelte.ts): the run outlives
+  // this panel, which unmounts when the dock switches.
+  const busy = $derived(exportRun.phase !== 'idle');
+  let renderBtn = $state<HTMLButtonElement | null>(null);
+  let cancelBtn = $state<HTMLButtonElement | null>(null);
+
+  function doRender() {
+    void exportRun.start({
+      output_path: outputPath,
+      preset,
+      crf: needsCrf ? crf : null,
+      width,
+      height,
+      start_seconds: startSeconds,
+      end_seconds: endSeconds,
+      hdr
+    });
+  }
+
+  async function doCancel() {
+    const hadFocus = document.activeElement === cancelBtn;
+    await exportRun.cancel();
+    const run = exportRun.current;
+    if (run) await run;
+    // The Cancel button goes away with the export; don't strand its focus.
+    await tick();
+    if (hadFocus && renderBtn?.isConnected) renderBtn.focus();
   }
 </script>
 
 <div class="border-vance-border rounded border bg-vance-bg p-2 text-[11px]">
   <div class="text-vance-muted mb-1 uppercase tracking-wider">Export</div>
 
-  <label class="mb-1 flex items-center gap-1">
-    <span class="text-vance-muted w-12">Save to</span>
-    <input
-      type="text"
-      bind:value={outputPath}
-      class="border-vance-border flex-1 rounded border bg-vance-panel px-1 font-mono text-[10px]"
-      placeholder="my-video.mp4"
-    />
-  </label>
+  <!-- Settings are fixed while an export runs (disabled fieldset). -->
+  <fieldset class="min-w-0" disabled={busy}>
+    <label class="mb-1 flex items-center gap-1">
+      <span class="text-vance-muted w-12">Save to</span>
+      <input
+        type="text"
+        bind:value={outputPath}
+        class="border-vance-border flex-1 rounded border bg-vance-panel px-1 font-mono text-[10px]"
+        placeholder="my-video.mp4"
+      />
+    </label>
 
-  <label class="mb-1 flex items-center gap-1">
-    <span class="text-vance-muted w-12">Format</span>
-    <select
-      bind:value={preset}
-      class="border-vance-border flex-1 rounded border bg-vance-panel px-1 text-[10px]"
-    >
-      {#each PRESETS as p}
-        <option value={p.value}>{p.label}</option>
-      {/each}
-    </select>
-  </label>
+    <label class="mb-1 flex items-center gap-1">
+      <span class="text-vance-muted w-12">Format</span>
+      <select
+        bind:value={preset}
+        class="border-vance-border flex-1 rounded border bg-vance-panel px-1 text-[10px]"
+      >
+        {#each PRESETS as p}
+          <option value={p.value}>{p.label}</option>
+        {/each}
+      </select>
+    </label>
 
-  {#if needsCrf}
+    {#if needsCrf}
+      <label
+        class="mb-1 flex items-center gap-1"
+        title="Lower number = higher quality (and larger file)"
+      >
+        <span class="text-vance-muted w-12">Quality</span>
+        <input
+          type="number"
+          bind:value={crf}
+          min="0"
+          max="63"
+          class="border-vance-border w-16 rounded border bg-vance-panel px-1 font-mono text-[10px]"
+        />
+        <span class="text-vance-muted text-[10px]">lower = better</span>
+      </label>
+    {/if}
+
     <label
       class="mb-1 flex items-center gap-1"
-      title="Lower number = higher quality (and larger file)"
+      title="Export in HDR — brighter highlights and richer color (HEVC 10-bit)."
     >
-      <span class="text-vance-muted w-12">Quality</span>
+      <span class="text-vance-muted w-12">HDR</span>
+      <input type="checkbox" bind:checked={hdr} />
+    </label>
+
+    <div class="mb-1 flex items-center gap-1">
+      <span class="text-vance-muted w-12">Size</span>
       <input
         type="number"
-        bind:value={crf}
-        min="0"
-        max="63"
+        bind:value={
+          () => (widthEdit === undefined ? seqWidth : widthEdit),
+          (v) => (widthEdit = sizeEdit(v, seqWidth))
+        }
+        min="2"
         class="border-vance-border w-16 rounded border bg-vance-panel px-1 font-mono text-[10px]"
+        placeholder={String(seqWidth)}
+        aria-label="Export width in pixels"
+        title="Defaults to the sequence frame size"
       />
-      <span class="text-vance-muted text-[10px]">lower = better</span>
-    </label>
-  {/if}
-
-  <label
-    class="mb-1 flex items-center gap-1"
-    title="Export in HDR — brighter highlights and richer color (HEVC 10-bit)."
-  >
-    <span class="text-vance-muted w-12">HDR</span>
-    <input type="checkbox" bind:checked={hdr} />
-  </label>
-
-  <div class="mb-1 flex items-center gap-1">
-    <span class="text-vance-muted w-12">Size</span>
-    <input
-      type="number"
-      bind:value={width}
-      min="2"
-      class="border-vance-border w-16 rounded border bg-vance-panel px-1 font-mono text-[10px]"
-      placeholder="W"
-    />
-    <span class="text-vance-muted">×</span>
-    <input
-      type="number"
-      bind:value={height}
-      min="2"
-      class="border-vance-border w-16 rounded border bg-vance-panel px-1 font-mono text-[10px]"
-      placeholder="H"
-    />
-  </div>
-
-  <div class="mb-1 flex items-center gap-1">
-    <span class="text-vance-muted w-12">Range</span>
-    <input
-      type="number"
-      bind:value={startSeconds}
-      step="0.1"
-      min="0"
-      class="border-vance-border w-16 rounded border bg-vance-panel px-1 font-mono text-[10px]"
-      placeholder="start s"
-    />
-    <span class="text-vance-muted">→</span>
-    <input
-      type="number"
-      bind:value={endSeconds}
-      step="0.1"
-      min="0"
-      class="border-vance-border w-16 rounded border bg-vance-panel px-1 font-mono text-[10px]"
-      placeholder="end s"
-    />
-  </div>
-
-  <button
-    type="button"
-    class="bg-vance-accent text-vance-bg w-full rounded px-2 py-1 text-[11px] font-medium disabled:opacity-50"
-    onclick={doRender}
-    disabled={rendering || !outputPath}
-  >
-    {rendering ? 'Rendering…' : 'Render'}
-  </button>
-
-  {#if lastOutcome}
-    <div class="text-vance-muted mt-1 font-mono text-[10px]">
-      <div>→ {lastOutcome.output_path}</div>
-      <div>
-        {lastOutcome.video_frames} frames · {lastOutcome.audio_samples} samples ·
-        {lastOutcome.elapsed_seconds.toFixed(2)} s
-      </div>
+      <span class="text-vance-muted">×</span>
+      <input
+        type="number"
+        bind:value={
+          () => (heightEdit === undefined ? seqHeight : heightEdit),
+          (v) => (heightEdit = sizeEdit(v, seqHeight))
+        }
+        min="2"
+        class="border-vance-border w-16 rounded border bg-vance-panel px-1 font-mono text-[10px]"
+        placeholder={String(seqHeight)}
+        aria-label="Export height in pixels"
+        title="Defaults to the sequence frame size"
+      />
     </div>
-  {/if}
+
+    <div class="mb-1 flex items-center gap-1">
+      <span class="text-vance-muted w-12">Range</span>
+      <input
+        type="number"
+        bind:value={startSeconds}
+        step="0.1"
+        min="0"
+        class="border-vance-border w-16 rounded border bg-vance-panel px-1 font-mono text-[10px]"
+        placeholder="start s"
+      />
+      <span class="text-vance-muted">→</span>
+      <input
+        type="number"
+        bind:value={endSeconds}
+        step="0.1"
+        min="0"
+        class="border-vance-border w-16 rounded border bg-vance-panel px-1 font-mono text-[10px]"
+        placeholder="end s"
+      />
+    </div>
+  </fieldset>
+
+  <div class="flex gap-1">
+    <button
+      bind:this={renderBtn}
+      type="button"
+      class="bg-vance-accent text-vance-bg flex-1 rounded px-2 py-1 text-[11px] font-medium disabled:opacity-50"
+      onclick={doRender}
+      disabled={busy || !outputPath}
+    >
+      {busy ? 'Rendering…' : 'Render'}
+    </button>
+    {#if busy}
+      <!-- aria-disabled, not disabled, while cancelling: a focused button
+           that turns disabled drops keyboard focus. -->
+      <button
+        bind:this={cancelBtn}
+        type="button"
+        class="border-vance-border rounded border bg-vance-panel px-2 py-1 text-[11px] hover:brightness-125 aria-disabled:cursor-default aria-disabled:opacity-50 aria-disabled:hover:brightness-100"
+        aria-disabled={exportRun.phase === 'cancelling'}
+        onclick={doCancel}
+      >
+        {exportRun.phase === 'cancelling' ? 'Cancelling…' : 'Cancel'}
+      </button>
+    {/if}
+  </div>
+
+  <div role="status" class="text-vance-muted mt-1 text-[10px]">
+    {#if busy}
+      Exporting. Cancel stops it without writing a file.
+    {:else if exportRun.lastCancelled}
+      Export cancelled. No file was written.
+    {:else if exportRun.lastEndedUnseen}
+      The export that was running has ended.
+    {:else if exportRun.lastOutcome}
+      {@const o = exportRun.lastOutcome}
+      <div class="font-mono">
+        <div>→ {o.output_path}</div>
+        <div>
+          {o.video_frames} frames · {o.audio_samples} samples ·
+          {o.elapsed_seconds.toFixed(2)} s
+        </div>
+      </div>
+    {/if}
+  </div>
 </div>

@@ -13,6 +13,9 @@
     type MographControl,
     type MographValue
   } from '$lib/ipc';
+  import { reportableError } from '$lib/toast.svelte';
+  import { refreshError } from '$lib/export-busy';
+  import { exportRun } from '$lib/export-run.svelte';
   import { projectState } from '$lib/project.svelte';
 
   let catalog = $state<[string, string][]>([]);
@@ -25,13 +28,15 @@
   // Existing mograph items in the project, for re-editing.
   let mographItems = $derived(projectState.media.filter((m) => m.kind === 'mograph'));
 
+  // Loads again after an export, which turns the catalog away while it runs.
   $effect(() => {
+    if (exportRun.busy) return;
     void mographCatalog()
       .then((c) => {
         catalog = c;
         if (!selectedKey && c.length) selectedKey = c[0][0];
       })
-      .catch((e) => (error = String(e)));
+      .catch((e) => (error = refreshError(e)));
   });
 
   async function act<T>(fn: () => Promise<T>): Promise<T | undefined> {
@@ -40,7 +45,7 @@
     try {
       return await fn();
     } catch (e) {
-      error = String(e);
+      error = reportableError(e);
     } finally {
       busy = false;
     }

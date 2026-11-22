@@ -1,7 +1,185 @@
 // Typed wrappers around the Tauri commands `vance-app` exposes. Keeping
 // these in one place makes it easy to update when the Rust side changes.
 
-import { invoke } from '@tauri-apps/api/core';
+import { invoke as tauriInvoke, type InvokeArgs } from '@tauri-apps/api/core';
+import { createEditQueue } from '../edit-queue';
+
+// ---- Ordered engine calls ---------------------------------------------------
+//
+// Engine commands run concurrently, so commands that change state go through
+// one ordered queue (edit-queue.ts): each starts after the previous settled.
+// These stay outside it: reads and polls, viewing and transport (decoding,
+// scrubbing, play / stop, viewport bounds), lock-free controls (cancel,
+// status, peaks service), and long jobs that must not hold up edits (exports,
+// imports from slow drives, AI jobs, sign-in waits). A command missing from
+// the list is ordered, which is the safe default.
+const UNORDERED = new Set([
+  // reads, polls
+  'ai_python_available',
+  'ai_tool_status',
+  'analyze_loudness',
+  'backend_version',
+  'buses',
+  'can_redo',
+  'can_undo',
+  'captions',
+  'clip_connections',
+  'compute_scopes',
+  'control_status',
+  'crash_log_dir',
+  'current_project_path',
+  'current_sequence_contents',
+  'current_timeline_seconds',
+  'custom_columns',
+  'detect_capabilities',
+  'diag_log',
+  'edit_history',
+  'fusion_comp',
+  'get_app_settings',
+  'grading_command_schema',
+  'image_gen_available',
+  'is_magnetic',
+  'is_playing',
+  'last_resume_pts',
+  'list_audio_plugins',
+  'list_ofx_plugins',
+  'list_plugin_params',
+  'list_wasm_plugins',
+  'magic_mask_available',
+  'media_list',
+  'meter_snapshot',
+  'midi_ports',
+  'mograph_catalog',
+  'mograph_instance',
+  'nodegraph_compile',
+  'nodegraph_palette',
+  'ocio_list_colorspaces',
+  'plugins_folder',
+  'poll_control_actions',
+  'project_info',
+  'query_media',
+  'rescan_plugins',
+  'review_comments',
+  'shader_preview',
+  'shader_template',
+  'smart_bin_members',
+  'smart_bins',
+  'source_state',
+  'transcription_available',
+  'validate_expression',
+  'voice_isolation_available',
+  // viewing, transport
+  'clear_source_marks',
+  'decode_and_render_at',
+  'decode_sequence_at',
+  'decode_source_at',
+  'load_source',
+  'open_file',
+  'play_sequence',
+  'scrub_begin',
+  'scrub_end',
+  'scrub_grain',
+  'set_scopes_enabled',
+  'set_source_mark_in',
+  'set_source_mark_out',
+  'set_source_viewport_bounds',
+  'set_viewport_bounds',
+  'start_playback',
+  'stop_playback',
+  // lock-free controls, peaks service
+  'cancel_export',
+  'cancel_import',
+  'export_status',
+  'peaks_backfill_video_audio',
+  'peaks_cancel',
+  'peaks_enqueue',
+  'peaks_for_clip',
+  'peaks_meta',
+  'peaks_prioritize',
+  'peaks_service_status',
+  'peaks_set_cache_dir',
+  'peaks_status',
+  'peaks_use_untitled_cache_dir',
+  // long jobs, outside services
+  'add_wasm_plugin',
+  'await_oauth',
+  'catalog_browse',
+  'catalog_detail',
+  'catalog_install',
+  'catalog_report',
+  'catalog_review',
+  'catalog_reviews',
+  'entitlement_install',
+  'entitlement_uninstall',
+  'entitlements_list',
+  'entitlements_reconcile',
+  'generate_image',
+  'import_media_file',
+  'install_ai_tool',
+  'isolate_voice',
+  'magic_mask',
+  'payment_checkout',
+  'payment_connect',
+  'payment_connect_status',
+  'publish_authorized',
+  'publish_video',
+  'remove_wasm_plugin',
+  'render_and_replace',
+  'render_sequence',
+  'seller_effects',
+  'seller_status',
+  'set_app_settings',
+  'shader_save',
+  'start_midi_control',
+  'start_oauth',
+  'start_osc_control',
+  'stop_midi_control',
+  'stop_osc_control',
+  'transcribe_media'
+]);
+
+/** Slider streams (sent per input event): the target a value is for. Only
+ *  the newest pending value per target is sent. */
+const pick =
+  (...names: string[]) =>
+  (args: Record<string, unknown>) =>
+    JSON.stringify(names.map((n) => args[n]));
+const COALESCE: Record<string, (args: Record<string, unknown>) => string> = {
+  set_track_pan: pick('trackId'),
+  set_clip_pan: pick('trackId', 'clipId'),
+  set_track_gain_db: pick('trackId'),
+  set_clip_gain_db: pick('trackId', 'clipId'),
+  set_master_gain_db: pick(),
+  set_bus_gain_db: pick('busId'),
+  set_bus_pan: pick('busId'),
+  update_audio_effect: pick('trackId', 'index'),
+  update_bus_insert: pick('busId', 'index'),
+  set_mograph_value: pick('mediaId', 'controlId'),
+  set_transition_param: pick('trackId', 'transitionId', 'key'),
+  update_effect_param: pick('trackId', 'clipId', 'effectId', 'key'),
+  update_effect_params: (a) =>
+    JSON.stringify([
+      a.trackId,
+      a.clipId,
+      a.effectId,
+      ((a.params as [string, unknown][] | undefined) ?? []).map(([k]) => k).sort()
+    ]),
+  preview_grade_params: (a) =>
+    JSON.stringify([
+      a.clipId,
+      a.effectId,
+      ((a.params as [string, unknown][] | undefined) ?? []).map(([k]) => k).sort()
+    ])
+};
+
+const editQueue = createEditQueue();
+
+function invoke<T>(cmd: string, args?: InvokeArgs): Promise<T> {
+  if (UNORDERED.has(cmd)) return tauriInvoke<T>(cmd, args);
+  const keyOf = COALESCE[cmd];
+  const key = keyOf ? `${cmd}|${keyOf((args ?? {}) as Record<string, unknown>)}` : null;
+  return editQueue.push<T>(key, () => tauriInvoke<T>(cmd, args));
+}
 
 export type StreamInfo = {
   width: number;
@@ -228,6 +406,17 @@ export function evalNumber(v: EffectValue, t: number, fallback = 0): number {
   return fallback;
 }
 
+/** Insert (or replace) the keyframe at clip time `t`, keeping the list
+ *  sorted and the replaced keyframe's easing. Times within 1 ms count as
+ *  the same keyframe. */
+export function upsertKeyframe(kfs: Keyframe[], t: number, value: number): Keyframe[] {
+  const prev = kfs.find((k) => Math.abs(k.time_seconds - t) <= 1e-3);
+  const next = kfs.filter((k) => Math.abs(k.time_seconds - t) > 1e-3);
+  next.push({ time_seconds: t, value, interp: prev?.interp ?? 'Linear' });
+  next.sort((a, b) => a.time_seconds - b.time_seconds);
+  return next;
+}
+
 export type EffectInfo = {
   id: string;
   kind: string;
@@ -313,6 +502,10 @@ export type TrackContents = {
   pan: number;
   /** Phase 7.7: built-in audio effect chain (EQ + comp + limiter). */
   audio_effects: AudioEffectSpec[];
+  /** GOAT-4: where the track's main output goes (master or a group bus). */
+  output: BusOutput;
+  /** GOAT-4: aux sends from this track to group buses. */
+  sends: Send[];
 };
 
 /** Phase 7.7 / 7.10 — tagged-enum spec for one entry in a track's audio
@@ -505,6 +698,15 @@ export const moveTrack = (trackId: string, toPosition: number): Promise<void> =>
 /** Show / hide a track. */
 export const setTrackEnabled = (trackId: string, enabled: boolean): Promise<void> =>
   invoke('set_track_enabled', { trackId, enabled });
+/** Lock or unlock a track (undoable). A locked track's clips, effects and
+ *  transitions can't change and the track can't be deleted; mute, solo,
+ *  visibility, order and name stay editable. */
+export const setTrackLocked = (trackId: string, locked: boolean): Promise<void> =>
+  invoke('set_track_locked', { trackId, locked });
+/** Rename a track (trimmed); an empty name restores its automatic position
+ *  name (V1 = bottom video track, A1 = first audio track). */
+export const renameTrack = (trackId: string, name: string): Promise<void> =>
+  invoke('rename_track', { trackId, name });
 export const setClipBlendMode = (
   trackId: string,
   clipId: string,
@@ -517,8 +719,11 @@ export const setFrameSize = (width: number | null, height: number | null): Promi
 export const setMatteView = (clipId: string | null): Promise<void> =>
   invoke('set_matte_view', { clipId });
 
-/** Send a debug line into the engine's tracing log. */
-export const diagLog = (message: string): Promise<void> => invoke('diag_log', { message });
+/** Send a debug line into the engine's tracing log. Best effort: never
+ *  rejects, so a log line can't break the action it describes (e.g. while an
+ *  export turns engine calls away). */
+export const diagLog = (message: string): Promise<void> =>
+  invoke<void>('diag_log', { message }).catch(() => undefined);
 
 // ---- Media library + edit ops --------------------------------------------
 
@@ -544,7 +749,20 @@ export type MediaItemInfo = {
    *  to enqueue peak extraction and whether to draw a waveform on
    *  a video clip's body. */
   has_audio_track: boolean;
+  /** Display width / height of the picture: stored width × pixel aspect ÷
+   *  height (titles, MoGraph and Fusion use their own size). `null` when not
+   *  measured yet, and for audio. */
+  display_aspect: number | null;
 };
+
+/** Payload of `engine://import-waiting` (an import is waiting on its file,
+ *  e.g. a slow or hung drive) and `engine://import-settled` (that wait
+ *  ended). */
+export type ImportWaitEvent = { file_name: string };
+
+/** Stop the import that is waiting on its file (lock-free); the import then
+ *  fails and adds nothing. */
+export const cancelImport = (): Promise<void> => invoke('cancel_import');
 
 /** Pull metadata from a media file via the decoder and register it
  *  in the current project's media library. */
@@ -1571,13 +1789,30 @@ export type RenderOutcome = {
 export const renderSequence = (req: RenderRequest): Promise<RenderOutcome> =>
   invoke('render_sequence', { req });
 
+/** Stop the export in progress: `renderSequence` / `renderAndReplace` then
+ *  reject with "Export cancelled" (see `EXPORT_CANCELLED`) and nothing is
+ *  written; an existing file at the destination is left as it was. A no-op
+ *  when no export runs. */
+export const cancelExport = (): Promise<void> => invoke('cancel_export');
+
+/** Whether an export is running (lock-free; also after a webview reload,
+ *  when the page lost track of it). */
+export const exportStatus = (): Promise<boolean> => invoke('export_status');
+
+/** The error text of an export stopped by `cancelExport`. */
+export const EXPORT_CANCELLED = 'Export cancelled';
+
+/** The error text of any other engine command while an export holds the
+ *  engine (frozen contract with vance-app). The command did nothing. */
+export const EXPORT_IN_PROGRESS = 'Export in progress';
+
 /** Phase 8.7 — render-and-replace request. Renders the range, imports
  *  the result as a new media file, then overwrites the range on
- *  `track_id` with a single clip pointing at the rendered file. */
+ *  `track_id` with a single clip pointing at the rendered file. Always
+ *  rendered as ProRes 4444 with alpha (ADR 0007 follow-up), so there is no
+ *  codec choice. */
 export type RenderAndReplaceRequest = {
   output_path: string;
-  preset: EncoderPresetKey;
-  crf?: number | null;
   width?: number | null;
   height?: number | null;
   track_id: string;

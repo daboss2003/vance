@@ -17,17 +17,23 @@
     type WasmPlugin,
     type OfxPlugin
   } from '$lib/ipc';
+  import { reportableError } from '$lib/toast.svelte';
+  import { isExportBusy, refreshError } from '$lib/export-busy';
+  import { exportRun } from '$lib/export-run.svelte';
   import { projectState } from '$lib/project.svelte';
   import { openMarket, market } from '$lib/effectsMarket.svelte';
 
   let {
     trackId,
-    clipId
+    clipId,
+    locked = false
   }: {
     /** Selected clip's track id, or null when no single clip is selected. */
     trackId: string | null;
     /** Selected clip id, or null. */
     clipId: string | null;
+    /** The clip's track is locked: nothing can be applied to it. */
+    locked?: boolean;
   } = $props();
 
   let plugins = $state<WasmPlugin[] | null>(null);
@@ -42,15 +48,16 @@
     try {
       plugins = await listWasmPlugins();
     } catch (e) {
-      error = String(e);
-      plugins = [];
+      // An export turned it away: keep the list; it loads after the export.
+      error = refreshError(e);
+      if (error !== null) plugins = [];
     }
     // OFX is best-effort + read-only; failures here don't block WASM.
     try {
       const cat = await listOfxPlugins();
       ofxPlugins = cat.plugins;
-    } catch {
-      ofxPlugins = [];
+    } catch (e) {
+      if (!isExportBusy(e)) ofxPlugins = [];
     } finally {
       loading = false;
     }
@@ -59,11 +66,11 @@
   // When the marketplace closes after an install/remove, refresh our list.
   $effect(() => {
     void market.installed;
-    if (!market.open) void refresh();
+    if (!market.open && !exportRun.busy) void refresh();
   });
 
   async function apply(plugin: WasmPlugin) {
-    if (!trackId || !clipId) return;
+    if (!trackId || !clipId || locked) return;
     error = null;
     try {
       if (plugin.kind === 'transition') {
@@ -76,16 +83,17 @@
       // Refresh the project so the new effect / transition shows.
       await projectState.refresh();
     } catch (e) {
-      error = String(e);
+      error = reportableError(e);
     }
   }
 
   // Load once on mount.
   $effect(() => {
-    if (plugins === null && !loading) void refresh();
+    if (plugins === null && !loading && !exportRun.busy) void refresh();
   });
 
-  const canApply = $derived(trackId !== null && clipId !== null);
+  const hasClip = $derived(trackId !== null && clipId !== null);
+  const canApply = $derived(hasClip && !locked);
 </script>
 
 <div class="border-vance-border rounded border bg-vance-bg p-2 text-[11px]">
@@ -116,7 +124,7 @@
     <div class="mb-1 text-[10px] text-red-400">{error}</div>
   {/if}
 
-  {#if !canApply}
+  {#if !hasClip}
     <div class="text-vance-muted mb-1 text-[10px] italic">Select a clip to apply an effect.</div>
   {/if}
 

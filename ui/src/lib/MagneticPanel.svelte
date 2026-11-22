@@ -6,6 +6,8 @@
    */
   import { projectState } from '$lib/project.svelte';
   import { selectionState } from '$lib/selection.svelte';
+  import { toast } from '$lib/toast.svelte';
+  import { lockedTrackMessage, splitByLock } from '$lib/track-lock';
 
   let busy = $state(false);
 
@@ -39,12 +41,14 @@
   }
 
   function rippleDeleteSelected() {
-    const ids = [...selectionState.ids];
+    // Clips on locked tracks are skipped (the engine refuses them).
+    const { editable, locked } = splitByLock(projectState.sequence?.tracks ?? [], [
+      ...selectionState.ids
+    ]);
+    if (locked.length > 0) toast.info(lockedTrackMessage(locked[0].track.name));
     void act(async () => {
-      for (const id of ids) {
-        const track = projectState.trackOfClip(id);
-        if (track) await projectState.rippleDeleteClip(track, id);
-      }
+      for (const { trackId, clipId } of editable)
+        await projectState.rippleDeleteClip(trackId, clipId);
     });
   }
 </script>

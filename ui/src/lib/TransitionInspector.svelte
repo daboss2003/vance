@@ -19,15 +19,20 @@
     type WasmPlugin
   } from '$lib/ipc';
   import { projectState } from '$lib/project.svelte';
+  import { exportRun } from '$lib/export-run.svelte';
+  import { EXPORT_BUSY_HINT, isExportBusy } from '$lib/export-busy';
 
   let { track, clip }: { track: TrackContents; clip: ClipContents } = $props();
 
   let plugins = $state<WasmPlugin[] | null>(null);
+  // An export turns the list away: stay "loading" and fetch once it ends.
   $effect(() => {
-    if (plugins === null)
+    if (plugins === null && !exportRun.busy)
       void listWasmPlugins()
         .then((p) => (plugins = p))
-        .catch(() => (plugins = []));
+        .catch((e) => {
+          if (!isExportBusy(e)) plugins = [];
+        });
   });
 
   // The transition (if any) at the cut immediately after this clip.
@@ -99,7 +104,9 @@
               max={param.max}
               step={(param.max - param.min) / 1000 || 0.001}
               value={currentValue(param.key, param.default)}
-              class="flex-1"
+              disabled={track.locked || exportRun.busy}
+              title={exportRun.busy ? EXPORT_BUSY_HINT : undefined}
+              class="flex-1 disabled:opacity-50"
               onchange={(e) =>
                 setParam(param.key, parseFloat((e.target as HTMLInputElement).value))}
             />

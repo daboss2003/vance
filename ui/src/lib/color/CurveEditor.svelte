@@ -22,6 +22,7 @@
     points,
     color = '#e6ebf5',
     identityY = null,
+    disabled = false,
     onInput,
     onCommit
   }: {
@@ -33,6 +34,8 @@
      *  `0.5` so the empty-curve display is a flat no-op line, not the
      *  diagonal). Null/undefined keeps the classic y=x baseline. */
     identityY?: number | null;
+    /** Read-only (the clip's track is locked): shows the curve, takes no input. */
+    disabled?: boolean;
     onInput: (points: Pt[]) => void;
     onCommit: (points: Pt[]) => void;
   } = $props();
@@ -133,6 +136,7 @@
   }
 
   function onDown(ev: PointerEvent) {
+    if (disabled) return;
     const el = ev.currentTarget as SVGSVGElement;
     el.setPointerCapture(ev.pointerId);
     const hit = hitTest(ev, el);
@@ -172,6 +176,7 @@
   // Double-click an interior point to delete it. Endpoints can't be
   // deleted (the curve must span input 0..1).
   function onDblClick(ev: MouseEvent) {
+    if (disabled) return;
     const el = ev.currentTarget as SVGSVGElement;
     const hit = hitTest(ev, el);
     if (hit > 0 && hit < pts.length - 1) {
@@ -183,6 +188,7 @@
 
   // Reset to identity (clears all interior points). Bound to the button.
   function reset() {
+    if (disabled) return;
     // Reset to the per-channel identity baseline so a multiplier-curve
     // reset doesn't accidentally encode a diagonal as the new identity.
     const y0 = identityY ?? 0;
@@ -209,7 +215,8 @@
   <div class="flex items-center justify-between">
     <span class="text-vance-muted text-[10px] uppercase tracking-wide">{label}</span>
     <button
-      class="text-vance-muted text-[10px] hover:brightness-150"
+      class="text-vance-muted text-[10px] hover:brightness-150 disabled:opacity-50"
+      {disabled}
       onclick={reset}
       title="Reset this channel to identity"
     >
@@ -220,8 +227,11 @@
     width={SIZE}
     height={SIZE}
     viewBox={`0 0 ${SIZE} ${SIZE}`}
-    class="cursor-crosshair touch-none select-none rounded border border-vance-border bg-[#15181d]"
+    class="touch-none select-none rounded border border-vance-border bg-[#15181d] {disabled
+      ? 'cursor-not-allowed opacity-50'
+      : 'cursor-crosshair'}"
     role="application"
+    aria-disabled={disabled}
     aria-label={`${label} tone curve, ${pts.length} points`}
     onpointerdown={onDown}
     onpointermove={onMove}

@@ -21,6 +21,8 @@
     type ControlAction,
     type ControlStatus
   } from '$lib/ipc';
+  import { reportableError } from '$lib/toast.svelte';
+  import { refreshError } from '$lib/export-busy';
   import { projectState } from '$lib/project.svelte';
 
   let status = $state<ControlStatus>({
@@ -38,7 +40,7 @@
     try {
       status = await controlStatus();
     } catch (e) {
-      error = String(e);
+      error = refreshError(e);
     }
   }
 
@@ -101,7 +103,7 @@
           window.dispatchEvent(new CustomEvent('vance:control', { detail: a }));
       }
     } catch (e) {
-      error = String(e);
+      error = reportableError(e);
     }
   }
 
@@ -112,7 +114,7 @@
       else await startOscControl(oscPort);
       await refresh();
     } catch (e) {
-      error = String(e);
+      error = reportableError(e);
     }
   }
   async function toggleMidi() {
@@ -122,7 +124,7 @@
       else await startMidiControl(midiIndex);
       await refresh();
     } catch (e) {
-      error = String(e);
+      error = reportableError(e);
     }
   }
 </script>

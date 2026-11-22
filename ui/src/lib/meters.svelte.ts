@@ -108,13 +108,18 @@ class MetersStore {
 
   private pollHandle: number | null = null;
   private lastTickMs = 0;
+  /** A snapshot request is pending: the 33 ms timer skips its tick rather
+   *  than stack requests on a busy engine. */
+  private inFlight = false;
 
   /** Begin polling. Idempotent — calling twice doesn't start two timers. */
   start() {
     if (this.pollHandle != null) return;
     this.lastTickMs = performance.now();
     this.pollHandle = window.setInterval(() => {
-      void this.tick();
+      if (this.inFlight) return;
+      this.inFlight = true;
+      void this.tick().finally(() => (this.inFlight = false));
     }, POLL_MS);
   }
 

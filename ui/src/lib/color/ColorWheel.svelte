@@ -15,6 +15,7 @@
     masterMin = -1,
     masterMax = 1,
     showMaster = true,
+    disabled = false,
     onInput,
     onCommit
   }: {
@@ -24,6 +25,8 @@
     masterMin?: number;
     masterMax?: number;
     showMaster?: boolean;
+    /** Read-only (the clip's track is locked): shows the values, takes no input. */
+    disabled?: boolean;
     onInput: (rgb: Rgb, master: number) => void;
     onCommit: (rgb: Rgb, master: number) => void;
   } = $props();
@@ -74,6 +77,7 @@
   }
 
   function onWheelDown(ev: PointerEvent) {
+    if (disabled) return;
     const el = ev.currentTarget as SVGSVGElement;
     el.setPointerCapture(ev.pointerId);
     dragging = true;
@@ -103,6 +107,7 @@
 
   // Double-click resets the wheel balance to neutral.
   function resetWheel() {
+    if (disabled) return;
     onCommit([0, 0, 0], master);
   }
 
@@ -122,9 +127,12 @@
     <svg
       width={SIZE}
       height={SIZE}
-      class="cursor-crosshair touch-none select-none"
+      class="touch-none select-none {disabled
+        ? 'cursor-not-allowed opacity-50'
+        : 'cursor-crosshair'}"
       role="slider"
-      tabindex="0"
+      tabindex={disabled ? -1 : 0}
+      aria-disabled={disabled}
       aria-label={`${label} balance trackball`}
       aria-valuemin={-1}
       aria-valuemax={1}
@@ -162,11 +170,12 @@
     {#if showMaster}
       <input
         type="range"
-        class="vance-vrange h-[96px]"
+        class="vance-vrange h-[96px] disabled:opacity-50"
         min={masterMin}
         max={masterMax}
         step="0.001"
         value={master}
+        {disabled}
         oninput={onMasterInput}
         onchange={onMasterCommit}
         aria-label={`${label} master`}

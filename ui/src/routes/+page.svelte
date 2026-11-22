@@ -4,6 +4,7 @@
   import {
     currentTimelineSeconds,
     scrubGrain,
+    type ImportWaitEvent,
     evalNumber,
     isKeyframes,
     COLOR_SPACE_OPTIONS,
@@ -51,7 +52,7 @@
   import { getAppSettings, crashLogDir } from '$lib/ipc';
   import { listen } from '@tauri-apps/api/event';
   import Toasts from '$lib/Toasts.svelte';
-  import { toast, pushToast } from '$lib/toast.svelte';
+  import { toast, pushToast, reportableError } from '$lib/toast.svelte';
   import { importToast } from '$lib/import-feedback';
   import Dialogs from '$lib/Dialogs.svelte';
   import { openDialog, dialogs } from '$lib/dialog.svelte';
@@ -147,6 +148,37 @@
     return () => un?.();
   });
 
+  // Keyboard vs pointer focus, for which keys a focused button owns (keys.ts).
+  $effect(() => installInputModality(window));
+
+  // After a webview reload the engine may still be exporting: show it.
+  $effect(() => {
+    untrack(() => void exportRun.adopt());
+  });
+
+  // Imports waiting on their file (a slow or hung drive): a notice with Cancel.
+  $effect(() => {
+    const offs: (() => void)[] = [];
+    let gone = false;
+    const on = (name: string, fn: (fileName: string) => void) =>
+      void listen<ImportWaitEvent>(name, (e) => fn(e.payload.file_name)).then((u) =>
+        gone ? u() : offs.push(u)
+      );
+    on('engine://import-waiting', (f) => importWaits.waiting(f));
+    on('engine://import-settled', (f) => importWaits.settled(f));
+    return () => {
+      gone = true;
+      for (const u of offs) u();
+    };
+  });
+
+  // Engine notices (e.g. "generating proxies for layers over the memory cap").
+  $effect(() => {
+    let un: (() => void) | null = null;
+    void listen<string>('engine://notice', (e) => toast.info(e.payload)).then((u) => (un = u));
+    return () => un?.();
+  });
+
   // Native menu bar → app actions. The Rust menu emits `menu://action` with an
   // item id; map each to the same handler as the matching toolbar button.
   $effect(() => {
@@ -170,7 +202,7 @@
           activeDock = 'export';
           break;
         case 'new_title':
-          titleModalOpen = true;
+          openTitleModal();
           break;
         case 'undo':
           void projectState.undo();
@@ -196,9 +228,8 @@
           break;
         case 'insert':
         case 'overwrite': {
-          const tid = firstVideoTrackId();
-          if (tid && projectState.source && projectState.sequence)
-            projectState.insertFromSource(tid, e.payload === 'overwrite');
+          if (projectState.source && projectState.sequence)
+            editFromSource(e.payload === 'overwrite');
           break;
         }
         // ---- Playback ----
@@ -309,11 +340,16 @@
   }
 
   async function importMediaPath(path: string, name: string) {
+    if (exportRun.refusesEdit()) return;
     if (!projectState.info) {
       toast.error('Create or open a project first, then add media.');
       return;
     }
-    const t = importToast(name, await projectState.importMedia(path));
+    const outcome = await projectState.importMedia(path);
+    if (!outcome.ok && importWaits.wasCancelled(name, outcome.error)) outcome.cancelled = true;
+    // The import is over either way; don't leave its waiting notice up.
+    importWaits.settled(name);
+    const t = importToast(name, outcome);
     toast[t.kind](t.message);
   }
 
@@ -370,6 +406,17 @@
   });
 
   import TransitionInspector from '$lib/TransitionInspector.svelte';
+  import CompositeInspector from '$lib/CompositeInspector.svelte';
+  import KeyerInspector from '$lib/KeyerInspector.svelte';
+  import FrameSizeControl from '$lib/FrameSizeControl.svelte';
+  import { KEYER_KIND, keyerDefaults } from '$lib/keyer-keys';
+  import { canEditTrackContents, lockedTrackMessage, splitByLock } from '$lib/track-lock';
+  import { hasKeyboardFocus, installInputModality, targetOwnsKey } from '$lib/keys';
+  import { EXPORT_BUSY_HINT, isExportBusy } from '$lib/export-busy';
+  import { exportRun } from '$lib/export-run.svelte';
+  import { sequenceSize } from '$lib/export-size';
+  import TrackLockNotice from '$lib/TrackLockNotice.svelte';
+  import { importWaits } from '$lib/import-wait.svelte';
   import ColorWheel from '$lib/color/ColorWheel.svelte';
   import CurveEditor from '$lib/color/CurveEditor.svelte';
   import ScopeCanvas from '$lib/color/ScopeCanvas.svelte';
@@ -404,6 +451,15 @@
   let titleDraftDuration = $state<number>(3);
   let titleDraftSize = $state<number>(96);
   let titleSubmitting = $state<boolean>(false);
+
+  /** Open the new-title dialog. The default font size (96 px was tuned for a
+   *  720-px-tall frame) scales with the sequence height, so text keeps the
+   *  same relative size now that titles are created at the sequence size. */
+  function openTitleModal() {
+    const seqH = projectState.sequence?.frame_size?.[1] ?? 1080;
+    titleDraftSize = Math.round((96 * seqH) / 720);
+    titleModalOpen = true;
+  }
 
   // Which grade node's wheels are shown on the Color page.
   let selectedNodeId = $state<string | null>(null);
@@ -573,17 +629,17 @@
         await startPlayback(lastPts ?? target);
         playing = true;
       } catch (e) {
-        playError = String(e);
+        playError = reportableError(e);
       }
     }
   }
 
   function handleKeydown(e: KeyboardEvent) {
-    // Don't steal keys when the user is typing in an input.
-    const target = e.target as HTMLElement | null;
-    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
-      return;
-    }
+    // Don't steal keys while the user types, or Space / Enter from a button
+    // with keyboard focus (it activates the button; it must not also start
+    // playback). After a click, Space plays even if the click focused it.
+    const target = e.target instanceof Element ? e.target : null;
+    if (targetOwnsKey(target, e.key, hasKeyboardFocus(target))) return;
     switch (e.key) {
       case ' ':
         e.preventDefault();
@@ -655,21 +711,19 @@
         // Insert: ripple-place a source clip at the Record playhead.
         if (projectState.source && projectState.sequence) {
           e.preventDefault();
-          const tid = firstVideoTrackId();
-          if (tid) projectState.insertFromSource(tid, false);
+          editFromSource(false);
         }
         return;
       case '.':
         // Overwrite at Record playhead.
         if (projectState.source && projectState.sequence) {
           e.preventDefault();
-          const tid = firstVideoTrackId();
-          if (tid) projectState.insertFromSource(tid, true);
+          editFromSource(true);
         }
         return;
       case 't':
       case 'T':
-        // Drop a 1s cross-dissolve at the cut after the selected clip.
+        // Toggle a cross-dissolve at the cut after the selected clip.
         if (selectionState.count === 1 && projectState.sequence) {
           e.preventDefault();
           addDissolveForSelection();
@@ -679,6 +733,7 @@
       case 'Z':
         if (e.metaKey || e.ctrlKey) {
           e.preventDefault();
+          if (exportRun.refusesEdit()) return;
           if (e.shiftKey) projectState.redo();
           else projectState.undo();
         }
@@ -688,7 +743,7 @@
         // Windows-style redo, also accepted on Mac as an alt.
         if (e.metaKey || e.ctrlKey) {
           e.preventDefault();
-          projectState.redo();
+          if (!exportRun.refusesEdit()) projectState.redo();
         }
         return;
     }
@@ -705,15 +760,25 @@
     const y = Math.max(0, Math.round(r.top * dpr));
     const w = Math.max(0, Math.round(r.width * dpr));
     const h = Math.max(0, Math.round(r.height * dpr));
-    setter(x, y, w, h).catch((e) => console.error(label, e));
+    // Polled every 250 ms: quiet while an export turns engine calls away.
+    setter(x, y, w, h).catch((e) => {
+      if (!isExportBusy(e)) console.error(label, e);
+    });
   }
 
   // Any full-window HTML overlay that must sit ABOVE the native video windows.
   // The onboarding wizard, plus every modal (marketplace, Effect Studio,
   // Settings, confirm dialogs). While one is up we collapse the native windows
   // so it isn't punched through — see reportBounds().
+  // The frame-size dialog (FrameSizeControl) is one of those modals.
+  let frameSizeOpen = $state(false);
   const overlayBlocking = $derived(
-    showOnboarding || market.open || studio.open || account.open || dialogs.length > 0
+    showOnboarding ||
+      market.open ||
+      studio.open ||
+      account.open ||
+      dialogs.length > 0 ||
+      frameSizeOpen
   );
 
   function reportBounds() {
@@ -823,7 +888,7 @@
       // Auto-render the first frame.
       await render(0);
     } catch (e) {
-      openError = String(e);
+      openError = reportableError(e);
     }
   }
 
@@ -866,7 +931,8 @@
 
   /** Clip-relative time of the current playhead, clamped to >= 0. */
   async function clipRelativeTime(c: ClipContents): Promise<number> {
-    const t = (await currentTimelineSeconds()) ?? c.timeline_in_seconds;
+    // No playhead (none yet, or the engine is busy exporting): the clip start.
+    const t = (await currentTimelineSeconds().catch(() => null)) ?? c.timeline_in_seconds;
     return Math.max(0, t - c.timeline_in_seconds);
   }
 
@@ -908,11 +974,16 @@
     track: TrackContents,
     clip: ClipContents,
     effect: EffectInfo,
-    key: string
+    key: string,
+    // The value the slider shows when the param has nothing stored
+    // (imported projects): pin that, not 0, so adding a keyframe can't
+    // silently zero e.g. opacity.
+    shownDefault: number
   ) {
     const clipT = await clipRelativeTime(clip);
     const existing = effect.params[key];
-    const currentVal = existing !== undefined ? evalNumber(existing, clipT, 0) : 0;
+    const currentVal =
+      existing !== undefined ? evalNumber(existing, clipT, shownDefault) : shownDefault;
     let kfs: Keyframe[];
     let prevInterp: KeyframeInterp = 'Linear';
     if (existing !== undefined && isKeyframes(existing)) {
@@ -927,24 +998,8 @@
     await projectState.updateEffectParam(track.id, clip.id, effect.id, key, kfs);
   }
 
-  /** Remove a keyframe by time. If the resulting list is empty,
-   *  collapses the param back to a plain `Number(0)`. */
-  async function removeKeyframe(
-    track: TrackContents,
-    clip: ClipContents,
-    effect: EffectInfo,
-    key: string,
-    time_seconds: number
-  ) {
-    const existing = effect.params[key];
-    if (existing === undefined || !isKeyframes(existing)) return;
-    const kfs = existing.filter((k) => Math.abs(k.time_seconds - time_seconds) > 1e-3);
-    if (kfs.length === 0) {
-      await projectState.updateEffectParam(track.id, clip.id, effect.id, key, 0);
-    } else {
-      await projectState.updateEffectParam(track.id, clip.id, effect.id, key, kfs);
-    }
-  }
+  /** Keyframe time as shown in the keyframe lists, for labels. */
+  const kfAt = (k: Keyframe) => k.time_seconds.toFixed(2);
 
   /** Cycle a keyframe's outgoing interpolation: Linear → Bezier →
    *  Hold → Linear. Affects the segment from this keyframe to the
@@ -1358,23 +1413,70 @@
   function toggleQualBool(node: EffectInfo, key: string) {
     commitQual(node, key, readQual(node, key) > 0.5 ? 0 : 1);
   }
+  /** Pick the window shape (one undoable edit). A new ellipse is made round
+   *  on screen (GK.windowShapeParams), by the clip's own display aspect, or
+   *  the sequence's while the clip's media hasn't been measured. */
+  async function commitWindowShape(node: EffectInfo, shape: number) {
+    const d = selectedClipDetails;
+    if (!d) return;
+    const [fw, fh] = sequenceSize(projectState.sequence);
+    const media = projectState.media.find((m) => m.id === d.clip.media_id);
+    const params = GK.windowShapeParams(
+      shape,
+      node.params[GK.WINDOW_KEYS.sizeX],
+      node.params[GK.WINDOW_KEYS.sizeY],
+      GK.windowDisplayAspect(media?.display_aspect, fw, fh)
+    );
+    await projectState.updateEffectParams(d.track.id, d.clip.id, node.id, params);
+    refreshScopesNow();
+  }
 
-  /** Solo / unsolo this node's qualifier matte (engine viewer state). */
-  function toggleMatte(node: EffectInfo) {
+  /** Solo / unsolo this node's qualifier matte (engine viewer state). A call
+   *  the engine refuses (e.g. during an export) leaves the toggle as it was. */
+  async function toggleMatte(node: EffectInfo) {
     const d = selectedClipDetails;
     if (!d) return;
     if (matteNodeId === node.id) {
-      clearMatte();
-    } else {
-      matteNodeId = node.id;
-      matteClipId = d.clip.id;
-      projectState.setMatteNode(d.clip.id, node.id);
+      const clip = matteClipId;
+      if (clip && (await projectState.setMatteNode(clip, null)) === 'ok') {
+        matteNodeId = null;
+        matteClipId = null;
+      }
+      return;
+    }
+    // Shown at once; rolled back if the engine refuses it.
+    const prevNode = matteNodeId;
+    const prevClip = matteClipId;
+    matteNodeId = node.id;
+    matteClipId = d.clip.id;
+    const res = await projectState.setMatteNode(d.clip.id, node.id);
+    if (res !== 'ok' && matteNodeId === node.id) {
+      matteNodeId = prevNode;
+      matteClipId = prevClip;
     }
   }
+
+  // A matte-solo clear the engine turned away during an export, sent again
+  // once the export ends so the solo can't outlive its clip or page.
+  let matteClearRetry = $state<string | null>(null);
+  $effect(() => {
+    const clip = matteClearRetry;
+    if (clip === null || exportRun.busy) return;
+    untrack(() => {
+      matteClearRetry = null;
+      void projectState.setMatteNode(clip, null);
+    });
+  });
+
+  /** Drop the solo because its clip, node or page went away. */
   function clearMatte() {
-    if (matteNodeId && matteClipId) projectState.setMatteNode(matteClipId, null);
+    const clip = matteClipId;
     matteNodeId = null;
     matteClipId = null;
+    if (!clip) return;
+    void projectState.setMatteNode(clip, null).then((res) => {
+      if (res === 'busy') matteClearRetry = clip;
+    });
   }
 
   // ---- Point tracker (Phase 6.11) ----------------------------------------
@@ -1427,11 +1529,28 @@
     return seq.tracks.find((t) => t.kind === 'video' && t.enabled)?.id ?? null;
   }
 
-  /** Toggle a 1s cross-dissolve at the cut following the single
+  /** Three-point edit from the Source monitor onto the first video track. A
+   *  locked target is refused here with the lock hint, not by the engine. */
+  function editFromSource(overwrite: boolean) {
+    if (exportRun.refusesEdit()) return;
+    const tid = firstVideoTrackId();
+    const track = projectState.sequence?.tracks.find((t) => t.id === tid);
+    if (!track) return;
+    if (!canEditTrackContents(track)) {
+      toast.info(lockedTrackMessage(track.name));
+      return;
+    }
+    projectState.insertFromSource(track.id, overwrite);
+  }
+
+  /** Toggle a cross-dissolve (1 s asked for) at the cut following the single
    *  selected clip. Adds one if absent, removes the existing one if
    *  present, no-op if there's no clip immediately after the
-   *  selection on the same track. */
+   *  selection on the same track. The engine may store a shorter one (it
+   *  clamps to the shorter neighbouring clip); everything that shows a
+   *  duration reads it back from the refreshed sequence. */
   async function addDissolveForSelection() {
+    if (exportRun.refusesEdit()) return;
     const seq = projectState.sequence;
     if (!seq) return;
     if (selectionState.count !== 1) return;
@@ -1439,6 +1558,10 @@
     for (const t of seq.tracks) {
       const idx = t.clips.findIndex((c) => c.id === id);
       if (idx < 0) continue;
+      if (!canEditTrackContents(t)) {
+        toast.info(lockedTrackMessage(t.name));
+        return;
+      }
       if (idx + 1 >= t.clips.length) return;
       const clip = t.clips[idx];
       const cutAt = clip.timeline_in_seconds + clip.duration_seconds;
@@ -1457,22 +1580,16 @@
   /** Delete every currently-selected clip from the active sequence,
    *  one engine call per clip. Each becomes its own undo step. */
   async function deleteSelectedClips() {
+    if (exportRun.refusesEdit()) return;
     const seq = projectState.sequence;
     if (!seq) return;
-    const ids = [...selectionState.ids];
     // Build (trackId, clipId) pairs first, then issue removes. We can't
     // rely on `projectState.sequence` after the first await because it
-    // refreshes mid-loop.
-    const targets: { trackId: string; clipId: string }[] = [];
-    for (const id of ids) {
-      for (const t of seq.tracks) {
-        if (t.clips.some((c) => c.id === id)) {
-          targets.push({ trackId: t.id, clipId: id });
-          break;
-        }
-      }
-    }
-    selectionState.clear();
+    // refreshes mid-loop. Clips on locked tracks are skipped (the engine
+    // refuses them) and stay selected.
+    const { editable: targets, locked } = splitByLock(seq.tracks, [...selectionState.ids]);
+    if (locked.length > 0) toast.info(lockedTrackMessage(locked[0].track.name));
+    selectionState.replace(locked.map((l) => l.clipId));
     for (const { trackId, clipId } of targets) {
       await projectState.removeClip(trackId, clipId);
     }
@@ -1480,6 +1597,7 @@
 
   async function handleImportMedia() {
     if (!projectState.info) return;
+    if (exportRun.refusesEdit()) return;
     const selected = await open({
       multiple: false,
       directory: false,
@@ -1532,6 +1650,15 @@
     }
     return null;
   });
+  /** The selected clip's track is locked: the engine refuses edits to it,
+   *  so its grading and inspector controls are disabled. */
+  const selectedLocked = $derived(
+    !!selectedClipDetails && !canEditTrackContents(selectedClipDetails.track)
+  );
+  /** Grading controls are off: the clip's track is locked, or an export holds
+   *  the engine (then `EXPORT_BUSY_HINT` is their tooltip). */
+  const gradeOff = $derived(selectedLocked || exportRun.busy);
+  const pausedHint = $derived(exportRun.busy ? EXPORT_BUSY_HINT : undefined);
 
   async function render(pts: number) {
     renderError = null;
@@ -1543,7 +1670,7 @@
       // for a frame past the last decodable one. Treat as a no-op (stay
       // on the current frame) instead of surfacing an error banner.
       if (msg.includes('no frame at or after')) return;
-      renderError = msg;
+      renderError = reportableError(e);
     }
   }
 
@@ -1586,7 +1713,7 @@
         await startPlayback(lastPts ?? pts);
         playing = true;
       } catch (e) {
-        playError = String(e);
+        playError = reportableError(e);
       }
     }
   }
@@ -1610,7 +1737,7 @@
         lastPts = resumePts;
         playing = false;
       } catch (e) {
-        playError = String(e);
+        playError = reportableError(e);
       }
     } else if (isSequencePlayable()) {
       // Phase 4.7.5: play the active sequence from the current
@@ -1627,7 +1754,7 @@
         await playSequence(from);
         playing = true;
       } catch (e) {
-        playError = String(e);
+        playError = reportableError(e);
       }
     } else {
       try {
@@ -1644,7 +1771,7 @@
         await startPlayback(from);
         playing = true;
       } catch (e) {
-        playError = String(e);
+        playError = reportableError(e);
       }
     }
   }
@@ -1711,6 +1838,9 @@
         >{projectState.sequence.name}</span
       >
     {/if}
+    <!-- Renders nothing without a sequence; stays mounted so its dialog can
+         close itself (and release frameSizeOpen) if the sequence goes away. -->
+    <FrameSizeControl bind:open={frameSizeOpen} />
 
     {#if projectState.info}
       <span
@@ -1914,16 +2044,16 @@
       <button
         class="rounded bg-vance-bg border-vance-border border px-2 py-1 text-xs hover:brightness-110 disabled:opacity-50"
         onclick={() => projectState.undo()}
-        disabled={!projectState.canUndo}
-        title="Undo (⌘Z)"
+        disabled={!projectState.canUndo || exportRun.busy}
+        title={pausedHint ?? 'Undo (⌘Z)'}
       >
         Undo
       </button>
       <button
         class="rounded bg-vance-bg border-vance-border border px-2 py-1 text-xs hover:brightness-110 disabled:opacity-50"
         onclick={() => projectState.redo()}
-        disabled={!projectState.canRedo}
-        title="Redo (⌘⇧Z)"
+        disabled={!projectState.canRedo || exportRun.busy}
+        title={pausedHint ?? 'Redo (⌘⇧Z)'}
       >
         Redo
       </button>
@@ -1949,7 +2079,7 @@
             <button
               class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125 disabled:opacity-50"
               onclick={() => addGradeNode('primary')}
-              disabled={!selectedClipDetails}
+              disabled={!selectedClipDetails || gradeOff}
               title="Add a primary (lift/gamma/gain) grade node"
             >
               + Primary
@@ -1957,7 +2087,7 @@
             <button
               class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125 disabled:opacity-50"
               onclick={() => addGradeNode('log')}
-              disabled={!selectedClipDetails}
+              disabled={!selectedClipDetails || gradeOff}
               title="Add a log (offset/shadow/mid/highlight) grade node"
             >
               + Log
@@ -1965,18 +2095,23 @@
             <button
               class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125 disabled:opacity-50"
               onclick={() => addGradeNode('curves')}
-              disabled={!selectedClipDetails}
+              disabled={!selectedClipDetails || gradeOff}
               title="Add a curves (per-channel tone curve) grade node"
             >
               + Curves
             </button>
           </div>
         </div>
+        {#if selectedClipDetails && selectedLocked}
+          <TrackLockNotice track={selectedClipDetails.track} />
+        {/if}
         {#if !selectedClipDetails}
           <p class="text-vance-muted text-xs italic">Select a clip on the timeline to grade it.</p>
         {:else if gradeNodes.length === 0}
           <p class="text-vance-muted text-xs italic">
-            No grade nodes. Add one above — nodes apply top-to-bottom.
+            {selectedLocked
+              ? 'No grade nodes.'
+              : 'No grade nodes. Add one above — nodes apply top-to-bottom.'}
           </p>
         {:else}
           <ul class="flex flex-col gap-1 text-xs">
@@ -1991,6 +2126,7 @@
                 <input
                   type="checkbox"
                   checked={node.enabled}
+                  disabled={gradeOff}
                   onchange={() => toggleNodeEnabled(node)}
                   title="Bypass / enable this node"
                 />
@@ -2003,7 +2139,7 @@
                 <button
                   class="text-vance-muted hover:brightness-125 disabled:opacity-30"
                   onclick={() => moveNode(node, i - 1)}
-                  disabled={i === 0}
+                  disabled={gradeOff || i === 0}
                   title="Move up (earlier in chain)"
                 >
                   ↑
@@ -2011,13 +2147,14 @@
                 <button
                   class="text-vance-muted hover:brightness-125 disabled:opacity-30"
                   onclick={() => moveNode(node, i + 1)}
-                  disabled={i === gradeNodes.length - 1}
+                  disabled={gradeOff || i === gradeNodes.length - 1}
                   title="Move down (later in chain)"
                 >
                   ↓
                 </button>
                 <button
-                  class="text-vance-muted hover:text-red-400"
+                  class="text-vance-muted hover:text-red-400 disabled:opacity-30 disabled:hover:text-inherit"
+                  disabled={gradeOff}
                   onclick={() => deleteNode(node)}
                   title="Delete node"
                 >
@@ -2074,14 +2211,18 @@
             <h3 class="text-vance-muted text-[11px] uppercase">Media</h3>
             <div class="flex gap-1">
               <button
-                class="rounded bg-vance-bg border-vance-border border px-2 py-0.5 text-[10px] hover:brightness-125"
-                onclick={() => (titleModalOpen = true)}
+                class="rounded bg-vance-bg border-vance-border border px-2 py-0.5 text-[10px] hover:brightness-125 disabled:opacity-50"
+                onclick={openTitleModal}
+                disabled={exportRun.busy}
+                title={pausedHint}
               >
                 + Title
               </button>
               <button
-                class="rounded bg-vance-bg border-vance-border border px-2 py-0.5 text-[10px] hover:brightness-125"
+                class="rounded bg-vance-bg border-vance-border border px-2 py-0.5 text-[10px] hover:brightness-125 disabled:opacity-50"
                 onclick={handleImportMedia}
+                disabled={exportRun.busy}
+                title={pausedHint}
               >
                 + Import
               </button>
@@ -2268,10 +2409,7 @@
               <span class="mx-1 text-vance-muted">·</span>
               <button
                 class="rounded bg-[var(--color-vance-accent)] px-2 py-0.5 font-semibold text-[#003040] hover:brightness-110 disabled:opacity-50"
-                onclick={() => {
-                  const tid = firstVideoTrackId();
-                  if (tid) projectState.insertFromSource(tid, false);
-                }}
+                onclick={() => editFromSource(false)}
                 disabled={!projectState.sequence}
                 title=", : insert at Record playhead"
               >
@@ -2279,10 +2417,7 @@
               </button>
               <button
                 class="rounded bg-vance-bg border-vance-border border px-2 py-0.5 hover:brightness-125 disabled:opacity-50"
-                onclick={() => {
-                  const tid = firstVideoTrackId();
-                  if (tid) projectState.insertFromSource(tid, true);
-                }}
+                onclick={() => editFromSource(true)}
                 disabled={!projectState.sequence}
                 title=". : overwrite at Record playhead"
               >
@@ -2587,7 +2722,11 @@
         </h2>
         {#if !activeNode}
           <p class="text-vance-muted text-xs italic">
-            {selectedClipDetails ? 'Add a grade node to start.' : 'Select a clip to grade.'}
+            {selectedClipDetails
+              ? selectedLocked
+                ? 'This clip has no grade nodes.'
+                : 'Add a grade node to start.'
+              : 'Select a clip to grade.'}
           </p>
         {:else}
           {@const node = activeNode}
@@ -2602,6 +2741,7 @@
                 <input
                   type="checkbox"
                   checked={qOn}
+                  disabled={gradeOff}
                   onchange={() => toggleQualBool(node, GK.QUALIFIER_KEYS.enable)}
                 />
                 <span class="text-vance-muted uppercase tracking-wider">Qualifier</span>
@@ -2611,7 +2751,7 @@
                   class="rounded border px-1 py-0.5 {readQual(node, GK.QUALIFIER_KEYS.invert) > 0.5
                     ? 'border-[var(--color-vance-accent)] bg-[#003040]'
                     : 'bg-vance-bg border-vance-border'} disabled:opacity-40"
-                  disabled={!qOn}
+                  disabled={!qOn || gradeOff}
                   onclick={() => toggleQualBool(node, GK.QUALIFIER_KEYS.invert)}
                   title="Invert the mask"
                 >
@@ -2630,41 +2770,43 @@
               </div>
             </div>
             {#if qOn}
-              <div class="flex flex-col gap-2 text-[10px]" class:opacity-40={!qOn}>
-                {#each [['Hue', [GK.QUALIFIER_KEYS.hueC, GK.QUALIFIER_KEYS.hueRange, GK.QUALIFIER_KEYS.hueSoft]], ['Sat', [GK.QUALIFIER_KEYS.satLo, GK.QUALIFIER_KEYS.satHi, GK.QUALIFIER_KEYS.satSoft]], ['Luma', [GK.QUALIFIER_KEYS.lumaLo, GK.QUALIFIER_KEYS.lumaHi, GK.QUALIFIER_KEYS.lumaSoft]]] as [label, keys] (label)}
-                  {@const labels =
-                    label === 'Hue' ? ['center', 'range', 'soft'] : ['lo', 'hi', 'soft']}
-                  <div>
-                    <div class="text-vance-muted mb-0.5">{label}</div>
-                    <div class="grid grid-cols-3 gap-1">
-                      {#each keys as k, i (k)}
-                        <label class="flex flex-col">
-                          <span class="text-vance-muted text-[9px]">{labels[i]}</span>
-                          <input
-                            type="range"
-                            min="0"
-                            max={labels[i] === 'soft' ? 0.5 : 1}
-                            step="0.001"
-                            value={readQual(node, k)}
-                            oninput={(e) =>
-                              previewQual(
-                                node,
-                                k,
-                                parseFloat((e.currentTarget as HTMLInputElement).value)
-                              )}
-                            onchange={(e) =>
-                              commitQual(
-                                node,
-                                k,
-                                parseFloat((e.currentTarget as HTMLInputElement).value)
-                              )}
-                          />
-                        </label>
-                      {/each}
+              <fieldset class="min-w-0 disabled:opacity-50" disabled={gradeOff} title={pausedHint}>
+                <div class="flex flex-col gap-2 text-[10px]" class:opacity-40={!qOn}>
+                  {#each [['Hue', [GK.QUALIFIER_KEYS.hueC, GK.QUALIFIER_KEYS.hueRange, GK.QUALIFIER_KEYS.hueSoft]], ['Sat', [GK.QUALIFIER_KEYS.satLo, GK.QUALIFIER_KEYS.satHi, GK.QUALIFIER_KEYS.satSoft]], ['Luma', [GK.QUALIFIER_KEYS.lumaLo, GK.QUALIFIER_KEYS.lumaHi, GK.QUALIFIER_KEYS.lumaSoft]]] as [label, keys] (label)}
+                    {@const labels =
+                      label === 'Hue' ? ['center', 'range', 'soft'] : ['lo', 'hi', 'soft']}
+                    <div>
+                      <div class="text-vance-muted mb-0.5">{label}</div>
+                      <div class="grid grid-cols-3 gap-1">
+                        {#each keys as k, i (k)}
+                          <label class="flex flex-col">
+                            <span class="text-vance-muted text-[9px]">{labels[i]}</span>
+                            <input
+                              type="range"
+                              min="0"
+                              max={labels[i] === 'soft' ? 0.5 : 1}
+                              step="0.001"
+                              value={readQual(node, k)}
+                              oninput={(e) =>
+                                previewQual(
+                                  node,
+                                  k,
+                                  parseFloat((e.currentTarget as HTMLInputElement).value)
+                                )}
+                              onchange={(e) =>
+                                commitQual(
+                                  node,
+                                  k,
+                                  parseFloat((e.currentTarget as HTMLInputElement).value)
+                                )}
+                            />
+                          </label>
+                        {/each}
+                      </div>
                     </div>
-                  </div>
-                {/each}
-              </div>
+                  {/each}
+                </div>
+              </fieldset>
             {/if}
           </div>
 
@@ -2672,170 +2814,173 @@
                on-viewport drag handles arrive in 6.10b. Combined with the
                qualifier via the shared matte toggle above. -->
           {@const wShape = winShape(node)}
-          <div class="mb-4 rounded border border-vance-border p-2">
-            <div class="mb-2 flex items-center justify-between">
-              <span class="text-vance-muted text-[11px] uppercase tracking-wider">Power Window</span
-              >
-              <select
-                class="bg-vance-bg border-vance-border rounded border px-1 py-0.5 text-[10px]"
-                value={wShape}
-                onchange={(e) =>
-                  commitQual(
-                    node,
-                    GK.WINDOW_KEYS.shape,
-                    parseInt((e.currentTarget as HTMLSelectElement).value, 10)
-                  )}
-              >
-                <option value={0}>Off</option>
-                <option value={1}>Ellipse</option>
-                <option value={2}>Rectangle</option>
-              </select>
-            </div>
-            {#if wShape >= 1}
-              <div class="flex flex-col gap-2 text-[10px]">
-                {#each WIN_GROUPS as g (g.label)}
-                  <div>
-                    <div class="text-vance-muted mb-0.5">{g.label}</div>
-                    <div class="grid grid-cols-2 gap-1">
-                      {#each g.keys as k, i (k)}
-                        <label class="flex flex-col">
-                          <span class="text-vance-muted text-[9px]">{g.labels[i]}</span>
-                          <input
-                            type="range"
-                            min="0"
-                            max="1"
-                            step="0.001"
-                            value={readWin(node, k)}
-                            oninput={(e) =>
-                              previewQual(
-                                node,
-                                k,
-                                parseFloat((e.currentTarget as HTMLInputElement).value)
-                              )}
-                            onchange={(e) =>
-                              commitQual(
-                                node,
-                                k,
-                                parseFloat((e.currentTarget as HTMLInputElement).value)
-                              )}
-                          />
-                        </label>
-                      {/each}
+          <!-- Shape, sliders, invert and tracker all edit the node. -->
+          <fieldset class="min-w-0 disabled:opacity-50" disabled={gradeOff} title={pausedHint}>
+            <div class="mb-4 rounded border border-vance-border p-2">
+              <div class="mb-2 flex items-center justify-between">
+                <span class="text-vance-muted text-[11px] uppercase tracking-wider"
+                  >Power Window</span
+                >
+                <select
+                  class="bg-vance-bg border-vance-border rounded border px-1 py-0.5 text-[10px]"
+                  value={wShape}
+                  onchange={(e) =>
+                    commitWindowShape(
+                      node,
+                      parseInt((e.currentTarget as HTMLSelectElement).value, 10)
+                    )}
+                >
+                  <option value={0}>Off</option>
+                  <option value={1}>Ellipse</option>
+                  <option value={2}>Rectangle</option>
+                </select>
+              </div>
+              {#if wShape >= 1}
+                <div class="flex flex-col gap-2 text-[10px]">
+                  {#each WIN_GROUPS as g (g.label)}
+                    <div>
+                      <div class="text-vance-muted mb-0.5">{g.label}</div>
+                      <div class="grid grid-cols-2 gap-1">
+                        {#each g.keys as k, i (k)}
+                          <label class="flex flex-col">
+                            <span class="text-vance-muted text-[9px]">{g.labels[i]}</span>
+                            <input
+                              type="range"
+                              min="0"
+                              max="1"
+                              step="0.001"
+                              value={readWin(node, k)}
+                              oninput={(e) =>
+                                previewQual(
+                                  node,
+                                  k,
+                                  parseFloat((e.currentTarget as HTMLInputElement).value)
+                                )}
+                              onchange={(e) =>
+                                commitQual(
+                                  node,
+                                  k,
+                                  parseFloat((e.currentTarget as HTMLInputElement).value)
+                                )}
+                            />
+                          </label>
+                        {/each}
+                      </div>
                     </div>
-                  </div>
-                {/each}
-                <div class="flex items-center justify-between">
-                  <label class="flex flex-1 flex-col">
-                    <span class="text-vance-muted text-[9px]">rotation</span>
-                    <input
-                      type="range"
-                      min="-180"
-                      max="180"
-                      step="1"
-                      value={readWin(node, GK.WINDOW_KEYS.rotation) / RAD_PER_DEG}
-                      oninput={(e) =>
-                        previewQual(
-                          node,
-                          GK.WINDOW_KEYS.rotation,
-                          parseFloat((e.currentTarget as HTMLInputElement).value) * RAD_PER_DEG
-                        )}
-                      onchange={(e) =>
+                  {/each}
+                  <div class="flex items-center justify-between">
+                    <label class="flex flex-1 flex-col">
+                      <span class="text-vance-muted text-[9px]">rotation</span>
+                      <input
+                        type="range"
+                        min="-180"
+                        max="180"
+                        step="1"
+                        value={readWin(node, GK.WINDOW_KEYS.rotation) / RAD_PER_DEG}
+                        oninput={(e) =>
+                          previewQual(
+                            node,
+                            GK.WINDOW_KEYS.rotation,
+                            parseFloat((e.currentTarget as HTMLInputElement).value) * RAD_PER_DEG
+                          )}
+                        onchange={(e) =>
+                          commitQual(
+                            node,
+                            GK.WINDOW_KEYS.rotation,
+                            parseFloat((e.currentTarget as HTMLInputElement).value) * RAD_PER_DEG
+                          )}
+                      />
+                    </label>
+                    <button
+                      class="ml-2 self-end rounded border px-1 py-0.5 {readWin(
+                        node,
+                        GK.WINDOW_KEYS.invert
+                      ) > 0.5
+                        ? 'border-[var(--color-vance-accent)] bg-[#003040]'
+                        : 'bg-vance-bg border-vance-border'}"
+                      onclick={() =>
                         commitQual(
                           node,
-                          GK.WINDOW_KEYS.rotation,
-                          parseFloat((e.currentTarget as HTMLInputElement).value) * RAD_PER_DEG
+                          GK.WINDOW_KEYS.invert,
+                          readWin(node, GK.WINDOW_KEYS.invert) > 0.5 ? 0 : 1
                         )}
-                    />
-                  </label>
-                  <button
-                    class="ml-2 self-end rounded border px-1 py-0.5 {readWin(
-                      node,
-                      GK.WINDOW_KEYS.invert
-                    ) > 0.5
-                      ? 'border-[var(--color-vance-accent)] bg-[#003040]'
-                      : 'bg-vance-bg border-vance-border'}"
-                    onclick={() =>
-                      commitQual(
-                        node,
-                        GK.WINDOW_KEYS.invert,
-                        readWin(node, GK.WINDOW_KEYS.invert) > 0.5 ? 0 : 1
-                      )}
-                  >
-                    invert
-                  </button>
-                </div>
-                <p class="text-vance-muted text-[9px] italic">
-                  Drag handles on the viewport arrive in 6.10b.
-                </p>
+                    >
+                      invert
+                    </button>
+                  </div>
+                  <p class="text-vance-muted text-[9px] italic">
+                    Drag handles on the viewport arrive in 6.10b.
+                  </p>
 
-                <!-- Point tracker (Phase 6.11). Tracks the window center
+                  <!-- Point tracker (Phase 6.11). Tracks the window center
                      forward from the clip start by ZNCC on the Y plane;
                      writes win_cx/win_cy keyframes in ONE undoable edit.
                      Synchronous v1 — the UI is blocked while tracking. -->
-                <div class="mt-2 border-t border-vance-border pt-2">
-                  <div class="text-vance-muted mb-1 text-[10px] uppercase tracking-wider">
-                    Tracker
-                  </div>
-                  <div class="grid grid-cols-3 gap-1 text-[10px]">
-                    <label class="flex flex-col">
-                      <span class="text-vance-muted text-[9px]">frames</span>
-                      <input
-                        type="number"
-                        min="2"
-                        max="240"
-                        step="1"
-                        class="bg-vance-bg border-vance-border rounded border px-1 py-0.5"
-                        bind:value={trackFrames}
-                      />
-                    </label>
-                    <label class="flex flex-col">
-                      <span class="text-vance-muted text-[9px]">patch ½</span>
-                      <input
-                        type="number"
-                        min="2"
-                        max="64"
-                        step="1"
-                        class="bg-vance-bg border-vance-border rounded border px-1 py-0.5"
-                        bind:value={trackPatchHalf}
-                      />
-                    </label>
-                    <label class="flex flex-col">
-                      <span class="text-vance-muted text-[9px]">search ±</span>
-                      <input
-                        type="number"
-                        min="1"
-                        max="128"
-                        step="1"
-                        class="bg-vance-bg border-vance-border rounded border px-1 py-0.5"
-                        bind:value={trackSearchRadius}
-                      />
-                    </label>
-                  </div>
-                  <button
-                    class="mt-1 w-full rounded border border-[var(--color-vance-accent)] bg-[#003040] px-2 py-0.5 text-[11px] disabled:opacity-40"
-                    onclick={() => runTracker(node)}
-                    disabled={trackBusy}
-                  >
-                    {trackBusy ? 'Tracking…' : 'Track from clip start →'}
-                  </button>
-                  {#if trackSummary}
-                    <p class="text-vance-muted mt-1 text-[9px]">
-                      Tracked {trackSummary.frames_tracked} frames ({trackSummary.start_clip_seconds.toFixed(
-                        2
-                      )}s →
-                      {trackSummary.end_clip_seconds.toFixed(2)}s) · mean score {trackSummary.mean_score.toFixed(
-                        2
-                      )}
+                  <div class="mt-2 border-t border-vance-border pt-2">
+                    <div class="text-vance-muted mb-1 text-[10px] uppercase tracking-wider">
+                      Tracker
+                    </div>
+                    <div class="grid grid-cols-3 gap-1 text-[10px]">
+                      <label class="flex flex-col">
+                        <span class="text-vance-muted text-[9px]">frames</span>
+                        <input
+                          type="number"
+                          min="2"
+                          max="240"
+                          step="1"
+                          class="bg-vance-bg border-vance-border rounded border px-1 py-0.5"
+                          bind:value={trackFrames}
+                        />
+                      </label>
+                      <label class="flex flex-col">
+                        <span class="text-vance-muted text-[9px]">patch ½</span>
+                        <input
+                          type="number"
+                          min="2"
+                          max="64"
+                          step="1"
+                          class="bg-vance-bg border-vance-border rounded border px-1 py-0.5"
+                          bind:value={trackPatchHalf}
+                        />
+                      </label>
+                      <label class="flex flex-col">
+                        <span class="text-vance-muted text-[9px]">search ±</span>
+                        <input
+                          type="number"
+                          min="1"
+                          max="128"
+                          step="1"
+                          class="bg-vance-bg border-vance-border rounded border px-1 py-0.5"
+                          bind:value={trackSearchRadius}
+                        />
+                      </label>
+                    </div>
+                    <button
+                      class="mt-1 w-full rounded border border-[var(--color-vance-accent)] bg-[#003040] px-2 py-0.5 text-[11px] disabled:opacity-40"
+                      onclick={() => runTracker(node)}
+                      disabled={trackBusy}
+                    >
+                      {trackBusy ? 'Tracking…' : 'Track from clip start →'}
+                    </button>
+                    {#if trackSummary}
+                      <p class="text-vance-muted mt-1 text-[9px]">
+                        Tracked {trackSummary.frames_tracked} frames ({trackSummary.start_clip_seconds.toFixed(
+                          2
+                        )}s →
+                        {trackSummary.end_clip_seconds.toFixed(2)}s) · mean score {trackSummary.mean_score.toFixed(
+                          2
+                        )}
+                      </p>
+                    {/if}
+                    <p class="text-vance-muted text-[9px] italic">
+                      Replaces win_cx/win_cy keyframes from the clip start through the tracked
+                      range. Decoder must be open on this clip (play/seek it once first).
                     </p>
-                  {/if}
-                  <p class="text-vance-muted text-[9px] italic">
-                    Replaces win_cx/win_cy keyframes from the clip start through the tracked range.
-                    Decoder must be open on this clip (play/seek it once first).
-                  </p>
+                  </div>
                 </div>
-              </div>
-            {/if}
-          </div>
+              {/if}
+            </div>
+          </fieldset>
 
           {#if mode === 'primary'}
             {#each ['lift', 'gamma', 'gain'] as group (group)}
@@ -2843,6 +2988,7 @@
               <div class="mb-4">
                 <ColorWheel
                   label={group}
+                  disabled={gradeOff}
                   rgb={w.rgb}
                   master={w.master}
                   masterMin={group === 'lift' ? -0.5 : 0}
@@ -2858,6 +3004,7 @@
               <div class="mb-4">
                 <ColorWheel
                   label={group}
+                  disabled={gradeOff}
                   rgb={w.rgb}
                   master={w.master}
                   showMaster={false}
@@ -2886,6 +3033,7 @@
             <!-- (HSL hue-wheel tabs are now full members of CURVE_CHANNELS above — 6.8b shipped.) -->
             <CurveEditor
               label={chMeta.label}
+              disabled={gradeOff}
               color={chMeta.color}
               identityY={chMeta.identityY ?? null}
               points={readCurve(node, curveChannel)}
@@ -2910,10 +3058,18 @@
         {#if selectedClipDetails}
           {@const c = selectedClipDetails.clip}
           {@const t = selectedClipDetails.track}
+          {@const tLocked = !canEditTrackContents(t)}
+          {@const editsOff = tLocked || exportRun.busy}
           <div class="mb-2">
             <div class="text-xs uppercase tracking-wider text-vance-muted">Clip</div>
             <div class="mt-1 break-all text-sm font-medium">{c.name}</div>
           </div>
+
+          {#if tLocked}
+            <!-- The engine refuses edits to a locked track's clips; the
+                 controls below are disabled and this says why. -->
+            <TrackLockNotice track={t} />
+          {/if}
 
           <!-- Inspector tabs -->
           <div class="mb-3 flex gap-1 text-[11px]">
@@ -2947,10 +3103,15 @@
               <dd>{c.enabled ? 'enabled' : 'muted'}</dd>
             </dl>
           {:else}
+            <!-- M1 — blend mode + opacity for layers on video tracks. -->
+            {#if t.kind === 'video'}
+              <CompositeInspector track={t} clip={c} />
+            {/if}
+
             <!-- Phase 10.6 — WASM effect plugins browser. Applies a
                discovered plugin to this clip as a `wasm:<id>` effect. -->
             <div class="mt-3">
-              <EffectsBrowser trackId={t.id} clipId={c.id} />
+              <EffectsBrowser trackId={t.id} clipId={c.id} locked={editsOff} />
             </div>
 
             <!-- Transition at this clip's following cut (if any). Lets the
@@ -2963,53 +3124,56 @@
                edit but the mixer ignores it; we still show the
                controls so the user sees the value land). -->
             {#if t.kind === 'audio'}
-              <div class="mt-3">
-                <div class="mb-1 text-[11px] uppercase tracking-wider text-vance-muted">Pan</div>
-                <label class="flex items-center gap-2 font-mono text-xs">
-                  <span class="w-12 text-vance-muted">track</span>
-                  <input
-                    type="range"
-                    min="-1"
-                    max="1"
-                    step="0.01"
-                    value={t.pan}
-                    oninput={(e) =>
-                      projectState.setTrackPan(
-                        t.id,
-                        parseFloat((e.target as HTMLInputElement).value)
-                      )}
-                    class="flex-1 accent-[var(--color-vance-accent)]"
-                  />
-                  <span class="w-10 text-right">{t.pan.toFixed(2)}</span>
-                </label>
-                <label class="mt-1 flex items-center gap-2 font-mono text-xs">
-                  <span class="w-12 text-vance-muted">clip</span>
-                  <input
-                    type="range"
-                    min="-1"
-                    max="1"
-                    step="0.01"
-                    value={c.pan}
-                    oninput={(e) =>
-                      projectState.setClipPan(
-                        t.id,
-                        c.id,
-                        parseFloat((e.target as HTMLInputElement).value)
-                      )}
-                    class="flex-1 accent-[var(--color-vance-accent)]"
-                  />
-                  <span class="w-10 text-right">{c.pan.toFixed(2)}</span>
-                </label>
-                <div class="mt-0.5 text-[10px] text-vance-muted">
-                  composed: {Math.max(-1, Math.min(1, t.pan + c.pan)).toFixed(2)} (clamped)
+              <!-- A disabled fieldset disables every control inside it. -->
+              <fieldset class="min-w-0 disabled:opacity-50" disabled={editsOff} title={pausedHint}>
+                <div class="mt-3">
+                  <div class="mb-1 text-[11px] uppercase tracking-wider text-vance-muted">Pan</div>
+                  <label class="flex items-center gap-2 font-mono text-xs">
+                    <span class="w-12 text-vance-muted">track</span>
+                    <input
+                      type="range"
+                      min="-1"
+                      max="1"
+                      step="0.01"
+                      value={t.pan}
+                      oninput={(e) =>
+                        projectState.setTrackPan(
+                          t.id,
+                          parseFloat((e.target as HTMLInputElement).value)
+                        )}
+                      class="flex-1 accent-[var(--color-vance-accent)]"
+                    />
+                    <span class="w-10 text-right">{t.pan.toFixed(2)}</span>
+                  </label>
+                  <label class="mt-1 flex items-center gap-2 font-mono text-xs">
+                    <span class="w-12 text-vance-muted">clip</span>
+                    <input
+                      type="range"
+                      min="-1"
+                      max="1"
+                      step="0.01"
+                      value={c.pan}
+                      oninput={(e) =>
+                        projectState.setClipPan(
+                          t.id,
+                          c.id,
+                          parseFloat((e.target as HTMLInputElement).value)
+                        )}
+                      class="flex-1 accent-[var(--color-vance-accent)]"
+                    />
+                    <span class="w-10 text-right">{c.pan.toFixed(2)}</span>
+                  </label>
+                  <div class="mt-0.5 text-[10px] text-vance-muted">
+                    composed: {Math.max(-1, Math.min(1, t.pan + c.pan)).toFixed(2)} (clamped)
+                  </div>
                 </div>
-              </div>
 
-              <!-- Phase 7.7 — per-track built-in DSP insert chain
+                <!-- Phase 7.7 — per-track built-in DSP insert chain
                  (parametric EQ + compressor + limiter). Shown for
                  audio tracks since the engine ignores the chain on
                  video tracks. -->
-              <AudioEffectChain trackId={t.id} effects={t.audio_effects} />
+                <AudioEffectChain trackId={t.id} effects={t.audio_effects} />
+              </fieldset>
             {/if}
 
             <!-- Effects: list each attached effect with its kind + a
@@ -3017,89 +3181,104 @@
              slider, transform widgets, etc.). -->
             <div class="mt-4">
               <div
-                class="mb-1 flex items-center justify-between text-[11px] uppercase tracking-wider"
+                class="mb-1 flex items-start justify-between gap-2 text-[11px] uppercase tracking-wider"
               >
                 <span class="text-vance-muted">Effects</span>
-                <div class="flex gap-1">
-                  <button
-                    class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
-                    onclick={() => projectState.addEffect(t.id, c.id, 'opacity', { value: 1 })}
-                    title="Attach an opacity effect"
-                  >
-                    + Opacity
-                  </button>
-                  <button
-                    class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
-                    onclick={() =>
-                      projectState.addEffect(t.id, c.id, 'transform', {
-                        translate_x: 0,
-                        translate_y: 0,
-                        scale_x: 1,
-                        scale_y: 1,
-                        rotation: 0
-                      })}
-                    title="Attach a transform effect (position/scale/rotate)"
-                  >
-                    + Transform
-                  </button>
-                  <button
-                    class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
-                    onclick={() =>
-                      projectState.addEffect(t.id, c.id, 'crop', {
-                        left: 0,
-                        right: 0,
-                        top: 0,
-                        bottom: 0
-                      })}
-                    title="Attach a crop effect"
-                  >
-                    + Crop
-                  </button>
-                  <button
-                    class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
-                    onclick={() =>
-                      projectState.addEffect(t.id, c.id, 'color', {
-                        brightness: 0,
-                        contrast: 1
-                      })}
-                    title="Attach a brightness/contrast effect"
-                  >
-                    + Color
-                  </button>
-                  <button
-                    class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
-                    onclick={() =>
-                      projectState.addEffect(t.id, c.id, 'chroma_key', {
-                        r: 0,
-                        g: 1,
-                        b: 0,
-                        tolerance: 0.2,
-                        softness: 0.08
-                      })}
-                    title="Attach a chroma key (green-screen) effect"
-                  >
-                    + Chroma
-                  </button>
-                  <button
-                    class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
-                    onclick={() =>
-                      projectState.addEffect(t.id, c.id, 'luma_key', {
-                        threshold: 0.5,
-                        direction: 1,
-                        softness: 0.05
-                      })}
-                    title="Attach a luma key (brightness mask) effect"
-                  >
-                    + Luma
-                  </button>
-                  <button
-                    class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
-                    onclick={() => projectState.addEffect(t.id, c.id, 'lut', { path: '' })}
-                    title="Attach a 3D LUT effect (.cube / .3dl)"
-                  >
-                    + LUT
-                  </button>
-                </div>
+                <!-- Wraps: the add buttons outgrow the panel's width. -->
+                <fieldset
+                  class="min-w-0 disabled:opacity-50"
+                  disabled={editsOff}
+                  title={pausedHint}
+                >
+                  <div class="flex flex-wrap justify-end gap-1">
+                    <button
+                      class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+                      onclick={() => projectState.addEffect(t.id, c.id, 'opacity', { value: 1 })}
+                      title="Attach an opacity effect"
+                    >
+                      + Opacity
+                    </button>
+                    <button
+                      class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+                      onclick={() =>
+                        projectState.addEffect(t.id, c.id, 'transform', {
+                          translate_x: 0,
+                          translate_y: 0,
+                          scale_x: 1,
+                          scale_y: 1,
+                          rotation: 0
+                        })}
+                      title="Attach a transform effect (position/scale/rotate)"
+                    >
+                      + Transform
+                    </button>
+                    <button
+                      class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+                      onclick={() =>
+                        projectState.addEffect(t.id, c.id, 'crop', {
+                          left: 0,
+                          right: 0,
+                          top: 0,
+                          bottom: 0
+                        })}
+                      title="Attach a crop effect"
+                    >
+                      + Crop
+                    </button>
+                    <button
+                      class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+                      onclick={() =>
+                        projectState.addEffect(t.id, c.id, 'color', {
+                          brightness: 0,
+                          contrast: 1
+                        })}
+                      title="Attach a brightness/contrast effect"
+                    >
+                      + Color
+                    </button>
+                    <button
+                      class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+                      onclick={() =>
+                        projectState.addEffect(t.id, c.id, 'chroma_key', {
+                          r: 0,
+                          g: 1,
+                          b: 0,
+                          tolerance: 0.2,
+                          softness: 0.08
+                        })}
+                      title="Attach a chroma key (green-screen) effect"
+                    >
+                      + Chroma
+                    </button>
+                    <button
+                      class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+                      onclick={() =>
+                        projectState.addEffect(t.id, c.id, 'luma_key', {
+                          threshold: 0.5,
+                          direction: 1,
+                          softness: 0.05
+                        })}
+                      title="Attach a luma key (brightness mask) effect"
+                    >
+                      + Luma
+                    </button>
+                    <button
+                      class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+                      onclick={() =>
+                        projectState.addEffect(t.id, c.id, KEYER_KIND, keyerDefaults())}
+                      title="Attach a keyer (green / blue screen, with edge and spill controls)"
+                    >
+                      + Keyer
+                    </button>
+                    <button
+                      class="rounded bg-vance-bg border-vance-border border px-1.5 py-0.5 text-[10px] hover:brightness-125"
+                      onclick={() => projectState.addEffect(t.id, c.id, 'lut', { path: '' })}
+                      title="Attach a 3D LUT effect (.cube / .3dl)"
+                    >
+                      + LUT
+                    </button>
+                  </div>
+                </fieldset>
               </div>
               {#if c.effects.length === 0}
                 <p class="text-vance-muted text-xs italic">No effects.</p>
@@ -3110,7 +3289,8 @@
                       <div class="flex items-center justify-between">
                         <span class="font-mono">{e.kind}</span>
                         <button
-                          class="text-vance-muted hover:text-red-400"
+                          class="text-vance-muted hover:text-red-400 disabled:opacity-50 disabled:hover:text-inherit"
+                          disabled={editsOff}
                           onclick={() => projectState.removeEffect(t.id, c.id, e.id)}
                           title="Remove effect"
                         >
@@ -3155,7 +3335,7 @@
                             class="text-[12px] leading-none {animated
                               ? 'text-[var(--color-vance-accent)]'
                               : 'text-vance-muted'} hover:brightness-125"
-                            onclick={() => addKeyframeAtPlayhead(t, c, e, key)}
+                            onclick={() => addKeyframeAtPlayhead(t, c, e, key, cur)}
                             title="Add keyframe at playhead"
                           >
                             ◆
@@ -3178,8 +3358,16 @@
                                 </button>
                                 <button
                                   class="hover:text-red-400"
-                                  onclick={() => removeKeyframe(t, c, e, key, k.time_seconds)}
+                                  onclick={() =>
+                                    projectState.removeEffectKeyframe(
+                                      t.id,
+                                      c,
+                                      e,
+                                      key,
+                                      k.time_seconds
+                                    )}
                                   title="Remove keyframe"
+                                  aria-label="Remove keyframe at {kfAt(k)} seconds"
                                 >
                                   ✕
                                 </button>
@@ -3188,176 +3376,198 @@
                           </ul>
                         {/if}
                       {/snippet}
-                      {#if e.kind === 'opacity'}
-                        {@const raw = e.params.value}
-                        {@const animated = raw !== undefined && isKeyframes(raw)}
-                        {@const kfs: Keyframe[] =
+                      <!-- Intentional: the keyer is left out — its inspector
+                           disables its own edit controls but keeps "Show
+                           matte" (viewer state, not an edit) usable. -->
+                      <fieldset
+                        class="min-w-0 disabled:opacity-50"
+                        disabled={editsOff && e.kind !== KEYER_KIND}
+                        title={pausedHint}
+                      >
+                        {#if e.kind === 'opacity'}
+                          {@const raw = e.params.value}
+                          {@const animated = raw !== undefined && isKeyframes(raw)}
+                          {@const kfs: Keyframe[] =
                       animated && raw !== undefined && isKeyframes(raw) ? raw : []}
-                        {@const cur = raw !== undefined ? evalNumber(raw, 0, 1) : 1}
-                        <div
-                          class="mt-1 grid grid-cols-[3rem_minmax(0,1fr)_2.25rem_1rem] items-center gap-x-2"
-                        >
-                          <span class="text-vance-muted text-[10px]">value</span>
-                          <input
-                            type="range"
-                            min="0"
-                            max="1"
-                            step="0.01"
-                            value={cur}
-                            class="w-full min-w-0"
-                            onchange={(ev) => {
-                              const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
-                              setOrKeyframe(t, c, e, 'value', v);
-                            }}
-                          />
-                          <span class="font-mono text-right text-[10px]">{cur.toFixed(2)}</span>
-                          <button
-                            class="text-[12px] leading-none {animated
-                              ? 'text-[var(--color-vance-accent)]'
-                              : 'text-vance-muted'} hover:brightness-125"
-                            onclick={() => addKeyframeAtPlayhead(t, c, e, 'value')}
-                            title="Add keyframe at playhead"
+                          {@const cur = raw !== undefined ? evalNumber(raw, 0, 1) : 1}
+                          <div
+                            class="mt-1 grid grid-cols-[3rem_minmax(0,1fr)_2.25rem_1rem] items-center gap-x-2"
                           >
-                            ◆
-                          </button>
-                        </div>
-                        {#if animated && kfs.length > 0}
-                          <ul class="mt-1 flex flex-col gap-0.5 pl-12 text-[10px] text-vance-muted">
-                            {#each kfs as k (k.time_seconds)}
-                              <li class="flex items-center justify-between gap-2">
-                                <span class="font-mono">{k.time_seconds.toFixed(2)}s</span>
-                                <span class="font-mono">{k.value.toFixed(2)}</span>
-                                <button
-                                  class="hover:text-red-400"
-                                  onclick={() => removeKeyframe(t, c, e, 'value', k.time_seconds)}
-                                  title="Remove keyframe"
-                                >
-                                  ✕
-                                </button>
-                              </li>
-                            {/each}
-                          </ul>
+                            <span class="text-vance-muted text-[10px]">value</span>
+                            <input
+                              type="range"
+                              min="0"
+                              max="1"
+                              step="0.01"
+                              value={cur}
+                              class="w-full min-w-0"
+                              onchange={(ev) => {
+                                const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
+                                setOrKeyframe(t, c, e, 'value', v);
+                              }}
+                            />
+                            <span class="font-mono text-right text-[10px]">{cur.toFixed(2)}</span>
+                            <button
+                              class="text-[12px] leading-none {animated
+                                ? 'text-[var(--color-vance-accent)]'
+                                : 'text-vance-muted'} hover:brightness-125"
+                              onclick={() => addKeyframeAtPlayhead(t, c, e, 'value', cur)}
+                              title="Add keyframe at playhead"
+                            >
+                              ◆
+                            </button>
+                          </div>
+                          {#if animated && kfs.length > 0}
+                            <ul
+                              class="mt-1 flex flex-col gap-0.5 pl-12 text-[10px] text-vance-muted"
+                            >
+                              {#each kfs as k (k.time_seconds)}
+                                <li class="flex items-center justify-between gap-2">
+                                  <span class="font-mono">{k.time_seconds.toFixed(2)}s</span>
+                                  <span class="font-mono">{k.value.toFixed(2)}</span>
+                                  <button
+                                    class="hover:text-red-400"
+                                    onclick={() =>
+                                      projectState.removeEffectKeyframe(
+                                        t.id,
+                                        c,
+                                        e,
+                                        'value',
+                                        k.time_seconds
+                                      )}
+                                    title="Remove keyframe"
+                                    aria-label="Remove keyframe at {kfAt(k)} seconds"
+                                  >
+                                    ✕
+                                  </button>
+                                </li>
+                              {/each}
+                            </ul>
+                          {/if}
+                        {:else if e.kind === 'transform'}
+                          {@const tx =
+                            typeof e.params.translate_x === 'number' ? e.params.translate_x : 0}
+                          {@const ty =
+                            typeof e.params.translate_y === 'number' ? e.params.translate_y : 0}
+                          {@const sx = typeof e.params.scale_x === 'number' ? e.params.scale_x : 1}
+                          {@const sy = typeof e.params.scale_y === 'number' ? e.params.scale_y : 1}
+                          {@const rot =
+                            typeof e.params.rotation === 'number' ? e.params.rotation : 0}
+                          <div
+                            class="mt-1 grid grid-cols-[3rem_minmax(0,1fr)_2.25rem] items-center gap-x-2 gap-y-1"
+                          >
+                            <span class="text-vance-muted text-[10px]">x</span>
+                            <input
+                              type="range"
+                              min="-1"
+                              max="1"
+                              step="0.01"
+                              value={tx}
+                              class="w-full min-w-0"
+                              onchange={(ev) => {
+                                const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
+                                projectState.updateEffectParam(t.id, c.id, e.id, 'translate_x', v);
+                              }}
+                            />
+                            <span class="font-mono text-right text-[10px]">{tx.toFixed(2)}</span>
+
+                            <span class="text-vance-muted text-[10px]">y</span>
+                            <input
+                              type="range"
+                              min="-1"
+                              max="1"
+                              step="0.01"
+                              value={ty}
+                              class="flex-1"
+                              onchange={(ev) => {
+                                const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
+                                projectState.updateEffectParam(t.id, c.id, e.id, 'translate_y', v);
+                              }}
+                            />
+                            <span class="font-mono text-right text-[10px]">{ty.toFixed(2)}</span>
+
+                            <span class="text-vance-muted text-[10px]">scale x</span>
+                            <input
+                              type="range"
+                              min="0.1"
+                              max="3"
+                              step="0.01"
+                              value={sx}
+                              class="w-full min-w-0"
+                              onchange={(ev) => {
+                                const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
+                                projectState.updateEffectParam(t.id, c.id, e.id, 'scale_x', v);
+                              }}
+                            />
+                            <span class="font-mono text-right text-[10px]">{sx.toFixed(2)}</span>
+
+                            <span class="text-vance-muted text-[10px]">scale y</span>
+                            <input
+                              type="range"
+                              min="0.1"
+                              max="3"
+                              step="0.01"
+                              value={sy}
+                              class="flex-1"
+                              onchange={(ev) => {
+                                const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
+                                projectState.updateEffectParam(t.id, c.id, e.id, 'scale_y', v);
+                              }}
+                            />
+                            <span class="font-mono text-right text-[10px]">{sy.toFixed(2)}</span>
+
+                            <span class="text-vance-muted text-[10px]">rot°</span>
+                            <input
+                              type="range"
+                              min="-180"
+                              max="180"
+                              step="1"
+                              value={rot}
+                              class="w-full min-w-0"
+                              onchange={(ev) => {
+                                const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
+                                projectState.updateEffectParam(t.id, c.id, e.id, 'rotation', v);
+                              }}
+                            />
+                            <span class="font-mono text-right text-[10px]">{rot.toFixed(0)}°</span>
+                          </div>
+                        {:else if e.kind === 'crop'}
+                          {@render numericParam('left', 'left', 0, 0.95, 0.01, 0, 2)}
+                          {@render numericParam('right', 'right', 0, 0.95, 0.01, 0, 2)}
+                          {@render numericParam('top', 'top', 0, 0.95, 0.01, 0, 2)}
+                          {@render numericParam('bottom', 'bot', 0, 0.95, 0.01, 0, 2)}
+                        {:else if e.kind === 'color'}
+                          {@render numericParam('brightness', 'bright', -1, 1, 0.01, 0, 2)}
+                          {@render numericParam('contrast', 'contr', 0, 3, 0.01, 1, 2)}
+                        {:else if e.kind === 'chroma_key'}
+                          {@render numericParam('r', 'R', 0, 1, 0.01, 0, 2)}
+                          {@render numericParam('g', 'G', 0, 1, 0.01, 1, 2)}
+                          {@render numericParam('b', 'B', 0, 1, 0.01, 0, 2)}
+                          {@render numericParam('tolerance', 'tol', 0, 1, 0.01, 0.2, 2)}
+                          {@render numericParam('softness', 'soft', 0, 0.5, 0.01, 0.08, 2)}
+                        {:else if e.kind === 'luma_key'}
+                          {@render numericParam('threshold', 'thr', 0, 1, 0.01, 0.5, 2)}
+                          {@render numericParam('direction', 'dir', -1, 1, 1, 1, 0)}
+                          {@render numericParam('softness', 'soft', 0, 0.5, 0.01, 0.05, 2)}
+                        {:else if e.kind === KEYER_KIND}
+                          <KeyerInspector track={t} clip={c} effect={e} />
+                        {:else if e.kind === 'lut'}
+                          {@const rawPath = e.params.path}
+                          {@const lutPath: string = typeof rawPath === 'string' ? rawPath : ''}
+                          <div class="mt-1 flex items-center gap-2 text-[10px]">
+                            <button
+                              class="rounded bg-vance-bg border-vance-border border px-2 py-0.5 hover:brightness-125"
+                              onclick={() => pickLutFile(t, c, e)}
+                              title="Pick a .cube or .3dl LUT file"
+                            >
+                              Pick file…
+                            </button>
+                            <span class="text-vance-muted truncate font-mono" title={lutPath}>
+                              {lutPath || '(none selected)'}
+                            </span>
+                          </div>
                         {/if}
-                      {:else if e.kind === 'transform'}
-                        {@const tx =
-                          typeof e.params.translate_x === 'number' ? e.params.translate_x : 0}
-                        {@const ty =
-                          typeof e.params.translate_y === 'number' ? e.params.translate_y : 0}
-                        {@const sx = typeof e.params.scale_x === 'number' ? e.params.scale_x : 1}
-                        {@const sy = typeof e.params.scale_y === 'number' ? e.params.scale_y : 1}
-                        {@const rot = typeof e.params.rotation === 'number' ? e.params.rotation : 0}
-                        <div
-                          class="mt-1 grid grid-cols-[3rem_minmax(0,1fr)_2.25rem] items-center gap-x-2 gap-y-1"
-                        >
-                          <span class="text-vance-muted text-[10px]">x</span>
-                          <input
-                            type="range"
-                            min="-1"
-                            max="1"
-                            step="0.01"
-                            value={tx}
-                            class="w-full min-w-0"
-                            onchange={(ev) => {
-                              const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
-                              projectState.updateEffectParam(t.id, c.id, e.id, 'translate_x', v);
-                            }}
-                          />
-                          <span class="font-mono text-right text-[10px]">{tx.toFixed(2)}</span>
-
-                          <span class="text-vance-muted text-[10px]">y</span>
-                          <input
-                            type="range"
-                            min="-1"
-                            max="1"
-                            step="0.01"
-                            value={ty}
-                            class="flex-1"
-                            onchange={(ev) => {
-                              const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
-                              projectState.updateEffectParam(t.id, c.id, e.id, 'translate_y', v);
-                            }}
-                          />
-                          <span class="font-mono text-right text-[10px]">{ty.toFixed(2)}</span>
-
-                          <span class="text-vance-muted text-[10px]">scale x</span>
-                          <input
-                            type="range"
-                            min="0.1"
-                            max="3"
-                            step="0.01"
-                            value={sx}
-                            class="w-full min-w-0"
-                            onchange={(ev) => {
-                              const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
-                              projectState.updateEffectParam(t.id, c.id, e.id, 'scale_x', v);
-                            }}
-                          />
-                          <span class="font-mono text-right text-[10px]">{sx.toFixed(2)}</span>
-
-                          <span class="text-vance-muted text-[10px]">scale y</span>
-                          <input
-                            type="range"
-                            min="0.1"
-                            max="3"
-                            step="0.01"
-                            value={sy}
-                            class="flex-1"
-                            onchange={(ev) => {
-                              const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
-                              projectState.updateEffectParam(t.id, c.id, e.id, 'scale_y', v);
-                            }}
-                          />
-                          <span class="font-mono text-right text-[10px]">{sy.toFixed(2)}</span>
-
-                          <span class="text-vance-muted text-[10px]">rot°</span>
-                          <input
-                            type="range"
-                            min="-180"
-                            max="180"
-                            step="1"
-                            value={rot}
-                            class="w-full min-w-0"
-                            onchange={(ev) => {
-                              const v = parseFloat((ev.currentTarget as HTMLInputElement).value);
-                              projectState.updateEffectParam(t.id, c.id, e.id, 'rotation', v);
-                            }}
-                          />
-                          <span class="font-mono text-right text-[10px]">{rot.toFixed(0)}°</span>
-                        </div>
-                      {:else if e.kind === 'crop'}
-                        {@render numericParam('left', 'left', 0, 0.95, 0.01, 0, 2)}
-                        {@render numericParam('right', 'right', 0, 0.95, 0.01, 0, 2)}
-                        {@render numericParam('top', 'top', 0, 0.95, 0.01, 0, 2)}
-                        {@render numericParam('bottom', 'bot', 0, 0.95, 0.01, 0, 2)}
-                      {:else if e.kind === 'color'}
-                        {@render numericParam('brightness', 'bright', -1, 1, 0.01, 0, 2)}
-                        {@render numericParam('contrast', 'contr', 0, 3, 0.01, 1, 2)}
-                      {:else if e.kind === 'chroma_key'}
-                        {@render numericParam('r', 'R', 0, 1, 0.01, 0, 2)}
-                        {@render numericParam('g', 'G', 0, 1, 0.01, 1, 2)}
-                        {@render numericParam('b', 'B', 0, 1, 0.01, 0, 2)}
-                        {@render numericParam('tolerance', 'tol', 0, 1, 0.01, 0.2, 2)}
-                        {@render numericParam('softness', 'soft', 0, 0.5, 0.01, 0.08, 2)}
-                      {:else if e.kind === 'luma_key'}
-                        {@render numericParam('threshold', 'thr', 0, 1, 0.01, 0.5, 2)}
-                        {@render numericParam('direction', 'dir', -1, 1, 1, 1, 0)}
-                        {@render numericParam('softness', 'soft', 0, 0.5, 0.01, 0.05, 2)}
-                      {:else if e.kind === 'lut'}
-                        {@const rawPath = e.params.path}
-                        {@const lutPath: string = typeof rawPath === 'string' ? rawPath : ''}
-                        <div class="mt-1 flex items-center gap-2 text-[10px]">
-                          <button
-                            class="rounded bg-vance-bg border-vance-border border px-2 py-0.5 hover:brightness-125"
-                            onclick={() => pickLutFile(t, c, e)}
-                            title="Pick a .cube or .3dl LUT file"
-                          >
-                            Pick file…
-                          </button>
-                          <span class="text-vance-muted truncate font-mono" title={lutPath}>
-                            {lutPath || '(none selected)'}
-                          </span>
-                        </div>
-                      {/if}
+                      </fieldset>
                     </li>
                   {/each}
                 </ul>

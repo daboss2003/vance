@@ -6,6 +6,7 @@
    * Vimeo/TikTok OAuth connects (their uploaders are the next step).
    */
   import { publishAuthorized, startOauth, awaitOauth, publishVideo } from '$lib/ipc';
+  import { reportableError } from '$lib/toast.svelte';
 
   const PLATFORMS = ['YouTube', 'Vimeo', 'TikTok'];
   let platform = $state('YouTube');
@@ -52,7 +53,7 @@
       authorized = await awaitOauth();
       status = authorized ? `${platform} connected.` : null;
     } catch (e) {
-      error = String(e);
+      error = reportableError(e);
       status = null;
     } finally {
       busy = false;
@@ -81,7 +82,7 @@
       });
       status = `Published: ${url}`;
     } catch (e) {
-      error = String(e);
+      error = reportableError(e);
       status = null;
     } finally {
       busy = false;

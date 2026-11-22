@@ -9,7 +9,7 @@
   // for hundreds of clips is not GPU-bound. WebGL2 with batched
   // rectangles will land alongside 4.x perf work for 1000+ clips.
 
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import {
     currentTimelineSeconds,
     decodeSequenceAt,
@@ -57,6 +57,20 @@
     KF_HITBOX,
     type AutomationHit
   } from './automation-hit';
+  import TrackMenu from './TrackMenu.svelte';
+  import {
+    createLockGuard,
+    isRefusedClipDrag,
+    laneCursor,
+    lockActionLabel,
+    lockedTrackOf,
+    moveGroup
+  } from '$lib/track-lock';
+  import { toast } from '$lib/toast.svelte';
+  import { hasKeyboardFocus, targetOwnsKey } from '$lib/keys';
+  import { exportRun } from '$lib/export-run.svelte';
+  import { EXPORT_BUSY_HINT } from '$lib/export-busy';
+  import { reopenAfterRefusal, type RenameCommit } from './rename';
 
   let { refreshTick = 0 }: { refreshTick?: number } = $props();
 
@@ -70,6 +84,16 @@
   // seconds are clipped off the left edge of the visible area.
   let pixelsPerSecond = $state<number>(60);
   let scrollSeconds = $state<number>(0);
+  // Vertical scroll of the track rows (px), once there are more tracks than
+  // fit. The wheel over the track headers drives it.
+  let scrollY = $state<number>(0);
+
+  // Open track header menu, in viewport coordinates.
+  let trackMenu = $state<{ trackId: string | null; x: number; y: number } | null>(null);
+  // Inline track rename field over a header: double-click the header or
+  // choose "Rename…" in the track menu.
+  let renaming = $state<{ trackId: string; draft: string } | null>(null);
+  const uid = $props.id();
 
   // Engine's current playhead, fetched from `current_timeline_seconds`.
   // Updated by the playback poll set up in onMount.
@@ -85,7 +109,8 @@
   // Phase 7.5 M1 — header widened by 18 px so a stereo meter strip
   // (2× 6 px bars + 2 px gap + 4 px margin = ~18 px) can sit between
   // the M/S buttons and the timeline edge without overlapping either.
-  const TRACK_HEADER_W = 106; // px reserved on the left
+  // M1 compositing — and by 19 px more for the lock toggle.
+  const TRACK_HEADER_W = 125; // px reserved on the left
   // Mixer button geometry inside the track header.
   const MIXER_BTN_SIZE = 16; // square button (px)
   const MIXER_BTN_GAP = 3; // gap between M and S
@@ -95,6 +120,16 @@
   const METER_BAR_GAP = 2;
   const METER_STRIP_W = METER_BAR_W * 2 + METER_BAR_GAP;
   const METER_STRIP_X = TRACK_HEADER_W - METER_STRIP_W - 4;
+  // M1 visibility (eye) toggle: video rows only, in the meter slot they
+  // leave empty.
+  const EYE_BTN_X = TRACK_HEADER_W - MIXER_BTN_SIZE - 4;
+  // M1 lock toggle, every row, left of the eye / meter slot. Painted on the
+  // canvas like its neighbours; a real <button> sits over it (template).
+  const LOCK_BTN_X = EYE_BTN_X - MIXER_BTN_SIZE - MIXER_BTN_GAP;
+  const LOCK_ACTIVE = '#4c9dff'; // --color-vance-accent
+  const LOCKED_HATCH = 'rgba(148, 155, 171, 0.12)';
+  const HIDDEN_ROW_WASH = 'rgba(13, 15, 18, 0.5)';
+  const HIDDEN_HEADER_TEXT = '#5a6172';
 
   // Track rows are alternating shaded.
   const VIDEO_FILL = '#3a4252';
@@ -186,25 +221,54 @@
     ctx.fillStyle = '#0d0f12';
     ctx.fillRect(0, 0, cssW, cssH);
 
-    if (!sequence || sequence.tracks.length === 0) {
+    if (!sequence || rows.length === 0) {
       ctx.fillStyle = '#5a6172';
       ctx.font = '12px ui-sans-serif, system-ui, sans-serif';
       ctx.textBaseline = 'middle';
       ctx.fillText(
-        sequence ? 'No tracks on this sequence yet.' : 'No sequence loaded.',
+        sequence ? 'No tracks yet. Right-click here to add one.' : 'No sequence loaded.',
         TRACK_HEADER_W + 12,
         cssH / 2
       );
       return;
     }
 
-    drawRuler(ctx, cssW);
+    // Tracks may have been removed (or the panel grown) since the last scroll.
+    scrollY = Math.min(scrollY, maxScrollY(cssH));
+
+    // Rows scroll under the fixed ruler, so clip them to the area below it.
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, RULER_HEIGHT, cssW, cssH - RULER_HEIGHT);
+    ctx.clip();
     drawTracks(ctx, cssW, cssH);
-    drawPlayhead(ctx, cssH);
-    drawTrackHeaders(ctx, cssH);
-    drawMarquee(ctx);
     drawMoveDragOverlay(ctx, cssH);
     drawTrimSnapLine(ctx, cssH);
+    drawTrackHeaders(ctx, cssH);
+    drawMarquee(ctx);
+    ctx.restore();
+
+    drawRuler(ctx, cssW);
+    drawPlayhead(ctx, cssH);
+    // Phase 7.4 M5 — drag readout floats above everything.
+    if (cursorCss && (fadeDrag || kfDrag)) {
+      const tagText = dragReadoutText();
+      if (tagText) drawDragTag(ctx, cursorCss.x, cursorCss.y, tagText);
+    }
+    drawScrollThumb(ctx, cssH);
+  }
+
+  /** Thin thumb at the header column's right edge while the rows overflow. */
+  function drawScrollThumb(ctx: CanvasRenderingContext2D, cssH: number) {
+    const viewH = cssH - RULER_HEIGHT;
+    const contentH = rows.length * TRACK_HEIGHT;
+    if (viewH <= 0 || contentH <= viewH) return;
+    const thumbH = Math.max(16, (viewH * viewH) / contentH);
+    const thumbY = RULER_HEIGHT + (scrollY / (contentH - viewH)) * (viewH - thumbH);
+    ctx.fillStyle = 'rgba(148, 155, 171, 0.5)';
+    ctx.beginPath();
+    ctx.roundRect(TRACK_HEADER_W - 3, thumbY, 2, thumbH, 1);
+    ctx.fill();
   }
 
   function drawTrimSnapLine(ctx: CanvasRenderingContext2D, cssH: number) {
@@ -226,7 +290,9 @@
    *  move-drag is in flight. */
   function drawMoveDragOverlay(ctx: CanvasRenderingContext2D, cssH: number) {
     if (!moveDrag) return;
-    const y = trackY(moveDrag.trackIdx);
+    const row = rowOfTrack(moveDrag.trackId);
+    if (row < 0) return;
+    const y = trackY(row);
     const x = timeToX(moveDrag.originalTimelineIn);
     const w = moveDrag.durationSeconds * pixelsPerSecond;
     // Dashed grey outline at the source position.
@@ -332,8 +398,62 @@
 
   // ---- Tracks + clips -----------------------------------------------------
 
-  function trackY(rowIdx: number): number {
-    return RULER_HEIGHT + rowIdx * TRACK_HEIGHT;
+  // ---- Row order ----------------------------------------------------------
+  //
+  // Intentional: video tracks are drawn REVERSED, so the top row is the top
+  // compositing layer (the last video track; V2 above V1), then audio tracks
+  // in sequence order (ADR 0007). Every y↔track mapping (draw, hit-tests,
+  // drop, marquee, drag previews, keyframe lanes) goes through `rows`,
+  // `trackY` and `rowAtY` so they can never disagree. Track indices into
+  // `sequence.tracks` are not row indices; don't mix them.
+  const rows = $derived.by<TrackContents[]>(() => {
+    const tracks = sequence?.tracks ?? [];
+    return [
+      ...tracks.filter((t) => t.kind === 'video').reverse(),
+      ...tracks.filter((t) => t.kind !== 'video')
+    ];
+  });
+
+  /** Top y (canvas-local) of draw row `row`. */
+  function trackY(row: number): number {
+    return RULER_HEIGHT + row * TRACK_HEIGHT - scrollY;
+  }
+
+  /** Draw row under canvas-local `localY`, or -1 (ruler, below the last row). */
+  function rowAtY(localY: number): number {
+    if (localY < RULER_HEIGHT) return -1;
+    const row = Math.floor((localY - RULER_HEIGHT + scrollY) / TRACK_HEIGHT);
+    return row >= 0 && row < rows.length ? row : -1;
+  }
+
+  /** Draw row of the track `trackId`, or -1. */
+  function rowOfTrack(trackId: string): number {
+    return rows.findIndex((t) => t.id === trackId);
+  }
+
+  function trackById(trackId: string): TrackContents | null {
+    return rows.find((t) => t.id === trackId) ?? null;
+  }
+
+  function trackOfClipId(clipId: string | null): TrackContents | null {
+    if (!clipId) return null;
+    return rows.find((t) => t.clips.some((c) => c.id === clipId)) ?? null;
+  }
+
+  /** The locked track that would refuse moving `clipId` (with its magnetic
+   *  group), or null. */
+  function moveLockedTrack(clipId: string | null): TrackContents | null {
+    if (!clipId) return null;
+    return lockedTrackOf(rows, moveGroup(clipId, projectState.magnetic, projectState.connections));
+  }
+
+  // Edits on a locked track (move, trim, fades, gain keyframes, drops) are
+  // refused here, before a drag starts, instead of by the engine on release.
+  // Selecting, mute / solo / eye / lock, track moves and rename still work.
+  const lockGuard = createLockGuard((message) => toast.info(message));
+
+  function maxScrollY(cssH: number): number {
+    return Math.max(0, rows.length * TRACK_HEIGHT - (cssH - RULER_HEIGHT));
   }
 
   function drawTracks(ctx: CanvasRenderingContext2D, cssW: number, cssH: number) {
@@ -341,10 +461,11 @@
     const visibleLeft = scrollSeconds;
     const visibleRight = scrollSeconds + (cssW - TRACK_HEADER_W) / pixelsPerSecond;
 
-    sequence.tracks.forEach((track, rowIdx) => {
-      const y = trackY(rowIdx);
-      // Row background — alternating, slightly muted when locked.
-      ctx.fillStyle = ROW_BG[rowIdx % 2];
+    rows.forEach((track, row) => {
+      const y = trackY(row);
+      if (y + TRACK_HEIGHT < RULER_HEIGHT || y > cssH) return;
+      // Row background — alternating (hatched on top when locked).
+      ctx.fillStyle = ROW_BG[row % 2];
       ctx.fillRect(TRACK_HEADER_W, y, cssW - TRACK_HEADER_W, TRACK_HEIGHT);
 
       // Phase 7.4 M5 — track-wide gain lane underlay. Drawn BEFORE clips
@@ -355,21 +476,48 @@
       drawClips(ctx, track, y, visibleLeft, visibleRight);
       drawTransitions(ctx, track, y, visibleLeft, visibleRight);
 
+      // A locked track's clips can't be edited: hatch the whole row, clips too.
+      if (track.locked) drawLockedHatch(ctx, y, cssW);
+
+      // A hidden video track stays editable but reads as switched off.
+      if (track.kind === 'video' && !track.enabled) {
+        ctx.fillStyle = HIDDEN_ROW_WASH;
+        ctx.fillRect(TRACK_HEADER_W, y, cssW - TRACK_HEADER_W, TRACK_HEIGHT);
+      }
+
       // Row separator.
       ctx.strokeStyle = '#2a2e36';
       ctx.beginPath();
       ctx.moveTo(TRACK_HEADER_W, y + TRACK_HEIGHT - 0.5);
       ctx.lineTo(cssW, y + TRACK_HEIGHT - 0.5);
       ctx.stroke();
+
+      // Heavier rule where the video stack ends and the audio rows begin.
+      if (row > 0 && track.kind !== 'video' && rows[row - 1].kind === 'video') {
+        ctx.strokeStyle = '#3b424c';
+        ctx.beginPath();
+        ctx.moveTo(0, y + 0.5);
+        ctx.lineTo(cssW, y + 0.5);
+        ctx.stroke();
+      }
     });
+  }
 
-    // Phase 7.4 M5 — drag readout floats above everything.
-    if (cursorCss && (fadeDrag || kfDrag)) {
-      const tagText = dragReadoutText();
-      if (tagText) drawDragTag(ctx, cursorCss.x, cursorCss.y, tagText);
+  /** Diagonal hatch across a locked row's lane (the usual NLE cue). */
+  function drawLockedHatch(ctx: CanvasRenderingContext2D, y: number, cssW: number) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(TRACK_HEADER_W, y, cssW - TRACK_HEADER_W, TRACK_HEIGHT);
+    ctx.clip();
+    ctx.strokeStyle = LOCKED_HATCH;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let x = TRACK_HEADER_W - TRACK_HEIGHT; x < cssW; x += 8) {
+      ctx.moveTo(x, y + TRACK_HEIGHT);
+      ctx.lineTo(x + TRACK_HEIGHT, y);
     }
-
-    void cssH;
+    ctx.stroke();
+    ctx.restore();
   }
 
   /** Drag readout text builder, kept inline so both fade and keyframe
@@ -895,7 +1043,6 @@
     kind: HitKind;
     clip: ClipContents;
     track: TrackContents;
-    trackIdx: number;
   };
 
   /** Hit-test: where on a clip (if any) is (localX, localY)? Returns
@@ -904,22 +1051,21 @@
   function hitAt(localX: number, localY: number): Hit | null {
     if (!sequence) return null;
     if (localX < TRACK_HEADER_W) return null;
-    if (localY < RULER_HEIGHT) return null;
-    const trackIdx = Math.floor((localY - RULER_HEIGHT) / TRACK_HEIGHT);
-    if (trackIdx < 0 || trackIdx >= sequence.tracks.length) return null;
-    const track = sequence.tracks[trackIdx];
+    const row = rowAtY(localY);
+    if (row < 0) return null;
+    const track = rows[row];
     for (const c of track.clips) {
       const xLeft = timeToX(c.timeline_in_seconds);
       const xRight = xLeft + c.duration_seconds * pixelsPerSecond;
       // Test edges first so handles win even if the clip is short.
       if (Math.abs(localX - xLeft) <= HANDLE_PX) {
-        return { kind: 'left', clip: c, track, trackIdx };
+        return { kind: 'left', clip: c, track };
       }
       if (Math.abs(localX - xRight) <= HANDLE_PX) {
-        return { kind: 'right', clip: c, track, trackIdx };
+        return { kind: 'right', clip: c, track };
       }
       if (localX >= xLeft && localX <= xRight) {
-        return { kind: 'body', clip: c, track, trackIdx };
+        return { kind: 'body', clip: c, track };
       }
     }
     return null;
@@ -961,11 +1107,19 @@
 
     ctx.font = '11px ui-sans-serif, system-ui, sans-serif';
     ctx.textBaseline = 'middle';
-    sequence.tracks.forEach((track, rowIdx) => {
-      const y = trackY(rowIdx);
-      // Track name label (V1, A1, ...).
-      ctx.fillStyle = TRACK_HEADER_TEXT;
+    rows.forEach((track, row) => {
+      const y = trackY(row);
+      if (y + TRACK_HEIGHT < RULER_HEIGHT || y > cssH) return;
+      const hidden = track.kind === 'video' && !track.enabled;
+      // Track name label (V1, A1, ...), clipped so a long name can't run
+      // under the M button.
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, y, MIXER_BTN_X - 4, TRACK_HEIGHT);
+      ctx.clip();
+      ctx.fillStyle = hidden ? HIDDEN_HEADER_TEXT : TRACK_HEADER_TEXT;
       ctx.fillText(track.name, 6, y + TRACK_HEIGHT / 2);
+      ctx.restore();
       // Phase 7.3 — M (mute) and S (solo) toggle buttons. Drawn for
       // every track for visual consistency; the engine ignores mixer
       // state on Video tracks during the audio fold.
@@ -979,15 +1133,96 @@
         track.solo,
         '#e6c52c'
       );
+      drawLockToggle(ctx, LOCK_BTN_X, btnY, track.locked);
       // Phase 7.5 M1 — stereo meter strip for audio tracks. Video
-      // tracks reserve the slot (so the row layout stays uniform) but
-      // skip the live draw — the fold thread never produces a meter
-      // entry for them.
+      // tracks never get a meter entry from the fold thread, so their
+      // slot holds the visibility (eye) toggle instead.
       if (track.kind === 'audio') {
         const display = metersStore.tracks[track.id];
         if (display) drawMeterStrip(ctx, METER_STRIP_X, y + 4, TRACK_HEIGHT - 8, display);
+      } else {
+        drawEyeToggle(ctx, EYE_BTN_X, btnY, track.enabled);
+      }
+      if (row > 0 && track.kind !== 'video' && rows[row - 1].kind === 'video') {
+        ctx.strokeStyle = '#3b424c';
+        ctx.beginPath();
+        ctx.moveTo(0, y + 0.5);
+        ctx.lineTo(TRACK_HEADER_W, y + 0.5);
+        ctx.stroke();
       }
     });
+  }
+
+  /** Eye button: open eye when the track is visible, dim and struck through
+   *  when hidden. */
+  function drawEyeToggle(ctx: CanvasRenderingContext2D, x: number, y: number, visible: boolean) {
+    ctx.save();
+    ctx.fillStyle = visible ? '#2c2f37' : '#1c1f25';
+    ctx.strokeStyle = visible ? '#4a4e58' : '#33373f';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.roundRect(x + 0.5, y + 0.5, MIXER_BTN_SIZE - 1, MIXER_BTN_SIZE - 1, 3);
+    ctx.fill();
+    ctx.stroke();
+    const cx = x + MIXER_BTN_SIZE / 2;
+    const cy = y + MIXER_BTN_SIZE / 2;
+    const ink = visible ? '#c8cfdb' : HIDDEN_HEADER_TEXT;
+    ctx.strokeStyle = ink;
+    ctx.fillStyle = ink;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(cx - 5, cy);
+    ctx.quadraticCurveTo(cx, cy - 5, cx + 5, cy);
+    ctx.quadraticCurveTo(cx, cy + 5, cx - 5, cy);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(cx, cy, 1.6, 0, Math.PI * 2);
+    ctx.fill();
+    if (!visible) {
+      ctx.beginPath();
+      ctx.moveTo(cx - 5, cy + 5);
+      ctx.lineTo(cx + 5, cy - 5);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  /** Lock button: a closed padlock on the accent fill when locked, an open
+   *  one otherwise. */
+  function drawLockToggle(ctx: CanvasRenderingContext2D, x: number, y: number, locked: boolean) {
+    ctx.save();
+    ctx.fillStyle = locked ? LOCK_ACTIVE : '#2c2f37';
+    ctx.strokeStyle = locked ? LOCK_ACTIVE : '#4a4e58';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.roundRect(x + 0.5, y + 0.5, MIXER_BTN_SIZE - 1, MIXER_BTN_SIZE - 1, 3);
+    ctx.fill();
+    ctx.stroke();
+    // Padlock in a 24-unit grid scaled into the middle 12 px of the button.
+    const s = 0.5;
+    const ox = x + 2;
+    const oy = y + 2;
+    const ink = locked ? '#0d0f12' : '#9099a8';
+    ctx.strokeStyle = ink;
+    ctx.fillStyle = ink;
+    ctx.lineWidth = 1.2;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.roundRect(ox + 4 * s, oy + 11 * s, 16 * s, 10 * s, 1);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(ox + 7.5 * s, oy + 11 * s);
+    ctx.lineTo(ox + 7.5 * s, oy + 7 * s);
+    if (locked) {
+      ctx.arc(ox + 12 * s, oy + 7 * s, 4.5 * s, Math.PI, Math.PI * 2);
+      ctx.lineTo(ox + 16.5 * s, oy + 11 * s);
+    } else {
+      // Open: the shackle stops short of the body on the right.
+      ctx.arc(ox + 12 * s, oy + 7 * s, 4.5 * s, Math.PI, Math.PI * 2 - 0.25);
+    }
+    ctx.stroke();
+    ctx.restore();
   }
 
   /** Phase 7.5 M1 — stereo vertical meter strip. RMS fills from the
@@ -1081,29 +1316,133 @@
     ctx.restore();
   }
 
-  /** Hit-test the mixer toggles in a track header. Returns
-   *  `{ trackId, kind }` if the click is inside an M or S button. */
-  function hitTestMixerButton(
-    cssX: number,
-    cssY: number
-  ): { trackId: string; kind: 'mute' | 'solo' } | null {
+  type HeaderButton = { track: TrackContents; kind: 'mute' | 'solo' | 'visible' };
+
+  /** Hit-test the buttons in a track header: M, S, and the eye on video
+   *  rows. */
+  function hitTestHeaderButton(cssX: number, cssY: number): HeaderButton | null {
     if (!sequence || cssX > TRACK_HEADER_W) return null;
-    if (cssY < RULER_HEIGHT) return null;
-    const rowIdx = Math.floor((cssY - RULER_HEIGHT) / TRACK_HEIGHT);
-    if (rowIdx < 0 || rowIdx >= sequence.tracks.length) return null;
-    const track = sequence.tracks[rowIdx];
-    const y = trackY(rowIdx);
-    const btnY = y + (TRACK_HEIGHT - MIXER_BTN_SIZE) / 2;
+    const row = rowAtY(cssY);
+    if (row < 0) return null;
+    const track = rows[row];
+    const btnY = trackY(row) + (TRACK_HEIGHT - MIXER_BTN_SIZE) / 2;
     if (cssY < btnY || cssY > btnY + MIXER_BTN_SIZE) return null;
     const mX = MIXER_BTN_X;
     const sX = MIXER_BTN_X + MIXER_BTN_SIZE + MIXER_BTN_GAP;
     if (cssX >= mX && cssX < mX + MIXER_BTN_SIZE) {
-      return { trackId: track.id, kind: 'mute' };
+      return { track, kind: 'mute' };
     }
     if (cssX >= sX && cssX < sX + MIXER_BTN_SIZE) {
-      return { trackId: track.id, kind: 'solo' };
+      return { track, kind: 'solo' };
+    }
+    if (track.kind === 'video' && cssX >= EYE_BTN_X && cssX < EYE_BTN_X + MIXER_BTN_SIZE) {
+      return { track, kind: 'visible' };
     }
     return null;
+  }
+
+  /** Hover tooltip for the track header column ('' elsewhere). */
+  function headerTooltip(button: HeaderButton | null, cssX: number, cssY: number): string {
+    if (button) {
+      if (exportRun.busy) return EXPORT_BUSY_HINT;
+      const t = button.track;
+      if (button.kind === 'visible') return t.enabled ? 'Hide track' : 'Show track';
+      if (button.kind === 'mute') return t.mute ? 'Unmute track' : 'Mute track';
+      return t.solo ? 'Unsolo track' : 'Solo track';
+    }
+    if (cssX < TRACK_HEADER_W && rowAtY(cssY) >= 0) {
+      return 'Double-click to rename. Right-click for track options.';
+    }
+    return '';
+  }
+
+  /** Open the track header menu at viewport (clientX, clientY). */
+  function openTrackMenu(trackId: string | null, clientX: number, clientY: number) {
+    trackMenu = { trackId, x: clientX, y: clientY };
+  }
+
+  /** Scroll the rows so draw row `row` is fully in view. */
+  function revealRow(row: number) {
+    if (!canvas) return;
+    const h = canvas.getBoundingClientRect().height;
+    if (trackY(row) < RULER_HEIGHT) scrollY = row * TRACK_HEIGHT;
+    else if (trackY(row) + TRACK_HEIGHT > h)
+      scrollY = Math.min(maxScrollY(h), (row + 1) * TRACK_HEIGHT - (h - RULER_HEIGHT));
+    scheduleDraw();
+  }
+
+  // ---- Track rename -------------------------------------------------------
+
+  const RENAME_W = 176; // px; wider than the header so the placeholder fits
+  const RENAME_H = 22; // px
+  // vance-timeline `MAX_TRACK_NAME_CHARS`. `maxlength` counts UTF-16 units,
+  // which is never more permissive than the engine's character count.
+  const MAX_TRACK_NAME_CHARS = 64;
+
+  const renameTarget = $derived(
+    renaming ? (rows.find((t) => t.id === renaming?.trackId) ?? null) : null
+  );
+  const renameTop = $derived(
+    renameTarget
+      ? trackY(rows.indexOf(renameTarget)) + Math.round((TRACK_HEIGHT - RENAME_H) / 2)
+      : 0
+  );
+
+  // The track went away under the field (undo, a new project): drop the edit.
+  $effect(() => {
+    if (renaming && !renameTarget) renaming = null;
+  });
+
+  /** The name the engine gives `track` when its name is cleared: V1 is the
+   *  bottom video track, A1 the first audio track. */
+  function automaticName(track: TrackContents): string {
+    const group = (sequence?.tracks ?? []).filter((t) => t.kind === track.kind);
+    return `${track.kind === 'video' ? 'V' : 'A'}${group.findIndex((t) => t.id === track.id) + 1}`;
+  }
+
+  async function startRename(trackId: string) {
+    // Let a closing track menu hand focus back first; it would otherwise pull
+    // focus out of the new field.
+    await tick();
+    const row = rowOfTrack(trackId);
+    if (row < 0) return;
+    revealRow(row);
+    renaming = { trackId, draft: rows[row].name };
+  }
+
+  async function commitRename(via: RenameCommit) {
+    const r = renaming;
+    if (!r) return;
+    renaming = null;
+    const track = sequence?.tracks.find((t) => t.id === r.trackId);
+    if (!track) return;
+    const name = r.draft.trim();
+    // Unchanged: skip the engine call so no empty undo step is recorded.
+    if (name === track.name || (name === '' && track.name === automaticName(track))) return;
+    if (await projectState.renameTrack(track.id, name)) return;
+    // Refused: the engine's toast says why (rules in rename.ts).
+    if (reopenAfterRefusal(via, renaming !== null, rowOfTrack(r.trackId) >= 0)) {
+      revealRow(rowOfTrack(r.trackId));
+      renaming = { trackId: r.trackId, draft: r.draft };
+    }
+  }
+
+  function onRenameKeydown(e: KeyboardEvent) {
+    if (e.isComposing) return;
+    if (e.key !== 'Enter' && e.key !== 'Escape') return;
+    // Esc must not also reach the app's handlers (it clears the selection).
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.key === 'Enter') void commitRename('enter');
+    else renaming = null;
+    // Clearing `renaming` first turns the blur this causes into a no-op.
+    canvas?.focus({ preventScroll: true });
+  }
+
+  /** Focus the rename field and select its text when it appears. */
+  function focusAndSelect(node: HTMLInputElement) {
+    node.focus({ preventScroll: true });
+    node.select();
   }
 
   // ---- Playhead -----------------------------------------------------------
@@ -1140,6 +1479,18 @@
       const next = Math.max(2, Math.min(2000, pixelsPerSecond * factor));
       pixelsPerSecond = next;
       scrollSeconds = Math.max(0, tAtCursor - (cursorX - TRACK_HEADER_W) / pixelsPerSecond);
+      scheduleDraw();
+      return;
+    }
+    // Over the track headers the wheel scrolls the rows vertically (once
+    // there are more tracks than fit); elsewhere it pans time.
+    const rect = (canvas as HTMLCanvasElement).getBoundingClientRect();
+    if (e.clientX - rect.left < TRACK_HEADER_W && e.clientY - rect.top >= RULER_HEIGHT) {
+      e.preventDefault();
+      // The rename field is pinned to its row; finish it rather than let the
+      // row scroll away from under it.
+      void commitRename('scroll');
+      scrollY = Math.max(0, Math.min(maxScrollY(rect.height), scrollY + e.deltaY));
       scheduleDraw();
       return;
     }
@@ -1255,7 +1606,6 @@
    *  while this is set, ignoring the persisted `timeline_in`. */
   type MoveDrag = {
     trackId: string;
-    trackIdx: number;
     clipId: string;
     originalTimelineIn: number;
     durationSeconds: number;
@@ -1273,7 +1623,6 @@
    *  candidate values to render the clip at. Committed on mouseup. */
   type TrimDrag = {
     trackId: string;
-    trackIdx: number;
     clipId: string;
     edge: 'left' | 'right';
     /** Original anchors so we can compute the delta and constrain. */
@@ -1307,10 +1656,10 @@
    *  Returns null when the cursor is not on any automation control. */
   function hitAutomation(cssX: number, cssY: number): AutomationHit | null {
     if (!sequence || cssX < TRACK_HEADER_W || cssY < RULER_HEIGHT) return null;
-    const rowIdx = Math.floor((cssY - RULER_HEIGHT) / TRACK_HEIGHT);
-    if (rowIdx < 0 || rowIdx >= sequence.tracks.length) return null;
-    const track = sequence.tracks[rowIdx];
-    const y = trackY(rowIdx);
+    const row = rowAtY(cssY);
+    if (row < 0) return null;
+    const track = rows[row];
+    const y = trackY(row);
     // Search per-clip targets first (highest priority). Shared
     // FadeChipGeom ensures the hit pass sees exactly what the draw pass
     // painted — no draw/hit drift, no zero-fade grip stealing trim.
@@ -1376,6 +1725,7 @@
   function onMouseDown(e: MouseEvent) {
     if (e.button !== 0) return;
     if (!canvas) return;
+    lockGuard.begin();
     const rect = canvas.getBoundingClientRect();
     const localX = e.clientX - rect.left;
     const localY = e.clientY - rect.top;
@@ -1400,19 +1750,21 @@
       scheduleDraw();
       return;
     }
-    // A. Phase 7.3 — track-header mixer toggle hit-test runs BEFORE clip
-    // hit-testing because the buttons live inside TRACK_HEADER_W where
-    // hitAt never returns clips anyway. Fire-and-forget so the canvas
-    // stays responsive; commitEdit refreshes the sequence on resolve.
-    const mixHit = hitTestMixerButton(localX, localY);
-    if (mixHit && sequence) {
-      const track = sequence.tracks.find((t) => t.id === mixHit.trackId);
-      if (track) {
-        if (mixHit.kind === 'mute') {
-          void projectState.setTrackMute(track.id, !track.mute);
-        } else {
-          void projectState.setTrackSolo(track.id, !track.solo);
-        }
+    // A. Phase 7.3 — track-header toggle hit-test (M / S, plus the M1 eye
+    // on video rows) runs BEFORE clip hit-testing because the buttons live
+    // inside TRACK_HEADER_W where hitAt never returns clips anyway.
+    // Fire-and-forget so the canvas stays responsive; commitEdit refreshes
+    // the sequence on resolve.
+    const headerHit = hitTestHeaderButton(localX, localY);
+    if (headerHit) {
+      if (exportRun.refusesEdit()) return;
+      const track = headerHit.track;
+      if (headerHit.kind === 'mute') {
+        void projectState.setTrackMute(track.id, !track.mute);
+      } else if (headerHit.kind === 'solo') {
+        void projectState.setTrackSolo(track.id, !track.solo);
+      } else {
+        void projectState.setTrackEnabled(track.id, !track.enabled);
       }
       return;
     }
@@ -1421,7 +1773,9 @@
     // body interactions. Priority resolved inside hitAutomation per the
     // spike's documented order.
     const autoHit = hitAutomation(localX, localY);
-    if (autoHit) {
+    // On a locked track a fade / keyframe handle doesn't edit; the press
+    // falls through to the clip under it, so a click still selects.
+    if (autoHit && !exportRun.refusesEdit() && !lockGuard.refuses(trackById(autoHit.trackId))) {
       handleAutomationMouseDown(e, autoHit, localX, localY);
       return;
     }
@@ -1436,7 +1790,8 @@
     if (e.altKey && hit?.kind === 'body' && sequence) {
       const track = sequence.tracks.find((t) => t.clips.some((c) => c.id === hit.clip.id));
       if (track && track.kind === 'audio') {
-        const cy = trackY(sequence.tracks.indexOf(track)) + 4;
+        if (exportRun.refusesEdit() || lockGuard.refuses(track)) return;
+        const cy = trackY(rowOfTrack(track.id)) + 4;
         const ch = TRACK_HEIGHT - 8;
         const lane = clipLaneRect(cy, ch);
         if (lane) {
@@ -1449,11 +1804,12 @@
       }
     }
     if (e.altKey && sequence && !hit && localX >= TRACK_HEADER_W && localY >= RULER_HEIGHT) {
-      const rowIdx = Math.floor((localY - RULER_HEIGHT) / TRACK_HEIGHT);
-      if (rowIdx >= 0 && rowIdx < sequence.tracks.length) {
-        const track = sequence.tracks[rowIdx];
+      const row = rowAtY(localY);
+      if (row >= 0) {
+        const track = rows[row];
         if (track.kind === 'audio') {
-          const lane = trackLaneRect(trackY(rowIdx));
+          if (exportRun.refusesEdit() || lockGuard.refuses(track)) return;
+          const lane = trackLaneRect(trackY(row));
           const tSec = scrollSeconds + (localX - TRACK_HEADER_W) / pixelsPerSecond;
           const db = clampDb(dbForY(localY, lane.top, lane.height));
           void createTrackKeyframe(track.id, tSec, db);
@@ -1636,17 +1992,35 @@
     // and the cursor flips to col-resize over an edge handle.
     if (canvas && !dragStart) {
       const rect = canvas.getBoundingClientRect();
-      const hit = hitAt(e.clientX - rect.left, e.clientY - rect.top);
+      const lx = e.clientX - rect.left;
+      const ly = e.clientY - rect.top;
+      const hit = hitAt(lx, ly);
       const id = hit ? hit.clip.id : null;
       const edge = hit?.kind === 'left' || hit?.kind === 'right' ? hit.kind : null;
+      const laneTrack = lx >= TRACK_HEADER_W ? (rows[rowAtY(ly)] ?? null) : null;
+      // During an export every lane reads as locked: edits are paused.
+      const locked = !!laneTrack?.locked || (exportRun.busy && laneTrack !== null);
       if (id !== hoverClipId) {
         hoverClipId = id;
         scheduleDraw();
       }
-      if (edge !== hoverEdge) {
-        hoverEdge = edge;
-        canvas.style.cursor = edge ? 'ew-resize' : '';
+      // No trim-handle highlight on a locked clip; the cursor says why.
+      const shownEdge = locked ? null : edge;
+      if (shownEdge !== hoverEdge) {
+        hoverEdge = shownEdge;
+        scheduleDraw();
       }
+      const headerHit = hitTestHeaderButton(lx, ly);
+      const cursor = laneCursor({
+        edge: edge !== null,
+        handle: locked && hitAutomation(lx, ly) !== null,
+        headerButton: headerHit !== null,
+        locked,
+        dropBlocked: locked && dragState.mediaId !== null
+      });
+      if (canvas.style.cursor !== cursor) canvas.style.cursor = cursor;
+      const tip = headerTooltip(headerHit, lx, ly);
+      if (canvas.title !== tip) canvas.title = tip;
     }
 
     if (!dragStart) return;
@@ -1677,6 +2051,12 @@
       };
       scheduleDraw();
     } else if (dragStart.kind === 'move' && dragStart.downOnClipId && sequence) {
+      // A clip doesn't move when its track, or in magnetic mode the track of
+      // any clip connected below it, is locked; the release still selects it.
+      if (exportRun.refusesEdit() || lockGuard.refuses(moveLockedTrack(dragStart.downOnClipId))) {
+        if (canvas) canvas.style.cursor = 'not-allowed';
+        return;
+      }
       ensureMoveDrag(dragStart);
       if (moveDrag && canvas) {
         const rect = canvas.getBoundingClientRect();
@@ -1697,6 +2077,10 @@
       dragStart.downOnClipId &&
       sequence
     ) {
+      if (exportRun.refusesEdit() || lockGuard.refuses(trackOfClipId(dragStart.downOnClipId))) {
+        if (canvas) canvas.style.cursor = 'not-allowed';
+        return;
+      }
       ensureTrimDrag(dragStart);
       if (trimDrag && canvas) {
         const rect = canvas.getBoundingClientRect();
@@ -1756,7 +2140,7 @@
     let newTime = original.time_seconds;
     let newValue = original.value;
     if (kd.scope === 'track') {
-      const lane = trackLaneRect(trackY(sequence.tracks.findIndex((t) => t.id === kd.trackId)));
+      const lane = trackLaneRect(trackY(rowOfTrack(kd.trackId)));
       const targetTime = scrollSeconds + (cssX - TRACK_HEADER_W) / pixelsPerSecond;
       const targetDb = dbForY(cssY, lane.top, lane.height);
       if (kd.axisLock !== 'value') {
@@ -1772,8 +2156,7 @@
       const track = sequence.tracks.find((t) => t.id === kd.trackId);
       const clip = track?.clips.find((c) => c.id === kd.clipId);
       if (!clip || !track) return;
-      const trackIdx = sequence.tracks.indexOf(track);
-      const cy = trackY(trackIdx) + 4;
+      const cy = trackY(rowOfTrack(track.id)) + 4;
       const ch = TRACK_HEIGHT - 8;
       const lane = clipLaneRect(cy, ch);
       if (!lane) return;
@@ -1801,13 +2184,11 @@
 
   function ensureTrimDrag(ds: NonNullable<typeof dragStart>) {
     if (trimDrag || !sequence || !ds.downOnClipId) return;
-    for (let i = 0; i < sequence.tracks.length; i++) {
-      const track = sequence.tracks[i];
+    for (const track of sequence.tracks) {
       const clip = track.clips.find((c) => c.id === ds.downOnClipId);
       if (!clip) continue;
       trimDrag = {
         trackId: track.id,
-        trackIdx: i,
         clipId: clip.id,
         edge: ds.kind === 'trim-left' ? 'left' : 'right',
         originalTimelineIn: clip.timeline_in_seconds,
@@ -1834,7 +2215,7 @@
       // Don't let the user drag past timeline_out (zero-length).
       const maxTimelineIn = timelineOut - 1 / Math.max(1, pixelsPerSecond);
       let candTimelineIn = Math.min(Math.max(0, cursorT), maxTimelineIn);
-      const snap = noSnap ? null : snapEdge(candTimelineIn, td.trackIdx, td.clipId);
+      const snap = noSnap ? null : snapEdge(candTimelineIn, td.trackId, td.clipId);
       if (snap != null) {
         candTimelineIn = snap;
         td.snapAt = snap;
@@ -1852,7 +2233,7 @@
       // (cursorT - originalTimelineIn).
       const minTimelineOut = td.originalTimelineIn + 1 / Math.max(1, pixelsPerSecond);
       let candTimelineOut = Math.max(minTimelineOut, cursorT);
-      const snap = noSnap ? null : snapEdge(candTimelineOut, td.trackIdx, td.clipId);
+      const snap = noSnap ? null : snapEdge(candTimelineOut, td.trackId, td.clipId);
       if (snap != null) {
         candTimelineOut = snap;
         td.snapAt = snap;
@@ -1869,11 +2250,11 @@
   /** Snap a single timeline value to the closest of {playhead, t=0,
    *  every neighbor clip's edges on the same track} within
    *  `HANDLE_PX` pixels' worth of seconds. */
-  function snapEdge(candidate: number, trackIdx: number, skipClipId: string): number | null {
+  function snapEdge(candidate: number, trackId: string, skipClipId: string): number | null {
     if (!sequence) return null;
     const tolSec = HANDLE_PX / pixelsPerSecond;
     const candidates: number[] = [0, playheadSeconds];
-    const track = sequence.tracks[trackIdx];
+    const track = sequence.tracks.find((t) => t.id === trackId);
     if (track) {
       for (const c of track.clips) {
         if (c.id === skipClipId) continue;
@@ -1898,15 +2279,13 @@
    *  we have its original anchor + duration to snap against. */
   function ensureMoveDrag(ds: NonNullable<typeof dragStart>) {
     if (moveDrag || !sequence || !ds.downOnClipId || !canvas) return;
-    for (let i = 0; i < sequence.tracks.length; i++) {
-      const track = sequence.tracks[i];
+    for (const track of sequence.tracks) {
       const clip = track.clips.find((c) => c.id === ds.downOnClipId);
       if (!clip) continue;
       const rect = canvas.getBoundingClientRect();
       const cursorT = scrollSeconds + (ds.clientX - rect.left - TRACK_HEADER_W) / pixelsPerSecond;
       moveDrag = {
         trackId: track.id,
-        trackIdx: i,
         clipId: clip.id,
         originalTimelineIn: clip.timeline_in_seconds,
         durationSeconds: clip.duration_seconds,
@@ -1927,7 +2306,7 @@
     const tolSec = tolPx / pixelsPerSecond;
     const candidates: number[] = [0, playheadSeconds];
 
-    const myTrack = sequence.tracks[m.trackIdx];
+    const myTrack = sequence.tracks.find((t) => t.id === m.trackId);
     if (myTrack) {
       for (const c of myTrack.clips) {
         if (c.id === m.clipId) continue;
@@ -2075,7 +2454,17 @@
     }
 
     // ---- Click (≤ 3 px) ---------------------------------------------------
-    if (moved > 3 || !canvas || !sequence) return;
+    // A move / trim the lock refused still selects its clip (the inspector
+    // then offers the unlock), but doesn't seek to where it was dropped.
+    const refusedDrag = isRefusedClipDrag(
+      ds.kind,
+      moved,
+      exportRun.busy ||
+        (ds.kind === 'move'
+          ? !!moveLockedTrack(ds.downOnClipId)
+          : !!trackOfClipId(ds.downOnClipId)?.locked)
+    );
+    if ((moved > 3 && !refusedDrag) || !canvas || !sequence) return;
 
     if (ds.downOnClipId) {
       // Clip-click selection behavior (Premiere defaults).
@@ -2110,6 +2499,7 @@
         selectionState.selectOnly(ds.downOnClipId);
       }
       scheduleDraw();
+      if (refusedDrag) return;
       // Also seek the playhead to the click position — feels natural in
       // every NLE. The seek runs in the background; we don't await it.
       const localX = e.clientX - canvas.getBoundingClientRect().left;
@@ -2154,11 +2544,12 @@
     if (!sequence) return [];
     const xLo = Math.min(rect.x0, rect.x1);
     const xHi = Math.max(rect.x0, rect.x1);
-    const yLo = Math.min(rect.y0, rect.y1);
+    // Rows scrolled up under the ruler aren't visible, so can't be lassoed.
+    const yLo = Math.max(RULER_HEIGHT, Math.min(rect.y0, rect.y1));
     const yHi = Math.max(rect.y0, rect.y1);
     const ids: string[] = [];
-    sequence.tracks.forEach((track, rowIdx) => {
-      const y = trackY(rowIdx) + 4;
+    rows.forEach((track, row) => {
+      const y = trackY(row) + 4;
       const yh = TRACK_HEIGHT - 8;
       if (y + yh < yLo || y > yHi) return;
       for (const c of track.clips) {
@@ -2173,15 +2564,17 @@
 
   // ---- Media drag-drop from Browser --------------------------------------
 
-  /** Map a (canvas-local) cursor position to (timeline_seconds, trackIdx). */
-  function dropTargetAt(localX: number, localY: number): { t: number; trackIdx: number } | null {
+  /** Map a (canvas-local) cursor position to (timeline_seconds, track). */
+  function dropTargetAt(
+    localX: number,
+    localY: number
+  ): { t: number; track: TrackContents } | null {
     if (!sequence) return null;
     if (localX < TRACK_HEADER_W) return null;
     const t = scrollSeconds + (localX - TRACK_HEADER_W) / pixelsPerSecond;
-    if (localY < RULER_HEIGHT) return null;
-    const trackIdx = Math.floor((localY - RULER_HEIGHT) / TRACK_HEIGHT);
-    if (trackIdx < 0 || trackIdx >= sequence.tracks.length) return null;
-    return { t: Math.max(0, t), trackIdx };
+    const row = rowAtY(localY);
+    if (row < 0) return null;
+    return { t: Math.max(0, t), track: rows[row] };
   }
 
   /** Global mouseup handler: if we're currently drag-carrying a
@@ -2208,11 +2601,13 @@
     const target = dropTargetAt(localX, localY);
     await diagLog(
       `timeline: drop at localX=${localX.toFixed(0)} localY=${localY.toFixed(0)} target=${
-        target ? `t=${target.t.toFixed(2)} trackIdx=${target.trackIdx}` : 'null'
+        target ? `t=${target.t.toFixed(2)} track=${target.track.name}` : 'null'
       }`
     );
     if (!target) return;
-    const track = sequence.tracks[target.trackIdx];
+    const track = target.track;
+    lockGuard.begin();
+    if (exportRun.refusesEdit() || lockGuard.refuses(track)) return;
     await diagLog(`timeline: inserting on track ${track.id} (${track.name})`);
     await projectState.insertClip(track.id, mediaId, target.t);
     await diagLog('timeline: insertClip returned');
@@ -2228,8 +2623,8 @@
    */
   function onKeyDown(e: KeyboardEvent) {
     // Don't steal keys while typing into an input.
-    const target = e.target as HTMLElement | null;
-    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+    const target = e.target instanceof Element ? e.target : null;
+    if (targetOwnsKey(target, e.key, hasKeyboardFocus(target))) return;
     if (e.key === 'Escape') {
       // Cancel any in-flight drag — M5 automation drags AND the
       // existing move/trim drags. Without clearing all of these the
@@ -2280,6 +2675,9 @@
   async function setSelectedKeyframeInterp(interp: 'linear' | 'bezier' | 'hold') {
     const sel = selectedKf;
     if (!sel || !sequence) return;
+    // The keyframe may have been selected before its track was locked.
+    lockGuard.begin();
+    if (exportRun.refusesEdit() || lockGuard.refuses(trackById(sel.trackId))) return;
     if (sel.scope === 'clip') {
       const track = sequence.tracks.find((t) => t.id === sel.trackId);
       const clip = track?.clips.find((c) => c.id === sel.clipId);
@@ -2297,6 +2695,8 @@
   async function deleteSelectedKeyframe() {
     const sel = selectedKf;
     if (!sel || !sequence) return;
+    lockGuard.begin();
+    if (exportRun.refusesEdit() || lockGuard.refuses(trackById(sel.trackId))) return;
     if (sel.scope === 'clip') {
       const track = sequence.tracks.find((t) => t.id === sel.trackId);
       const clip = track?.clips.find((c) => c.id === sel.clipId);
@@ -2322,15 +2722,28 @@
     return !!(dragStart || fadeDrag || kfDrag || moveDrag || trimDrag);
   }
 
-  /** Right-click on a fade wedge or keyframe removes it. */
+  /** Right-click on a track header (or anywhere on a sequence with no
+   *  tracks) opens the track menu; on a fade wedge or keyframe it removes
+   *  that wedge / keyframe. */
   function onContextMenu(e: MouseEvent) {
     if (!canvas || !sequence) return;
     if (dragInFlight()) return;
     const rect = canvas.getBoundingClientRect();
     const localX = e.clientX - rect.left;
     const localY = e.clientY - rect.top;
+    if (rows.length === 0 || (localX < TRACK_HEADER_W && localY >= RULER_HEIGHT)) {
+      e.preventDefault();
+      const row = rowAtY(localY);
+      openTrackMenu(row >= 0 ? rows[row].id : null, e.clientX, e.clientY);
+      return;
+    }
     const hit = hitAutomation(localX, localY);
     if (!hit) return;
+    lockGuard.begin();
+    if (exportRun.refusesEdit() || lockGuard.refuses(trackById(hit.trackId))) {
+      e.preventDefault();
+      return;
+    }
     if (hit.kind === 'fade-grip' || hit.kind === 'fade-chip') {
       e.preventDefault();
       const sideKey = hit.side;
@@ -2348,15 +2761,49 @@
     }
   }
 
-  /** Double-click on a fade grip or keyframe removes it. */
+  /** Shift+F10 / the context-menu key on the focused timeline opens the track
+   *  menu for the selected clip's track, else the top row. */
+  function onCanvasKeyDown(e: KeyboardEvent) {
+    if (!(e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10'))) return;
+    if (!canvas || !sequence || dragInFlight()) return;
+    e.preventDefault();
+    const target = rows.find((t) => t.clips.some((c) => selectionState.has(c.id))) ?? rows[0];
+    const rect = canvas.getBoundingClientRect();
+    let y = RULER_HEIGHT + 8;
+    if (target) {
+      // Bring the row into view so the menu opens next to it.
+      const row = rowOfTrack(target.id);
+      revealRow(row);
+      y = Math.max(RULER_HEIGHT, trackY(row)) + TRACK_HEIGHT / 2;
+    }
+    openTrackMenu(target?.id ?? null, rect.left + 8, rect.top + y);
+  }
+
+  /** Double-click on a track header renames the track; on a fade grip or
+   *  keyframe it removes that grip / keyframe. */
   function onDoubleClick(e: MouseEvent) {
     if (!canvas || !sequence) return;
     if (dragInFlight()) return;
     const rect = canvas.getBoundingClientRect();
     const localX = e.clientX - rect.left;
     const localY = e.clientY - rect.top;
+    if (localX < TRACK_HEADER_W) {
+      // The M / S / eye buttons already toggled on each click.
+      const row = rowAtY(localY);
+      if (row >= 0 && !hitTestHeaderButton(localX, localY)) {
+        e.preventDefault();
+        if (exportRun.refusesEdit()) return;
+        void startRename(rows[row].id);
+      }
+      return;
+    }
     const hit = hitAutomation(localX, localY);
     if (!hit) return;
+    lockGuard.begin();
+    if (exportRun.refusesEdit() || lockGuard.refuses(trackById(hit.trackId))) {
+      e.preventDefault();
+      return;
+    }
     if (hit.kind === 'fade-grip' || hit.kind === 'fade-chip') {
       e.preventDefault();
       const setter = hit.side === 'in' ? projectState.setClipFadeIn : projectState.setClipFadeOut;
@@ -2425,14 +2872,26 @@
   });
 </script>
 
-<div class="flex h-full w-full flex-col" bind:this={wrap}>
+<div class="relative flex h-full w-full flex-col overflow-hidden" bind:this={wrap}>
+  <!-- Focusable so Shift+F10 can open the track menu from the keyboard.
+       Intentional: role="application", not "img" — a canvas has no role of
+       its own, so without one screen readers skip its label, and this is a
+       focusable surface the app drives from the keyboard (Space, J/K/L,
+       arrows, Shift+F10), which "img" would leave to the screen reader's
+       browse mode. Svelte's rule counts <canvas> as interactive and flags
+       every non-widget role on it. -->
+  <!-- svelte-ignore a11y_no_interactive_element_to_noninteractive_role -->
   <canvas
     bind:this={canvas}
     class="block h-full w-full cursor-grab active:cursor-grabbing"
+    tabindex="0"
+    role="application"
+    aria-label="Timeline tracks. Press Shift+F10 for track options."
     onwheel={onWheel}
     onmousedown={onMouseDown}
     oncontextmenu={onContextMenu}
     ondblclick={onDoubleClick}
+    onkeydown={onCanvasKeyDown}
     onmouseleave={() => {
       if (hoverClipId !== null) {
         hoverClipId = null;
@@ -2440,4 +2899,72 @@
       }
     }}
   ></canvas>
+  <!-- Lock toggles: the canvas paints them like M / S / eye; these buttons
+       over the painted ones make them focusable and give them a state for
+       screen readers. Clipped to the rows area so they scroll under the ruler
+       with the rows. -->
+  <div
+    class="pointer-events-none absolute left-0 overflow-hidden"
+    style:top="{RULER_HEIGHT}px"
+    style:bottom="0"
+    style:width="{TRACK_HEADER_W}px"
+  >
+    {#each rows as track, row (track.id)}
+      <button
+        type="button"
+        class="pointer-events-auto absolute cursor-pointer rounded-[3px] bg-transparent aria-disabled:cursor-not-allowed"
+        style:left="{LOCK_BTN_X}px"
+        style:top="{trackY(row) - RULER_HEIGHT + (TRACK_HEIGHT - MIXER_BTN_SIZE) / 2}px"
+        style:width="{MIXER_BTN_SIZE}px"
+        style:height="{MIXER_BTN_SIZE}px"
+        data-track-lock={track.id}
+        aria-label="Lock track {track.name}"
+        aria-pressed={track.locked}
+        aria-disabled={exportRun.busy}
+        title={exportRun.busy ? EXPORT_BUSY_HINT : lockActionLabel(track.locked)}
+        onclick={() => {
+          if (!exportRun.refusesEdit()) void projectState.setTrackLocked(track.id, !track.locked);
+        }}
+        onfocus={() => revealRow(row)}
+        onwheel={onWheel}
+        oncontextmenu={(e) => {
+          e.preventDefault();
+          if (!dragInFlight()) openTrackMenu(track.id, e.clientX, e.clientY);
+        }}
+      ></button>
+    {/each}
+  </div>
+  {#if renaming && renameTarget}
+    <input
+      use:focusAndSelect
+      type="text"
+      maxlength={MAX_TRACK_NAME_CHARS}
+      bind:value={renaming.draft}
+      class="bg-vance-bg border-vance-accent text-vance-fg placeholder:text-vance-muted absolute left-px z-10 rounded border px-1 text-[11px] shadow-lg outline-none"
+      style:top="{renameTop}px"
+      style:width="{RENAME_W}px"
+      style:height="{RENAME_H}px"
+      placeholder="Empty: automatic name ({automaticName(renameTarget)})"
+      aria-label="Track name"
+      aria-describedby="{uid}-rename-hint"
+      autocomplete="off"
+      spellcheck="false"
+      onkeydown={onRenameKeydown}
+      onblur={() => void commitRename('blur')}
+    />
+    <span id="{uid}-rename-hint" class="sr-only">
+      Press Enter to save or Escape to cancel. Leave it empty to use the automatic name, which
+      follows the track's position.
+    </span>
+  {/if}
 </div>
+
+{#if trackMenu}
+  <TrackMenu
+    trackId={trackMenu.trackId}
+    x={trackMenu.x}
+    y={trackMenu.y}
+    onClose={() => (trackMenu = null)}
+    onRename={(id) => void startRename(id)}
+  />
+{/if}

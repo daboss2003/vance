@@ -15,6 +15,9 @@
     decodeSequenceAt,
     type ReviewComment
   } from '$lib/ipc';
+  import { reportableError } from '$lib/toast.svelte';
+  import { refreshError } from '$lib/export-busy';
+  import { exportRun } from '$lib/export-run.svelte';
 
   let comments = $state<ReviewComment[]>([]);
   let author = $state('Me');
@@ -27,15 +30,16 @@
   let open = $derived(comments.filter((c) => !c.resolved).length);
   let visible = $derived(showResolved ? comments : comments.filter((c) => !c.resolved));
 
+  // Also after an export, which turns the list away while it runs.
   $effect(() => {
-    void refresh();
+    if (!exportRun.busy) void refresh();
   });
 
   async function refresh() {
     try {
       comments = await reviewComments();
     } catch (e) {
-      error = String(e);
+      error = refreshError(e);
     }
   }
 
@@ -45,7 +49,7 @@
     try {
       return await fn();
     } catch (e) {
-      error = String(e);
+      error = reportableError(e);
     } finally {
       busy = false;
     }

@@ -7,6 +7,7 @@
   import { projectState } from '$lib/project.svelte';
   import { selectionState } from '$lib/selection.svelte';
   import { toast } from '$lib/toast.svelte';
+  import { lockedTrackMessage, splitByLock } from '$lib/track-lock';
 
   let targetLufs = $state(-16);
   let busy = $state(false);
@@ -22,27 +23,20 @@
     void voiceIsolationAvailable().then((v) => (isolateAvail = v));
   });
 
-  /** Resolve a selected clip id to its (trackId, clipId). */
-  function trackForClip(clipId: string): string | null {
-    const tracks = projectState.sequence?.tracks ?? [];
-    for (const t of tracks) {
-      if (t.clips.some((c) => c.id === clipId)) return t.id;
-    }
-    return null;
-  }
-
   async function levelSelected() {
     const ids = selectionState.ids;
     if (ids.length === 0) {
       toast.error('Select one or more clips on the timeline first.');
       return;
     }
+    // Leveling sets clip gain, which a locked track refuses: skip those.
+    const { editable, locked } = splitByLock(projectState.sequence?.tracks ?? [], ids);
+    if (locked.length > 0) toast.info(lockedTrackMessage(locked[0].track.name));
+    if (editable.length === 0) return;
     busy = true;
     let done = 0;
     try {
-      for (const clipId of ids) {
-        const trackId = trackForClip(clipId);
-        if (!trackId) continue;
+      for (const { trackId, clipId } of editable) {
         try {
           await levelClip(trackId, clipId, targetLufs);
           done++;

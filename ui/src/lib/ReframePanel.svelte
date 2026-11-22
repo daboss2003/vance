@@ -7,8 +7,10 @@
    * viewer (play/scrub it once) before running.
    */
   import { smartReframe, magicMask, magicMaskAvailable, type TrackSummary } from '$lib/ipc';
+  import { reportableError } from '$lib/toast.svelte';
   import { projectState } from '$lib/project.svelte';
   import { selectionState } from '$lib/selection.svelte';
+  import { canEditTrackContents, lockedTrackMessage } from '$lib/track-lock';
 
   const PRESETS: Record<string, [number, number]> = {
     '9:16 vertical': [1080, 1920],
@@ -41,7 +43,7 @@
       await projectState.refresh();
       status = `Imported isolated subject: ${info.name}. Key out the background to composite.`;
     } catch (e) {
-      error = String(e);
+      error = reportableError(e);
       status = null;
     } finally {
       busy = false;
@@ -49,12 +51,26 @@
   }
 
   /** Resolve the first selected clip to (trackId, clipId, sourceInSeconds). */
-  function selectedClip(): { trackId: string; clipId: string; sourceIn: number } | null {
+  function selectedClip(): {
+    trackId: string;
+    trackName: string;
+    locked: boolean;
+    clipId: string;
+    sourceIn: number;
+  } | null {
     const id = selectionState.ids[0];
     if (!id) return null;
     for (const t of projectState.sequence?.tracks ?? []) {
       const c = t.clips.find((c) => c.id === id);
-      if (c) return { trackId: t.id, clipId: c.id, sourceIn: c.source_in_seconds };
+      if (c) {
+        return {
+          trackId: t.id,
+          trackName: t.name,
+          locked: !canEditTrackContents(t),
+          clipId: c.id,
+          sourceIn: c.source_in_seconds
+        };
+      }
     }
     return null;
   }
@@ -63,6 +79,11 @@
     const sel = selectedClip();
     if (!sel) {
       error = 'Select a clip on the timeline first (and play it once so the decoder is open).';
+      return;
+    }
+    // Reframing writes keyframes onto the clip, which a locked track refuses.
+    if (sel.locked) {
+      error = lockedTrackMessage(sel.trackName);
       return;
     }
     const [w, h] = PRESETS[preset];
@@ -86,7 +107,7 @@
       await projectState.refresh();
       status = `Reframed ${s.frames_tracked} frames (mean match ${(s.mean_score * 100).toFixed(0)}%). Export at ${w}×${h}.`;
     } catch (e) {
-      error = String(e);
+      error = reportableError(e);
       status = null;
     } finally {
       busy = false;

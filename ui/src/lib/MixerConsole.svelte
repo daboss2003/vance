@@ -30,8 +30,13 @@
     type AudioEffectSpec,
     type Send
   } from '$lib/ipc';
+  import { reportableError } from '$lib/toast.svelte';
   import { projectState } from '$lib/project.svelte';
+  import { lockedTrackUsingBus } from '$lib/track-lock';
+  import { exportRun } from '$lib/export-run.svelte';
+  import { EXPORT_BUSY_HINT, refreshError } from '$lib/export-busy';
 
+  const uid = $props.id();
   let strips = $state<AudioBus[]>([]);
   let busy = $state(false);
   let error = $state<string | null>(null);
@@ -40,24 +45,26 @@
     try {
       strips = await buses();
     } catch (e) {
-      error = String(e);
+      error = refreshError(e);
     }
   }
 
-  // Re-pull when the project's edit log advances (an undo/route lands).
+  // Re-pull when the project's edit log advances (an undo/route lands), and
+  // after an export (the engine turns the list away while one runs).
   $effect(() => {
     void projectState.editTick;
-    void refresh();
+    if (!exportRun.busy) void refresh();
   });
 
   async function act(fn: () => Promise<unknown>) {
+    if (exportRun.refusesEdit()) return;
     busy = true;
     error = null;
     try {
       await fn();
       await refresh();
     } catch (e) {
-      error = String(e);
+      error = reportableError(e);
     } finally {
       busy = false;
     }
@@ -109,7 +116,7 @@
   }
 </script>
 
-<div class="console">
+<div class="console" title={exportRun.busy ? EXPORT_BUSY_HINT : undefined}>
   <div class="head">
     <span>Mixer — Groups</span>
     <button
@@ -117,7 +124,7 @@
         const name = window.prompt('Bus name (e.g. "Dialogue", "Music", "Reverb")');
         if (name) void act(() => addBus(name));
       }}
-      disabled={busy}>＋ Group</button
+      disabled={busy || exportRun.busy}>＋ Group</button
     >
   </div>
   {#if error}<div class="err">{error}</div>{/if}
@@ -126,6 +133,7 @@
   {:else}
     <div class="strips">
       {#each strips as b (b.id)}
+        {@const lockedUser = lockedTrackUsingBus(projectState.sequence?.tracks ?? [], b.id)}
         <div class="strip" class:muted={b.mute}>
           <div class="name" title={b.id}>{b.name}</div>
           <label class="row">
@@ -136,7 +144,7 @@
               max="12"
               step="0.5"
               value={b.gain_db}
-              disabled={busy}
+              disabled={busy || exportRun.busy}
               onchange={(e) =>
                 act(() => setBusGainDb(b.id, parseFloat((e.target as HTMLInputElement).value)))}
             />
@@ -150,7 +158,7 @@
               max="1"
               step="0.05"
               value={b.pan}
-              disabled={busy}
+              disabled={busy || exportRun.busy}
               onchange={(e) =>
                 act(() => setBusPan(b.id, parseFloat((e.target as HTMLInputElement).value)))}
             />
@@ -160,7 +168,7 @@
             <span>Out</span>
             <select
               value={b.output === 'Master' ? 'master' : b.output.Bus}
-              disabled={busy}
+              disabled={busy || exportRun.busy}
               onchange={(e) => onOutputChange(b, (e.target as HTMLSelectElement).value)}
             >
               <option value="master">Master</option>
@@ -173,14 +181,20 @@
             <div class="sec-head">
               <span>Effects</span>
               <span class="add-group">
-                <button disabled={busy} title="Add EQ" onclick={() => addInsert(b, 'eq')}
-                  >＋EQ</button
+                <button
+                  disabled={busy || exportRun.busy}
+                  title="Add EQ"
+                  onclick={() => addInsert(b, 'eq')}>＋EQ</button
                 >
-                <button disabled={busy} title="Add Compressor" onclick={() => addInsert(b, 'comp')}
-                  >＋ Compressor</button
+                <button
+                  disabled={busy || exportRun.busy}
+                  title="Add Compressor"
+                  onclick={() => addInsert(b, 'comp')}>＋ Compressor</button
                 >
-                <button disabled={busy} title="Add Limiter" onclick={() => addInsert(b, 'limit')}
-                  >＋ Limiter</button
+                <button
+                  disabled={busy || exportRun.busy}
+                  title="Add Limiter"
+                  onclick={() => addInsert(b, 'limit')}>＋ Limiter</button
                 >
               </span>
             </div>
@@ -192,7 +206,7 @@
                   <span>{insertLabel(ins)}</span>
                   <button
                     class="x"
-                    disabled={busy}
+                    disabled={busy || exportRun.busy}
                     onclick={() => act(() => removeBusInsert(b.id, i))}>✕</button
                   >
                 </div>
@@ -203,7 +217,7 @@
             <div class="sec-head">
               <span>Aux / FX</span>
               <select
-                disabled={busy}
+                disabled={busy || exportRun.busy}
                 value=""
                 onchange={(e) => {
                   const v = (e.target as HTMLSelectElement).value;
@@ -225,7 +239,7 @@
                   <span>→ {sendLabel(s)}</span>
                   <button
                     class="x"
-                    disabled={busy}
+                    disabled={busy || exportRun.busy}
                     onclick={() => act(() => removeBusSend(b.id, i))}>✕</button
                   >
                 </div>
@@ -235,15 +249,23 @@
           <div class="row actions">
             <button
               class:on={b.mute}
-              disabled={busy}
+              disabled={busy || exportRun.busy}
               onclick={() => act(() => setBusMute(b.id, !b.mute))}
             >
               {b.mute ? 'Muted' : 'Mute'}
             </button>
-            <button class="rm" disabled={busy} onclick={() => act(() => removeBus(b.id))}
-              >Remove</button
+            <button
+              class="rm"
+              disabled={busy || exportRun.busy || !!lockedUser}
+              aria-describedby={lockedUser ? `${uid}-${b.id}-locked` : undefined}
+              onclick={() => act(() => removeBus(b.id))}>Remove</button
             >
           </div>
+          {#if lockedUser}
+            <div class="locked" id="{uid}-{b.id}-locked">
+              Track {lockedUser.name} is locked and uses this group. Unlock it to remove the group.
+            </div>
+          {/if}
           <div class="route">→ {outputLabel(b.output)}</div>
         </div>
       {/each}
@@ -320,6 +342,12 @@
   }
   .actions .rm {
     color: var(--muted, #999);
+  }
+  .locked {
+    margin-top: 2px;
+    font-size: 10px;
+    line-height: 1.35;
+    color: var(--muted, #949bab);
   }
   .route {
     margin-top: 4px;

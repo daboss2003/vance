@@ -12,6 +12,18 @@
     <div class="toast {t.kind}" role={t.kind === 'error' ? 'alert' : 'status'}>
       <span class="ico">{ICON[t.kind]}</span>
       <span class="msg">{t.message}</span>
+      {#if t.action}
+        {@const a = t.action}
+        <!-- aria-disabled while busy: a focused button that turns disabled
+             drops keyboard focus. -->
+        <button
+          class="act"
+          aria-disabled={a.busy}
+          onclick={() => {
+            if (!a.busy) void a.run();
+          }}>{a.busy ? a.busyLabel : a.label}</button
+        >
+      {/if}
       <button class="x" onclick={() => dismissToast(t.id)} aria-label="Dismiss">✕</button>
     </div>
   {/each}
@@ -70,6 +82,24 @@
     min-width: 0;
     white-space: pre-line;
     word-break: break-word;
+  }
+  .act {
+    flex-shrink: 0;
+    cursor: pointer;
+    padding: 2px 9px;
+    border-radius: 6px;
+    border: 1px solid var(--border-strong, #3a4150);
+    background: var(--panel-bg, #1e2127);
+    color: var(--fg, #dfe3e9);
+    font-size: 12px;
+    line-height: 1.4;
+  }
+  .act:hover:not([aria-disabled='true']) {
+    border-color: var(--accent, #4c9dff);
+  }
+  .act[aria-disabled='true'] {
+    cursor: default;
+    opacity: 0.6;
   }
   .x {
     flex-shrink: 0;

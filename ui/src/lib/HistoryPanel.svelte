@@ -9,6 +9,9 @@
    */
 
   import { editHistory, checkpointHistory, gotoHistory, type HistoryNode } from '$lib/ipc';
+  import { reportableError } from '$lib/toast.svelte';
+  import { refreshError } from '$lib/export-busy';
+  import { exportRun } from '$lib/export-run.svelte';
 
   let nodes = $state<HistoryNode[]>([]);
   let busy = $state(false);
@@ -36,7 +39,7 @@
     try {
       nodes = await editHistory();
     } catch (e) {
-      error = String(e);
+      error = refreshError(e);
     } finally {
       busy = false;
     }
@@ -48,7 +51,7 @@
       await gotoHistory(id);
       await refresh();
     } catch (e) {
-      error = String(e);
+      error = reportableError(e);
     } finally {
       busy = false;
     }
@@ -61,12 +64,13 @@
       await checkpointHistory(name);
       await refresh();
     } catch (e) {
-      error = String(e);
+      error = reportableError(e);
     }
   }
 
+  // Also after an export, which turns the list away while it runs.
   $effect(() => {
-    void refresh();
+    if (!exportRun.busy) void refresh();
   });
 </script>
 

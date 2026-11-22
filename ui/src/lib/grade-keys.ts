@@ -107,4 +107,51 @@ export function windowDefault(key: string): number {
   return 0;
 }
 
+/** Window shape values (`win_shape`). */
+export const WINDOW_ELLIPSE = 1;
+
+/** Half-width (`win_sx`, a fraction of the clip's width) that makes a window
+ *  of half-height `sy` (a fraction of its height) round on screen. The
+ *  renderer evaluates windows in the clip's SOURCE UV and measures x in
+ *  display widths (`aspect` = storage width × pixel aspect / height, see
+ *  vance-render grade.wgsl `window_mask`), and a clip is fitted into the
+ *  frame without stretching, so round in the clip's display space is round
+ *  on screen: sx = sy × height / display width = sy / displayAspect. */
+export function roundWindowHalfWidth(sy: number, displayAspect: number): number {
+  return displayAspect > 0 && Number.isFinite(displayAspect) ? sy / displayAspect : sy;
+}
+
+/** The display aspect to round a window by: the clip's own (its media's
+ *  `display_aspect`, which is what the renderer measures windows in), else
+ *  the sequence frame's (`frameW / frameH`, square pixels) while the clip's
+ *  isn't known. */
+export function windowDisplayAspect(
+  clipAspect: number | null | undefined,
+  frameW: number,
+  frameH: number
+): number {
+  if (clipAspect != null && Number.isFinite(clipAspect) && clipAspect > 0) return clipAspect;
+  return frameH > 0 ? frameW / frameH : 1;
+}
+
+/** The params to write when the user picks window `shape`. An ellipse whose
+ *  size was never set (both `win_sx` and `win_sy` absent: the 0.25 × 0.25
+ *  default, which is wide on a 16:9 clip) becomes a circle of the default
+ *  height, round on screen for `displayAspect`. A size the user set is kept
+ *  as they set it, stretched or not; rectangles keep the default. */
+export function windowShapeParams(
+  shape: number,
+  storedSx: unknown,
+  storedSy: unknown,
+  displayAspect: number
+): [string, number][] {
+  const params: [string, number][] = [[WINDOW_KEYS.shape, shape]];
+  if (shape === WINDOW_ELLIPSE && storedSx === undefined && storedSy === undefined) {
+    const sy = windowDefault(WINDOW_KEYS.sizeY);
+    params.push([WINDOW_KEYS.sizeX, roundWindowHalfWidth(sy, displayAspect)]);
+    params.push([WINDOW_KEYS.sizeY, sy]);
+  }
+  return params;
+}
+
 export const MAX_GRADE_NODES = 8;

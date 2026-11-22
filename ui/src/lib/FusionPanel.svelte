@@ -17,6 +17,7 @@
     type FusionAnim,
     type FusionRgba
   } from '$lib/ipc';
+  import { reportableError } from '$lib/toast.svelte';
   import { projectState } from '$lib/project.svelte';
 
   let editId = $state<string | null>(null);
@@ -38,7 +39,7 @@
     try {
       return await fn();
     } catch (e) {
-      error = String(e);
+      error = reportableError(e);
     } finally {
       busy = false;
     }

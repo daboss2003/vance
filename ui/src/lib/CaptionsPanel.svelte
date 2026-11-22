@@ -20,6 +20,8 @@
   } from '$lib/ipc';
   import { projectState } from '$lib/project.svelte';
   import { toast } from '$lib/toast.svelte';
+  import { refreshError } from '$lib/export-busy';
+  import { exportRun } from '$lib/export-run.svelte';
 
   let cues = $state<Cue[]>([]);
   let busy = $state(false);
@@ -34,9 +36,10 @@
     projectState.media.filter((m) => m.kind === 'video' || m.kind === 'audio')
   );
 
+  // Also after an export, which turns the list away while it runs.
   $effect(() => {
     void projectState.editTick;
-    void refresh();
+    if (!exportRun.busy) void refresh();
   });
   $effect(() => {
     void transcriptionAvailable().then((v) => (whisperOk = v));
@@ -46,7 +49,8 @@
     try {
       cues = await ipcCaptions();
     } catch (e) {
-      toast.error(String(e));
+      const msg = refreshError(e);
+      if (msg !== null) toast.error(msg);
     }
   }
 
