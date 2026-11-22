@@ -1,6 +1,6 @@
 # ADR 0007 — Multi-Track Compositing
 
-- **Status:** Proposed (design approved; implementation not started)
+- **Status:** Accepted (implemented 2026-11-22; see "Follow-up decisions" for what changed since)
 - **Date:** 2026-11-20
 - **Deciders:** Vance core team
 - **Builds on:** ADR 0006 (shared-memory frame transport, which this step needs for several layers)
@@ -161,7 +161,62 @@ and grade preview, and deleting the hand-copied paths.
 - **Rewriting playback** risks regressions in A/V sync and end of stream. The soak and
   real-media tests help.
 - **Rgba16Float precision** against the existing golden-test tolerances.
-- **Lock ordering:** never hold the render state while plugins run.
+- **Lock ordering:** render state → add-on host / LUT cache, never the reverse. Frames are
+  fetched before the render lock is taken (`plan_requests` + `Prefetched`), so a decode wait
+  never holds the renderer.
+
+## Follow-up decisions (2026-11-22)
+
+Made during implementation and after the post-build bug hunt:
+
+- **Tracks.** Automatic names (`^[VA]\d+$`) follow position and renumber on every structural
+  edit; Rename keeps a custom name. A locked track can't be deleted until it's unlocked, and the
+  track header has a lock toggle. Track names refuse control, separator and invisible formatting
+  characters, except the joiner between two emoji and the tag characters of a flag sequence. A lock freezes the track's contents and stored clip and mixer
+  parameters; mute, solo, visibility, order and name stay editable.
+- **Frame size.** Opening a project fills in a missing `frame_size` from the sequence's earliest
+  video clip (display size, so anamorphic footage gets its true aspect). After that, a clip sets
+  the size only when the sequence has no video clips yet. New titles are created at the sequence
+  size.
+- **Export renders from full-resolution originals.** Proxies, including the memory-cap swap, are
+  preview-only. Proxies are made at half the display size (square pixels), and the keyer's
+  pixel-based settings are scaled to match the original. Proxies of HDR (PQ/HLG) footage are
+  10-bit ProRes 422 Proxy tagged PQ/HLG BT.2020: intra-frame, built into FFmpeg, fast to scrub.
+- **Render-and-replace** renders the track alone over a transparent backdrop into ProRes 4444.
+  Opacity and opacity keyframes are baked into the alpha (W3C opacity only scales source alpha,
+  so this is exact for every blend mode). The new clip keeps the blend mode the replaced clips
+  share. It refuses, before rendering anything, whenever the result wouldn't look the same:
+  - mixed blend modes in the range;
+  - a range edge inside a dissolve;
+  - a dissolve under a blend mode that isn't linear in the source (Darken, Lighten, Difference,
+    Soft Light, Hard Light, Color Dodge, Color Burn);
+  - HDR (PQ/HLG) footage, until a 16-bit alpha path exists (media/export milestone);
+  - a locked or hidden track.
+- **Keyer.** Clip White defaults to 0.9, so near-kept colours such as olive skin stay opaque.
+  There is no spill suppression when the key is inverted or the key colour is neutral. Choke and
+  soften are measured in display pixels (anamorphic sources included) and scaled for proxies.
+- **HDR blend modes** clamp only where the formula breaks above 1.0. Screen uses the W3C formula
+  when both values are within [0, 1] and `max(backdrop, source)` otherwise. The rule is
+  continuous at 1.0, and neither a black nor a white Screen layer dims highlights. Overlay, Soft Light, Hard Light, Color Dodge and Color Burn
+  clamp. SDR results are unchanged.
+- **Keyer choke and soften** run as compute line passes. Choke is a separable octagon (horizontal,
+  vertical, then two diagonal min/max passes) using a doubling table, so its cost doesn't grow with
+  the radius and thin gaps erode at any radius up to the 64 px cap. Soften uses exact taps up to
+  8 px and three variance-matched box passes above (within 4 codes of the exact kernel). Both are
+  measured in the source's own display pixels.
+- **Transparent output** (render-and-replace): `OutputSpec.transparent` composites over a
+  transparent backdrop, and `finish_to_rgba8/64` return straight alpha. Colour is zeroed wherever
+  alpha rounds to 0 at the target bit depth. Preview always flattens.
+- **HDR add-on readback** (`read_layer_rgba8` / `write_layer_rgba8`) converts working → Rec.709
+  before the sRGB encode and back again, so Fusion `MediaIn` footage keeps its colours in a wide
+  working space. The output primaries come from `OutputSpec.output_primaries`, not a guess from
+  the transfer.
+- **Stream encoding hints.** The decoder reports each stream's YUV range, matrix and sample
+  aspect ratio (protocol v6, ADR 0006), and every frame carries them (`FrameData.color`, also in
+  the frame cache). Unsignalled YUV is limited range, including PQ and HLG. The unsignalled
+  matrix is BT.601 at 576 lines or fewer, otherwise it follows the primaries (BT.2020 or
+  BT.709). Sources with alpha arrive as straight-alpha RGBA8.
+- **Fonts.** The MoGraph and Fusion renderers, and their font databases, are built on first use.
 
 ## Consequences
 

@@ -70,11 +70,14 @@ raw blob after the message as the fallback everywhere.**
    nonce)`: `/vance` plus three fixed-width hex fields, 30 bytes, within macOS's 31-byte POSIX
    limit. A random nonce keeps a recycled pid from colliding with a crashed process's leftover.
 10. **Protocol.** The decoder protocol moved to v3 here, then v4 (releases ride on every request
-    in a `DecoderEnvelope`) and v5 (`OpenError::NeedsContainer`): `Frame { meta: FrameMeta, payload:
+    in a `DecoderEnvelope`), v5 (`OpenError::NeedsContainer`) and v6 (`StreamInfo` carries the
+    stream's YUV range, matrix and sample aspect ratio; `PixelFormat::Rgba8` carries sources with
+    alpha, see ADR 0007): `Frame { meta: FrameMeta, payload:
     FramePayload }` with `Inline { len }` (exactly one blob follows) or `Shared(SlotRef)`, plus
     `AttachShm` / `ShmAttached` / `ShmUnavailable`; stale releases are logged by the sidecar.
     `FrameData` is no longer a wire type; its `bytes` is a `FrameBytes` (owned or leased, read
-    through `Deref<Target = [u8]>`).
+    through `Deref<Target = [u8]>`). `Clone` is an owned copy; `share()` hands out a zero-copy
+    second owner, whose lease lasts until every owner drops.
 11. **Frame-threaded decode** ships in the same milestone. The thread count is
     `VANCE_DECODE_THREADS`, else `available_parallelism().min(8)`, software decode only.
     One-shot decodes (`Seek` / `DecodeAt`) use slice threads only, so "first frame at or after
@@ -118,7 +121,7 @@ raw blob after the message as the fallback everywhere.**
   raising `MAX_FRAME_BYTES`.
 
 **Harder:**
-- The decoder protocol is v5: app and sidecar must ship together (they already do); the `Hello`
+- The decoder protocol is v6: app and sidecar must ship together (they already do); the `Hello`
   handshake reports a mismatch clearly in both directions.
 - Slot ownership is a protocol invariant both sides must keep. The pool and lease bookkeeping
   is generation-checked and covered by tests, but a bug there corrupts frames rather than
