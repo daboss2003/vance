@@ -49,7 +49,8 @@ use vance_timeline::ClipId;
 use crate::cached_decode::cached_decode_at;
 use crate::compose::{FrameProvider, FrameRequest};
 use crate::decoder_pool::{
-    duplicate_error, is_fatal, source_seconds_to_pts, DecoderPool, PooledDecoder,
+    duplicate_error, is_fatal, source_seconds_to_pts, DecoderPool, OpenAttempt, PooledDecoder,
+    Reservation,
 };
 use crate::engine::EngineError;
 
@@ -118,6 +119,9 @@ fn last_frame(
 }
 
 /// Scrub / single-frame provider: pooled `decode_at` + the frame cache.
+// Intentional: lib API for the integration tests; the engine's scrub path
+// uses `ScrubFetcher`, so the bin target doesn't construct it.
+#[allow(dead_code)]
 pub struct ScrubProvider<'a> {
     /// Decoders to borrow from.
     pub pool: &'a mut DecoderPool,
@@ -126,6 +130,7 @@ pub struct ScrubProvider<'a> {
 }
 
 /// One file's requests in a scrub `frames` call, decoded on one decoder.
+#[allow(dead_code)]
 struct ScrubJob {
     dec: PooledDecoder,
     /// Indexes into the requests.
@@ -137,6 +142,7 @@ struct ScrubJob {
     fatal: bool,
 }
 
+#[allow(dead_code)]
 impl ScrubJob {
     fn run(&mut self, reqs: &[FrameRequest], cache: &FrameCache) {
         let mut idx = std::mem::take(&mut self.idx).into_iter();
@@ -163,24 +169,43 @@ impl ScrubJob {
 
     fn frame_at(&mut self, target: i64, cache: &FrameCache) -> Result<FrameData, ClientError> {
         let dec = &mut self.dec;
-        if let Some(last) = self.last_pts.filter(|&last| target > last) {
-            return cached_decode_at(&mut dec.client, cache, &dec.path, last).map(|(f, _)| f);
-        }
-        match cached_decode_at(&mut dec.client, cache, &dec.path, target) {
-            Ok((f, _)) => Ok(f),
-            // `decode_at` finds no frame at or after a target past the last
-            // frame; the rule then gives the last frame.
-            Err(ClientError::Decode(reason)) => {
-                match last_frame(&mut dec.client, &dec.info, target)? {
-                    Some(f) if f.pts < target => {
-                        self.last_pts = Some(f.pts);
-                        Ok(f)
-                    }
-                    _ => Err(ClientError::Decode(reason)),
-                }
+        scrub_frame_at(
+            &mut dec.client,
+            &dec.info,
+            &dec.path,
+            &mut self.last_pts,
+            target,
+            cache,
+        )
+    }
+}
+
+/// The scrub frame for `target` of the file `path` open in `client`: the
+/// first frame at or after it, else (past the end) the last frame, whose
+/// PTS is kept in `last_pts`.
+fn scrub_frame_at(
+    client: &mut DecoderClient,
+    info: &StreamInfo,
+    path: &str,
+    last_pts: &mut Option<i64>,
+    target: i64,
+    cache: &FrameCache,
+) -> Result<FrameData, ClientError> {
+    if let Some(last) = last_pts.filter(|&last| target > last) {
+        return cached_decode_at(client, cache, path, last).map(|(f, _)| f);
+    }
+    match cached_decode_at(client, cache, path, target) {
+        Ok((f, _)) => Ok(f),
+        // `decode_at` finds no frame at or after a target past the last
+        // frame; the rule then gives the last frame.
+        Err(ClientError::Decode(reason)) => match last_frame(client, info, target)? {
+            Some(f) if f.pts < target => {
+                *last_pts = Some(f.pts);
+                Ok(f)
             }
-            Err(e) => Err(e),
-        }
+            _ => Err(ClientError::Decode(reason)),
+        },
+        Err(e) => Err(e),
     }
 }
 
@@ -249,6 +274,406 @@ impl FrameProvider for ScrubProvider<'_> {
 
     fn failure(&self, req: &FrameRequest) -> Option<String> {
         self.pool.failure(&req.path).map(str::to_owned)
+    }
+}
+
+// Intentional: `SCRUB_HANG_LIMIT` is lib API (tests); the bin doesn't name it.
+#[allow(unused_imports)]
+pub use scrub_fetch::{ScrubFetcher, ScrubFrames, SCRUB_HANG_LIMIT};
+
+/// Per-layer scrub fetching ([`ScrubFetcher`]).
+mod scrub_fetch {
+    use super::*;
+
+    /// How long a scrub layer may go without answering before its sidecar is
+    /// killed (a hung network share, a decoder loop).
+    pub const SCRUB_HANG_LIMIT: Duration = Duration::from_secs(30);
+    /// `fetch` calls a layer may go unnamed before its held picture is dropped.
+    const SCRUB_FORGET_AFTER: u64 = 8;
+
+    /// Scrub frames decoded on worker threads, per layer, so one slow file
+    /// doesn't hold the whole frame (or the engine).
+    ///
+    /// [`ScrubFetcher::fetch`] waits a bounded time for each file's decode.
+    /// A layer whose file is still decoding (or opening) keeps showing the
+    /// last frame it had ("held") and is reported pending; the decode goes on
+    /// in the background, `on_landed` is called when it finishes, and the next
+    /// `fetch` shows it. One job runs per file at a time; a job that doesn't
+    /// answer for [`SCRUB_HANG_LIMIT`] has its sidecar killed. Opens go through
+    /// [`DecoderPool::reserve`] / [`DecoderPool::adopt`], so the pool's budget,
+    /// proxies and kill registry apply as for [`ScrubProvider`].
+    pub struct ScrubFetcher {
+        on_landed: Option<Arc<dyn Fn() + Send + Sync>>,
+        /// In-flight jobs by (requested) path.
+        jobs: HashMap<String, FetchJob>,
+        tx: std::sync::mpsc::Sender<JobDone>,
+        rx: std::sync::mpsc::Receiver<JobDone>,
+        /// Each layer's last frame, and the request it answers.
+        held: HashMap<ClipId, Held>,
+        generation: u64,
+        pub(super) hang_limit: Duration,
+    }
+
+    struct Held {
+        req: FrameRequest,
+        frame: FrameData,
+        touched: u64,
+    }
+
+    struct FetchJob {
+        started: Instant,
+        kill: Arc<Mutex<Option<SidecarKill>>>,
+        killed: bool,
+    }
+
+    /// What a scrub job sends back.
+    struct JobDone {
+        path: String,
+        decoder: JobDecoder,
+        /// Every request it was given.
+        reqs: Vec<FrameRequest>,
+        /// What each decoded to (empty when the open failed).
+        results: Vec<(FrameRequest, Result<FrameData, ClientError>)>,
+        last_pts: Option<i64>,
+        /// The sidecar failed: drop the decoder instead of keeping it.
+        fatal: bool,
+    }
+
+    enum JobDecoder {
+        /// Was idle in the pool: put it back.
+        Pooled(PooledDecoder),
+        /// Opened by the job: the pool adopts it.
+        Opened(OpenAttempt),
+    }
+
+    impl ScrubFetcher {
+        /// A fetcher calling `on_landed` (from a worker thread) whenever a
+        /// layer's decode finishes: repaint then, and the next `fetch` shows
+        /// it. It may also fire for a decode the `fetch` itself waited for.
+        pub fn new(on_landed: Option<Arc<dyn Fn() + Send + Sync>>) -> Self {
+            let (tx, rx) = std::sync::mpsc::channel();
+            Self {
+                on_landed,
+                jobs: HashMap::new(),
+                tx,
+                rx,
+                held: HashMap::new(),
+                generation: 0,
+                hang_limit: SCRUB_HANG_LIMIT,
+            }
+        }
+
+        /// Whether a layer's decode is still running.
+        pub fn busy(&self) -> bool {
+            !self.jobs.is_empty()
+        }
+
+        /// The frames for `reqs`: each file's decode gets up to `wait`; a layer
+        /// whose decode is still running keeps its previous frame (if it had
+        /// one) and is pending in the result.
+        pub fn fetch(
+            &mut self,
+            pool: &mut DecoderPool,
+            cache: &Arc<FrameCache>,
+            reqs: Vec<FrameRequest>,
+            wait: Duration,
+        ) -> ScrubFrames {
+            self.generation += 1;
+            pool.clear_failures();
+            let deadline = Instant::now() + wait;
+            let mut failures: HashMap<ClipId, String> = HashMap::new();
+            // What landed since the last call.
+            while let Ok(done) = self.rx.try_recv() {
+                self.land(pool, done, &mut failures);
+            }
+            // Each file's requests not answered by a held frame: one job per
+            // file, unless one is already running for it.
+            let mut groups: Vec<(&str, Vec<&FrameRequest>)> = Vec::new();
+            for r in reqs.iter().filter(|r| !r.path.is_empty()) {
+                if self.held.get(&r.clip_id).is_some_and(|h| h.req == *r) {
+                    continue;
+                }
+                match groups.iter_mut().find(|(p, _)| *p == r.path) {
+                    Some((_, rs)) => rs.push(r),
+                    None => groups.push((&r.path, vec![r])),
+                }
+            }
+            let active = reqs
+                .iter()
+                .map(|r| r.path.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            for (path, rs) in groups {
+                if self.jobs.contains_key(path) {
+                    continue;
+                }
+                let rs: Vec<FrameRequest> = rs.into_iter().cloned().collect();
+                self.start(pool, cache, path, rs, active);
+            }
+            // Wait (bounded) for this frame's decodes.
+            while !self.jobs.is_empty() {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match self.rx.recv_timeout(left) {
+                    Ok(done) => self.land(pool, done, &mut failures),
+                    Err(_) => break,
+                }
+            }
+            self.kill_hung();
+            let generation = self.generation;
+            let mut out = ScrubFrames {
+                reqs: Vec::with_capacity(reqs.len()),
+                frames: Vec::with_capacity(reqs.len()),
+                failures: Vec::with_capacity(reqs.len()),
+                pending: Vec::with_capacity(reqs.len()),
+            };
+            for r in reqs {
+                let held = self.held.get_mut(&r.clip_id);
+                let exact = held.as_ref().is_some_and(|h| h.req == r);
+                let frame = held.map(|h| {
+                    h.touched = generation;
+                    h.frame.share()
+                });
+                out.pending.push(!exact && self.jobs.contains_key(&r.path));
+                out.failures.push(failures.get(&r.clip_id).cloned());
+                out.frames.push(frame);
+                out.reqs.push(r);
+            }
+            self.held
+                .retain(|_, h| generation - h.touched < SCRUB_FORGET_AFTER);
+            out
+        }
+
+        /// Start a job decoding `reqs` of `path`.
+        fn start(
+            &mut self,
+            pool: &mut DecoderPool,
+            cache: &Arc<FrameCache>,
+            path: &str,
+            reqs: Vec<FrameRequest>,
+            active: usize,
+        ) {
+            let last_pts = pool.last_frame_pts(path);
+            let (decoder, kill) = match pool.reserve(path, active) {
+                Reservation::Ready(dec) => {
+                    let kill = Arc::new(Mutex::new(Some(dec.client.kill_handle())));
+                    (JobStart::Pooled(dec), kill)
+                }
+                Reservation::Pending(open) => {
+                    let kill = open.kill_slot();
+                    (JobStart::Open(open), kill)
+                }
+            };
+            let (tx, cache, on_landed) =
+                (self.tx.clone(), Arc::clone(cache), self.on_landed.clone());
+            let job_path = path.to_owned();
+            let spawned = std::thread::Builder::new()
+                .name("vance-scrub-layer".into())
+                .spawn(move || {
+                    let done = run_fetch_job(job_path, decoder, reqs, &cache, last_pts);
+                    let _ = tx.send(done);
+                    if let Some(cb) = on_landed {
+                        cb();
+                    }
+                });
+            match spawned {
+                Ok(_) => {
+                    self.jobs.insert(
+                        path.to_owned(),
+                        FetchJob {
+                            started: Instant::now(),
+                            kill,
+                            killed: false,
+                        },
+                    );
+                }
+                Err(e) => pool.record_error(
+                    path,
+                    EngineError::PlaybackThread(format!("scrub layer thread: {e}")),
+                ),
+            }
+        }
+
+        /// Take in a finished job: its decoder back to the pool, its frames as
+        /// the layers' new pictures, its errors as their failures.
+        fn land(
+            &mut self,
+            pool: &mut DecoderPool,
+            done: JobDone,
+            failures: &mut HashMap<ClipId, String>,
+        ) {
+            self.jobs.remove(&done.path);
+            if let Some(pts) = done.last_pts {
+                pool.note_last_frame_pts(&done.path, pts);
+            }
+            let decoder = match done.decoder {
+                JobDecoder::Pooled(d) => Ok(d),
+                JobDecoder::Opened(attempt) => pool.adopt(attempt),
+            };
+            match decoder {
+                Ok(d) if done.fatal => drop(d),
+                Ok(d) => pool.put(d),
+                Err(e) => {
+                    let msg = e.to_string();
+                    pool.record_error(&done.path, e);
+                    for r in &done.reqs {
+                        failures.insert(r.clip_id, msg.clone());
+                        self.held.remove(&r.clip_id);
+                    }
+                }
+            }
+            for (r, result) in done.results {
+                match result {
+                    Ok(frame) => {
+                        failures.remove(&r.clip_id);
+                        let touched = self.generation;
+                        self.held.insert(
+                            r.clip_id,
+                            Held {
+                                req: r,
+                                frame,
+                                touched,
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        failures.insert(r.clip_id, e.to_string());
+                        self.held.remove(&r.clip_id);
+                        pool.record_error(&r.path, e.into());
+                    }
+                }
+            }
+        }
+
+        /// Kill the sidecars of jobs that haven't answered for the hang limit.
+        fn kill_hung(&mut self) {
+            for (path, job) in &mut self.jobs {
+                if !job.killed && job.started.elapsed() >= self.hang_limit {
+                    if let Some(kill) = job.kill.lock().as_ref() {
+                        tracing::warn!(%path, "scrub layer hasn't answered; killing its decoder");
+                        kill.kill();
+                        job.killed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for ScrubFetcher {
+        // Intentional: in-flight jobs aren't joined; their sidecars are killed so
+        // none is left behind on a hung share. A job that finishes anyway drops
+        // its decoder (nobody receives it).
+        fn drop(&mut self) {
+            for job in self.jobs.values() {
+                if let Some(kill) = job.kill.lock().as_ref() {
+                    kill.kill();
+                }
+            }
+        }
+    }
+
+    // Intentional: unboxed, as `Reservation` (moved into the job at once).
+    #[allow(clippy::large_enum_variant)]
+    enum JobStart {
+        Pooled(PooledDecoder),
+        Open(crate::decoder_pool::PendingOpen),
+    }
+
+    /// A scrub job: open the decoder if need be, then decode `reqs`.
+    fn run_fetch_job(
+        path: String,
+        start: JobStart,
+        reqs: Vec<FrameRequest>,
+        cache: &FrameCache,
+        mut last_pts: Option<i64>,
+    ) -> JobDone {
+        #[cfg(test)]
+        super::tests::scrub_gate(&path);
+        let mut decoder = match start {
+            JobStart::Pooled(d) => JobDecoder::Pooled(d),
+            JobStart::Open(open) => JobDecoder::Opened(open.open()),
+        };
+        let target = match &mut decoder {
+            JobDecoder::Pooled(d) => Some((&mut d.client, &d.info, d.path.as_str())),
+            JobDecoder::Opened(a) => a.decoder_mut(),
+        };
+        let mut results = Vec::with_capacity(reqs.len());
+        let mut fatal = false;
+        if let Some((client, info, file)) = target {
+            let (file, info) = (file.to_owned(), info.clone());
+            let mut failed: Option<ClientError> = None;
+            for r in reqs.iter().cloned() {
+                if let Some(e) = &failed {
+                    // The sidecar died: the file's other requests fail with it.
+                    results.push((r, Err(duplicate_error(e))));
+                    continue;
+                }
+                let t = source_seconds_to_pts(r.source_seconds, info.time_base);
+                let result = scrub_frame_at(client, &info, &file, &mut last_pts, t, cache);
+                if let Err(e) = &result {
+                    if is_fatal(e) {
+                        fatal = true;
+                        failed = Some(duplicate_error(e));
+                    }
+                }
+                results.push((r, result));
+            }
+        }
+        // (The open failed otherwise: `land` reports it for `reqs`.)
+        JobDone {
+            path,
+            decoder,
+            reqs,
+            results,
+            last_pts,
+            fatal,
+        }
+    }
+
+    /// What [`ScrubFetcher::fetch`] got for one frame: a [`FrameProvider`] for
+    /// `compose_frame` (like [`crate::compose::Prefetched`]), plus which layers
+    /// are still decoding.
+    pub struct ScrubFrames {
+        reqs: Vec<FrameRequest>,
+        frames: Vec<Option<FrameData>>,
+        failures: Vec<Option<String>>,
+        pending: Vec<bool>,
+    }
+
+    impl ScrubFrames {
+        /// Whether any layer is still decoding (showing its previous frame, or
+        /// nothing yet): repaint when the fetcher's `on_landed` fires.
+        pub fn pending(&self) -> bool {
+            self.pending.iter().any(|&p| p)
+        }
+
+        /// Whether `req`'s layer is still decoding (not an error: don't report
+        /// it as one).
+        pub fn is_pending(&self, req: &FrameRequest) -> bool {
+            self.reqs
+                .iter()
+                .zip(&self.pending)
+                .any(|(r, &p)| p && r == req)
+        }
+    }
+
+    impl FrameProvider for ScrubFrames {
+        fn frames(&mut self, reqs: &[FrameRequest]) -> Vec<Option<FrameData>> {
+            reqs.iter()
+                .map(|r| {
+                    let i = self
+                        .reqs
+                        .iter()
+                        .zip(&self.frames)
+                        .position(|(have, f)| have == r && f.is_some())?;
+                    self.frames[i].take()
+                })
+                .collect()
+        }
+
+        fn failure(&self, req: &FrameRequest) -> Option<String> {
+            let i = self.reqs.iter().position(|have| have == req)?;
+            self.failures[i].clone()
+        }
     }
 }
 
@@ -1377,5 +1802,159 @@ mod tests {
             matches!(&st.end, Some(StreamEnd::Failed(e)) if is_fatal(e)),
             "the dead sidecar must end the current stream, not vanish with stream 0"
         );
+    }
+
+    /// Paths whose scrub job waits (a slow file) until released.
+    static GATED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static UNGATED: Condvar = Condvar::new();
+
+    pub(super) fn scrub_gate(path: &str) {
+        let mut gated = GATED.lock();
+        while gated.iter().any(|g| g == path) {
+            UNGATED.wait(&mut gated);
+        }
+    }
+
+    fn gate(path: &str) {
+        GATED.lock().push(path.to_owned());
+    }
+
+    fn ungate(path: &str) {
+        GATED.lock().retain(|g| g != path);
+        UNGATED.notify_all();
+    }
+
+    /// The frames `fetch` got for `reqs`, with their pending flags.
+    fn frames_of(got: &mut ScrubFrames, reqs: &[FrameRequest]) -> Vec<(Option<i64>, bool)> {
+        let pending: Vec<bool> = reqs.iter().map(|r| got.is_pending(r)).collect();
+        got.frames(reqs)
+            .into_iter()
+            .zip(pending)
+            .map(|(f, p)| (f.map(|f| f.pts), p))
+            .collect()
+    }
+
+    #[test]
+    fn a_slow_scrub_layer_holds_its_picture_while_a_fast_one_updates() {
+        let Some(mut pool) = real_pool() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let files = crate::decoder_pool::tests::copies(dir.path(), 2);
+        let (fast, slow) = (&files[0], &files[1]);
+        let landed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&landed);
+        let on_landed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let mut fetcher = ScrubFetcher::new(Some(on_landed));
+        let cache =
+            Arc::new(FrameCache::new(dir.path().join("cache"), 1 << 24, 1 << 26).expect("cache"));
+        let (a, b) = (ClipId::new(), ClipId::new());
+        let at = |t: f64| vec![request(a, fast, t), request(b, slow, t)];
+        // Both decode within the wait.
+        let first = at(0.5);
+        let mut got = fetcher.fetch(&mut pool, &cache, first.clone(), Duration::from_secs(20));
+        assert!(!got.pending());
+        let shown = frames_of(&mut got, &first);
+        let (Some(a0), Some(b0)) = (shown[0].0, shown[1].0) else {
+            panic!("both decoded: {shown:?}")
+        };
+        drop(got);
+        // The slow file stalls: the fast layer updates at once, the slow
+        // one keeps its old picture and is pending.
+        gate(slow);
+        // A safety net: without the fix, `fetch` would wait for the gate.
+        ungate_later(slow, Duration::from_secs(3));
+        let second = at(2.0);
+        let started = Instant::now();
+        let mut got = fetcher.fetch(
+            &mut pool,
+            &cache,
+            second.clone(),
+            Duration::from_millis(300),
+        );
+        let took = started.elapsed();
+        let shown = frames_of(&mut got, &second);
+        drop(got);
+        assert!(
+            took < Duration::from_secs(2),
+            "one slow file held the frame: {took:?}"
+        );
+        let (a1, pending_a) = shown[0];
+        assert!(
+            a1.is_some_and(|p| p > a0) && !pending_a,
+            "the fast layer updated"
+        );
+        assert_eq!(shown[1], (Some(b0), true), "the slow one holds its picture");
+        // It lands: the next fetch shows it.
+        let before = landed.load(std::sync::atomic::Ordering::SeqCst);
+        ungate(slow);
+        assert!(wait_for(20, || !fetcher_busy_after(&landed, before)));
+        let mut got = fetcher.fetch(&mut pool, &cache, second.clone(), Duration::ZERO);
+        let shown = frames_of(&mut got, &second);
+        assert!(!got.pending());
+        assert_eq!(shown[0], (a1, false), "the fast layer, unchanged");
+        assert!(
+            shown[1].0.is_some_and(|p| p > b0) && !shown[1].1,
+            "the slow layer landed"
+        );
+    }
+
+    /// Whether no layer landed since `before` was counted.
+    fn fetcher_busy_after(landed: &std::sync::atomic::AtomicUsize, before: usize) -> bool {
+        landed.load(std::sync::atomic::Ordering::SeqCst) <= before
+    }
+
+    /// Release `path`'s gate after `after`, in case a reverted fix blocks.
+    fn ungate_later(path: &str, after: Duration) {
+        let path = path.to_owned();
+        std::thread::spawn(move || {
+            std::thread::sleep(after);
+            ungate(&path);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_scrub_layer_that_never_answers_is_killed_after_the_limit() {
+        use crate::decoder_pool::tests::{decoder_bin, fixture, pid_recording_decoder, read_pid};
+        let Some(real) = decoder_bin() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, pid_file) = pid_recording_decoder(dir.path(), &real);
+        let mut pool = DecoderPool::new(
+            bin,
+            6,
+            crate::decoder_pool::MemoryBudget {
+                cap_bytes: u64::MAX,
+            },
+        );
+        let cache =
+            Arc::new(FrameCache::new(dir.path().join("cache"), 1 << 24, 1 << 26).expect("cache"));
+        let mut fetcher = ScrubFetcher::new(None);
+        fetcher.hang_limit = Duration::from_millis(300);
+        let path = fixture().to_string_lossy().into_owned();
+        let clip = ClipId::new();
+        let first = vec![request(clip, &path, 0.5)];
+        let mut got = fetcher.fetch(&mut pool, &cache, first.clone(), Duration::from_secs(20));
+        assert!(got.frames(&first)[0].is_some());
+        drop(got);
+        let pid = read_pid(&pid_file);
+        signal(pid, libc::SIGSTOP);
+        // Its next frame never comes: pending, then killed past the limit.
+        let next = vec![request(clip, &path, 3.0)];
+        let got = fetcher.fetch(&mut pool, &cache, next.clone(), Duration::from_millis(50));
+        assert!(got.pending());
+        std::thread::sleep(Duration::from_millis(400));
+        drop(fetcher.fetch(&mut pool, &cache, next.clone(), Duration::from_millis(50)));
+        // The kill makes its request fail: the job lands with an error, and
+        // its (dead) decoder is dropped, not kept.
+        let landed = wait_for(10, || {
+            let got = fetcher.fetch(&mut pool, &cache, next.clone(), Duration::from_millis(50));
+            got.failure(&next[0]).is_some()
+        });
+        let gone = wait_for(10, || !alive(pid));
+        signal(pid, libc::SIGKILL);
+        assert!(landed, "the killed layer reports an error");
+        // Reaped, so not kept as an idle decoder either.
+        assert!(gone, "the hung decoder is still there");
     }
 }

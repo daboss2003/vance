@@ -32,7 +32,7 @@ use crate::compose::{
     FrameRequest, LutCache, Prefetched, Purpose, SkipKind, SkippedLayer, ViewerState,
 };
 use crate::decoder_pool::{total_ram_bytes, DecoderPool, MemoryBudget};
-use crate::layer_feed::{FeedPolicy, ScrubProvider, StreamProvider};
+use crate::layer_feed::{FeedPolicy, StreamProvider};
 
 /// Errors surfaced through Tauri command handlers as plain strings.
 #[derive(Debug, thiserror::Error)]
@@ -598,22 +598,17 @@ fn media_item_hash_prefix_hex(m: &MediaItem) -> String {
     } else {
         // Single metadata call — split into mtime + length together so
         // a race between two reads of the same file can't conjure a
-        // prefix that mixes pre- and post-write state. Only once the file
-        // system answered a timed check: on a dead mount even `stat` blocks
-        // (under the engine lock, for the media list), and the file counts
-        // as unreadable then.
-        // Intentional: the timed check gives no length, so `metadata` runs
-        // after it answered; a drive dying between the two can still block.
-        let answered = file_exists_now(&m.path).is_some();
-        let (mtime_nanos, len_bytes) = match answered.then(|| std::fs::metadata(&m.path)) {
-            Some(Ok(md)) => {
-                let mtime = md
-                    .modified()
-                    .ok()
+        // prefix that mixes pre- and post-write state. Timed: on a dead
+        // mount even `stat` blocks (under the engine lock, for the media
+        // list); a file that doesn't answer counts as unreadable.
+        use crate::decoder_pool::fs_probe::{metadata_within, DEFAULT_TIMEOUT};
+        let (mtime_nanos, len_bytes) = match metadata_within(&m.path, DEFAULT_TIMEOUT) {
+            Ok(Some((mtime, len))) => {
+                let mtime = mtime
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_nanos() as i128)
                     .unwrap_or(0);
-                (mtime, md.len())
+                (mtime, len)
             }
             _ => (0i128, 0u64),
         };
@@ -1534,11 +1529,14 @@ pub struct Engine {
     sizing_deferred: std::collections::HashSet<SequenceId>,
     /// When [`Self::sizing_deferred`] was last retried.
     sizing_retried_at: Option<Instant>,
-    /// A scrub frame still decoding off the engine lock, with the preview
-    /// pool ([`Self::scrub_fetch`]).
-    scrub_in_flight: Option<ScrubInFlight>,
-    /// A scrub was held meanwhile: repaint once it lands.
-    scrub_repaint_wanted: bool,
+    /// Decodes the preview pool's scrub layers off the engine thread, per
+    /// layer ([`ScrubFetcher`]); made with the pool, dropped with it.
+    scrub_fetcher: Option<crate::layer_feed::ScrubFetcher>,
+    /// Set (from the fetcher's threads) when a layer's decode lands.
+    scrub_landed: Arc<AtomicBool>,
+    /// The last scrub frame held a layer still decoding: repaint once one
+    /// lands.
+    scrub_pending: bool,
     /// Files measured off the engine lock for a deferred sizing, by item.
     background_measures: HashMap<MediaItemId, std::sync::mpsc::Receiver<BackgroundMeasure>>,
     /// Items a background measure found have no usable size.
@@ -1593,8 +1591,8 @@ pub struct Engine {
     /// An edit asked for a repaint inside the coalescing interval; the
     /// next poll or edit after it does it.
     repaint_pending: bool,
-    /// Files whose decoders the scrub watchdog had to kill (a hung drive),
-    /// not asked for again until the time given.
+    /// Files whose size probe had to be killed (a hung drive), not probed
+    /// again until the time given.
     hung_paths: HashMap<String, Instant>,
     /// Old proxies being remade, by original path: put back if the remake
     /// fails, deleted after it succeeds when the engine made them.
@@ -1733,9 +1731,9 @@ pub struct Engine {
     /// Unit tests' import open limit (instead of [`IMPORT_PROBE_LIMIT`]).
     #[cfg(test)]
     test_probe_limit: Option<Duration>,
-    /// Unit tests' scrub wait and kill limits (see [`Engine::scrub_limits`]).
+    /// Unit tests' scrub wait (see [`Engine::scrub_wait`]).
     #[cfg(test)]
-    test_scrub_limits: Option<(Duration, Duration)>,
+    test_scrub_wait: Option<Duration>,
 }
 
 /// A headless Record viewer for unit tests: repaints read back here.
@@ -6681,7 +6679,7 @@ impl Engine {
     /// chaining: sequence playback runs straight through cuts and gaps.
     pub fn is_playing(&mut self) -> bool {
         self.poll_auto_proxies();
-        self.collect_late_scrub();
+        self.repaint_when_landed();
         self.flush_pending_repaint();
         if let Some(session) = self.seq_playback.as_ref() {
             // One take: a broken proxy never splits from its original's request.
@@ -8701,134 +8699,21 @@ struct QueuedProxy {
 /// clip) may wait for its decoder before it's killed and the clip counts as
 /// not measured yet. Opening a local file takes well under 100 ms and a
 /// sleeping disk or network share wakes in a second or two.
-const SCRUB_FETCH_LIMIT: Duration = Duration::from_secs(3);
+const SIZE_PROBE_LIMIT: Duration = Duration::from_secs(3);
 
-/// How long a scrub waits for its frame's decoders. Past it the viewer keeps
-/// its picture and the command returns; the decode goes on off the engine
-/// lock and the viewer shows it once it lands.
+/// How long a scrub waits for its layers' decodes. A layer still decoding
+/// then keeps its last picture (the others show their new ones), and the
+/// viewer is repainted when it lands; its decoder is killed only after
+/// [`crate::layer_feed::SCRUB_HANG_LIMIT`] without an answer.
 const SCRUB_WAIT: Duration = Duration::from_secs(3);
 
-/// How long a scrub frame's decoders may go without answering before
-/// they're killed (a hung drive). A slow drive that answers by then keeps
-/// its decoders.
-const SCRUB_KILL_AFTER: Duration = Duration::from_secs(30);
+/// The wait while a layer is still decoding from an earlier scrub: the
+/// fetcher waits for every running decode, so a hung layer would otherwise
+/// hold each scrub the whole [`SCRUB_WAIT`]. Enough for a file that answers.
+const SCRUB_BUSY_WAIT: Duration = Duration::from_millis(250);
 
-/// A scrub frame still decoding past [`SCRUB_WAIT`], on its own thread with
-/// the preview pool.
-struct ScrubInFlight {
-    reqs: Vec<FrameRequest>,
-    rx: std::sync::mpsc::Receiver<ScrubFetched>,
-}
-
-/// What a scrub decode thread hands back.
-struct ScrubFetched {
-    pool: DecoderPool,
-    frames: Prefetched,
-    /// Files whose decoders hung (killed): left out for a while.
-    hung: Vec<String>,
-}
-
-/// Decode a scrub frame's layers with `pool` (on the decode thread), killing
-/// decoders that go `kill_after` without an answer.
-fn fetch_scrub_frames(
-    mut pool: DecoderPool,
-    cache: Arc<vance_cache::FrameCache>,
-    reqs: Vec<FrameRequest>,
-    kill_after: Duration,
-) -> ScrubFetched {
-    let watchdog = FetchWatchdog::arm(pool.sidecars(), kill_after);
-    let mut frames = Prefetched::fetch(
-        &mut ScrubProvider {
-            pool: &mut pool,
-            cache: cache.clone(),
-        },
-        reqs.clone(),
-    );
-    let mut hung = Vec::new();
-    if watchdog.disarm() {
-        frames = refetch_after_hang(&mut pool, &reqs, frames, &cache, &mut hung);
-    }
-    ScrubFetched { pool, frames, hung }
-}
-
-/// After the watchdog killed a scrub frame's busy decoders: every layer
-/// lost its decoder, not only the hung one (all of a frame's decoders are
-/// out at once). Fetch the missing files again one at a time, each within
-/// [`HUNG_RETRY_LIMIT`]; one that hangs again is the hung file (into
-/// `hung`). The rest come back.
-fn refetch_after_hang(
-    pool: &mut DecoderPool,
-    reqs: &[FrameRequest],
-    mut first: Prefetched,
-    cache: &Arc<vance_cache::FrameCache>,
-    hung: &mut Vec<String>,
-) -> Prefetched {
-    let failures: Vec<Option<String>> = reqs.iter().map(|r| first.failure(r)).collect();
-    let mut got = Fetched {
-        frames: first.frames(reqs),
-        failures,
-        reqs: reqs.to_vec(),
-    };
-    let mut missing: Vec<&str> = Vec::new();
-    for (r, f) in reqs.iter().zip(&got.frames) {
-        if f.is_none() && !missing.contains(&r.path.as_str()) {
-            missing.push(&r.path);
-        }
-    }
-    for path in missing {
-        let again: Vec<FrameRequest> = reqs.iter().filter(|r| r.path == path).cloned().collect();
-        let watchdog = FetchWatchdog::arm(pool.sidecars(), HUNG_RETRY_LIMIT);
-        let mut retry = Prefetched::fetch(
-            &mut ScrubProvider {
-                pool: &mut *pool,
-                cache: cache.clone(),
-            },
-            again.clone(),
-        );
-        if watchdog.disarm() {
-            tracing::warn!(path, "decoding hung; leaving the layer out for now");
-            hung.push(path.to_owned());
-        }
-        let why: Vec<Option<String>> = again.iter().map(|r| retry.failure(r)).collect();
-        for ((r, frame), why) in again.iter().zip(retry.frames(&again)).zip(why) {
-            if let Some(i) = got.reqs.iter().position(|have| have == r) {
-                got.frames[i] = frame;
-                got.failures[i] = why;
-            }
-        }
-    }
-    Prefetched::fetch(&mut got, reqs.to_vec())
-}
-
-/// The per-file limit when a hung frame's files are fetched again: a file
-/// that just opened fine reopens in well under a second.
-const HUNG_RETRY_LIMIT: Duration = Duration::from_secs(1);
-
-/// Frames already fetched, served again to rebuild a [`Prefetched`].
-struct Fetched {
-    reqs: Vec<FrameRequest>,
-    frames: Vec<Option<vance_decoder::FrameData>>,
-    failures: Vec<Option<String>>,
-}
-
-impl FrameProvider for Fetched {
-    fn frames(&mut self, reqs: &[FrameRequest]) -> Vec<Option<vance_decoder::FrameData>> {
-        reqs.iter()
-            .map(|r| {
-                let i = self.reqs.iter().position(|have| have == r)?;
-                self.frames[i].take()
-            })
-            .collect()
-    }
-
-    fn failure(&self, req: &FrameRequest) -> Option<String> {
-        let i = self.reqs.iter().position(|have| have == req)?;
-        self.failures[i].clone()
-    }
-}
-
-/// How long a file whose decoder hung is left out of scrub frames before
-/// it's tried again (each try can cost [`SCRUB_FETCH_LIMIT`]).
+/// How long a file whose decoder hung (a size probe) is left out of probes
+/// before it's tried again (each try can cost [`SIZE_PROBE_LIMIT`]).
 const HUNG_PATH_PAUSE: Duration = Duration::from_secs(10);
 
 /// Runs `on_timeout` (a kill) if the work it watches outlasts its limit:
@@ -9124,6 +9009,8 @@ impl Engine {
     /// measuring in the background the original of a layer that decodes
     /// another file (its proxy), whose frames can't tell.
     fn learn_media_dims(&mut self, layers: &[(MediaItemId, String)], probe: bool) {
+        let now = Instant::now();
+        self.hung_paths.retain(|_, until| *until > now);
         for (media, decoded) in layers {
             if self.media_dims.contains_key(media) {
                 continue;
@@ -9186,6 +9073,9 @@ impl Engine {
     /// sequence playback first: the pool is on the playback thread then.
     fn ensure_scrub_pool(&mut self) {
         if self.scrub_pool.is_none() {
+            // Its fetcher's decodes belong to the old pool: dropped (killing
+            // any still running) with it.
+            self.scrub_fetcher = None;
             self.scrub_pool = Some(new_decoder_pool());
         }
     }
@@ -9262,21 +9152,12 @@ impl Engine {
                 .ok_or(EngineError::NoProject)?;
             plan_requests(project, &seq, &plan, Purpose::Preview, None)
         };
-        // A file whose decoder hung recently isn't asked for (its layer is
-        // left out, with the usual notice) until it's had time to recover.
-        let now = Instant::now();
-        self.hung_paths.retain(|_, until| *until > now);
-        let fetch: Vec<FrameRequest> = reqs
-            .iter()
-            .filter(|r| !self.hung_paths.contains_key(&r.path))
-            .cloned()
-            .collect();
         let hold = !matches!(sink, PreviewSink::Rgba8 { hold: false, .. });
-        let Some(mut frames) = self.scrub_fetch(&fetch, &cache, hold) else {
-            // Still decoding (a slow or hung drive): the viewer keeps its
-            // picture, and shows this once it lands.
-            return Ok(None);
-        };
+        // Outside the render lock. A layer still decoding (a slow or hung
+        // drive) keeps its last picture; the viewer is repainted once it
+        // lands.
+        let mut frames = self.scrub_fetch(&reqs, &cache, hold);
+        self.scrub_pending = frames.pending();
         let layers: Vec<(MediaItemId, String)> =
             reqs.iter().map(|r| (r.media, r.path.clone())).collect();
         // A layer decoding its proxy can't tell its original's size: that's
@@ -9338,124 +9219,76 @@ impl Engine {
         let over_budget = pool.take_proxy_requests();
         let broken = pool.take_broken_proxies();
         self.handle_proxy_requests(over_budget, &broken);
+        // A layer still decoding isn't a failure: no notice for it.
+        skipped.retain(|s| {
+            !reqs
+                .iter()
+                .any(|r| r.clip_id == s.clip_id && frames.is_pending(r))
+        });
+        drop(frames);
         self.notice_skipped_layers(&skipped, false);
         self.kick_layer_prefetch(&reqs);
         result
     }
 
-    /// A scrub frame's decoded layers. They're decoded on a thread of their
-    /// own with the preview pool, off the engine lock: a frame that takes
-    /// past [`SCRUB_WAIT`] (a slow or hung drive) is left decoding, and with
-    /// `hold` this answers `None` meanwhile (the viewer keeps its picture
-    /// and is repainted once it lands, see [`Self::collect_late_scrub`]);
-    /// without, it waits. Asked again for the frame in flight it waits for
-    /// that one; for another, `hold` answers `None` until it lands. Decoders
-    /// are killed only after [`SCRUB_KILL_AFTER`] without an answer.
+    /// A scrub frame's layers from the preview pool, through its
+    /// [`ScrubFetcher`]: each file decodes on a thread of its own, waited for
+    /// up to [`Self::scrub_wait`]; one still decoding keeps its last picture
+    /// and is pending. Without `hold` (reads that must have every layer)
+    /// pending layers are waited out.
+    ///
+    /// [`ScrubFetcher`]: crate::layer_feed::ScrubFetcher
     fn scrub_fetch(
         &mut self,
-        fetch: &[FrameRequest],
+        reqs: &[FrameRequest],
         cache: &Arc<vance_cache::FrameCache>,
         hold: bool,
-    ) -> Option<Prefetched> {
-        let (wait, kill_after) = self.scrub_limits();
+    ) -> crate::layer_feed::ScrubFrames {
+        self.ensure_scrub_pool();
+        if self.scrub_fetcher.is_none() {
+            let landed = self.scrub_landed.clone();
+            // Intentional: only a flag, read by the UI's poll: it runs on the
+            // fetcher's threads, may fire more than once per decode, and must
+            // neither block nor take the engine lock.
+            let on_landed: Arc<dyn Fn() + Send + Sync> =
+                Arc::new(move || landed.store(true, Ordering::Release));
+            self.scrub_fetcher = Some(crate::layer_feed::ScrubFetcher::new(Some(on_landed)));
+        }
         loop {
-            let Some(in_flight) = self.scrub_in_flight.as_ref() else {
-                self.ensure_scrub_pool();
-                let pool = self.scrub_pool.take().expect("ensured above");
-                let (tx, rx) = std::sync::mpsc::channel();
-                let (cache, reqs) = (cache.clone(), fetch.to_vec());
-                let spawned = std::thread::Builder::new()
-                    .name("vance-engine.scrub".into())
-                    .spawn(move || {
-                        let _ = tx.send(fetch_scrub_frames(pool, cache, reqs, kill_after));
-                    });
-                if let Err(e) = spawned {
-                    // The pool went with the closure that didn't run.
-                    tracing::warn!(error = %e, "no scrub decode thread");
-                    return None;
-                }
-                self.scrub_in_flight = Some(ScrubInFlight {
-                    reqs: fetch.to_vec(),
-                    rx,
-                });
-                continue;
-            };
-            let same = in_flight.reqs == fetch;
-            if hold && !same {
-                self.scrub_repaint_wanted = true;
-                return None;
-            }
-            let landed = if hold {
-                in_flight
-                    .rx
-                    .recv_timeout(wait)
-                    .map_err(|e| matches!(e, std::sync::mpsc::RecvTimeoutError::Disconnected))
-            } else {
-                in_flight.rx.recv().map_err(|_| true)
-            };
-            match landed {
-                Ok(done) => {
-                    self.scrub_in_flight = None;
-                    let frames = self.land_scrub(done);
-                    if same {
-                        return Some(frames);
-                    }
-                }
-                // Still decoding.
-                Err(false) => {
-                    self.scrub_repaint_wanted = true;
-                    return None;
-                }
-                // Its thread died with the pool: no frame this time, a new
-                // pool from the next one.
-                Err(true) => {
-                    self.scrub_in_flight = None;
-                    self.scrub_pool = None;
-                    return None;
-                }
+            let wait = self.scrub_wait();
+            // What lands from here on is news for the poll; what landed
+            // before is in this fetch.
+            self.scrub_landed.store(false, Ordering::Release);
+            let fetcher = self.scrub_fetcher.as_mut().expect("made above");
+            let pool = self.scrub_pool.as_mut().expect("ensured above");
+            let frames = fetcher.fetch(pool, cache, reqs.to_vec(), wait);
+            if hold || !frames.pending() {
+                return frames;
             }
         }
     }
 
-    /// A scrub decode's pool comes back (replacing any made meanwhile), and
-    /// its hung files are left out for [`HUNG_PATH_PAUSE`].
-    fn land_scrub(&mut self, done: ScrubFetched) -> Prefetched {
-        self.scrub_pool = Some(done.pool);
-        let until = Instant::now() + HUNG_PATH_PAUSE;
-        for path in done.hung {
-            self.hung_paths.insert(path, until);
+    /// How long a scrub waits for its layers: [`SCRUB_WAIT`], or
+    /// [`SCRUB_BUSY_WAIT`] while a layer still decodes from before.
+    fn scrub_wait(&self) -> Duration {
+        let busy = self.scrub_fetcher.as_ref().is_some_and(|f| f.busy());
+        #[cfg(test)]
+        if let Some(wait) = self.test_scrub_wait {
+            return if busy { wait / 4 } else { wait };
         }
-        done.frames
+        if busy {
+            SCRUB_BUSY_WAIT
+        } else {
+            SCRUB_WAIT
+        }
     }
 
-    /// A scrub frame that outlasted [`SCRUB_WAIT`] has landed: the preview
-    /// pool is back, and the viewer shows the latest scrub position.
-    fn collect_late_scrub(&mut self) {
-        let Some(in_flight) = self.scrub_in_flight.as_ref() else {
-            return;
-        };
-        match in_flight.rx.try_recv() {
-            Ok(done) => {
-                self.scrub_in_flight = None;
-                drop(self.land_scrub(done));
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => return,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.scrub_in_flight = None;
-            }
-        }
-        if std::mem::take(&mut self.scrub_repaint_wanted) {
+    /// A layer the last scrub frame held has landed: show the latest scrub
+    /// position (on the UI's poll, so landings close together repaint once).
+    fn repaint_when_landed(&mut self) {
+        if self.scrub_pending && self.scrub_landed.swap(false, Ordering::AcqRel) {
             self.repaint_now();
         }
-    }
-
-    /// The scrub wait and kill limits (shorter in unit tests).
-    fn scrub_limits(&self) -> (Duration, Duration) {
-        #[cfg(test)]
-        if let Some(limits) = self.test_scrub_limits {
-            return limits;
-        }
-        (SCRUB_WAIT, SCRUB_KILL_AFTER)
     }
 
     /// Queue a notice for each layer a frame left out ("couldn't show")
@@ -10250,6 +10083,8 @@ impl Engine {
         if let Some(&dims) = self.media_dims.get(&id) {
             return Measured::Size(dims);
         }
+        let now = Instant::now();
+        self.hung_paths.retain(|_, until| *until > now);
         if self.hung_paths.contains_key(path) {
             return Measured::Unknown;
         }
@@ -10264,7 +10099,7 @@ impl Engine {
         // the clip is then unmeasured (and the file left alone a while).
         self.ensure_scrub_pool();
         let sidecars = self.scrub_pool.as_ref().expect("ensured above").sidecars();
-        let watchdog = FetchWatchdog::arm(sidecars, SCRUB_FETCH_LIMIT);
+        let watchdog = FetchWatchdog::arm(sidecars, SIZE_PROBE_LIMIT);
         let taken = self.take_pooled_decoder(path);
         if watchdog.disarm() {
             tracing::warn!(path, "size probe hung; the clip stays unmeasured");
@@ -12424,7 +12259,7 @@ mod tests {
         let (result, took) = got.expect("the insert came back");
         assert_eq!(result, Ok(()), "the clip is placed");
         assert!(
-            took < SCRUB_FETCH_LIMIT + Duration::from_secs(3),
+            took < SIZE_PROBE_LIMIT + Duration::from_secs(3),
             "bounded: {took:?}"
         );
         assert_eq!(
@@ -12481,12 +12316,13 @@ mod tests {
         Some((e, dir, fifo))
     }
 
-    /// Polls like the UI (`is_playing`) until the viewer repaints, or `limit`;
-    /// meanwhile lets readers of `fifo` through, if given (the drive
-    /// answers: whenever its decoder gets to open it).
+    /// Polls like the UI (`is_playing`) until the viewer has repainted more
+    /// than `after` times, or `limit`; meanwhile lets readers of `fifo`
+    /// through, if given (the drive answers, whenever its decoder opens it).
     #[cfg(unix)]
     fn poll_until_repainted(
         e: &mut Engine,
+        after: usize,
         limit: Duration,
         fifo: Option<&Path>,
     ) -> Option<Duration> {
@@ -12496,7 +12332,7 @@ mod tests {
                 release(fifo);
             }
             e.is_playing();
-            if repaints(e) > 0 {
+            if repaints(e) > after {
                 return Some(started.elapsed());
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -12504,38 +12340,56 @@ mod tests {
         None
     }
 
-    /// A scrub whose file takes long (a slow drive) doesn't wait past the
-    /// scrub wait, nor kill the decoder: the viewer keeps its picture, the
-    /// next scrub doesn't wait on it either, and the frame shows once the
-    /// file answers.
+    /// The test viewer's pixel at (x, y).
+    fn viewer_px(e: &Engine, x: usize, y: usize) -> [u8; 3] {
+        let frame = e
+            .test_viewer
+            .as_ref()
+            .and_then(|v| v.frame.as_ref())
+            .expect("a repainted frame");
+        let i = (y * 64 + x) * 4;
+        [frame[i], frame[i + 1], frame[i + 2]]
+    }
+
+    /// A layer whose file takes long (a slow drive) doesn't hold the frame
+    /// past the scrub wait, nor the next scrubs: the rest shows at once,
+    /// with no notice while it's still decoding, and its decoder isn't
+    /// killed. Once it answers (with nothing playable here) it's reported.
     #[cfg(unix)]
     #[test]
-    fn a_slow_scrub_holds_the_picture_and_shows_once_it_lands() {
+    fn a_layer_still_decoding_holds_neither_the_frame_nor_gives_a_notice() {
         let Some((mut e, dir, fifo)) = blue_under_a_hung_layer("slow-scrub") else {
             return;
         };
         let wait = Duration::from_secs(1);
-        e.test_scrub_limits = Some((wait, Duration::from_secs(20)));
+        e.test_scrub_wait = Some(wait);
         let started = Instant::now();
         let first = e.repaint_preview(None);
         let first_took = started.elapsed();
+        let first_repaints = repaints(&e);
+        let first_centre = viewer_centre(&e);
         e.preview_t = Some(1.0);
         let started = Instant::now();
         let second = e.repaint_preview(None);
         let second_took = started.elapsed();
-        let held = repaints(&e);
-        // The drive answers (with nothing playable: the layer is left out).
-        let landed = poll_until_repainted(&mut e, Duration::from_secs(10), Some(&fifo));
+        let quiet = e.take_notices();
+        let before = repaints(&e);
+        let landed = poll_until_repainted(&mut e, before, Duration::from_secs(10), Some(&fifo));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(first.is_ok() && second.is_ok(), "{first:?} {second:?}");
         assert!(
             first_took >= wait && first_took < wait * 3,
             "waited the scrub wait, no longer: {first_took:?}"
         );
-        assert!(second_took < wait / 2, "didn't wait again: {second_took:?}");
-        assert_eq!(held, 0, "the viewer kept its picture meanwhile");
-        assert!(landed.is_some(), "shown once it landed");
-        assert_eq!(viewer_centre(&e), [0, 0, 255], "the layer below shows");
+        assert_eq!(first_repaints, 1, "shown without the slow layer");
+        assert_eq!(first_centre, [0, 0, 255], "the layer below shows");
+        assert!(
+            second_took < wait * 3 / 4,
+            "not held again: {second_took:?}"
+        );
+        assert_eq!(before, 2);
+        assert!(quiet.is_empty(), "no notice while it decodes: {quiet:?}");
+        assert!(landed.is_some(), "repainted once it landed");
         assert!(
             !e.hung_paths.contains_key(&*fifo.to_string_lossy()),
             "its decoder wasn't killed for being slow"
@@ -12544,34 +12398,155 @@ mod tests {
             e.take_notices()
                 .iter()
                 .any(|n| n.starts_with("Couldn't show nas: ")),
-            "the layer that answered with nothing is reported"
+            "a layer that answered with nothing is reported"
         );
     }
 
-    /// A scrub's decoder that doesn't answer at all is killed after the
-    /// kill limit (not before), its file left out a while, and the frame
-    /// shows without it.
+    /// Makes `out` with ffmpeg from a lavfi `graph`, all keyframes; `false`
+    /// (skip) without ffmpeg or libx264.
+    fn make_clip(out: &Path, graph: &str, format: Option<&str>) -> bool {
+        let mut cmd = std::process::Command::new("ffmpeg");
+        cmd.args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            graph,
+        ])
+        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "1"]);
+        if let Some(format) = format {
+            cmd.args(["-f", format]);
+        }
+        vance_ipc::process::status(cmd.arg(out)).is_ok_and(|s| s.success())
+    }
+
+    /// A slow layer and a fast one, scrubbed through the engine: the fast
+    /// one updates at once, the slow one keeps its last picture, and shows
+    /// its new one once its file answers (repainted on the UI's poll); the
+    /// scrub doesn't wait on it meanwhile.
     #[cfg(unix)]
     #[test]
-    fn a_hung_scrub_decoder_is_killed_only_after_the_limit() {
-        let Some((mut e, dir, fifo)) = blue_under_a_hung_layer("hung-scrub") else {
+    fn a_slow_layer_keeps_its_picture_while_a_fast_one_updates() {
+        if locate_decoder_binary().is_err() {
+            eprintln!("decoder sidecar missing — skipping");
+            return;
+        }
+        let (dir, fifo) = hung_file("slow-and-fast", "on-the-nas.ts");
+        let (fast, slow, late) = (
+            dir.join("fast.mp4"),
+            dir.join("slow.mp4"),
+            dir.join("late.ts"),
+        );
+        let made = make_clip(
+            &fast,
+            "color=c=red:s=64x32:d=0.5:r=24[a];color=c=lime:s=64x32:d=3.5:r=24[b];[a][b]concat=n=2:v=1",
+            None,
+        ) && make_clip(&slow, "color=c=blue:s=32x32:d=4:r=24", None)
+            // Short and small: read from a pipe, its decoder seeks within
+            // what it has buffered.
+            && make_clip(&late, "color=c=white:s=32x32:d=1:r=24", Some("mpegts"));
+        if !made {
+            eprintln!("ffmpeg / libx264 missing — skipping");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let mut e = Engine::default();
+        e.new_project("t".into()).unwrap();
+        let v1 = track_ids(&e)[0];
+        let v2 = e.add_track(TrackKind::Video, None, None).unwrap();
+        let import = |e: &mut Engine, p: &Path| {
+            let info = e.import_media_file(&p.to_string_lossy()).unwrap();
+            MediaItemId::from_uuid(info.id.parse().unwrap())
+        };
+        let (fast_media, slow_media) = (import(&mut e, &fast), import(&mut e, &slow));
+        e.insert_clip_at(v1, fast_media, 0.0).unwrap();
+        e.insert_clip_at(v2, slow_media, 0.0).unwrap();
+        let Some(mut e) = with_test_viewer(e, 0.25) else {
+            let _ = std::fs::remove_dir_all(&dir);
             return;
         };
-        let kill_after = Duration::from_secs(1);
-        e.test_scrub_limits = Some((Duration::from_millis(200), kill_after));
+        let wait = Duration::from_secs(1);
+        e.test_scrub_wait = Some(wait);
+        let is = |c: [u8; 3], want: [u8; 3]| c.iter().zip(want).all(|(a, b)| a.abs_diff(b) <= 24);
+        let (red, lime, blue, white) = ([255, 0, 0], [0, 255, 0], [0, 0, 255], [255; 3]);
+        let edge_and_centre = |e: &Engine| (viewer_px(e, 2, 16), viewer_centre(e));
+
+        e.repaint_preview(None).unwrap();
+        let shown = edge_and_centre(&e);
+        // The slow layer's file is now on a drive that takes long.
+        let slow_item = e
+            .current_project
+            .as_mut()
+            .unwrap()
+            .media
+            .get_mut(&slow_media)
+            .unwrap();
+        Arc::make_mut(slow_item).path = fifo.clone();
+        e.preview_t = Some(0.75);
         let started = Instant::now();
-        let first = e.repaint_preview(None);
-        let returned = started.elapsed();
-        let landed = poll_until_repainted(&mut e, Duration::from_secs(10), None);
+        e.repaint_preview(None).unwrap();
         let took = started.elapsed();
-        release(&fifo);
+        let held = edge_and_centre(&e);
+        let quiet = e.take_notices();
+        // The drive answers: the file opens (as often as it's opened).
+        let bytes = std::fs::read(&late).unwrap();
+        let feeding = Arc::new(AtomicBool::new(true));
+        let (feed, still) = (fifo.clone(), feeding.clone());
+        let feeder = std::thread::spawn(move || {
+            use std::io::Write;
+            while still.load(Ordering::SeqCst) {
+                let Ok(mut w) = std::fs::OpenOptions::new().write(true).open(&feed) else {
+                    return;
+                };
+                let _ = w.write_all(&bytes);
+            }
+        });
+        // Polled like the UI. A landing may repaint more than once (one that
+        // fired for a decode the scrub had already waited for, too): until
+        // the slow layer's new picture is up.
+        let before = repaints(&e);
+        let started = Instant::now();
+        let mut landed = None;
+        while started.elapsed() < Duration::from_secs(10) {
+            e.is_playing();
+            if repaints(&e) > before && is(viewer_centre(&e), white) {
+                landed = Some(started.elapsed());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let after = edge_and_centre(&e);
+        let notices = e.take_notices();
+        // Its decoders hold the FIFO open: gone with it, the feeder's writes
+        // fail and it stops.
+        drop(e);
+        feeding.store(false, Ordering::SeqCst);
+        {
+            // Lets a feeder blocked opening the FIFO through.
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo);
+        }
+        let _ = feeder.join();
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(first.is_ok(), "{first:?}");
-        assert!(returned < Duration::from_secs(1), "{returned:?}");
-        assert!(landed.is_some(), "shown without it");
-        assert!(took >= kill_after, "not killed before the limit: {took:?}");
-        assert_eq!(viewer_centre(&e), [0, 0, 255]);
-        assert!(e.hung_paths.contains_key(&*fifo.to_string_lossy()));
+        assert!(is(shown.0, red) && is(shown.1, blue), "both: {shown:?}");
+        assert!(
+            took < wait * 2,
+            "the scrub didn't wait on the slow layer: {took:?}"
+        );
+        assert!(is(held.0, lime), "the fast layer updated at once: {held:?}");
+        assert!(is(held.1, blue), "the slow one kept its picture: {held:?}");
+        assert!(quiet.is_empty(), "no notice while it decodes: {quiet:?}");
+        assert!(landed.is_some(), "repainted once it landed");
+        assert!(
+            is(after.0, lime) && is(after.1, white),
+            "the slow one's new picture: {after:?} {notices:?}"
+        );
     }
 
     /// A clip whose file doesn't answer may be the one that sizes the
@@ -12676,6 +12651,44 @@ mod tests {
         assert!(took < Duration::from_secs(2), "{took:?}");
         assert_eq!(found, Some(0), "the proxy that doesn't answer is left out");
         assert!(awaiting, "an original that doesn't answer stays offline");
+    }
+
+    /// The media list's hash prefix is the file's (path, mtime, length), as
+    /// the peaks side computes it; a file whose drive doesn't answer doesn't
+    /// hold the list (it counts as unreadable).
+    #[test]
+    fn the_media_hash_reads_its_file_with_a_timeout() {
+        use crate::decoder_pool::fs_probe::tests::{block, release};
+        let dir = std::env::temp_dir().join(format!("vance-v2-hash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (here, dead) = (dir.join("here.mov"), dir.join("dead.mov"));
+        std::fs::write(&here, b"twelve bytes").unwrap();
+        std::fs::write(&dead, b"x").unwrap();
+        let item =
+            |p: &Path| MediaItem::new(p.to_path_buf(), "m", MediaKind::Video, seconds_to_rt(1.0));
+        let meta = std::fs::metadata(&here).unwrap();
+        let mtime = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i128;
+        let want = crate::peaks::hash_prefix_from_path(&here, mtime, meta.len());
+        let hex: String = want.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(media_item_hash_prefix_hex(&item(&here)), hex);
+        block(&dead);
+        let started = Instant::now();
+        let unread = media_item_hash_prefix_hex(&item(&dead));
+        let took = started.elapsed();
+        release(&dead);
+        let _ = std::fs::remove_dir_all(&dir);
+        let blank: String = crate::peaks::hash_prefix_from_path(&dead, 0, 0)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        assert_eq!(unread, blank, "unreadable");
     }
 
     /// A monitor moves at once even while an export holds the engine; its

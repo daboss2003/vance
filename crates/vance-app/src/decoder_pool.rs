@@ -359,6 +359,7 @@ const CRASHED_OPEN_RETRY_AFTER: Duration = Duration::from_secs(10);
 
 /// A file that failed to open: not retried until it changes, or (a crash)
 /// until [`CRASHED_OPEN_RETRY_AFTER`] has passed.
+#[derive(Clone)]
 struct FailedOpen {
     /// The file's mtime at the failure.
     mtime: Option<SystemTime>,
@@ -366,6 +367,7 @@ struct FailedOpen {
     why: OpenFailure,
 }
 
+#[derive(Clone)]
 enum OpenFailure {
     /// The sidecar said why.
     Open(OpenError),
@@ -403,6 +405,201 @@ struct BrokenProxy {
     mtime: Option<SystemTime>,
     /// The original it stands in for.
     original: String,
+}
+
+/// What [`DecoderPool::reserve`] gives: a decoder at once, or the slow part
+/// of getting one, to run off the pool's thread.
+// Intentional: unboxed. One lives briefly per layer per scrub frame and is
+// moved out at once; boxing would only add an allocation.
+#[allow(clippy::large_enum_variant)]
+pub enum Reservation {
+    /// An idle decoder already on the file.
+    Ready(PooledDecoder),
+    /// A sidecar to spawn and open: [`PendingOpen::open`] (on any thread),
+    /// then [`DecoderPool::adopt`].
+    Pending(PendingOpen),
+}
+
+/// The slow part of a [`DecoderPool::take`] (file checks, spawn, open),
+/// detached from the pool so it can run on a worker thread. Its sidecar
+/// is in the pool's registry from the moment it starts, so stopping a
+/// session kills it like any other.
+pub struct PendingOpen {
+    bin: PathBuf,
+    /// The file to open (a proxy when the budget swapped one in).
+    file: String,
+    /// What the caller asked for.
+    requested: String,
+    /// `file` is a proxy standing in for this original.
+    proxy_for: Option<String>,
+    /// The file's size isn't known yet (its first open).
+    first_open: bool,
+    threads: ThreadBudget,
+    sidecars: SidecarRegistry,
+    /// The pool's cached failure for `file`, if any.
+    failed: Option<FailedOpen>,
+    /// The sidecar's kill handle, once it has started.
+    kill: Arc<Mutex<Option<SidecarKill>>>,
+}
+
+/// How a [`PendingOpen`] went; hand it to [`DecoderPool::adopt`].
+// Intentional: some fields are only read by `adopt` (see `Reservation`).
+#[allow(dead_code)]
+pub struct OpenAttempt {
+    file: String,
+    requested: String,
+    proxy_for: Option<String>,
+    first_open: bool,
+    threads: ThreadBudget,
+    /// A sidecar process was started.
+    spawned: bool,
+    /// The cached failure it was given turned out stale.
+    stale_failure: bool,
+    outcome: Result<(DecoderClient, StreamInfo, Busy), AttemptError>,
+}
+
+enum AttemptError {
+    /// Nothing to remember about the file (missing, cached failure, no
+    /// sidecar, killed by a stopping session).
+    Plain(EngineError),
+    /// The sidecar said why: remembered until the file changes.
+    Open(OpenError),
+    /// The sidecar died opening it: remembered for a while.
+    Crashed(ClientError),
+}
+
+impl PendingOpen {
+    /// The kill handle of this open's sidecar, filled in once it starts (for
+    /// a caller that gives up on a hung one).
+    pub fn kill_slot(&self) -> Arc<Mutex<Option<SidecarKill>>> {
+        Arc::clone(&self.kill)
+    }
+
+    /// Check the file, spawn a sidecar and open it: the slow part, safe on
+    /// any thread.
+    pub fn open(self) -> OpenAttempt {
+        let PendingOpen {
+            bin,
+            file,
+            requested,
+            proxy_for,
+            first_open,
+            threads,
+            sidecars,
+            failed,
+            kill,
+        } = self;
+        let mut attempt = OpenAttempt {
+            file,
+            requested,
+            proxy_for,
+            first_open,
+            threads,
+            spawned: false,
+            stale_failure: false,
+            outcome: Err(AttemptError::Plain(EngineError::NoFileOpen)),
+        };
+        attempt.outcome = attempt_open(&bin, &mut attempt, &sidecars, failed.as_ref(), &kill);
+        attempt
+    }
+}
+
+impl OpenAttempt {
+    /// The opened client, its stream and file, to decode with before
+    /// [`DecoderPool::adopt`] takes it.
+    pub fn decoder_mut(&mut self) -> Option<(&mut DecoderClient, &StreamInfo, &str)> {
+        match &mut self.outcome {
+            Ok((client, info, _)) => Some((client, info, self.file.as_str())),
+            Err(_) => None,
+        }
+    }
+}
+
+/// [`PendingOpen::open`]'s body: what `spawn_open` always did, without the
+/// pool.
+fn attempt_open(
+    bin: &Path,
+    attempt: &mut OpenAttempt,
+    sidecars: &SidecarRegistry,
+    failed: Option<&FailedOpen>,
+    kill_slot: &Mutex<Option<SidecarKill>>,
+) -> Result<(DecoderClient, StreamInfo, Busy), AttemptError> {
+    let path = attempt.file.clone();
+    // Checked here, not left to the sidecar: no process for a file that
+    // isn't there (offline media).
+    match exists_within(Path::new(&path), DEFAULT_TIMEOUT) {
+        Ok(true) => {}
+        Ok(false) => {
+            let e = ClientError::Open(OpenError::NotFound(path));
+            return Err(AttemptError::Plain(e.into()));
+        }
+        // A dead share: offline for this take (and, cached by the probe,
+        // for the next few seconds' too).
+        Err(TimedOut) => {
+            let why = format!("{path} (its storage isn't answering)");
+            let e = ClientError::Open(OpenError::NotFound(why));
+            return Err(AttemptError::Plain(e.into()));
+        }
+    }
+    if let Some(failed) = failed {
+        if failed.still_valid(&path) {
+            return Err(AttemptError::Plain(failed.error().into()));
+        }
+        attempt.stale_failure = true;
+    }
+    let options = ClientOptions {
+        threads: Some(attempt.threads),
+        ..Default::default()
+    };
+    // Registered as soon as the process exists, BEFORE its handshake and the
+    // open: a sidecar that hangs starting up (or opening a file on a hung
+    // network share) never returns, and stopping a session kills it
+    // through this.
+    let mut busy = None;
+    let spawned = DecoderClient::spawn_with_kill_handle(
+        bin,
+        std::iter::empty::<(&str, &str)>(),
+        options,
+        |kill| {
+            *kill_slot.lock() = Some(kill.clone());
+            busy = Some(sidecars.register(kill));
+        },
+    );
+    let mut client = match spawned {
+        Ok(client) => client,
+        Err(e) => {
+            let stopped = busy.as_ref().is_some_and(Busy::killed_by_stop);
+            let why = if stopped {
+                format!("stopped while starting a decoder for {path} ({e})")
+            } else {
+                e.to_string()
+            };
+            return Err(AttemptError::Plain(EngineError::DecoderSpawn(why)));
+        }
+    };
+    attempt.spawned = true;
+    let busy = busy.unwrap_or_else(|| sidecars.register(client.kill_handle()));
+    match client.open(&path) {
+        Ok(info) => Ok((client, info, busy)),
+        // Killed by a stopping session, not the file's fault: nothing to
+        // remember about the file, and NOT a file fault (`file_fault`), so a
+        // good proxy isn't marked broken and remade.
+        Err(e) if busy.killed_by_stop() => {
+            drop(client);
+            Err(AttemptError::Plain(EngineError::DecoderSpawn(format!(
+                "stopped while opening {path} ({e})"
+            ))))
+        }
+        Err(ClientError::Open(e)) => {
+            let _ = client.shutdown();
+            Err(AttemptError::Open(e))
+        }
+        Err(e) => {
+            // Dropping the client kills whatever is left of the sidecar.
+            drop(client);
+            Err(AttemptError::Crashed(e))
+        }
+    }
 }
 
 /// LRU pool of decoder sidecars keyed by path.
@@ -846,77 +1043,62 @@ impl DecoderPool {
         path: &str,
         threads: ThreadBudget,
     ) -> Result<PooledDecoder, EngineError> {
-        // Checked here, not left to the sidecar: no process for a file
-        // that isn't there (offline media).
-        match exists_within(Path::new(path), DEFAULT_TIMEOUT) {
-            Ok(true) => {}
-            Ok(false) => return Err(ClientError::Open(OpenError::NotFound(path.to_owned())).into()),
-            // A dead share: offline for this take (and, cached by the probe,
-            // for the next few seconds' too).
-            Err(TimedOut) => {
-                let why = format!("{path} (its storage isn't answering)");
-                return Err(ClientError::Open(OpenError::NotFound(why)).into());
-            }
+        let attempt = self.pending_open(path, path, None, threads).open();
+        self.finish_open(attempt)
+    }
+
+    /// The slow part of opening `file` (for `requested`), as a detached job.
+    fn pending_open(
+        &self,
+        file: &str,
+        requested: &str,
+        proxy_for: Option<String>,
+        threads: ThreadBudget,
+    ) -> PendingOpen {
+        PendingOpen {
+            bin: self.bin.clone(),
+            file: file.to_owned(),
+            requested: requested.to_owned(),
+            proxy_for,
+            first_open: !self.region_bytes.contains_key(file),
+            threads,
+            sidecars: self.sidecars.clone(),
+            failed: self.failed_opens.get(file).cloned(),
+            kill: Arc::default(),
         }
-        if let Some(failed) = self.failed_opens.get(path) {
-            if failed.still_valid(path) {
-                return Err(failed.error().into());
-            }
-            self.failed_opens.remove(path);
+    }
+
+    /// Take in what an open learned: the file's region size and stream, or
+    /// why it failed (remembered as `spawn_open` always did).
+    fn finish_open(&mut self, attempt: OpenAttempt) -> Result<PooledDecoder, EngineError> {
+        let OpenAttempt {
+            file,
+            threads,
+            spawned,
+            stale_failure,
+            outcome,
+            ..
+        } = attempt;
+        if stale_failure {
+            self.failed_opens.remove(&file);
         }
-        let options = ClientOptions {
-            threads: Some(threads),
-            ..Default::default()
-        };
-        // Registered as soon as the process exists, BEFORE its handshake
-        // and the open: a sidecar that hangs starting up (or opening a file
-        // on a hung network share) never returns, and stopping a session
-        // kills it through this.
-        let sidecars = self.sidecars.clone();
-        let mut busy = None;
-        let spawned = DecoderClient::spawn_with_kill_handle(
-            &self.bin,
-            std::iter::empty::<(&str, &str)>(),
-            options,
-            |kill| busy = Some(sidecars.register(kill)),
-        );
-        let mut client = match spawned {
-            Ok(client) => client,
-            Err(e) => {
-                let stopped = busy.as_ref().is_some_and(Busy::killed_by_stop);
-                let why = if stopped {
-                    format!("stopped while starting a decoder for {path} ({e})")
-                } else {
-                    e.to_string()
-                };
-                return Err(EngineError::DecoderSpawn(why));
-            }
-        };
-        self.spawns += 1;
-        let busy = busy.unwrap_or_else(|| self.sidecars.register(client.kill_handle()));
-        match client.open(path) {
-            Ok(info) => {
+        if spawned {
+            self.spawns += 1;
+        }
+        match outcome {
+            Ok((client, info, busy)) => {
                 self.region_bytes
-                    .insert(path.to_owned(), client.transport_stats().shm_bytes);
-                self.infos.insert(path.to_owned(), info.clone());
-                self.logged.remove(path);
-                Ok(self.check_out(client, path.to_owned(), info, threads, busy))
+                    .insert(file.clone(), client.transport_stats().shm_bytes);
+                self.infos.insert(file.clone(), info.clone());
+                self.logged.remove(&file);
+                Ok(self.check_out(client, file, info, threads, busy))
             }
-            // Killed by a stopping session, not the file's fault: nothing to
-            // remember about the file, and NOT a file fault (`file_fault`),
-            // so a good proxy isn't marked broken and remade.
-            Err(e) if busy.killed_by_stop() => {
-                drop(client);
-                Err(EngineError::DecoderSpawn(format!(
-                    "stopped while opening {path} ({e})"
-                )))
-            }
-            Err(ClientError::Open(e)) => {
-                self.remember_failed_open(path, OpenFailure::Open(e.clone()));
-                let _ = client.shutdown();
+            Err(AttemptError::Plain(e)) => Err(e),
+            Err(AttemptError::Open(e)) => {
+                self.remember_failed_open(&file, OpenFailure::Open(e.clone()));
                 Err(ClientError::Open(e).into())
             }
-            Err(e) => {
+            Err(AttemptError::Crashed(e)) => {
                 // Intentional: an open that kills the sidecar (or breaks the
                 // protocol) is cached like an `OpenError`, or every scrub
                 // frame would spawn a sidecar for the same crash.
@@ -924,10 +1106,85 @@ impl DecoderPool {
                     ClientError::Ipc(inner) => inner.to_string(),
                     other => other.to_string(),
                 };
-                self.remember_failed_open(path, OpenFailure::Crashed(msg));
-                // Dropping the client kills whatever is left of the sidecar.
-                drop(client);
+                self.remember_failed_open(&file, OpenFailure::Crashed(msg));
                 Err(e.into())
+            }
+        }
+    }
+
+    /// [`Self::take`] without waiting on a sidecar: an idle decoder now, or
+    /// the open to run elsewhere ([`PendingOpen::open`], then
+    /// [`Self::adopt`]). The budget picks the file as `take` does, except
+    /// that a file's FIRST open always opens the requested file: its size
+    /// is learned in `adopt`, and the next reserve swaps in its proxy if it
+    /// is over the budget. A proxy that won't open is marked broken in
+    /// `adopt`, and the next reserve opens its original.
+    pub fn reserve(&mut self, requested: &str, active_layers: usize) -> Reservation {
+        let threads = thread_budget(active_layers);
+        // A proxy named directly ("use proxies") that is known not to open.
+        let path = self
+            .broken_original(requested)
+            .unwrap_or_else(|| requested.to_owned());
+        if let Some(d) = self.reuse_idle(&path, threads) {
+            self.opened.insert(requested.to_owned(), d.path.clone());
+            return Reservation::Ready(d);
+        }
+        let proxy = self.proxies.get(&path).filter(|p| **p != path).cloned();
+        let file = match self.region_bytes.get(&path) {
+            Some(&needed) => match budget_choice(
+                self.out_bytes(),
+                needed,
+                self.budget.cap_bytes,
+                proxy.as_deref(),
+            ) {
+                BudgetChoice::Proxy(p) => p,
+                BudgetChoice::NeedsProxy => {
+                    self.request_proxy(&path);
+                    path.clone()
+                }
+                BudgetChoice::Fits => path.clone(),
+            },
+            None => path.clone(),
+        };
+        if file != path {
+            if let Some(d) = self.reuse_idle(&file, threads) {
+                self.opened.insert(requested.to_owned(), d.path.clone());
+                return Reservation::Ready(d);
+            }
+        }
+        let needed = self.region_bytes.get(&file).copied();
+        self.evict_idle(1, Some(needed.unwrap_or(0)));
+        let proxy_for = if file != path {
+            Some(path.clone())
+        } else {
+            self.original_of_proxy(&file)
+        };
+        Reservation::Pending(self.pending_open(&file, requested, proxy_for, threads))
+    }
+
+    /// Check out what a [`PendingOpen`] opened (or learn why it couldn't):
+    /// the end of a [`Self::reserve`].
+    pub fn adopt(&mut self, attempt: OpenAttempt) -> Result<PooledDecoder, EngineError> {
+        let requested = attempt.requested.clone();
+        let file = attempt.file.clone();
+        let proxy_for = attempt.proxy_for.clone();
+        let first_open = attempt.first_open;
+        let out_before = self.out_bytes();
+        match self.finish_open(attempt) {
+            Ok(d) => {
+                let over = budget_choice(out_before, d.checkout.bytes, self.budget.cap_bytes, None);
+                let has_proxy = self.proxies.get(&file).is_some_and(|p| *p != file);
+                if first_open && over == BudgetChoice::NeedsProxy && !has_proxy {
+                    self.request_proxy(&file);
+                }
+                self.opened.insert(requested, d.path.clone());
+                Ok(d)
+            }
+            Err(e) => {
+                if let Some(original) = proxy_for.filter(|_| file_fault(&e)) {
+                    self.mark_broken_proxy(&file, &original, &e);
+                }
+                Err(e)
             }
         }
     }
@@ -1000,7 +1257,7 @@ pub(crate) mod tests {
     }
 
     /// `n` copies of the fixture under distinct names (distinct pool keys).
-    fn copies(dir: &Path, n: usize) -> Vec<String> {
+    pub(crate) fn copies(dir: &Path, n: usize) -> Vec<String> {
         (0..n)
             .map(|i| {
                 let p = dir.join(format!("clip{i}.mp4"));
@@ -1656,6 +1913,80 @@ pub(crate) mod tests {
         assert_eq!(fs_probe::tests::checks(&clip), 1);
         assert_eq!(pool.spawns, 0, "no sidecar for a file that doesn't answer");
         fs_probe::tests::release(&clip);
+    }
+
+    /// `reserve`, the open on another thread, then `adopt`.
+    fn reserve_on_a_worker(
+        pool: &mut DecoderPool,
+        path: &str,
+    ) -> Result<PooledDecoder, EngineError> {
+        match pool.reserve(path, 1) {
+            Reservation::Ready(d) => Ok(d),
+            Reservation::Pending(open) => {
+                let attempt = std::thread::spawn(move || open.open()).join().unwrap();
+                pool.adopt(attempt)
+            }
+        }
+    }
+
+    #[test]
+    fn reserve_gives_an_idle_decoder_or_an_open_to_run_elsewhere() {
+        let Some(bin) = decoder_bin() else { return };
+        let path = fixture().to_string_lossy().into_owned();
+        let mut pool = DecoderPool::new(bin, 6, big_budget());
+        assert!(
+            matches!(pool.reserve(&path, 1), Reservation::Pending(_)),
+            "nothing idle"
+        );
+        assert_eq!(pool.spawns, 0, "reserve itself never spawns");
+        let mut d = reserve_on_a_worker(&mut pool, &path).expect("opened on a worker");
+        assert_eq!((d.path.as_str(), pool.spawns), (path.as_str(), 1));
+        assert_eq!(pool.opened_path(&path), Some(path.as_str()));
+        assert!(
+            pool.stream_info(&path).is_some(),
+            "adopt learned the stream"
+        );
+        decode_one(&mut d);
+        pool.put(d);
+        let Reservation::Ready(d) = pool.reserve(&path, 1) else {
+            panic!("the idle decoder")
+        };
+        assert_eq!(frames_seen(&d), 1);
+        drop(d);
+    }
+
+    #[test]
+    fn an_adopted_failed_open_is_remembered() {
+        let Some(bin) = decoder_bin() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("junk.mp4");
+        std::fs::write(&junk, b"not a video").unwrap();
+        let junk = junk.to_string_lossy().into_owned();
+        let mut pool = DecoderPool::new(bin, 6, big_budget());
+        assert!(reserve_on_a_worker(&mut pool, &junk).is_err());
+        assert_eq!(pool.spawns, 1);
+        assert!(pool.failed_opens.contains_key(&junk), "cached as before");
+        assert!(reserve_on_a_worker(&mut pool, &junk).is_err());
+        assert_eq!(pool.spawns, 1, "the cached failure, no new sidecar");
+    }
+
+    #[test]
+    fn a_proxy_failing_in_adopt_is_broken_and_the_next_reserve_opens_the_original() {
+        let Some(bin) = decoder_bin() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let original = copies(dir.path(), 1).remove(0);
+        let proxy = dir.path().join("o.proxy.mov");
+        std::fs::write(&proxy, b"truncated").unwrap();
+        let proxy = proxy.to_string_lossy().into_owned();
+        let mut pool = DecoderPool::new(bin, 6, big_budget());
+        pool.set_proxy_paths(HashMap::from([(original.clone(), proxy.clone())]));
+        // "Use proxies": the proxy is asked for by name.
+        assert!(reserve_on_a_worker(&mut pool, &proxy).is_err());
+        assert_eq!(pool.take_broken_proxies(), std::slice::from_ref(&proxy));
+        assert_eq!(pool.take_proxy_requests(), std::slice::from_ref(&original));
+        let d = reserve_on_a_worker(&mut pool, &proxy).expect("the original");
+        assert_eq!(d.path, original);
+        assert_eq!(pool.opened_path(&proxy), Some(original.as_str()));
     }
 
     #[test]

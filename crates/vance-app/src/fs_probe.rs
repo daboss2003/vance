@@ -57,10 +57,20 @@ pub fn mtime_within(path: &Path, timeout: Duration) -> Result<Option<SystemTime>
     stat_within(path, timeout).map(|s| s.mtime)
 }
 
+/// `path`'s `(modification time, length in bytes)` (`Ok(None)`: no such
+/// file), if the file system answers within `timeout`.
+pub fn metadata_within(
+    path: &Path,
+    timeout: Duration,
+) -> Result<Option<(Option<SystemTime>, u64)>, TimedOut> {
+    stat_within(path, timeout).map(|s| s.exists.then_some((s.mtime, s.len)))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Stat {
     exists: bool,
     mtime: Option<SystemTime>,
+    len: u64,
 }
 
 #[derive(Default)]
@@ -166,10 +176,12 @@ fn check(path: &Path) -> Stat {
         Ok(meta) => Stat {
             exists: true,
             mtime: meta.modified().ok(),
+            len: meta.len(),
         },
         Err(_) => Stat {
             exists: false,
             mtime: None,
+            len: 0,
         },
     }
 }
@@ -237,6 +249,9 @@ pub(crate) mod tests {
         );
         let want = std::fs::metadata(&file).unwrap().modified().ok();
         assert_eq!(mtime_within(&file, DEFAULT_TIMEOUT), Ok(want));
+        assert_eq!(metadata_within(&file, DEFAULT_TIMEOUT), Ok(Some((want, 1))));
+        let gone = dir.path().join("gone.mp4");
+        assert_eq!(metadata_within(&gone, DEFAULT_TIMEOUT), Ok(None));
     }
 
     #[test]
@@ -254,6 +269,7 @@ pub(crate) mod tests {
         // Cached: answered at once, with no new check.
         let again = Instant::now();
         assert_eq!(mtime_within(&dead, timeout), Err(TimedOut));
+        assert_eq!(metadata_within(&dead, timeout), Err(TimedOut));
         assert_eq!(exists_within(&dead, Duration::from_secs(5)), Err(TimedOut));
         assert!(again.elapsed() < Duration::from_millis(50), "cached");
         assert_eq!(checks(&dead), 1, "one stuck check, not one per call");
