@@ -1572,7 +1572,11 @@ fn hdr_compare(a: &[u8], b: &[u8], img: &RgbaImage, w2o: vance_color::Transform)
                     .max(1.0);
                 pq_linear(c.saturating_add(ulp as u16)) - pq_linear(c)
             };
-            let allowed = eight_bit + f16 + pq_step(a) + pq_step(b);
+            // Intentional: an f16 store may flush a subnormal (< 2^-14) to 0;
+            // Vulkan allows it and Mesa's lavapipe does it, Metal doesn't. One
+            // flush per side's working-space chain, carried into the output.
+            let f16_flush = 2.0 * 2f64.powi(-14) * norm(&w2o, ch);
+            let allowed = eight_bit + f16 + f16_flush + pq_step(a) + pq_step(b);
             let err = (lin(a, ch) - lin(b, ch)).abs();
             let ratio = err / allowed;
             if ratio > worst.0 {
