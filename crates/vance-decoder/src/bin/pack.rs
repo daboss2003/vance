@@ -97,9 +97,12 @@ pub fn has_alpha(pf: ffmpeg::format::Pixel) -> bool {
 /// Whether `pf` holds RGB (or palette / XYZ) samples rather than YUV or
 /// gray, so no YUV matrix or range applies to it.
 pub fn is_rgb_like(pf: ffmpeg::format::Pixel) -> bool {
-    use ffmpeg::sys::{AV_PIX_FMT_FLAG_PAL, AV_PIX_FMT_FLAG_RGB, AV_PIX_FMT_FLAG_XYZ};
-    let rgb = (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL | AV_PIX_FMT_FLAG_XYZ) as u64;
-    pixel_flags(pf) & rgb != 0
+    use ffmpeg::format::Pixel as P;
+    use ffmpeg::sys::{AV_PIX_FMT_FLAG_PAL, AV_PIX_FMT_FLAG_RGB};
+    let rgb = (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL) as u64;
+    // Intentional: XYZ is matched by format, not by AV_PIX_FMT_FLAG_XYZ,
+    // which only FFmpeg 7+ defines (Linux CI builds against FFmpeg 6.1).
+    pixel_flags(pf) & rgb != 0 || matches!(pf, P::XYZ12LE | P::XYZ12BE)
 }
 
 /// Whether every alpha sample of `frame` (a format with alpha) is 0. Read

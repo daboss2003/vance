@@ -31,6 +31,25 @@ fn probe(path: &Path, field: &str) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// `field` of the first frame of `path`'s video stream, via ffprobe.
+fn probe_first_frame(path: &Path, field: &str) -> String {
+    let out = Command::new("ffprobe")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-select_streams",
+            "v:0",
+        ])
+        .args(["-read_intervals", "%+#1"])
+        .args(["-show_entries", &format!("frame={field}")])
+        .args(["-of", "default=noprint_wrappers=1:nokey=1"])
+        .arg(path)
+        .output()
+        .expect("run ffprobe");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 /// The frame at `t` of `path`, decoded by ffmpeg to `pix_fmt` (rgb24 /
 /// rgba) at `w × h`.
 fn decode_as(path: &Path, pix_fmt: &str, (w, h): (u32, u32), t: f64) -> Vec<u8> {
@@ -434,7 +453,13 @@ fn an_hdr_proxy_is_tagged_hdr_and_previews_like_the_original() {
         ("width", "160"),
         ("height", "120"),
     ] {
-        assert_eq!(probe(&proxy, field), want, "HDR proxy {field}");
+        let got = match probe(&proxy, field) {
+            // Intentional: FFmpeg 7's ffprobe leaves a ProRes stream's range
+            // "unknown" and reports it on the frames (FFmpeg 8 fills both).
+            s if field == "color_range" && s == "unknown" => probe_first_frame(&proxy, field),
+            s => s,
+        };
+        assert_eq!(got, want, "HDR proxy {field}");
     }
     let marker = vance_app_lib::proxy::current_marker(&proxy).expect("a current marker");
     assert_eq!(
