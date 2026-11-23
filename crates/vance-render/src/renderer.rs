@@ -146,9 +146,9 @@ pub struct Renderer {
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     /// Whether the device enabled `TEXTURE_FORMAT_16BIT_NORM` (needed for
-    /// R16Unorm 10-bit plane textures). When false, a 10-bit source falls
-    /// back to 8-bit R8 planes (down-shifted) instead of crashing — the
-    /// feature is native-only and absent on some Vulkan/GL adapters.
+    /// R16Unorm 10-bit plane textures). When false, a 10-bit source uploads
+    /// as two-byte Rg8 planes the shader filters (the same 10-bit codes) —
+    /// the feature is native-only and absent on some Vulkan/GL adapters.
     supports_r16: bool,
     /// Plane textures ([`frame_planes`]): Y / U / V, Y / UV (NV12), or RGBA
     /// in the Y slot; an unused slot holds a 1×1 dummy. `None` until the
@@ -196,8 +196,6 @@ pub struct Renderer {
     blit: Option<BlitResources>,
     /// M1 multi-layer compositor on the same device (ADR 0007).
     compositor: crate::compositor::Compositor,
-    /// Reused buffer for the 10-bit → 8-bit plane fallback.
-    plane_scratch: Vec<u8>,
 }
 
 /// Resources for the RGBA passthrough blit (a fullscreen-triangle
@@ -1200,7 +1198,6 @@ impl Renderer {
             current_params: initial_params,
             blit: None,
             compositor,
-            plane_scratch: Vec::new(),
         })
     }
 
@@ -1516,8 +1513,7 @@ impl Renderer {
                 got: frame.bytes.len(),
             });
         }
-        let mut scratch = std::mem::take(&mut self.plane_scratch);
-        let fp = frame_planes(frame, self.supports_r16, &mut scratch);
+        let fp = frame_planes(frame, self.supports_r16);
         let slots = [&mut self.tex_y, &mut self.tex_u, &mut self.tex_v];
         let labels = ["tex_y", "tex_u", "tex_v"];
         let mut realloc = false;
@@ -1540,7 +1536,6 @@ impl Renderer {
         next.source[1] = fp.kind;
         next.source[2] = fp.ten_bit as u32;
         next.pixel_aspect = frame.color.pixel_aspect();
-        self.plane_scratch = scratch;
         if bytemuck::bytes_of(&next) != bytemuck::bytes_of(&self.current_params) {
             self.current_params = next;
             self.queue.write_buffer(
@@ -2409,6 +2404,9 @@ pub(crate) const SRC_PLANAR: u32 = 0;
 pub(crate) const SRC_RGBA: u32 = 1;
 /// NV12: Y + one interleaved two-channel UV plane.
 pub(crate) const SRC_NV12: u32 = 2;
+/// 10-bit Y / U / V as little-endian two-byte Rg8 texels (no 16-bit-norm
+/// textures): filtered in the shader.
+pub(crate) const SRC_PLANAR10: u32 = 3;
 
 /// One plane texture's upload: its size and format and the tightly packed
 /// rows.
@@ -2431,17 +2429,12 @@ pub(crate) struct FramePlanes<'a> {
     pub(crate) planes: [Option<Plane<'a>>; 3],
 }
 
-/// The plane uploads of `frame`, as views into its bytes: NV12's UV plane
-/// stays interleaved (a two-channel texture), 10-bit samples stay
-/// little-endian `u16` for R16Unorm planes, RGBA8 is one plane. The one
-/// copy is the fallback for a GPU without 16-bit-norm textures: 10-bit
-/// samples are rounded to 8 bits into `scratch` (reused across frames) —
-/// 8-bit precision, but the clip plays instead of crashing.
-pub(crate) fn frame_planes<'a>(
-    frame: &'a FrameData,
-    supports_r16: bool,
-    scratch: &'a mut Vec<u8>,
-) -> FramePlanes<'a> {
+/// The plane uploads of `frame`, as views into its bytes (no copies): NV12's
+/// UV plane stays interleaved (a two-channel texture), 10-bit samples stay
+/// little-endian `u16` — R16Unorm planes, or on a GPU without 16-bit-norm
+/// textures two-byte Rg8Unorm planes the shader filters itself (the same
+/// 10-bit codes) — and RGBA8 is one plane.
+pub(crate) fn frame_planes<'a>(frame: &'a FrameData, supports_r16: bool) -> FramePlanes<'a> {
     use wgpu::TextureFormat::{R16Unorm, R8Unorm, Rg8Unorm, Rgba8Unorm};
     let (w, h) = (frame.width, frame.height);
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
@@ -2492,20 +2485,12 @@ pub(crate) fn frame_planes<'a>(
             sample_scale: 65535.0 / 1023.0,
             planes: planar(bytes, R16Unorm, 2),
         },
-        PixelFormat::Yuv420P10Le => {
-            scratch.clear();
-            scratch.extend(bytes.chunks_exact(2).map(|c| {
-                let code = u16::from_le_bytes([c[0], c[1]]).min(1023);
-                ((code + 2) >> 2).min(255) as u8
-            }));
-            let shifted: &'a [u8] = scratch;
-            FramePlanes {
-                kind: SRC_PLANAR,
-                ten_bit: false,
-                sample_scale: 1.0,
-                planes: planar(shifted, R8Unorm, 1),
-            }
-        }
+        PixelFormat::Yuv420P10Le => FramePlanes {
+            kind: SRC_PLANAR10,
+            ten_bit: true,
+            sample_scale: 1.0,
+            planes: planar(bytes, Rg8Unorm, 2),
+        },
         PixelFormat::Rgba8 => FramePlanes {
             kind: SRC_RGBA,
             ten_bit: false,
@@ -2580,8 +2565,8 @@ async fn create_device(
     let limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
     // R16Unorm plane textures (10-bit YUV sources) need TEXTURE_FORMAT_16BIT_
     // NORM, which is a native (non-baseline) feature. Request it only when
-    // the adapter offers it (universal on desktop Metal/Vulkan/D3D12); 8-bit
-    // decode + everything else works without it.
+    // the adapter offers it (universal on desktop Metal/Vulkan/D3D12);
+    // without it 10-bit planes upload as two-byte Rg8 texels.
     let features = wgpu::Features::TEXTURE_FORMAT_16BIT_NORM & adapter.features();
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
@@ -2673,6 +2658,42 @@ mod layout_tests {
     // size is hand-computed from the std140 layout; a mismatch means
     // the shader will read grade/pipeline fields at the wrong offset
     // and silently corrupt output.
+    #[test]
+    fn legacy_ten_bit_fallback_matches_the_r16_path() {
+        let (w, h) = (34u32, 18u32);
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let mut bytes = Vec::new();
+        for (n, base) in [(w * h, 64u16), (cw * ch, 300), (cw * ch, 700)] {
+            for i in 0..n {
+                bytes.extend_from_slice(&(base + (i * 13 % 800) as u16).min(1019).to_le_bytes());
+            }
+        }
+        let frame = FrameData {
+            pts: 0,
+            width: w,
+            height: h,
+            pixel_format: PixelFormat::Yuv420P10Le,
+            strides: vec![w, cw, cw],
+            bytes: bytes.into(),
+            color: Default::default(),
+        };
+        let run = |r16: bool| {
+            let mut r = Renderer::new(RendererConfig::default()).expect("renderer");
+            r.supports_r16 = r16 && r.supports_r16;
+            r.upload_frame(&frame).unwrap();
+            r.render_to_rgba_buffer(w, h).unwrap()
+        };
+        let (hi, lo) = (run(true), run(false));
+        let d = hi
+            .iter()
+            .zip(&lo)
+            .map(|(a, b)| (*a as i32 - *b as i32).abs())
+            .max()
+            .unwrap();
+        // Same 10-bit codes on both paths (see the compositor's test).
+        assert!(d <= 1, "legacy 10-bit fallback vs R16: max diff {d}");
+    }
+
     #[test]
     fn render_params_size_matches_std140() {
         // Field offsets (bytes), all naturally 4/16-aligned under repr(C):

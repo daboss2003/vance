@@ -1507,8 +1507,100 @@ fn read_texture_rgba8(r: &Renderer, t: &wgpu::Texture) -> Vec<u8> {
 
 // ---- HDR pack / unpack primaries (B7) ---------------------------------------
 
+/// A PQ rgba64 code as linear light (working 1.0 = 100 cd/m²).
+fn pq_linear(code: u16) -> f64 {
+    let (m1, m2, c1, c2, c3) = (0.1593017578125, 78.84375, 0.8359375, 18.8515625, 18.6875);
+    let v = (code as f64 / 65535.0).powf(1.0 / m2);
+    ((v - c1).max(0.0) / (c2 - c3 * v)).powf(1.0 / m1) * 100.0
+}
+
+fn srgb_linear(code: f64) -> f64 {
+    let e = (code / 255.0).clamp(0.0, 1.0);
+    if e <= 0.04045 {
+        e / 12.92
+    } else {
+        ((e + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Compare two PQ rgba64 renders of the straight sRGB `img` (output
+/// primaries Rec.2020, working → output `w2o`) per channel in linear light,
+/// against what precision allows at that pixel: one 8-bit sRGB code of the
+/// source (a GPU may round the CPU copy differently) through Rec.709 →
+/// Rec.2020 and the alpha, four f16 roundings of the largest working value
+/// (slot and accumulator, each side) into the output primaries, and one f16
+/// step of the PQ code each side. Returns the worst error / allowance and
+/// where it is.
+fn hdr_compare(a: &[u8], b: &[u8], img: &RgbaImage, w2o: vance_color::Transform) -> (f64, String) {
+    let m = vance_color::transform::primaries_to_primaries(
+        vance_color::Primaries::Bt709,
+        vance_color::Primaries::Bt2020,
+    );
+    let o2w = w2o.inverse();
+    let norm =
+        |t: &vance_color::Transform, i: usize| t.0[i].iter().map(|v| v.abs() as f64).sum::<f64>();
+    let o2w_max = (0..3).map(|i| norm(&o2w, i)).fold(0.0, f64::max);
+    let mut worst = (0.0f64, String::new());
+    for p in 0..(img.width * img.height) as usize {
+        let src = &img.pixels[p * 4..p * 4 + 4];
+        let alpha = src[3] as f64 / 255.0;
+        let code =
+            |f: &[u8], ch: usize| u16::from_le_bytes([f[p * 8 + 2 * ch], f[p * 8 + 2 * ch + 1]]);
+        let lin = |f: &[u8], ch: usize| pq_linear(code(f, ch));
+        let largest = (0..3)
+            .map(|ch| lin(a, ch).max(lin(b, ch)))
+            .fold(0.0, f64::max);
+        let step: Vec<f64> = (0..3)
+            .map(|j| {
+                let c = src[j] as f64;
+                (srgb_linear(c + 1.0) - srgb_linear(c)).max(srgb_linear(c) - srgb_linear(c - 1.0))
+            })
+            .collect();
+        for ch in 0..3 {
+            let eight_bit = alpha
+                * (0..3)
+                    .map(|j| m.0[ch][j].abs() as f64 * step[j])
+                    .sum::<f64>();
+            let f16 = 4.0 * 2f64.powi(-11) * largest * o2w_max * norm(&w2o, ch);
+            // The readback target is Rgba16Float: PQ codes carry f16
+            // spacing (16 codes around 0.4).
+            let pq_step = |f: &[u8]| {
+                let c = code(f, ch);
+                let e = (c as f64 / 65535.0).max(2f64.powi(-14));
+                let ulp = (2f64.powi(e.log2().floor() as i32 - 10) * 65535.0)
+                    .ceil()
+                    .max(1.0);
+                pq_linear(c.saturating_add(ulp as u16)) - pq_linear(c)
+            };
+            let allowed = eight_bit + f16 + pq_step(a) + pq_step(b);
+            let err = (lin(a, ch) - lin(b, ch)).abs();
+            let ratio = err / allowed;
+            if ratio > worst.0 {
+                worst = (
+                    ratio,
+                    format!(
+                        "pixel {p} ch{ch}: source {src:?}, PQ code {} vs {}, linear {:.6} vs \
+                         {:.6}, allowed ±{allowed:.6}",
+                        code(a, ch),
+                        code(b, ch),
+                        lin(a, ch),
+                        lin(b, ch)
+                    ),
+                );
+            }
+        }
+    }
+    worst
+}
+
 #[test]
 fn hdr_readback_round_trips_in_a_wide_working_space() {
+    // Read back → write back must reproduce the layer up to what precision
+    // allows (`hdr_compare`). Not a fixed PQ-code tolerance: near black one
+    // 8-bit sRGB code is ~1000 PQ codes, so a GPU rounding the CPU copy
+    // differently (float → unorm8) looks like a bug there; and not straight
+    // sRGB, where converting wide-gamut values back to Rec.709 multiplies
+    // the f16 error of a saturated colour.
     let img = rgba8_frame(16, 8).1;
     for working in [
         vance_color::ColorSpace::LinearRec2020,
@@ -1532,20 +1624,44 @@ fn hdr_readback_round_trips_in_a_wide_working_space() {
             .unwrap();
         c.composite(l, NORMAL).unwrap();
         let direct = c.finish_to_rgba64().unwrap();
-        // … and through a CPU round trip (read → write).
-        c.begin_frame(&spec).unwrap();
-        let l = c
-            .render_layer(LayerKey(1), LayerSource::Rgba(&img), &params(p))
-            .unwrap();
-        let back = c.read_layer_rgba8(l).unwrap();
+        // … and through a CPU round trip (read → write → read).
+        let trip = |c: &mut Compositor, edit: &dyn Fn(&mut RgbaImage)| {
+            c.begin_frame(&spec).unwrap();
+            let l = c
+                .render_layer(LayerKey(1), LayerSource::Rgba(&img), &params(p))
+                .unwrap();
+            let mut back = c.read_layer_rgba8(l).unwrap();
+            edit(&mut back);
+            c.write_layer_rgba8(l, &back).unwrap();
+            let again = c.read_layer_rgba8(l).unwrap();
+            c.composite(l, NORMAL).unwrap();
+            (back, again, c.finish_to_rgba64().unwrap())
+        };
+        let (back, again, tripped) = trip(c, &|_| {});
         let d = max_diff_u8(&back.pixels, &img.pixels);
         assert!(d <= 1, "{working:?}: readback vs the sRGB source: {d}");
-        c.write_layer_rgba8(l, &back).unwrap();
-        c.composite(l, NORMAL).unwrap();
-        let tripped = c.finish_to_rgba64().unwrap();
-        let d = max_diff_u16(&direct, &tripped);
-        // An 8-bit straight round trip in PQ: a few hundred 16-bit codes.
-        assert!(d <= 700, "{working:?}: write-back composite vs direct: {d}");
+        let d = max_diff_u8(&again.pixels, &back.pixels);
+        assert!(
+            d <= 1,
+            "{working:?}: read after write vs what was written: {d}"
+        );
+        let (d, at) = hdr_compare(&direct, &tripped, &img, spec.working_to_output);
+        eprintln!("{working:?}: write-back composite vs direct: {d:.2} of the allowance ({at})");
+        assert!(
+            d <= 1.0,
+            "{working:?}: write-back composite vs direct: {d:.2} × allowed at {at}"
+        );
+        if working == vance_color::ColorSpace::LinearRec2020 {
+            // One 8-bit code above the source on the black pixel (0, 0) — as
+            // a GPU rounding differently can produce — is within the
+            // allowance but far past any fixed PQ-code tolerance.
+            let one_up = img.pixels[0] + 1;
+            let (_, _, tripped) = trip(c, &|b: &mut RgbaImage| b.pixels[0] = one_up);
+            let (d, at) = hdr_compare(&direct, &tripped, &img, spec.working_to_output);
+            assert!(d <= 1.0, "one code on black: {d:.2} × allowed at {at}");
+            let pq = max_diff_u16(&direct, &tripped);
+            assert!(pq > 700, "one code on black is {pq} PQ codes");
+        }
     }
 }
 

@@ -303,8 +303,6 @@ struct LayerSlot {
     planes: [Option<wgpu::Texture>; 3],
     /// An RGBA source (images, titles, RGBA8 frames).
     rgba: Option<wgpu::Texture>,
-    /// Reused buffer for the 10-bit → 8-bit plane fallback.
-    scratch: Vec<u8>,
     lut: Option<(wgpu::Texture, Arc<vance_color::Lut3d>)>,
     atlas: Option<wgpu::Texture>,
     /// Curve inputs baked into `atlas`.
@@ -1253,7 +1251,6 @@ impl LayerSlot {
         Self {
             planes: [None, None, None],
             rgba: None,
-            scratch: Vec::new(),
             lut: None,
             atlas: None,
             curves: Vec::new(),
@@ -1288,8 +1285,7 @@ impl LayerSlot {
             self.upload_rgba(device, queue, f.width, f.height, &f.bytes);
             return SourceFormat::RGBA;
         }
-        let mut scratch = std::mem::take(&mut self.scratch);
-        let fp = frame_planes(f, supports_r16, &mut scratch);
+        let fp = frame_planes(f, supports_r16);
         for (slot, plane) in self.planes.iter_mut().zip(&fp.planes) {
             match plane {
                 Some(p) => {
@@ -1310,7 +1306,6 @@ impl LayerSlot {
             ten_bit: fp.ten_bit,
             sample_scale: fp.sample_scale,
         };
-        self.scratch = scratch;
         self.rgba = None;
         format
     }
@@ -2840,7 +2835,7 @@ mod tests {
     }
 
     #[test]
-    fn ten_bit_r8_fallback_matches_the_r16_path() {
+    fn ten_bit_fallback_matches_the_r16_path() {
         let r = gpu_renderer();
         let (w, h) = (34u32, 18u32);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
@@ -2883,8 +2878,12 @@ mod tests {
             .map(|(a, b)| (*a as i32 - *b as i32).abs())
             .max()
             .unwrap();
-        // 8-bit precision: within two codes after the transfer curves.
-        assert!(d <= 2, "R8 fallback vs R16: max diff {d}");
+        // The fallback decodes the same 10-bit codes (two bytes per texel,
+        // filtered in the shader), so the paths differ only by float
+        // rounding at the 8-bit output. Luma sits on texel centres and
+        // chroma on quarter-texel offsets here, exact at any filter
+        // precision a conformant GPU has (≥ 4 sub-texel bits).
+        assert!(d <= 1, "10-bit fallback vs R16: max diff {d}");
     }
 
     #[test]

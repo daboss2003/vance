@@ -26,6 +26,9 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 const SRC_PLANAR: u32 = 0u;
 const SRC_RGBA: u32 = 1u;
 const SRC_NV12: u32 = 2u;
+// 10-bit planes as little-endian two-byte Rg8 texels (a GPU without 16-bit
+// norm textures).
+const SRC_PLANAR10: u32 = 3u;
 
 // `y_raw`/`u_raw`/`v_raw` are code / (2^bits − 1): 8-bit R8 samples as they
 // come, 10-bit R16Unorm samples after the sample scale. `range` 0 = limited,
@@ -97,6 +100,28 @@ fn rgba_bilinear(t: texture_2d<f32>, suv: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(m.rgb / m.a, m.a);
 }
 
+// A 10-bit code / 1023 at `uv` from a plane of little-endian two-byte Rg8
+// texels, bilinear with clamp-to-edge like a sampled plane. Done by hand: the
+// two bytes can't be filtered apart, and this keeps all 10 bits.
+fn plane10(t: texture_2d<f32>, uv: vec2<f32>) -> f32 {
+    let dims = vec2<i32>(textureDimensions(t));
+    let p = uv * vec2<f32>(dims) - vec2<f32>(0.5);
+    let f = p - floor(p);
+    let i0 = vec2<i32>(floor(p));
+    let lo = clamp(i0, vec2<i32>(0), dims - vec2<i32>(1));
+    let hi = clamp(i0 + vec2<i32>(1), vec2<i32>(0), dims - vec2<i32>(1));
+    let c00 = code10(textureLoad(t, vec2<i32>(lo.x, lo.y), 0));
+    let c10 = code10(textureLoad(t, vec2<i32>(hi.x, lo.y), 0));
+    let c01 = code10(textureLoad(t, vec2<i32>(lo.x, hi.y), 0));
+    let c11 = code10(textureLoad(t, vec2<i32>(hi.x, hi.y), 0));
+    return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y) / 1023.0;
+}
+
+// The u16 a little-endian two-byte Rg8 texel holds.
+fn code10(t: vec4<f32>) -> f32 {
+    return round(t.r * 255.0) + 256.0 * round(t.g * 255.0);
+}
+
 // A decoded frame's encoded colour + alpha at `uv` from its plane textures:
 // three planes, NV12 (`tu` holds UV in .rg), or RGBA in `ty`. `sc` is the
 // sample scale (1 for 8-bit, 65535/1023 for 10-bit R16Unorm planes).
@@ -115,11 +140,15 @@ fn sample_planes(
     if (kind == SRC_RGBA) {
         return rgba_bilinear(ty, uv);
     }
-    let y = textureSampleLevel(ty, s, uv, 0.0).r * sc;
     // Chroma sits at the centre of its 2×2 luma block (chroma coordinate =
     // luma coordinate / 2). An odd-size frame's chroma plane is ceil(n / 2)
     // wide, so the luma UV is rescaled onto it (exactly ×1 when even).
     let cuv = uv * (vec2<f32>(textureDimensions(ty)) / (2.0 * vec2<f32>(textureDimensions(tu))));
+    if (kind == SRC_PLANAR10) {
+        let rgb = yuv_to_rgb(plane10(ty, uv), plane10(tu, cuv), plane10(tv, cuv), range, matrix, true);
+        return vec4<f32>(rgb, 1.0);
+    }
+    let y = textureSampleLevel(ty, s, uv, 0.0).r * sc;
     var c: vec2<f32>;
     if (kind == SRC_NV12) {
         c = textureSampleLevel(tu, s, cuv, 0.0).rg * sc;

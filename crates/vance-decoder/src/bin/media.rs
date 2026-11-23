@@ -160,7 +160,14 @@ pub fn open(path: &str) -> Result<OpenContext, OpenError> {
     let dts_only = input.format().name() == "avi";
     let stream = input.stream(stream_index).ok_or(OpenError::NoVideoStream)?;
     let time_base = stream.time_base();
-    let frame_rate = displayed_frame_rate(stream.avg_frame_rate(), stream.rate(), dts_only);
+    // SAFETY: the live stream of `input`, its index as the demuxer read it.
+    let avi_step = dts_only.then(|| unsafe { avi_frame_step(stream.as_ptr().cast_mut()) });
+    let frame_rate = displayed_frame_rate(
+        stream.avg_frame_rate(),
+        stream.rate(),
+        avi_step.flatten().map(|step| (step, time_base)),
+        dts_only,
+    );
     let duration = stream.duration();
     let start_time = stream.start_time();
     let codec_id = stream.parameters().id();
@@ -1584,24 +1591,82 @@ fn reduced_aspect(num: c_int, den: c_int) -> (u32, u32) {
     (num / a, den / a)
 }
 
-/// The rate frames are shown at, `(num, den)`: the stream's average frame
-/// rate, except in AVI when FFmpeg's own estimate from the timestamps
-/// (`real`) is lower. AVI's rate is its chunk rate, and a `-c copy` remux
-/// from a 1/600 time base writes 24 chunks a frame, 23 of them empty: 600
-/// "fps" for a 25 fps clip.
+/// The rate frames are shown at, `(num, den)`. The stream's average frame
+/// rate, except in AVI, whose rate is its chunk rate: a `-c copy` remux pads
+/// every frame with empty chunks, how many depending on the FFmpeg version
+/// (23 of 24 from a 1/600 MOV with FFmpeg 7 and 8), and FFmpeg's own
+/// estimate (`real`) isn't the frame rate either (6.1 gives 50 for a 25 fps
+/// MJPEG remux). There `avi_step` is the frames' measured step in ticks of
+/// the time base ([`avi_frame_step`]); without one (no index), `real` when
+/// it is the lower.
 fn displayed_frame_rate(
     avg: ffmpeg::Rational,
     real: ffmpeg::Rational,
+    avi_step: Option<(i64, ffmpeg::Rational)>,
     dts_only: bool,
 ) -> (i64, i64) {
     let pair = |r: ffmpeg::Rational| (i64::from(r.numerator()), i64::from(r.denominator()));
     let (avg, real) = (pair(avg), pair(real));
     let valid = |(n, d): (i64, i64)| n > 0 && d > 0;
+    if let Some((step, time_base)) = avi_step {
+        let (tb_num, tb_den) = pair(time_base);
+        if step > 0 && valid((tb_num, tb_den)) {
+            // frames per second = 1 / (step * time base)
+            let (num, den) = (tb_den, tb_num.saturating_mul(step));
+            let (mut a, mut b) = (num, den);
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
+            return (num / a, den / a);
+        }
+    }
     if dts_only && valid(real) && (!valid(avg) || avg.0 * real.1 > real.0 * avg.1) {
         real
     } else {
         avg
     }
+}
+
+/// Index entries [`avi_frame_step`] looks at: the start of the file says
+/// enough.
+const FRAME_STEP_ENTRIES: c_int = 256;
+
+/// AVI: the step between the stream's frames, in ticks of its time base:
+/// the most common gap between consecutive entries of its index, which
+/// lists only chunks that hold a frame (an empty padding chunk still takes
+/// its tick). `None` without an index.
+///
+/// # Safety
+/// `stream` is a live stream of an open input, not touched meanwhile.
+unsafe fn avi_frame_step(stream: *mut ffmpeg::sys::AVStream) -> Option<i64> {
+    // SAFETY: as the caller promises; each entry is read before the next
+    // call (the pointers stay valid until the context is used).
+    let timestamps: Vec<i64> = unsafe {
+        let n = ffmpeg::sys::avformat_index_get_entries_count(stream).clamp(0, FRAME_STEP_ENTRIES);
+        (0..n)
+            .filter_map(|i| {
+                let entry = ffmpeg::sys::avformat_index_get_entry(stream, i);
+                (!entry.is_null()).then(|| (*entry).timestamp)
+            })
+            .collect()
+    };
+    most_common_step(&timestamps)
+}
+
+/// The most common positive gap between consecutive `timestamps` (the
+/// smaller one on a tie: a stream with dropped frames keeps its base rate).
+fn most_common_step(timestamps: &[i64]) -> Option<i64> {
+    let mut counts = std::collections::BTreeMap::new();
+    for pair in timestamps.windows(2) {
+        let step = pair[1] - pair[0];
+        if step > 0 {
+            *counts.entry(step).or_insert(0u32) += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
+        .map(|(step, _)| step)
 }
 
 /// Codecs we attach VideoToolbox to. Attaching it to anything else (PNG,
@@ -1839,15 +1904,55 @@ mod tests {
     #[test]
     fn avi_frame_rates_come_from_the_timestamps() {
         let r = ffmpeg::Rational::new;
-        assert_eq!(displayed_frame_rate(r(600, 1), r(25, 1), true), (25, 1));
-        assert_eq!(displayed_frame_rate(r(25, 1), r(25, 1), true), (25, 1));
-        assert_eq!(displayed_frame_rate(r(0, 0), r(25, 1), true), (25, 1));
+        // Measured: 24 ticks of 1/600, 2 of 1/50 (whatever FFmpeg's own
+        // estimate says), 1 of 1001/30000.
+        let step = |s, tb| Some((s, tb));
         assert_eq!(
-            displayed_frame_rate(r(30000, 1001), r(30, 1), true),
+            displayed_frame_rate(r(600, 1), r(600, 1), step(24, r(1, 600)), true),
+            (25, 1)
+        );
+        assert_eq!(
+            displayed_frame_rate(r(50, 1), r(50, 1), step(2, r(1, 50)), true),
+            (25, 1)
+        );
+        assert_eq!(
+            displayed_frame_rate(r(30000, 1001), r(30, 1), step(1, r(1001, 30000)), true),
             (30000, 1001)
         );
-        assert_eq!(displayed_frame_rate(r(600, 1), r(0, 0), true), (600, 1));
-        assert_eq!(displayed_frame_rate(r(600, 1), r(25, 1), false), (600, 1));
+        // No index: FFmpeg's estimate when it is the lower.
+        assert_eq!(
+            displayed_frame_rate(r(600, 1), r(25, 1), None, true),
+            (25, 1)
+        );
+        assert_eq!(
+            displayed_frame_rate(r(25, 1), r(25, 1), None, true),
+            (25, 1)
+        );
+        assert_eq!(displayed_frame_rate(r(0, 0), r(25, 1), None, true), (25, 1));
+        assert_eq!(
+            displayed_frame_rate(r(600, 1), r(0, 0), None, true),
+            (600, 1)
+        );
+        // Not AVI: the average rate.
+        assert_eq!(
+            displayed_frame_rate(r(600, 1), r(25, 1), None, false),
+            (600, 1)
+        );
+    }
+
+    #[test]
+    fn the_frame_step_is_the_most_common_gap() {
+        let ticks = |step: i64, n: i64| (0..n).map(|k| k * step).collect::<Vec<_>>();
+        assert_eq!(most_common_step(&ticks(24, 10)), Some(24));
+        assert_eq!(most_common_step(&ticks(2, 10)), Some(2));
+        assert_eq!(most_common_step(&ticks(1, 10)), Some(1));
+        // A dropped frame here and there doesn't change the rate.
+        assert_eq!(most_common_step(&[0, 1, 2, 4, 5, 6, 8, 9]), Some(1));
+        // A tie: the smaller step.
+        assert_eq!(most_common_step(&[0, 1, 2, 4, 6]), Some(1));
+        assert_eq!(most_common_step(&[0]), None);
+        assert_eq!(most_common_step(&[]), None);
+        assert_eq!(most_common_step(&[5, 5, 5]), None);
     }
 
     #[test]
