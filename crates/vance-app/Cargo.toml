@@ -38,6 +38,12 @@ ocio = ["vance-ocio/ocio"]
 clap = ["vance-audio/clap", "vance-plugin-host/clap"]
 lv2 = ["vance-audio/lv2", "vance-plugin-host/lv2"]
 
+# Lib API only the integration tests use (`layer_feed::ScrubProvider`),
+# kept out of the app build. The dev-dependency on this crate itself (below)
+# turns it on for every build that includes the tests, so `cargo test` and
+# `cargo xtask test` need no flag.
+test-support = []
+
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
@@ -113,3 +119,5 @@ windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation"] 
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Itself, with `test-support`, for the integration tests (see [features]).
+vance-app = { path = ".", features = ["test-support"] }

@@ -6527,6 +6527,7 @@ dependencies = [
  "tracing-chrome",
  "tracing-subscriber",
  "uuid",
+ "vance-app",
  "vance-audio",
  "vance-audio-plugins",
  "vance-cache",

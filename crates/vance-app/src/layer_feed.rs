@@ -1,7 +1,8 @@
-//! The two decoded-frame providers behind [`compose_frame`] (ADR 0007).
+//! The decoded-frame providers behind [`compose_frame`] (ADR 0007).
 //!
-//! - [`ScrubProvider`]: pooled `decode_at` plus the frame cache, fanned
-//!   out across layers: one decoder per file, each on its own thread.
+//! - [`ScrubFetcher`]: scrub frames per layer on workers; a slow layer holds
+//!   its last frame. `ScrubProvider` (tests only, feature `test-support`)
+//!   waits for every layer instead.
 //! - [`StreamProvider`]: per-clip streaming feeds — `Realtime` (playback)
 //!   may drop or hold frames, `Blocking` (export) never drops.
 //!
@@ -118,10 +119,14 @@ fn last_frame(
     Ok(None)
 }
 
-/// Scrub / single-frame provider: pooled `decode_at` + the frame cache.
-// Intentional: lib API for the integration tests; the engine's scrub path
-// uses `ScrubFetcher`, so the bin target doesn't construct it.
-#[allow(dead_code)]
+/// Scrub / single-frame provider: pooled `decode_at` + the frame cache,
+/// waiting for every layer. The app scrubs through [`ScrubFetcher`]; this is
+/// for tests (feature `test-support`).
+#[cfg(any(test, feature = "test-support"))]
+// Intentional: main.rs compiles this module into the bin as well; in a
+// test build the bin gets `test-support` too (feature unification) but never
+// uses this test-only API. The app build has neither the item nor the allow.
+#[cfg_attr(feature = "test-support", allow(dead_code))]
 pub struct ScrubProvider<'a> {
     /// Decoders to borrow from.
     pub pool: &'a mut DecoderPool,
@@ -130,7 +135,8 @@ pub struct ScrubProvider<'a> {
 }
 
 /// One file's requests in a scrub `frames` call, decoded on one decoder.
-#[allow(dead_code)]
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(feature = "test-support", allow(dead_code))]
 struct ScrubJob {
     dec: PooledDecoder,
     /// Indexes into the requests.
@@ -142,7 +148,8 @@ struct ScrubJob {
     fatal: bool,
 }
 
-#[allow(dead_code)]
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(feature = "test-support", allow(dead_code))]
 impl ScrubJob {
     fn run(&mut self, reqs: &[FrameRequest], cache: &FrameCache) {
         let mut idx = std::mem::take(&mut self.idx).into_iter();
@@ -209,6 +216,7 @@ fn scrub_frame_at(
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl FrameProvider for ScrubProvider<'_> {
     fn frames(&mut self, reqs: &[FrameRequest]) -> Vec<Option<FrameData>> {
         self.pool.clear_failures();
@@ -301,13 +309,15 @@ mod scrub_fetch {
     /// `fetch` shows it. One job runs per file at a time; a job that doesn't
     /// answer for [`SCRUB_HANG_LIMIT`] has its sidecar killed. Opens go through
     /// [`DecoderPool::reserve`] / [`DecoderPool::adopt`], so the pool's budget,
-    /// proxies and kill registry apply as for [`ScrubProvider`].
+    /// proxies and kill registry apply as for `take`.
     pub struct ScrubFetcher {
         on_landed: Option<Arc<dyn Fn() + Send + Sync>>,
         /// In-flight jobs by (requested) path.
         jobs: HashMap<String, FetchJob>,
         tx: std::sync::mpsc::Sender<JobDone>,
         rx: std::sync::mpsc::Receiver<JobDone>,
+        /// Jobs [`Self::reap_hung`] found finished, landed by the next fetch.
+        finished: Vec<JobDone>,
         /// Each layer's last frame, and the request it answers.
         held: HashMap<ClipId, Held>,
         generation: u64,
@@ -357,6 +367,7 @@ mod scrub_fetch {
                 jobs: HashMap::new(),
                 tx,
                 rx,
+                finished: Vec::new(),
                 held: HashMap::new(),
                 generation: 0,
                 hang_limit: SCRUB_HANG_LIMIT,
@@ -383,6 +394,9 @@ mod scrub_fetch {
             let deadline = Instant::now() + wait;
             let mut failures: HashMap<ClipId, String> = HashMap::new();
             // What landed since the last call.
+            for done in std::mem::take(&mut self.finished) {
+                self.land(pool, done, &mut failures);
+            }
             while let Ok(done) = self.rx.try_recv() {
                 self.land(pool, done, &mut failures);
             }
@@ -542,6 +556,20 @@ mod scrub_fetch {
                     }
                 }
             }
+        }
+
+        /// Kill the sidecars of decodes that haven't answered for
+        /// [`SCRUB_HANG_LIMIT`], without fetching: a timer's call, so a stuck
+        /// decoder doesn't linger once the user stops scrubbing. Cheap and
+        /// non-blocking (a kill, when due, is a signal).
+        pub fn reap_hung(&mut self) {
+            // Finished ones first, so a decoder that already answered is
+            // never killed; the next fetch lands them.
+            while let Ok(done) = self.rx.try_recv() {
+                self.jobs.remove(&done.path);
+                self.finished.push(done);
+            }
+            self.kill_hung();
         }
 
         /// Kill the sidecars of jobs that haven't answered for the hang limit.
@@ -1911,6 +1939,55 @@ mod tests {
             std::thread::sleep(after);
             ungate(&path);
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_scrub_decode_is_reaped_without_another_fetch() {
+        use crate::decoder_pool::tests::{decoder_bin, fixture, pid_recording_decoder, read_pid};
+        let Some(real) = decoder_bin() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, pid_file) = pid_recording_decoder(dir.path(), &real);
+        let mut pool = DecoderPool::new(
+            bin,
+            6,
+            crate::decoder_pool::MemoryBudget {
+                cap_bytes: u64::MAX,
+            },
+        );
+        let cache =
+            Arc::new(FrameCache::new(dir.path().join("cache"), 1 << 24, 1 << 26).expect("cache"));
+        let mut fetcher = ScrubFetcher::new(None);
+        fetcher.hang_limit = Duration::from_millis(300);
+        let path = fixture().to_string_lossy().into_owned();
+        let clip = ClipId::new();
+        let first = vec![request(clip, &path, 0.5)];
+        drop(fetcher.fetch(&mut pool, &cache, first, Duration::from_secs(20)));
+        let pid = read_pid(&pid_file);
+        signal(pid, libc::SIGSTOP);
+        let next = vec![request(clip, &path, 3.0)];
+        assert!(fetcher
+            .fetch(&mut pool, &cache, next.clone(), Duration::from_millis(50))
+            .pending());
+        // The user stops scrubbing: only the timer runs from here.
+        let early = Instant::now();
+        fetcher.reap_hung();
+        assert!(fetcher.busy(), "not killed before the limit");
+        assert!(
+            early.elapsed() < Duration::from_millis(100),
+            "reap_hung doesn't wait"
+        );
+        std::thread::sleep(Duration::from_millis(400));
+        let ended = wait_for(10, || {
+            fetcher.reap_hung();
+            !fetcher.busy()
+        });
+        signal(pid, libc::SIGKILL);
+        assert!(ended, "the stuck decode was never killed");
+        // The next fetch takes in its error and drops the dead decoder.
+        let got = fetcher.fetch(&mut pool, &cache, next.clone(), Duration::ZERO);
+        assert!(got.failure(&next[0]).is_some(), "the layer reports it");
+        assert!(wait_for(10, || !alive(pid)), "the dead decoder was reaped");
     }
 
     #[cfg(unix)]

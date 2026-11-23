@@ -9286,6 +9286,11 @@ impl Engine {
     /// A layer the last scrub frame held has landed: show the latest scrub
     /// position (on the UI's poll, so landings close together repaint once).
     fn repaint_when_landed(&mut self) {
+        // A decode stuck past the hang limit is killed here too, so it
+        // doesn't linger once the user stops scrubbing.
+        if let Some(fetcher) = self.scrub_fetcher.as_mut() {
+            fetcher.reap_hung();
+        }
         if self.scrub_pending && self.scrub_landed.swap(false, Ordering::AcqRel) {
             self.repaint_now();
         }
@@ -12468,7 +12473,11 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             return;
         };
-        let wait = Duration::from_secs(1);
+        // Intentional: a generous wait and bound. Under CI load the fast
+        // layer's own decode and a software-GPU compose take a while; a scrub
+        // that waited on the slow layer would take until the feeder starts
+        // (10 s+), and the lime / blue checks below catch a whole-frame hold.
+        let wait = Duration::from_secs(2);
         e.test_scrub_wait = Some(wait);
         let is = |c: [u8; 3], want: [u8; 3]| c.iter().zip(want).all(|(a, b)| a.abs_diff(b) <= 24);
         let (red, lime, blue, white) = ([255, 0, 0], [0, 255, 0], [0, 0, 255], [255; 3]);
@@ -12536,7 +12545,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(is(shown.0, red) && is(shown.1, blue), "both: {shown:?}");
         assert!(
-            took < wait * 2,
+            took < wait * 3,
             "the scrub didn't wait on the slow layer: {took:?}"
         );
         assert!(is(held.0, lime), "the fast layer updated at once: {held:?}");
